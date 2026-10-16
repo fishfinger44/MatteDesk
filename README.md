@@ -8,7 +8,7 @@
 
 Repair the plates once. Generate alpha mattes for multiple objects – the tool computes each mask for the whole shot. You fix only the frames that need it.
 
-`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `ComfyUI` · `Nuke / After Effects` · `100% local, no cloud, no LLM`
+`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `100% local, no cloud, no LLM`
 
 **English** · [Polski](README.pl.md) · UI language: English by default, 🌐 switch to Polish in the header
 

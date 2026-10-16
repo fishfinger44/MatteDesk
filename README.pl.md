@@ -8,7 +8,7 @@
 
 Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie liczy każdą maskę na całe ujęcie. Ty poprawiasz tylko te klatki, które tego wymagają.
 
-`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `ComfyUI` · `Nuke / After Effects` · `100% lokalnie, bez chmury i bez LLM`
+`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `100% lokalnie, bez chmury i bez LLM`
 
 [English](README.md) · **Polski** · język interfejsu: domyślnie angielski, 🌐 przełącznik na polski w nagłówku
 
