@@ -8,7 +8,7 @@
 
 Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie liczy każdą maskę na całe ujęcie. Ty poprawiasz tylko te klatki, które tego wymagają.
 
-`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `100% lokalnie, bez chmury i bez LLM`
+`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
 [English](README.md) · **Polski** · język interfejsu: domyślnie angielski, 🌐 przełącznik na polski w nagłówku
 
@@ -124,6 +124,12 @@ krawędzi względem gradientu obrazu. Po dwóch nieudanych próbach automatyczny
 Przycisk **Doktor** sprawdza ComfyUI, węzły, modele, ffmpeg i GPU. Gdy czegoś brakuje, otwiera się sam przy starcie i przy każdej pozycji
 daje przycisk **Zainstaluj** z paskiem postępu (MB, prędkość, czas do końca) oraz zbiorczy **„Zainstaluj wszystkie brakujące”**.
 Jest też przełącznik między **ComfyUI Desktop** a **ComfyUI z gita**.
+
+### 🤖 API dla agentów AI i skryptów
+Wszystko, co robi interfejs, jest dostępne przez lokalne REST API i wiersz poleceń `tools/md.py` (sama biblioteka standardowa) –
+opis w [docs/AGENT_API.md](docs/AGENT_API.md). Agent AI (np. Claude Code) albo skrypt pipeline'u może otworzyć ujęcie, uruchomić
+etapy i kolejkę na noc, czytać postęp, QA i wersje oraz eksportować – a decyzje „na oko” (który obiekt, gdzie klucz, czy krawędź jest
+dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej flagi potwierdzenia.
 
 ### 🔒 Zasady, które narzędzie wymusza
 - RGB zawsze z oryginalnego plate'u – ComfyUI dostarcza **wyłącznie alphę**,

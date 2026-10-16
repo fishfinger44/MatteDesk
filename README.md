@@ -8,7 +8,7 @@
 
 Repair the plates once. Generate alpha mattes for multiple objects – the tool computes each mask for the whole shot. You fix only the frames that need it.
 
-`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `100% local, no cloud, no LLM`
+`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
 **English** · [Polski](README.pl.md) · UI language: English by default, 🌐 switch to Polish in the header
 
@@ -126,6 +126,12 @@ measured against the image gradient. After two failed automatic attempts the too
 The **Doctor** button checks ComfyUI, nodes, models, ffmpeg and the GPU. When something is missing it opens by itself at start-up and
 gives each item an **Install** button with a progress bar (MB, speed, time left), plus a batch **"Install all missing"**.
 It also switches between **ComfyUI Desktop** and **ComfyUI from git**, and shows the licence of every third-party component.
+
+### 🤖 API for AI agents and scripts
+Everything the UI does is available over a local REST API and a command line, `tools/md.py` (standard library only) – documented
+in [docs/AGENT_API.md](docs/AGENT_API.md). An AI coding agent (e.g. Claude Code) or a pipeline script can open a shot, start stages
+and the overnight queue, read progress, QA and versions, and export – while "by eye" decisions (which object, where to put a key,
+whether an edge is good) stay with the artist in the UI. Exports and other writes need an explicit confirmation flag.
 
 ### 🔒 Rules the tool enforces
 - RGB always comes from the original plate – ComfyUI delivers **alpha only**,
