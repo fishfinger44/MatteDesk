@@ -1,0 +1,1813 @@
+{
+ "id": "b1a7e0c2-5d3f-4c1e-9a2b-ma2mba000003",
+ "revision": 0,
+ "last_node_id": 23,
+ "last_link_id": 34,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "LoadVideo",
+   "pos": [
+    0,
+    0
+   ],
+   "size": [
+    380,
+    480
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "file",
+     "type": "COMBO",
+     "link": null,
+     "widget": {
+      "name": "file"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "VIDEO",
+     "type": "VIDEO",
+     "links": [
+      1,
+      35,
+      36
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadVideo"
+   },
+   "widgets_values": [
+    "MBA_03_woman_elevator.mp4",
+    "image"
+   ],
+   "title": "1. Klip"
+  },
+  {
+   "id": 2,
+   "type": "GetVideoComponents",
+   "pos": [
+    420,
+    0
+   ],
+   "size": [
+    260,
+    110
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "video",
+     "type": "VIDEO",
+     "link": 1
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": [
+      2,
+      10,
+      13,
+      17,
+      24,
+      29
+     ]
+    },
+    {
+     "name": "audio",
+     "type": "AUDIO",
+     "links": []
+    },
+    {
+     "name": "fps",
+     "type": "FLOAT",
+     "links": []
+    },
+    {
+     "name": "bit_depth",
+     "type": "COMBO",
+     "links": []
+    },
+    {
+     "name": "color_space",
+     "type": "COMBO",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "GetVideoComponents"
+   }
+  },
+  {
+   "id": 3,
+   "type": "MatAnyone2SelectKeyframes",
+   "pos": [
+    420,
+    160
+   ],
+   "size": [
+    300,
+    110
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 2
+    },
+    {
+     "name": "keyframes",
+     "type": "STRING",
+     "link": null,
+     "widget": {
+      "name": "keyframes"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "keyframe_images",
+     "type": "IMAGE",
+     "links": [
+      5
+     ]
+    },
+    {
+     "name": "keyframes",
+     "type": "STRING",
+     "links": [
+      12
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "MatAnyone2SelectKeyframes"
+   },
+   "widgets_values": [
+    "0"
+   ],
+   "title": "2. Klatki kluczowe (np. 0, 110, -1)"
+  },
+  {
+   "id": 4,
+   "type": "CheckpointLoaderSimple",
+   "pos": [
+    0,
+    520
+   ],
+   "size": [
+    380,
+    100
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "ckpt_name",
+     "type": "COMBO",
+     "link": null,
+     "widget": {
+      "name": "ckpt_name"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      3,
+      14,
+      18,
+      28
+     ]
+    },
+    {
+     "name": "CLIP",
+     "type": "CLIP",
+     "links": [
+      4,
+      27
+     ]
+    },
+    {
+     "name": "VAE",
+     "type": "VAE",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CheckpointLoaderSimple"
+   },
+   "widgets_values": [
+    "sam3.1_multiplex_fp16.safetensors"
+   ],
+   "title": "SAM3"
+  },
+  {
+   "id": 5,
+   "type": "CLIPTextEncode",
+   "pos": [
+    0,
+    660
+   ],
+   "size": [
+    380,
+    120
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 4
+    },
+    {
+     "name": "text",
+     "type": "STRING",
+     "link": null,
+     "widget": {
+      "name": "text"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      6,
+      16
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPTextEncode"
+   },
+   "widgets_values": [
+    "woman"
+   ],
+   "title": "3. Kogo wyciac (tekst SAM3)"
+  },
+  {
+   "id": 6,
+   "type": "SAM3_Detect",
+   "pos": [
+    760,
+    160
+   ],
+   "size": [
+    300,
+    200
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 3
+    },
+    {
+     "name": "image",
+     "type": "IMAGE",
+     "link": 5
+    },
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": 6,
+     "shape": 7
+    },
+    {
+     "name": "positive_coords",
+     "type": "STRING",
+     "link": null,
+     "shape": 7
+    },
+    {
+     "name": "negative_coords",
+     "type": "STRING",
+     "link": null,
+     "shape": 7
+    },
+    {
+     "name": "threshold",
+     "type": "FLOAT",
+     "link": null,
+     "widget": {
+      "name": "threshold"
+     }
+    },
+    {
+     "name": "refine_iterations",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "refine_iterations"
+     }
+    },
+    {
+     "name": "individual_masks",
+     "type": "BOOLEAN",
+     "link": null,
+     "widget": {
+      "name": "individual_masks"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "masks",
+     "type": "MASK",
+     "links": [
+      7,
+      11
+     ]
+    },
+    {
+     "name": "bboxes",
+     "type": "BOUNDING_BOX",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SAM3_Detect"
+   },
+   "widgets_values": [
+    0.5,
+    2,
+    false
+   ],
+   "title": "Maski klatek kluczowych"
+  },
+  {
+   "id": 7,
+   "type": "MaskToImage",
+   "pos": [
+    1100,
+    160
+   ],
+   "size": [
+    220,
+    60
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "mask",
+     "type": "MASK",
+     "link": 7
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      8
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "MaskToImage"
+   }
+  },
+  {
+   "id": 8,
+   "type": "PreviewImage",
+   "pos": [
+    1100,
+    260
+   ],
+   "size": [
+    360,
+    300
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 8
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "PreviewImage"
+   },
+   "title": "Podglad masek klatek kluczowych"
+  },
+  {
+   "id": 9,
+   "type": "LoadMatAnyone2Model",
+   "pos": [
+    760,
+    420
+   ],
+   "size": [
+    300,
+    80
+   ],
+   "flags": {},
+   "order": 8,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "checkpoint",
+     "type": "COMBO",
+     "link": null,
+     "widget": {
+      "name": "checkpoint"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "model",
+     "type": "MATANYONE2_MODEL",
+     "links": [
+      9
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadMatAnyone2Model"
+   },
+   "widgets_values": [
+    "matanyone2.pth"
+   ]
+  },
+  {
+   "id": 10,
+   "type": "MatAnyone2RunKeyframes",
+   "pos": [
+    760,
+    540
+   ],
+   "size": [
+    300,
+    290
+   ],
+   "flags": {},
+   "order": 9,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model_pipe",
+     "type": "MATANYONE2_MODEL",
+     "link": 9
+    },
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 10
+    },
+    {
+     "name": "keyframe_masks",
+     "type": "MASK",
+     "link": 11
+    },
+    {
+     "name": "keyframes",
+     "type": "STRING",
+     "link": 12
+    },
+    {
+     "name": "start_frame",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "start_frame"
+     }
+    },
+    {
+     "name": "warmup_frames",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "warmup_frames"
+     }
+    },
+    {
+     "name": "erode_kernel",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "erode_kernel"
+     }
+    },
+    {
+     "name": "dilate_kernel",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "dilate_kernel"
+     }
+    },
+    {
+     "name": "max_size",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "max_size"
+     }
+    },
+    {
+     "name": "max_mem_frames",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "max_mem_frames"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "alpha_mattes",
+     "type": "MASK",
+     "links": [
+      21
+     ]
+    },
+    {
+     "name": "matte_video",
+     "type": "IMAGE",
+     "links": []
+    },
+    {
+     "name": "foreground",
+     "type": "IMAGE",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "MatAnyone2RunKeyframes"
+   },
+   "widgets_values": [
+    0,
+    10,
+    10,
+    10,
+    -1,
+    5
+   ],
+   "title": "4. MatAnyone 2 (krawedz, wlosy)"
+  },
+  {
+   "id": 11,
+   "type": "ImageFromBatch",
+   "pos": [
+    420,
+    860
+   ],
+   "size": [
+    260,
+    100
+   ],
+   "flags": {},
+   "order": 10,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "image",
+     "type": "IMAGE",
+     "link": 13
+    },
+    {
+     "name": "batch_index",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "batch_index"
+     }
+    },
+    {
+     "name": "length",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "length"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      15
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ImageFromBatch"
+   },
+   "widgets_values": [
+    0,
+    1
+   ],
+   "title": "Klatka 0 (start sledzenia)"
+  },
+  {
+   "id": 12,
+   "type": "SAM3_Detect",
+   "pos": [
+    720,
+    860
+   ],
+   "size": [
+    300,
+    200
+   ],
+   "flags": {},
+   "order": 11,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 14
+    },
+    {
+     "name": "image",
+     "type": "IMAGE",
+     "link": 15
+    },
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": 16,
+     "shape": 7
+    },
+    {
+     "name": "positive_coords",
+     "type": "STRING",
+     "link": null,
+     "shape": 7
+    },
+    {
+     "name": "negative_coords",
+     "type": "STRING",
+     "link": null,
+     "shape": 7
+    },
+    {
+     "name": "threshold",
+     "type": "FLOAT",
+     "link": null,
+     "widget": {
+      "name": "threshold"
+     }
+    },
+    {
+     "name": "refine_iterations",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "refine_iterations"
+     }
+    },
+    {
+     "name": "individual_masks",
+     "type": "BOOLEAN",
+     "link": null,
+     "widget": {
+      "name": "individual_masks"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "masks",
+     "type": "MASK",
+     "links": [
+      19
+     ]
+    },
+    {
+     "name": "bboxes",
+     "type": "BOUNDING_BOX",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SAM3_Detect"
+   },
+   "widgets_values": [
+    0.5,
+    2,
+    false
+   ],
+   "title": "Maska klatki 0 (dla sledzenia)"
+  },
+  {
+   "id": 13,
+   "type": "SAM3_VideoTrack",
+   "pos": [
+    1060,
+    860
+   ],
+   "size": [
+    300,
+    160
+   ],
+   "flags": {},
+   "order": 12,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 17
+    },
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 18
+    },
+    {
+     "name": "initial_mask",
+     "type": "MASK",
+     "link": 19,
+     "shape": 7
+    },
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": null,
+     "shape": 7
+    },
+    {
+     "name": "detection_threshold",
+     "type": "FLOAT",
+     "link": null,
+     "widget": {
+      "name": "detection_threshold"
+     }
+    },
+    {
+     "name": "max_objects",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "max_objects"
+     }
+    },
+    {
+     "name": "detect_interval",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "detect_interval"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "track_data",
+     "type": "SAM3_TRACK_DATA",
+     "links": [
+      20
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SAM3_VideoTrack"
+   },
+   "widgets_values": [
+    0.5,
+    1,
+    1
+   ],
+   "title": "5. SAM3 Video Track (rdzen sylwetki)"
+  },
+  {
+   "id": 14,
+   "type": "SAM3_TrackToMask",
+   "pos": [
+    1400,
+    860
+   ],
+   "size": [
+    260,
+    80
+   ],
+   "flags": {},
+   "order": 13,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "track_data",
+     "type": "SAM3_TRACK_DATA",
+     "link": 20
+    },
+    {
+     "name": "object_indices",
+     "type": "STRING",
+     "link": null,
+     "widget": {
+      "name": "object_indices"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "masks",
+     "type": "MASK",
+     "links": [
+      22
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SAM3_TrackToMask"
+   },
+   "widgets_values": [
+    ""
+   ]
+  },
+  {
+   "id": 15,
+   "type": "MatAnyone2CoreCombine",
+   "pos": [
+    1400,
+    420
+   ],
+   "size": [
+    340,
+    300
+   ],
+   "flags": {},
+   "order": 14,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "alpha",
+     "type": "MASK",
+     "link": 21
+    },
+    {
+     "name": "core_masks",
+     "type": "MASK",
+     "link": 22
+    },
+    {
+     "name": "core_erode_px",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "core_erode_px"
+     }
+    },
+    {
+     "name": "core_feather_px",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "core_feather_px"
+     }
+    },
+    {
+     "name": "gate_px",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "gate_px"
+     }
+    },
+    {
+     "name": "gate_low",
+     "type": "FLOAT",
+     "link": null,
+     "widget": {
+      "name": "gate_low"
+     }
+    },
+    {
+     "name": "gate_high",
+     "type": "FLOAT",
+     "link": null,
+     "widget": {
+      "name": "gate_high"
+     }
+    },
+    {
+     "name": "temporal_sigma",
+     "type": "FLOAT",
+     "link": null,
+     "widget": {
+      "name": "temporal_sigma"
+     }
+    },
+    {
+     "name": "edge_band_px",
+     "type": "INT",
+     "link": null,
+     "widget": {
+      "name": "edge_band_px"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "alpha",
+     "type": "MASK",
+     "links": [
+      25,
+      32
+     ]
+    },
+    {
+     "name": "matte_video",
+     "type": "IMAGE",
+     "links": [
+      23
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "MatAnyone2CoreCombine"
+   },
+   "widgets_values": [
+    3,
+    2,
+    12,
+    0.55,
+    0.8,
+    2.5,
+    6
+   ],
+   "title": "6. Polaczenie: bez dziur + stabilna krawedz"
+  },
+  {
+   "id": 16,
+   "type": "SaveImage",
+   "pos": [
+    1800,
+    420
+   ],
+   "size": [
+    360,
+    380
+   ],
+   "flags": {},
+   "order": 15,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 23
+    },
+    {
+     "name": "filename_prefix",
+     "type": "STRING",
+     "link": null,
+     "widget": {
+      "name": "filename_prefix"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveImage"
+   },
+   "widgets_values": [
+    "MatAnyone2/sam3core/matte"
+   ],
+   "title": "7. Matte PNG (do AE jako Luma Matte)"
+  },
+  {
+   "id": 17,
+   "type": "MarkdownNote",
+   "pos": [
+    0,
+    1100
+   ],
+   "size": [
+    760,
+    820
+   ],
+   "flags": {},
+   "order": 16,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "MarkdownNote"
+   },
+   "widgets_values": [
+    "## MatAnyone 2 + SAM3 core (NAJLEPSZY WARIANT)\n\n**Problem, ktory rozwiazuje:** MatAnyone 2 czasem wycina falszywe dziury wewnatrz postaci (np. jasne refleksy we wlosach bierze za tlo) i krawedz \"plywa\". SAM3 Video Track daje pelna sylwetke w kazdej klatce -> dziury sa zasypywane, a miekka krawedz/wlosy zostaja z MatAnyone.\n\n1. **Klip** (po Topazie).\n2. **Klatki kluczowe** – `0` wystarczy; przy trudnych ujeciach dodaj klatki, gdzie wchodzi nowa czesc ciala / po zasloniciu (np. `0, 110, -1`). `start_frame` w MatAnyone = klatka, gdzie osoba jest najwieksza i najostrzejsza.\n3. **Kogo wyciac** – tekst (`woman`, `man in suit`). Kilka osob w kadrze / trzymany przedmiot? Podlacz punkty (positive/negative_coords, np. Points Editor z KJNodes) do OBU nodow SAM3 Detect.\n4. **MatAnyone 2** – matte z wlosami.\n5. **SAM3 Video Track** – sledzi postac od klatki 0 (max_objects 1).\n6. **Polaczenie** – `core_erode_px` 3, `gate_px` 12 (wypelnia tylko tam, gdzie dookola jest postac = dziury), `temporal_sigma` 2.5 kl. (wygladzenie krawedzi w czasie; przy szybkim ruchu zmniejsz do 1–1.5).\n7. **Wynik** – `output/MatAnyone2/sam3core/matte_*` -> AE Luma Matte.\n8. **Odkazenie koloru** (pymatting) – polprzezroczyste pasma dostaja kolor wlosa zamiast starego tla (znika biala otoczka/pasma). `fg_*` = czysty pierwszy plan: w AE podmien NIM wideo w komp postaci (Replace Source), matte zostaje ta sama. ~0.3 s/kl.\n\nTest MBA winda: falszywa dziura we wlosach zniknela, miganie krawedzi -45%, ok. 2.5 min / 237 kl. 1080p (RTX 3080 Ti).\n\n**Kolory (dziala na OBRAZIE, nie na masce):** 8. odkazenie (pymatting) -> 10–11. Edge Cleanup tylko w regionie (SAM3 `hair`): `recolor`/`cut`, jasne/ciemne partie (sila+prog), despill niebieski/zielony, zasieg od krawedzi. W AE: podmien wideo w komp postaci na FINAL (Replace Source), matte bez zmian.\n**Zapis `Save Image Auto` (format = auto):** zrodlo 8-bit (mp4/png) -> PNG 8-bit; zrodlo >8-bit / EXR -> EXR 32-bit float bez kompresji, wartosci 1:1 (w AE wyglada jak zrodlo). Glebie czyta z naglowka pliku wideo (Load Video). Mozna wymusic png/exr."
+   ]
+  },
+  {
+   "id": 18,
+   "type": "ForegroundDecontaminate",
+   "pos": [
+    1800,
+    860
+   ],
+   "size": [
+    340,
+    120
+   ],
+   "flags": {},
+   "order": 18,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 24
+    },
+    {
+     "name": "alpha",
+     "type": "MASK",
+     "link": 25
+    },
+    {
+     "name": "regularization",
+     "type": "FLOAT",
+     "widget": {
+      "name": "regularization"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "foreground",
+     "type": "IMAGE",
+     "links": [
+      26,
+      31
+     ]
+    },
+    {
+     "name": "foreground_rgba",
+     "type": "IMAGE",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ForegroundDecontaminate"
+   },
+   "widgets_values": [
+    1e-05
+   ],
+   "title": "8. Odkazenie koloru krawedzi (bez bialej otoczki)"
+  },
+  {
+   "id": 19,
+   "type": "SaveImageAuto",
+   "pos": [
+    2180,
+    860
+   ],
+   "size": [
+    360,
+    380
+   ],
+   "flags": {},
+   "order": 19,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 26
+    },
+    {
+     "name": "source_video",
+     "type": "VIDEO",
+     "shape": 7,
+     "link": 35
+    },
+    {
+     "name": "source",
+     "type": "IMAGE",
+     "shape": 7,
+     "link": null
+    },
+    {
+     "name": "filename_prefix",
+     "type": "STRING",
+     "widget": {
+      "name": "filename_prefix"
+     },
+     "link": null
+    },
+    {
+     "name": "format",
+     "type": "COMBO",
+     "widget": {
+      "name": "format"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": []
+    },
+    {
+     "name": "saved_as",
+     "type": "STRING",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveImageAuto"
+   },
+   "widgets_values": [
+    "MatAnyone2/sam3core/fg_decontam",
+    "auto"
+   ],
+   "title": "9. Odkazony pierwszy plan (auto: PNG z mp4 / EXR 32f z EXR)"
+  },
+  {
+   "id": 20,
+   "type": "CLIPTextEncode",
+   "pos": [
+    1800,
+    1300
+   ],
+   "size": [
+    300,
+    100
+   ],
+   "flags": {},
+   "order": 20,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 27
+    },
+    {
+     "name": "text",
+     "type": "STRING",
+     "widget": {
+      "name": "text"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      30
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPTextEncode"
+   },
+   "widgets_values": [
+    "hair"
+   ],
+   "title": "10. Region: co czyscic (tekst SAM3)"
+  },
+  {
+   "id": 21,
+   "type": "SAM3_Detect",
+   "pos": [
+    2140,
+    1300
+   ],
+   "size": [
+    300,
+    200
+   ],
+   "flags": {},
+   "order": 21,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 28
+    },
+    {
+     "name": "image",
+     "type": "IMAGE",
+     "link": 29
+    },
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "shape": 7,
+     "link": 30
+    },
+    {
+     "name": "threshold",
+     "type": "FLOAT",
+     "widget": {
+      "name": "threshold"
+     },
+     "link": null
+    },
+    {
+     "name": "refine_iterations",
+     "type": "INT",
+     "widget": {
+      "name": "refine_iterations"
+     },
+     "link": null
+    },
+    {
+     "name": "individual_masks",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "individual_masks"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "masks",
+     "type": "MASK",
+     "links": [
+      33
+     ]
+    },
+    {
+     "name": "bboxes",
+     "type": "BOUNDING_BOX",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SAM3_Detect"
+   },
+   "widgets_values": [
+    0.4,
+    2,
+    false
+   ],
+   "title": "Maska wlosow (kazda klatka)"
+  },
+  {
+   "id": 22,
+   "type": "EdgeCleanup",
+   "pos": [
+    2480,
+    860
+   ],
+   "size": [
+    360,
+    420
+   ],
+   "flags": {},
+   "order": 22,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 31
+    },
+    {
+     "name": "alpha",
+     "type": "MASK",
+     "link": 32
+    },
+    {
+     "name": "region",
+     "type": "MASK",
+     "shape": 7,
+     "link": 33
+    },
+    {
+     "name": "action",
+     "type": "COMBO",
+     "widget": {
+      "name": "action"
+     },
+     "link": null
+    },
+    {
+     "name": "bright_strength",
+     "type": "FLOAT",
+     "widget": {
+      "name": "bright_strength"
+     },
+     "link": null
+    },
+    {
+     "name": "bright_threshold",
+     "type": "FLOAT",
+     "widget": {
+      "name": "bright_threshold"
+     },
+     "link": null
+    },
+    {
+     "name": "dark_strength",
+     "type": "FLOAT",
+     "widget": {
+      "name": "dark_strength"
+     },
+     "link": null
+    },
+    {
+     "name": "dark_threshold",
+     "type": "FLOAT",
+     "widget": {
+      "name": "dark_threshold"
+     },
+     "link": null
+    },
+    {
+     "name": "despill",
+     "type": "COMBO",
+     "widget": {
+      "name": "despill"
+     },
+     "link": null
+    },
+    {
+     "name": "despill_strength",
+     "type": "FLOAT",
+     "widget": {
+      "name": "despill_strength"
+     },
+     "link": null
+    },
+    {
+     "name": "edge_zone_px",
+     "type": "INT",
+     "widget": {
+      "name": "edge_zone_px"
+     },
+     "link": null
+    },
+    {
+     "name": "ref_radius",
+     "type": "INT",
+     "widget": {
+      "name": "ref_radius"
+     },
+     "link": null
+    },
+    {
+     "name": "protect_large_px",
+     "type": "INT",
+     "widget": {
+      "name": "protect_large_px"
+     },
+     "link": null
+    },
+    {
+     "name": "region_grow_px",
+     "type": "INT",
+     "widget": {
+      "name": "region_grow_px"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": [
+      34
+     ]
+    },
+    {
+     "name": "alpha",
+     "type": "MASK",
+     "links": []
+    },
+    {
+     "name": "fix_map",
+     "type": "MASK",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "EdgeCleanup"
+   },
+   "widgets_values": [
+    "recolor",
+    1.0,
+    0.05,
+    0.0,
+    0.1,
+    "blue",
+    0.5,
+    40,
+    12,
+    0,
+    6
+   ],
+   "title": "11. Edge Cleanup: jasne/ciemne partie, despill (tylko region)"
+  },
+  {
+   "id": 23,
+   "type": "SaveImageAuto",
+   "pos": [
+    2880,
+    860
+   ],
+   "size": [
+    360,
+    380
+   ],
+   "flags": {},
+   "order": 23,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 34
+    },
+    {
+     "name": "source_video",
+     "type": "VIDEO",
+     "shape": 7,
+     "link": 36
+    },
+    {
+     "name": "source",
+     "type": "IMAGE",
+     "shape": 7,
+     "link": null
+    },
+    {
+     "name": "filename_prefix",
+     "type": "STRING",
+     "widget": {
+      "name": "filename_prefix"
+     },
+     "link": null
+    },
+    {
+     "name": "format",
+     "type": "COMBO",
+     "widget": {
+      "name": "format"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": []
+    },
+    {
+     "name": "saved_as",
+     "type": "STRING",
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveImageAuto"
+   },
+   "widgets_values": [
+    "MatAnyone2/sam3core/fg_clean",
+    "auto"
+   ],
+   "title": "12. FINAL pierwszy plan (auto: PNG z mp4 / EXR 32f z EXR)"
+  }
+ ],
+ "links": [
+  [
+   1,
+   1,
+   0,
+   2,
+   0,
+   "VIDEO"
+  ],
+  [
+   2,
+   2,
+   0,
+   3,
+   0,
+   "IMAGE"
+  ],
+  [
+   3,
+   4,
+   0,
+   6,
+   0,
+   "MODEL"
+  ],
+  [
+   4,
+   4,
+   1,
+   5,
+   0,
+   "CLIP"
+  ],
+  [
+   5,
+   3,
+   0,
+   6,
+   1,
+   "IMAGE"
+  ],
+  [
+   6,
+   5,
+   0,
+   6,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   7,
+   6,
+   0,
+   7,
+   0,
+   "MASK"
+  ],
+  [
+   8,
+   7,
+   0,
+   8,
+   0,
+   "IMAGE"
+  ],
+  [
+   9,
+   9,
+   0,
+   10,
+   0,
+   "MATANYONE2_MODEL"
+  ],
+  [
+   10,
+   2,
+   0,
+   10,
+   1,
+   "IMAGE"
+  ],
+  [
+   11,
+   6,
+   0,
+   10,
+   2,
+   "MASK"
+  ],
+  [
+   12,
+   3,
+   1,
+   10,
+   3,
+   "STRING"
+  ],
+  [
+   13,
+   2,
+   0,
+   11,
+   0,
+   "IMAGE"
+  ],
+  [
+   14,
+   4,
+   0,
+   12,
+   0,
+   "MODEL"
+  ],
+  [
+   15,
+   11,
+   0,
+   12,
+   1,
+   "IMAGE"
+  ],
+  [
+   16,
+   5,
+   0,
+   12,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   17,
+   2,
+   0,
+   13,
+   0,
+   "IMAGE"
+  ],
+  [
+   18,
+   4,
+   0,
+   13,
+   1,
+   "MODEL"
+  ],
+  [
+   19,
+   12,
+   0,
+   13,
+   2,
+   "MASK"
+  ],
+  [
+   20,
+   13,
+   0,
+   14,
+   0,
+   "SAM3_TRACK_DATA"
+  ],
+  [
+   21,
+   10,
+   0,
+   15,
+   0,
+   "MASK"
+  ],
+  [
+   22,
+   14,
+   0,
+   15,
+   1,
+   "MASK"
+  ],
+  [
+   23,
+   15,
+   1,
+   16,
+   0,
+   "IMAGE"
+  ],
+  [
+   24,
+   2,
+   0,
+   18,
+   0,
+   "IMAGE"
+  ],
+  [
+   25,
+   15,
+   0,
+   18,
+   1,
+   "MASK"
+  ],
+  [
+   26,
+   18,
+   0,
+   19,
+   0,
+   "IMAGE"
+  ],
+  [
+   27,
+   4,
+   1,
+   20,
+   0,
+   "CLIP"
+  ],
+  [
+   28,
+   4,
+   0,
+   21,
+   0,
+   "MODEL"
+  ],
+  [
+   29,
+   2,
+   0,
+   21,
+   1,
+   "IMAGE"
+  ],
+  [
+   30,
+   20,
+   0,
+   21,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   31,
+   18,
+   0,
+   22,
+   0,
+   "IMAGE"
+  ],
+  [
+   32,
+   15,
+   0,
+   22,
+   1,
+   "MASK"
+  ],
+  [
+   33,
+   21,
+   0,
+   22,
+   2,
+   "MASK"
+  ],
+  [
+   34,
+   22,
+   0,
+   23,
+   0,
+   "IMAGE"
+  ],
+  [
+   35,
+   1,
+   0,
+   19,
+   1,
+   "VIDEO"
+  ],
+  [
+   36,
+   1,
+   0,
+   23,
+   1,
+   "VIDEO"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.6,
+   "offset": [
+    100,
+    100
+   ]
+  }
+ },
+ "version": 0.4
+}

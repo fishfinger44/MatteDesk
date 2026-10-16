@@ -1,0 +1,7 @@
+{
+  "_help": "Skopiuj jako config.local.json (tylko ta maszyna, poza gitem). Ścieżki mogą być względne do folderu MatteDesk. Puste = autodetekcja (ComfyUI Desktop).",
+  "comfy_dir": "",
+  "models_dir": "",
+  "comfy_port": 8000,
+  "ffmpeg_path": "ffmpeg"
+}

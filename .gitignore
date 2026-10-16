@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Run logs and doctor reports generated during local execution
+doctor_report.json
+doctor_report_*.json
+INSTALL_*.md
+log.txt
+
+# Overnight queue state (per machine)
+queue/
+
+# Per-machine tool config (paths, port)
+config.local.json
+
+# Backups of replaced Comfy node packages (Doctor "Zainstaluj")
+backups/
+.comfy_restart_pending.json
+
+# Tools installed by the Doctor (portable ffmpeg)
+bin/

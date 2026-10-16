@@ -1,0 +1,9 @@
+[project]
+name = "matte_desk"
+version = "0.1.0"
+description = "Interaktywne narzędzie do wycinania (alpha) z korektą klatek - MatteDesk"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

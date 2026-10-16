@@ -1,0 +1,724 @@
+{
+ "id": "bb77535e-df6b-4c80-ae75-35eeec597ab0",
+ "revision": 0,
+ "last_node_id": 11,
+ "last_link_id": 9,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "VHS_LoadVideo",
+   "pos": [
+    -601.9596831864811,
+    256.19633773380133
+   ],
+   "size": [
+    315,
+    314
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "meta_batch",
+     "name": "meta_batch",
+     "shape": 7,
+     "type": "VHS_BatchManager",
+     "link": null
+    },
+    {
+     "localized_name": "vae",
+     "name": "vae",
+     "shape": 7,
+     "type": "VAE",
+     "link": null
+    },
+    {
+     "localized_name": "video",
+     "name": "video",
+     "type": "COMBO",
+     "widget": {
+      "name": "video"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "force_rate",
+     "name": "force_rate",
+     "type": "FLOAT",
+     "widget": {
+      "name": "force_rate"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "custom_width",
+     "name": "custom_width",
+     "type": "INT",
+     "widget": {
+      "name": "custom_width"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "custom_height",
+     "name": "custom_height",
+     "type": "INT",
+     "widget": {
+      "name": "custom_height"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "frame_load_cap",
+     "name": "frame_load_cap",
+     "type": "INT",
+     "widget": {
+      "name": "frame_load_cap"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "skip_first_frames",
+     "name": "skip_first_frames",
+     "type": "INT",
+     "widget": {
+      "name": "skip_first_frames"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "select_every_nth",
+     "name": "select_every_nth",
+     "type": "INT",
+     "widget": {
+      "name": "select_every_nth"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "format",
+     "name": "format",
+     "shape": 7,
+     "type": "COMBO",
+     "widget": {
+      "name": "format"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "IMAGE",
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "slot_index": 0,
+     "links": []
+    },
+    {
+     "localized_name": "frame_count",
+     "name": "frame_count",
+     "type": "INT",
+     "links": null
+    },
+    {
+     "localized_name": "audio",
+     "name": "audio",
+     "type": "AUDIO",
+     "links": null
+    },
+    {
+     "localized_name": "video_info",
+     "name": "video_info",
+     "type": "VHS_VIDEOINFO",
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VHS_LoadVideo"
+   },
+   "widgets_values": [
+    "video.mp4",
+    "video",
+    0,
+    0,
+    0,
+    "",
+    1,
+    "AnimateDiff"
+   ],
+   "widgets_values_named": {
+    "video": "video.mp4",
+    "force_rate": "video",
+    "custom_width": 0,
+    "custom_height": 0,
+    "frame_load_cap": 0,
+    "skip_first_frames": "",
+    "select_every_nth": 1,
+    "format": "AnimateDiff"
+   }
+  },
+  {
+   "id": 2,
+   "type": "ImageScaleBy",
+   "pos": [
+    276.64749256725815,
+    198.8812453465539
+   ],
+   "size": [
+    315,
+    150
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "image",
+     "name": "image",
+     "type": "IMAGE",
+     "link": 5
+    },
+    {
+     "localized_name": "upscale_method",
+     "name": "upscale_method",
+     "type": "COMBO",
+     "widget": {
+      "name": "upscale_method"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "scale_by",
+     "name": "scale_by",
+     "type": "FLOAT",
+     "widget": {
+      "name": "scale_by"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "IMAGE",
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "slot_index": 0,
+     "links": [
+      8
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ImageScaleBy"
+   },
+   "widgets_values": [
+    "bicubic",
+    0.5
+   ],
+   "widgets_values_named": {
+    "upscale_method": "bicubic",
+    "scale_by": 0.5
+   }
+  },
+  {
+   "id": 4,
+   "type": "ImageScaleBy",
+   "pos": [
+    962.2451527170475,
+    177.8464838412853
+   ],
+   "size": [
+    315,
+    150
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "image",
+     "name": "image",
+     "type": "IMAGE",
+     "link": 3
+    },
+    {
+     "localized_name": "upscale_method",
+     "name": "upscale_method",
+     "type": "COMBO",
+     "widget": {
+      "name": "upscale_method"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "scale_by",
+     "name": "scale_by",
+     "type": "FLOAT",
+     "widget": {
+      "name": "scale_by"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "IMAGE",
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "slot_index": 0,
+     "links": [
+      6
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ImageScaleBy"
+   },
+   "widgets_values": [
+    "bicubic",
+    2
+   ],
+   "widgets_values_named": {
+    "upscale_method": "bicubic",
+    "scale_by": 2
+   }
+  },
+  {
+   "id": 6,
+   "type": "PlateLoadEXR",
+   "pos": [
+    -173.24113821563992,
+    197.10264539009734
+   ],
+   "size": [
+    340,
+    270
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "path_pattern",
+     "name": "path_pattern",
+     "type": "STRING",
+     "widget": {
+      "name": "path_pattern"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "first_frame",
+     "name": "first_frame",
+     "type": "INT",
+     "widget": {
+      "name": "first_frame"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "last_frame",
+     "name": "last_frame",
+     "type": "INT",
+     "widget": {
+      "name": "last_frame"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "crop_x",
+     "name": "crop_x",
+     "type": "INT",
+     "widget": {
+      "name": "crop_x"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "crop_y",
+     "name": "crop_y",
+     "type": "INT",
+     "widget": {
+      "name": "crop_y"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "crop_w",
+     "name": "crop_w",
+     "type": "INT",
+     "widget": {
+      "name": "crop_w"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "crop_h",
+     "name": "crop_h",
+     "type": "INT",
+     "widget": {
+      "name": "crop_h"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "scale",
+     "name": "scale",
+     "shape": 7,
+     "type": "FLOAT",
+     "widget": {
+      "name": "scale"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "bad_frames",
+     "name": "bad_frames",
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "bad_frames"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "images",
+     "name": "images",
+     "type": "IMAGE",
+     "slot_index": 0,
+     "links": [
+      5
+     ]
+    },
+    {
+     "localized_name": "plate_info",
+     "name": "plate_info",
+     "type": "PLATE_INFO",
+     "slot_index": 1,
+     "links": [
+      9
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PlateLoadEXR"
+   },
+   "widgets_values": [
+    "C:\\shots\\SH010\\frame_####.exr",
+    1,
+    806,
+    0,
+    0,
+    0,
+    0,
+    0.5,
+    ""
+   ],
+   "widgets_values_named": {
+    "path_pattern": "C:\\shots\\SH010\\frame_####.exr",
+    "first_frame": 0,
+    "last_frame": 180,
+    "crop_x": 0,
+    "crop_y": 0,
+    "crop_w": 0,
+    "crop_h": 0,
+    "scale": 0.5,
+    "bad_frames": ""
+   }
+  },
+  {
+   "id": 10,
+   "type": "PlateSaveEXR",
+   "pos": [
+    1331.2149583101452,
+    162.55718787176184
+   ],
+   "size": [
+    319.22421875,
+    122
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "rgba",
+     "name": "rgba",
+     "type": "IMAGE",
+     "link": 6
+    },
+    {
+     "localized_name": "plate_info",
+     "name": "plate_info",
+     "type": "PLATE_INFO",
+     "link": 9
+    },
+    {
+     "localized_name": "alpha",
+     "name": "alpha",
+     "shape": 7,
+     "type": "MASK",
+     "link": null
+    },
+    {
+     "localized_name": "out_pattern",
+     "name": "out_pattern",
+     "type": "STRING",
+     "widget": {
+      "name": "out_pattern"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "half_float",
+     "name": "half_float",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "half_float"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "PlateSaveEXR"
+   },
+   "widgets_values": [
+    "C:\\shots\\SH010\\frame_####.exr",
+    true
+   ],
+   "widgets_values_named": {
+    "out_pattern": "C:\\shots\\SH010\\frame_####.exr",
+    "half_float": true
+   }
+  },
+  {
+   "id": 3,
+   "type": "DepthCrafter",
+   "pos": [
+    630.6221596281893,
+    174.8205606352233
+   ],
+   "size": [
+    315,
+    194
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "depthcrafter_model",
+     "name": "depthcrafter_model",
+     "type": "DEPTHCRAFTER_MODEL",
+     "link": 7
+    },
+    {
+     "localized_name": "images",
+     "name": "images",
+     "type": "IMAGE",
+     "link": 8
+    },
+    {
+     "localized_name": "force_size",
+     "name": "force_size",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "force_size"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "num_inference_steps",
+     "name": "num_inference_steps",
+     "type": "INT",
+     "widget": {
+      "name": "num_inference_steps"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "guidance_scale",
+     "name": "guidance_scale",
+     "type": "FLOAT",
+     "widget": {
+      "name": "guidance_scale"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "window_size",
+     "name": "window_size",
+     "type": "INT",
+     "widget": {
+      "name": "window_size"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "overlap",
+     "name": "overlap",
+     "type": "INT",
+     "widget": {
+      "name": "overlap"
+     },
+     "link": null
+    },
+    {
+     "name": "image",
+     "type": "IMAGE",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "depth_maps",
+     "name": "depth_maps",
+     "type": "IMAGE",
+     "slot_index": 0,
+     "links": [
+      3
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DepthCrafter"
+   },
+   "widgets_values": [
+    true,
+    20,
+    0.5,
+    60,
+    20
+   ],
+   "widgets_values_named": {
+    "force_size": true,
+    "num_inference_steps": 20,
+    "guidance_scale": 0.5,
+    "window_size": 90,
+    "overlap": 30
+   }
+  },
+  {
+   "id": 11,
+   "type": "DownloadAndLoadDepthCrafterModel",
+   "pos": [
+    199.97254894776495,
+    -16.535381258576376
+   ],
+   "size": [
+    352.6314453125,
+    82
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "enable_model_cpu_offload",
+     "name": "enable_model_cpu_offload",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "enable_model_cpu_offload"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "enable_sequential_cpu_offload",
+     "name": "enable_sequential_cpu_offload",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "enable_sequential_cpu_offload"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "depthcrafter_model",
+     "name": "depthcrafter_model",
+     "type": "DEPTHCRAFTER_MODEL",
+     "links": [
+      7
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DownloadAndLoadDepthCrafterModel"
+   },
+   "widgets_values": [
+    true,
+    true
+   ],
+   "widgets_values_named": {
+    "enable_model_cpu_offload": true,
+    "enable_sequential_cpu_offload": true
+   }
+  }
+ ],
+ "links": [
+  [
+   3,
+   3,
+   0,
+   4,
+   0,
+   "IMAGE"
+  ],
+  [
+   5,
+   6,
+   0,
+   2,
+   0,
+   "IMAGE"
+  ],
+  [
+   6,
+   4,
+   0,
+   10,
+   0,
+   "IMAGE"
+  ],
+  [
+   7,
+   11,
+   0,
+   3,
+   0,
+   "DEPTHCRAFTER_MODEL"
+  ],
+  [
+   8,
+   2,
+   0,
+   3,
+   1,
+   "IMAGE"
+  ],
+  [
+   9,
+   6,
+   1,
+   10,
+   1,
+   "PLATE_INFO"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.8690852713178304,
+   "offset": [
+    101.54543794767746,
+    568.2102198182081
+   ]
+  }
+ },
+ "version": 0.4
+}

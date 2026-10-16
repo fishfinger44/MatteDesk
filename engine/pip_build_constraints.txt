@@ -1,0 +1,4 @@
+# Build-time constraints for pip runs of third-party node packs' install.py (PIP_BUILD_CONSTRAINT, engine/installer.py).
+# hatchling >= 1.26 refuses MatAnyone2's pyproject (force-include adds matanyone2/config/__init__.py twice:
+# "A second file is being added to the wheel archive at the same path"; SH050 2026-10-15).
+hatchling<1.26

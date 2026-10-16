@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<!-- MatteDesk – Copyright (C) 2026 Lech Gruszewski
+     SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MatteDesk – Interaktywne Narzędzie do Wycinania Alpha</title>
+  <meta name="description" content="MatteDesk - narzędzie do mattów alpha: SAM3 → korekty klatek → MatAnyone2, etapami">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/index.css">
+  <script src="/static/i18n.js"></script>
+</head>
+<body class="dark-theme">
+  <div id="app" class="app-container">
+    <!-- Top Bar Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-badge">
+          <img class="logo-img" src="/static/favicon.svg" alt="" width="22" height="22">
+          <span class="logo-text">MatteDesk</span>
+          <span class="version-tag" id="appVersion" title="Wersja MatteDesk – kliknij: O programie (autor, licencja)">v…</span>
+        </div>
+        <button class="btn btn-primary" id="openProjectModalBtn" title="Otwórz / skonfiguruj projekt ujęcia">📁 Projekt</button>
+        <div class="shot-info-pill" id="shotInfoPill" data-fold-name="ujęcie">
+          <span class="pill-label">Ujęcie:</span>
+          <span class="pill-value" id="shotNameDisplay">Brak projektu</span>
+          <span class="pill-divider">•</span>
+          <span class="pill-value" id="shotRangeDisplay">F0 - F0</span>
+          <span class="pill-divider">•</span>
+          <span class="pill-value" id="shotResDisplay">----x----</span>
+        </div>
+      </div>
+
+      <div class="header-center">
+        <div class="plate-selector-pill" id="plateSelectorPill" data-fold-name="wybór plate'u" title="Który plate oglądasz. Wycinanie zawsze na beauty; backlit / clear plate służą tylko do porównania i dopasowania (etap 0)">
+          <label for="plateSelect" class="plate-select-label">Plate:</label>
+          <select id="plateSelect" class="plate-select-dropdown">
+            <option value="beauty">Beauty Plate</option>
+          </select>
+          <span class="plate-vs" title="Porównanie: plate po lewej (oglądany) kontra plate po prawej">↔</span>
+          <select id="plateRefSelect" class="plate-select-dropdown" title="Prawa strona porównania: inny plate albo tło compu (białe / kolor / szachownica, BG – tło docelowe). Tło = wycięcie: RGB beauty × alpha wybranego obiektu na tym tle">
+            <option value="beauty">Beauty Plate</option>
+          </select>
+          <button type="button" class="plate-manage-btn" id="openPlatesModalBtn" title="Zarządzaj plate'ami ujęcia (dodaj lub zaktualizuj; też tło docelowe BG)">⚙️</button>
+        </div>
+        <div class="view-mode-tabs" id="viewModeTabs">
+          <button class="tab-btn active" data-view="none" title="Sam obraz plate'u">Plate</button>
+          <button class="tab-btn" data-view="core" title="Rdzeń SAM3 wybranego obiektu (niebieska nakładka) – po „▶▶ Przelicz całość”; w etapie 2 maska 1+2 (rdzeń + poprawki pędzlem)">Rdzeń</button>
+          <button class="tab-btn" data-view="alpha" title="Maska z miękką krawędzią wybranego obiektu (zielona nakładka; aktywna wersja) – od etapu 3 MatAnyone">Alpha</button>
+          <button class="tab-btn" data-view="comp" title="Podgląd compu: obiekt na tle czarnym / białym / 18 % / szachownicy / kolorze [V = zmiana tła] – od etapu 3 MatAnyone">Comp</button>
+        </div>
+        <div class="overlay-style" id="overlayStyle" data-fold-name="wygląd nakładki" title="Wygląd nakładki oglądanej warstwy (rdzeń / alpha / klucz) – zapamiętany w przeglądarce">
+          <span class="ovs-layer" id="ovsLayer">—</span>
+          <input type="color" id="ovsColor" class="ovs-color" value="#50a0ff" title="Kolor nakładki">
+          <input type="range" id="ovsOpacity" class="ovs-opacity" min="0" max="100" step="5" value="45" title="Krycie nakładki">
+          <span class="ovs-val" id="ovsOpacityVal">45%</span>
+          <button type="button" class="ovs-line" id="ovsLine" title="Wypełnienie / sam kontur maski">▣</button>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="header-more" id="headerMoreWrap" hidden>
+          <button type="button" class="btn btn-secondary header-more-btn" id="headerMoreBtn" aria-haspopup="true" aria-expanded="false">⋯</button>
+          <div class="header-more-menu" id="headerMoreMenu" hidden></div>
+        </div>
+        <div class="status-indicator" id="comfyStatusIndicator" data-fold-name="stan ComfyUI" title="Stan ComfyUI">
+          <span class="status-dot"></span>
+          <span class="status-text" id="comfyStatusText">ComfyUI: Sprawdzanie...</span>
+        </div>
+        <button class="btn btn-secondary" id="langToggle" data-fold-name="język" title="Język interfejsu: kliknij, żeby przełączyć EN / PL">🌐 EN</button>
+        <button class="btn btn-secondary" id="openDoctorBtn" title="Diagnostyka środowiska">🩺 Doktor</button>
+      </div>
+    </header>
+
+    <!-- Comparison of the plate pair: second row under the header, aligned with the "Plate:" pill (app.js alignCompareBar) -->
+    <div class="compare-bar" id="compareBar">
+      <div class="compare-inner" id="compareInner">
+        <span class="cmp-title muted">Porównanie:</span>
+        <span class="cmp-bg" id="cmpBgCtl" hidden>
+          <input type="color" id="cmpBgColor" value="#ffffff" title="Kolor tła (domyślnie białe)">
+          <button type="button" class="cmp-bg-btn" id="cmpBgChecker" title="Szachownica (przezroczystość) zamiast koloru">▦</button>
+        </span>
+        <div class="seg seg-cmp" id="p0Cmp">
+          <button data-m="none" class="active" title="Sam oglądany plate (lewy)">Plate</button>
+          <button data-m="comp" title="Wycięcie na wybranym tle: RGB beauty × alpha obiektu (finalna, a gdy jej brak – rdzeń)">Na tle</button>
+          <button data-m="ab" title="Prawa strona, gdy trzymasz C (działa w każdym trybie)">A/B (C)</button>
+          <button data-m="wipe" title="Prawa strona z lewej strony linii – przeciągnij linię">Wipe</button>
+          <button data-m="diff" title="|lewy − prawy| wzmocnione: przesunięcie = podwójne kontury">Różnica</button>
+          <button data-m="edges" title="Kontury plate'u po prawej nałożone na oglądany (dla backlitu – inny wygląd, różnica nic nie mówi)">Kontury</button>
+        </div>
+        <label class="cmp-extra" id="p0WipeRow" hidden title="Linia wipe"><input id="p0Wipe" type="range" min="0" max="1" step="0.005" value="0.5"></label>
+        <label class="cmp-extra" id="p0GainRow" hidden title="Wzmocnienie różnicy"><select id="p0Gain" class="plate-select-dropdown"><option value="2">×2</option><option value="4" selected>×4</option><option value="8">×8</option></select></label>
+      </div>
+    </div>
+
+    <!-- Stage bar: all stages visible, the current one highlighted; the panel shows only its tools -->
+    <nav class="stage-bar" id="stageBar" aria-label="Etapy">
+      <div class="stage-object" id="stageObjectBox" title="Obiekt, którego dotyczą etapy 1–6"></div>
+      <ol class="stage-list" id="stageList" title="✔ zielone = policzone · ↻ pomarańczowe = do przeliczenia (zmieniły się klucze / wcześniejszy etap) · ○ szare = jeszcze nie policzone · ◐ = policzone na części ujęcia"></ol>
+      <div class="stage-hint" id="stageHint"></div>
+    </nav>
+
+    <!-- Main Workspace -->
+    <main class="app-main">
+      <!-- Left Tools Panel -->
+      <aside class="tools-sidebar" id="toolsSidebar">
+        <div class="tool-section-title">Widok</div>
+        <button class="tool-btn active" id="toolSelectBtn" title="Nawigacja i przesuwanie (przeciągnij LPM / ŚPM)">
+          <span class="tool-icon">✋</span>
+          <span class="tool-label">Przesuń</span>
+        </button>
+        <button class="tool-btn" id="toolZoomFitBtn" title="Dopasuj do ekranu [2]">
+          <span class="tool-icon">⛶</span>
+          <span class="tool-label">Dopasuj</span>
+        </button>
+        <button class="tool-btn" id="toolZoom100Btn" title="Piksel 1:1 [1]">
+          <span class="tool-icon">1:1</span>
+          <span class="tool-label">1:1</span>
+        </button>
+        <div class="tool-separator"></div>
+        <div class="tool-section-title" id="drawToolsTitle">Rysuj</div>
+        <div id="drawTools"></div>
+      </aside>
+
+      <!-- Viewport Canvas Area -->
+      <section class="viewport-area" id="viewportArea">
+        <div class="canvas-wrapper" id="canvasWrapper">
+          <canvas id="mainCanvas"></canvas>
+          <div class="canvas-overlay-hud" id="canvasHud">
+            <span class="hud-item" id="hudZoom">Zoom: 100%</span>
+            <span class="hud-item" id="hudCoords">X: 0, Y: 0</span>
+            <span class="hud-item" id="hudPlateRes">4K Plate</span>
+            <span class="hud-item hud-mode" id="hudMode" style="display:none"></span>
+          </div>
+          <div class="canvas-note" id="canvasNote" style="display:none"></div>
+          <div class="edge-legend" id="edgeLegend" style="display:none">
+            <span><i style="background:#ff3c3c"></i>halo → zwęź</span>
+            <span><i style="background:#3c8cff"></i>ucięcie → poszerz</span>
+            <span><i class="off"></i>odznaczony</span>
+            <span class="muted">klik na odcinek = odznacz / zaznacz</span>
+          </div>
+          <div class="loading-spinner-overlay" id="loadingOverlay" style="display: none;">
+            <div class="spinner"></div>
+            <span id="loadingMessage">Ładowanie klatek...</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: panel of the current stage -->
+      <aside class="stage-panel" id="stagePanel">
+        <div class="stage-panel-empty" id="stagePanelEmpty">Otwórz projekt (📁 Projekt), żeby zacząć.</div>
+      </aside>
+    </main>
+
+    <!-- Bottom Controls & Timeline -->
+    <footer class="app-footer">
+      <div class="timeline-controls-bar">
+        <div class="transport-group">
+          <button class="ctrl-btn" id="btnFirstFrame" title="Pierwsza klatka (Home)">⏮</button>
+          <button class="ctrl-btn" id="btnPrevFrame" title="Poprzednia klatka (←)">◀</button>
+          <button class="ctrl-btn btn-play" id="btnPlayPause" title="Odtwórz / Pauza (Spacja)">▶</button>
+          <button class="ctrl-btn" id="btnNextFrame" title="Następna klatka (→)">▶</button>
+          <button class="ctrl-btn" id="btnLastFrame" title="Ostatnia klatka (End)">⏭</button>
+          <button class="ctrl-btn" id="btnPrevKey" title="Poprzedni klucz (Shift+←)">⇤🔑</button>
+          <button class="ctrl-btn" id="btnNextKey" title="Następny klucz (Shift+→)">🔑⇥</button>
+          <button class="ctrl-btn" id="btnDelKey" title="Usuń klucz bieżącej klatki (Del / Backspace; dwuklik na znaczniku klucza) – klucz użytkownika z potwierdzeniem, Ctrl+Z cofa" disabled>🔑✕</button>
+        </div>
+
+        <div class="frame-counter-group">
+          <span class="counter-label">Klatka:</span>
+          <input type="number" id="frameInput" class="frame-number-input" value="1" min="1" max="100">
+          <span class="counter-total" id="frameTotalDisplay">/ 100</span>
+          <span class="counter-index" id="frameIndexDisplay">(idx: 0)</span>
+          <span class="counter-key" id="frameKeyBadge" style="display:none" title="W tej klatce jest klucz"></span>
+        </div>
+
+        <div class="playback-options-group">
+          <label class="fps-label" for="fpsSelect">FPS:</label>
+          <select id="fpsSelect" class="fps-select">
+            <option value="12">12 fps</option>
+            <option value="24" selected>24 fps</option>
+            <option value="30">30 fps</option>
+            <option value="60">60 fps</option>
+          </select>
+          <span class="wa-label" id="waLabel" title="Zakres pracy (work area): znaczniki [ ] na osi czasu (przeciągnij; dwuklik = całe ujęcie). Shift+B = początek w bieżącej klatce, Shift+N = koniec, Alt+X = całe ujęcie. „▶▶ Przelicz całość”, „Przelicz finalnie” i eksport „work area” liczą tylko te klatki (zapis w project.json)">Zakres: całe ujęcie</span>
+          <button class="btn btn-ghost btn-sm" id="btnHelpShortcuts" title="Skróty klawiszowe">⌨️ Skróty</button>
+        </div>
+      </div>
+
+      <!-- Keys lane + scrubbable timeline track -->
+      <div class="timeline-track-container" id="timelineTrackContainer">
+        <div class="timeline-segs" id="timelineSegs" title="Odcinki kadru (etap 1 SAM3); pomarańczowe = przedziały do przeliczenia. Klik = skok"></div>
+        <div class="timeline-zones" id="timelineZones" title="Klucze aktywnej strefy (romby w kolorze strefy): klik = skok, PPM = usuń klucz; pasek = zakres między kluczami"></div>
+        <canvas class="timeline-load" id="timelineLoad" height="3" title="Wczytanie klatek: zielone = plate i nakładka widoku gotowe, czerwone = jeszcze nie, szare = brak wyniku w klatce"></canvas>
+        <div class="timeline-keys" id="timelineKeys" title="Klucze: niebieski = użytkownik, jasny = automatyczny, kropka = klucz z punktów. Klik = skok do klatki, dwuklik = usuń klucz"></div>
+        <div class="timeline-track" id="timelineTrack">
+          <div class="timeline-buffered-bar" id="timelineBufferedBar"></div>
+          <div class="timeline-playhead" id="timelinePlayhead"></div>
+        </div>
+        <div class="timeline-ruler" id="timelineRuler"></div>
+      </div>
+    </footer>
+
+    <!-- Open Project Modal -->
+    <div class="modal-backdrop" id="openProjectModal" style="display: none;">
+      <div class="modal-card modal-large">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <h3>Otwórz / skonfiguruj projekt ujęcia</h3>
+            <span class="modal-subtitle">Katalog roboczy ujęcia + plate'y. Manifest ujęcia jest tylko do odczytu – plate'y dodane tutaj trafiają do project.json narzędzia.</span>
+          </div>
+          <button class="modal-close-btn" id="closeProjectModalBtn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="workDirInput">Katalog roboczy ujęcia:</label>
+            <div class="input-with-action">
+              <input type="text" id="workDirInput" class="form-input" placeholder="Wybierz lub wklej katalog ujęcia (np. D:/projekty/film/work/SH010/)">
+              <button type="button" class="btn btn-secondary btn-sm" id="btnBrowseWorkDir" title="Wybierz katalog roboczy w oknie dialogowym systemu">📁 Wybierz katalog</button>
+            </div>
+            <span class="field-hint" id="workDirStatusHint">Jeśli katalog zawiera plik shot_manifest_*.json, zostanie wczytany automatycznie.</span>
+          </div>
+          <div class="form-group" id="recentProjectsGroup" style="display: none;">
+            <label>Ostatnie projekty:</label>
+            <div id="recentProjectsList" class="recent-projects-list"></div>
+          </div>
+
+          <div class="plates-section" id="modalPlatesSection" style="margin-top: 16px;">
+            <div class="section-title">Plate'y ujęcia</div>
+            <div class="form-group">
+              <label for="inputBeautyPlate">Beauty (X1) <span class="required-asterisk">* wymagany</span> – z niego wycinamy:</label>
+              <div class="input-with-action">
+                <input type="text" id="inputBeautyPlate" class="form-input" placeholder="Folder sekwencji, plik z wzorcem ####.exr albo plik wideo (MP4/MOV)">
+                <button type="button" class="btn btn-ghost btn-sm btn-browse-plate" data-target="inputBeautyPlate" title="Wybierz folder">📁</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="inputCleanPlate">Clear plate (samo tło) <span class="optional-label">(opcjonalny – tylko miarka krawędzi, nigdy maska)</span>:</label>
+              <div class="input-with-action">
+                <input type="text" id="inputCleanPlate" class="form-input" placeholder="Folder sekwencji lub plik z wzorcem ####">
+                <button type="button" class="btn btn-ghost btn-sm btn-browse-plate" data-target="inputCleanPlate" title="Wybierz folder">📁</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="inputBacklitPlate">Backlit (X2, sylwetka) <span class="optional-label">(opcjonalny – źródło maski, gdy obiekt zasłania światło)</span>:</label>
+              <div class="input-with-action">
+                <input type="text" id="inputBacklitPlate" class="form-input" placeholder="Folder sekwencji lub plik z wzorcem ####">
+                <button type="button" class="btn btn-ghost btn-sm btn-browse-plate" data-target="inputBacklitPlate" title="Wybierz folder">📁</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="inputDepthPlate">Głębia <span class="optional-label">(opcjonalny – gotowa mapa; inaczej policzy ją etap 0)</span>:</label>
+              <div class="input-with-action">
+                <input type="text" id="inputDepthPlate" class="form-input" placeholder="Folder sekwencji lub plik z wzorcem ####">
+                <button type="button" class="btn btn-ghost btn-sm btn-browse-plate" data-target="inputDepthPlate" title="Wybierz folder">📁</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="cancelOpenProjectBtn">Anuluj</button>
+          <button class="btn btn-primary" id="confirmOpenProjectBtn">Otwórz projekt</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Doctor Report Modal -->
+    <div class="modal-backdrop" id="doctorModal" style="display: none;">
+      <div class="modal-card modal-large">
+        <div class="modal-header">
+          <h3>Raport Doktora środowiska</h3>
+          <button class="modal-close-btn" id="closeDoctorModalBtn">✕</button>
+        </div>
+        <div class="modal-body" id="doctorReportContent">
+          <div class="spinner"></div> Sprawdzanie środowiska...
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="refreshDoctorBtn">Odśwież test</button>
+          <button class="btn btn-primary" id="closeDoctorBtn">Zamknij</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Clean Modal (deflicker & denoise – any plate) -->
+    <div class="modal-backdrop" id="cleanModal" style="display: none;">
+      <div class="modal-card modal-large">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <h3>✨ Czyszczenie plate'u: deflicker i odszumianie</h3>
+            <span class="modal-subtitle">Łańcuch deflickera v10 + odszumianie z kompensacją ruchu. Działa na każdym plate'cie (beauty, clear plate, backlit).</span>
+          </div>
+          <button class="modal-close-btn" id="closeCleanModalBtn">✕</button>
+        </div>
+        <div class="modal-body" id="cleanModalContent">
+          <div class="form-group">
+            <label for="cleanPlateSelect">Plate do czyszczenia:</label>
+            <select id="cleanPlateSelect" class="form-input">
+              <option value="beauty">Beauty Plate (beauty)</option>
+            </select>
+          </div>
+
+          <div class="align-status-card" id="cleanStatusCard">
+            <div class="status-badge-container">
+              <span class="badge badge-info" id="cleanBadgeStatus">Oczekuje na pomiar</span>
+            </div>
+            <p class="align-summary-text" id="cleanSummaryText">
+              Kliknij „Zmierz migotanie”, aby sprawdzić stabilność ekspozycji i kolorów (przepływ DIS).
+            </p>
+            <div class="align-metrics-grid" id="cleanMetricsGrid" style="display: none;">
+              <div class="metric-item"><span class="metric-label">Migotanie początkowe (R/G/B):</span><span class="metric-val" id="metricCleanInit">-</span></div>
+              <div class="metric-item"><span class="metric-label">Migotanie po czyszczeniu (R/G/B):</span><span class="metric-val" id="metricCleanFinal">-</span></div>
+              <div class="metric-item"><span class="metric-label">Redukcja migotania:</span><span class="metric-val" id="metricCleanRedPct">-</span></div>
+              <div class="metric-item"><span class="metric-label">Redukcja szumu:</span><span class="metric-val" id="metricCleanNoiseRed">-</span></div>
+            </div>
+          </div>
+
+          <div class="clean-options-section" style="margin-top: 14px;">
+            <div class="section-title">Etapy przetwarzania (łańcuch v10)</div>
+            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage1Checkbox" checked><span><strong>Etap 1:</strong> poziom lokalny z kompensacją ruchu (guided filter)</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage2Checkbox" checked><span><strong>Etap 2:</strong> niezależne kafle 9×6 z kompensacją ruchu</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage4Checkbox" checked><span><strong>Etap 4:</strong> globalna korekta per kanał z wygładzeniem w czasie</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage3Checkbox"><span><strong>Etap 3 (opcjonalny):</strong> cieniowanie, pasmo 2–40 px z przepływem DIS</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanDenoiseCheckbox"><span><strong>Odszumianie w czasie:</strong> filtr bilateralny z kompensacją ruchu (residuum szumu zapisane osobno)</span></label>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-top: 14px;">
+            <label for="cleanExportModeSelect">Zapis wyniku:</label>
+            <select id="cleanExportModeSelect" class="form-input">
+              <option value="nuke_group" selected>Group do Nuke'a (domyślnie, bez zapisu EXR)</option>
+              <option value="exr_deflicker">Pełne klatki EXR bez migotania (&lt;plate&gt;_deflicker/)</option>
+              <option value="exr_deflicker_dn">Pełne klatki EXR bez migotania + odszumione (&lt;plate&gt;_deflicker_dn/)</option>
+            </select>
+          </div>
+
+          <div class="progress-bar-container" id="cleanProgressBar" style="display: none; margin-top: 12px;">
+            <div class="progress-bar-fill" id="cleanProgressFill" style="width: 0%;"></div>
+            <span class="progress-text" id="cleanProgressText">0%</span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="closeCleanBtn">Zamknij</button>
+          <button class="btn btn-secondary" id="btnExportCleanNk" disabled>💾 Pokaż ścieżkę .nk</button>
+          <button class="btn btn-primary" id="btnMeasureClean">Zmierz migotanie</button>
+          <button class="btn btn-warning" id="btnRunClean" disabled>⚡ Wykonaj czyszczenie</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Camera 2D Modal -->
+    <div class="modal-backdrop" id="cameraModal" style="display: none;">
+      <div class="modal-card modal-lg">
+        <div class="modal-header">
+          <h3>📹 Ruch kamery 2D</h3>
+          <button class="modal-close-btn" id="closeCameraModalBtn">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-intro">
+            Planarny ruch kamery liczony z całej klatki (log-luma). Łańcuch homografii z kotwicami co ~24 klatki, wynik: <code>camera2d.json</code> i Group <code>Camera2D_&lt;shot&gt;.nk</code>.
+          </p>
+          <div class="align-status-card" id="cameraStatusCard">
+            <div class="status-badge-container">
+              <span class="badge badge-info" id="cameraBadgeStatus">Oczekuje na analizę</span>
+              <span class="badge badge-secondary" id="cameraMotionTypeBadge" style="display: none;">Typ: Statyczna</span>
+            </div>
+            <p class="align-summary-text" id="cameraSummaryText">Kliknij „Analizuj ruch kamery”.</p>
+            <div class="align-metrics-grid" id="cameraMetricsGrid" style="display: none;">
+              <div class="metric-item"><span class="metric-label">Typ ruchu:</span><span class="metric-val" id="metricCamMotionType">-</span></div>
+              <div class="metric-item"><span class="metric-label">Reszta (mediana):</span><span class="metric-val" id="metricCamResMedian">-</span></div>
+              <div class="metric-item"><span class="metric-label">Reszta (P95):</span><span class="metric-val" id="metricCamResP95">-</span></div>
+              <div class="metric-item"><span class="metric-label">Dryf na kotwicach:</span><span class="metric-val" id="metricCamDrift">-</span></div>
+            </div>
+          </div>
+          <div class="form-row" style="margin-top: 14px;">
+            <div class="form-group flex-1"><label for="cameraRefFrameInput">Klatka referencyjna:</label><input type="number" id="cameraRefFrameInput" class="form-input" value="1" min="1"></div>
+            <div class="form-group flex-1"><label for="cameraAnchorIntervalInput">Odstęp kotwic:</label><input type="number" id="cameraAnchorIntervalInput" class="form-input" value="24" min="6" max="96"></div>
+            <div class="form-group flex-1"><label for="cameraEvalWSelect">Rozdzielczość analizy:</label>
+              <select id="cameraEvalWSelect" class="form-input"><option value="1024" selected>1024 px (zalecana)</option><option value="1280">1280 px</option><option value="1920">1920 px</option></select></div>
+          </div>
+          <div class="progress-bar-container" id="cameraProgressBar" style="display: none; margin-top: 12px;">
+            <div class="progress-bar-fill" id="cameraProgressFill" style="width: 0%;"></div>
+            <span class="progress-text" id="cameraProgressText">0%</span>
+          </div>
+          <div class="align-file-info" id="cameraFileInfo" style="display: none; margin-top: 12px;">
+            <div class="info-row"><span class="info-label">Plik JSON:</span><code class="info-path" id="cameraJsonPathDisplay">-</code></div>
+            <div class="info-row"><span class="info-label">Skrypt Nuke:</span><code class="info-path" id="cameraNkPathDisplay">-</code></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnExportCameraNk" disabled>📄 Group do Nuke'a</button>
+          <button class="btn btn-primary" id="btnRunCameraTrack">▶️ Analizuj ruch kamery</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Plates Management Modal -->
+    <div class="modal-backdrop" id="platesModal" style="display: none;">
+      <div class="modal-card modal-large">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <h3>🎞️ Plate'y ujęcia</h3>
+            <span class="modal-subtitle" id="platesModalShotName">Ujęcie: -</span>
+          </div>
+          <button class="modal-close-btn" id="closePlatesModalBtn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="plates-section">
+            <div class="section-title">Plate'y w projekcie</div>
+            <div class="plates-list" id="platesListContainer"><div class="spinner"></div> Wczytywanie...</div>
+          </div>
+          <div class="plates-section add-plate-section">
+            <div class="section-title">Dodaj nowy plate lub zaktualizuj istniejący</div>
+            <form id="addPlateForm" class="add-plate-form" onsubmit="return false;">
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="plateNameSelect">Rola plate'u:</label>
+                  <select id="plateNameSelect" class="form-input">
+                    <option value="cleanplate">Clear plate (cleanplate)</option>
+                    <option value="backlit">Backlit (backlit)</option>
+                    <option value="beauty">Beauty (beauty)</option>
+                    <option value="depth">Głębia (depth)</option>
+                    <option value="bg">Tło docelowe – podgląd compu (bg): klatka EXR/PNG, sekwencja albo MP4</option>
+                    <option value="custom">Własny...</option>
+                  </select>
+                </div>
+                <div class="form-group flex-1" id="customPlateNameGroup" style="display: none;">
+                  <label for="customPlateNameInput">Własny identyfikator:</label>
+                  <input type="text" id="customPlateNameInput" class="form-input" placeholder="np. lighting_rim, fg_plate">
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="platePatternInput">Ścieżka do sekwencji lub folderu:</label>
+                <div class="input-with-action">
+                  <input type="text" id="platePatternInput" class="form-input" placeholder="Folder sekwencji lub plik z wzorcem ####">
+                  <button type="button" class="btn btn-secondary btn-sm" id="btnBrowsePlateFile" title="Wybierz pojedynczy plik: klatkę (EXR / PNG / JPG / TIFF) albo wideo (MP4 / MOV) – np. tło docelowe BG">📄 Plik…</button>
+                  <button type="button" class="btn btn-secondary btn-sm" id="btnBrowsePlatePath" title="Wybierz folder sekwencji w oknie systemowym – potem od razu sprawdza klatki">📁 Przeglądaj…</button>
+                  <button type="button" class="btn btn-secondary btn-sm" id="btnInspectPlatePath" title="Sprawdza ścieżkę na dysku: wykrywa sekwencję (liczba klatek, rozdzielczość, typ), folder zamienia na wzorzec ####. Nic nie zapisuje">🔍 Sprawdź sekwencję</button>
+                </div>
+                <span class="field-hint" id="plateInspectResult">Możesz wkleić folder sekwencji albo ścieżkę z wzorcem ####.</span>
+              </div>
+              <div class="form-group-checkbox">
+                <label class="checkbox-label"><input type="checkbox" id="plateGenProxiesCheckbox" checked><span>Wygeneruj proxy 1920 px od razu po zapisaniu</span></label>
+              </div>
+              <div class="form-actions">
+                <button type="button" class="btn btn-primary" id="btnSavePlate">💾 Zapisz plate w projekcie</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="closePlatesBtn">Zamknij</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Shortcuts Modal -->
+    <div class="modal-backdrop" id="shortcutsModal" style="display: none;">
+      <div class="modal-card modal-large">
+        <div class="modal-header">
+          <h3>Skróty klawiszowe</h3>
+          <button class="modal-close-btn" id="closeShortcutsBtn">✕</button>
+        </div>
+        <div class="modal-body">
+          <table class="shortcuts-table">
+            <tr><td><kbd>Spacja</kbd></td><td>Odtwórz / zatrzymaj</td></tr>
+            <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Klatka wstecz / w przód</td></tr>
+            <tr><td><kbd>Shift+←</kbd> / <kbd>Shift+→</kbd></td><td>Poprzedni / następny klucz</td></tr>
+            <tr><td><kbd>Del</kbd> / <kbd>Backspace</kbd></td><td>Etap 1 SAM3: usuń ostatni punkt klatki (bez punktów – usuń klucz; też 🔑✕ na pasku i dwuklik na znaczniku klucza); etap 2 CoTracker: usuń klucze poprawek tej klatki; etap 4 ViTMatte: usuń klucz SAM3 bieżącej klatki</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Przerwij wielokąt; drugi raz – wyłącz narzędzie (samo przesuwanie)</td></tr>
+            <tr><td><kbd>Home</kbd> / <kbd>End</kbd></td><td>Pierwsza / ostatnia klatka</td></tr>
+            <tr><td><kbd>Shift+B</kbd> / <kbd>Shift+N</kbd></td><td>Zakres pracy (work area): początek / koniec w bieżącej klatce (też przeciąganie znaczników [ ] na osi czasu)</td></tr>
+            <tr><td><kbd>Alt+X</kbd></td><td>Zakres pracy = całe ujęcie (też dwuklik na znaczniku)</td></tr>
+            <tr><td><kbd>1</kbd> / <kbd>2</kbd></td><td>Piksel 1:1 / dopasuj do okna</td></tr>
+            <tr><td><kbd>Kółko</kbd>, <kbd>LPM</kbd></td><td>Zoom w punkcie kursora, przesuwanie</td></tr>
+            <tr><td><kbd>Alt</kbd> (przytrzymaj)</td><td>Łapka przy każdym narzędziu: przeciąganie przesuwa obraz, po puszczeniu Alt wraca wybrane narzędzie</td></tr>
+            <tr><td colspan="2"><b>Etap 1 – SAM3 (wykryj + rdzeń)</b></td></tr>
+            <tr><td><kbd>G</kbd> / <kbd>R</kbd> (etap 1)</td><td>Narzędzie Punkt + / Punkt − (klik; PPM = odwrotny znak; klik na punkt = usuń; Esc = wyłącz – samo przesuwanie)</td></tr>
+            <tr><td><kbd>Enter</kbd> (etap 1)</td><td>„▶ Przelicz klatkę” (punkty / prompt → klucz SAM3); przy otwartym wielokącie – zamknij wielokąt</td></tr>
+            <tr><td>Klik w ramkę</td><td>Po „Wykryj kandydatów”: ramki z numerami na obrazie – najechanie pokazuje maskę, klik wybiera kandydata</td></tr>
+            <tr><td><kbd>K</kbd> / <kbd>L</kbd> (etap 1)</td><td>Korekta + / Korekta −: klik w dziurę = dodaj tylko ten fragment, klik na wyciek = usuń tylko ten fragment (reszta maski bez zmian; klucz SAM3)</td></tr>
+            <tr><td><kbd>P</kbd> (etap 1)</td><td>Wielokąt klucza SAM3 (Enter zamyka, PPM na 1. punkcie = usuwający)</td></tr>
+            <tr><td colspan="2"><b>Etap 2 – CoTracker (pędzel poprawek)</b></td></tr>
+            <tr><td><kbd>G</kbd> / <kbd>R</kbd> / <kbd>E</kbd> (etap 2)</td><td>Pędzel Dodaj / Usuń / Zmaż poprawkę – kreska = klucz poprawki, CoTracker3 przenosi ją na inne klatki</td></tr>
+            <tr><td colspan="2"><b>Etapy 4–5 – strefy ViTMatte / Eksperymenty</b></td></tr>
+            <tr><td><kbd>G</kbd> / <kbd>R</kbd> / <kbd>P</kbd></td><td>Pędzel dodaj / pędzel usuń / wielokąt (Enter zamyka, PPM na 1. punkcie = usuwający); <kbd>L</kbd> (etap 4) = lupa</td></tr>
+            <tr><td><kbd>[</kbd> / <kbd>]</kbd>, <kbd>Shift</kbd> + przeciągnij</td><td>Rozmiar pędzla (Shift + przeciąganie w lewo / prawo na obrazie; też suwak w lewym pasku). Piórko: nacisk = grubość, gumka = usuń</td></tr>
+            <tr><td><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Shift+Z</kbd></td><td>Cofnij / ponów (kreski, potem klucze)</td></tr>
+            <tr><td colspan="2"><b>Etapy 2–6 – widoki kontrolne masek</b></td></tr>
+            <tr><td><kbd>C</kbd> (przytrzymaj)</td><td>Sam plate bez nakładki (beauty)</td></tr>
+            <tr><td><kbd>O</kbd></td><td>Onion skin ±1: kontur maski z klatki −1 (czerwony) i +1 (niebieski) na bieżącej – ocena migotania krawędzi</td></tr>
+            <tr><td><kbd>M</kbd> (etapy 3–5)</td><td>Mapa migotania wersji (INFERNO) jako nakładka</td></tr>
+            <tr><td colspan="2"><b>Etapy 3–5 – wersje (MatAnyone / ViTMatte / Eksperymenty)</b></td></tr>
+            <tr><td><kbd>V</kbd></td><td>Comp: zmiana tła (czarne / białe / 18 % / szachownica / kolor)</td></tr>
+            <tr><td><kbd>N</kbd></td><td>Następna flaga QA</td></tr>
+            <tr><td><kbd>B</kbd> (etapy 3–5)</td><td>Wersja aktywna ↔ poprzednia (A/B bez przeliczania)</td></tr>
+            <tr><td colspan="2"><b>Etap 0 – Plate'y (clear plate / backlit)</b></td></tr>
+            <tr><td><kbd>C</kbd> (przytrzymaj)</td><td>Pokaż beauty (porównanie A/B)</td></tr>
+          </table>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" id="confirmShortcutsBtn">Rozumiem</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-backdrop" id="aboutModal" style="display: none;">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <h3>MatteDesk <span id="aboutVersion"></span></h3>
+            <span class="modal-subtitle">Interaktywne narzędzie do wycinania obiektów z ujęć – alpha, matte, roto.</span>
+          </div>
+          <button class="modal-close-btn" id="closeAboutModalBtn" title="Zamknij (Esc)">✕</button>
+        </div>
+        <div class="modal-body about-body">
+          <p><b>Autor:</b> Lech Gruszewski · © 2026</p>
+          <p><b>Licencja:</b> GNU GPL-3.0-or-later – wolno używać (także komercyjnie), zmieniać i rozpowszechniać, ale zmienione wersje muszą zostać otwarte na tej samej licencji. Pełny tekst: plik <code>LICENSE</code>.</p>
+          <p><b>Modele zewnętrzne</b> (SAM 3.1, MatAnyone2, CoTracker3, ViTMatte, DepthCrafter…) nie są częścią MatteDesk. Pobierasz je sam przez Doktora i obowiązują ich własne licencje – część z nich jest tylko do użytku niekomercyjnego. Lista: <code>THIRD_PARTY_LICENSES.md</code>.</p>
+          <ul class="about-links">
+            <li><a id="aboutLink_repo" target="_blank" rel="noopener">Kod źródłowy i zgłaszanie błędów</a></li>
+            <li><a id="aboutLink_support" target="_blank" rel="noopener">☕ Wesprzyj projekt (dobrowolnie)</a></li>
+          </ul>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" id="confirmAboutBtn">Zamknij</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/header_fit.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/objects.js"></script>
+  <script src="/static/workarea.js"></script>
+  <script src="/static/life.js"></script>
+  <script src="/static/zones.js"></script>
+  <script src="/static/brush.js"></script>
+  <script src="/static/stage0.js"></script>
+  <script src="/static/depth.js"></script>
+  <script src="/static/jobs.js"></script>
+  <script src="/static/tips.js"></script>
+  <script src="/static/about.js"></script>
+</body>
+</html>
