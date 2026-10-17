@@ -280,6 +280,8 @@ def test_node_packages_survive_public_export_unchanged():
     public copy differ from nodes installed from the dev repo (Doctor: "different version than in the repo")."""
     import importlib.util
     root = Path(__file__).resolve().parents[1]
+    if not (root / "tools" / "export_public.py").exists():
+        pytest.skip("export_public.py is not part of the public copy")
     spec = importlib.util.spec_from_file_location("export_public", root / "tools" / "export_public.py")
     ep = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ep)
@@ -290,3 +292,19 @@ def test_node_packages_survive_public_export_unchanged():
             if ep.neutralize(text) != text:
                 changed.append(str(p.relative_to(root)))
     assert not changed, changed
+
+
+def test_readme_download_button_points_at_current_setup():
+    """2026-10-17: the README button downloads the installer file itself; the public export sets the version in the link."""
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "tools" / "export_public.py").exists():
+        pytest.skip("export_public.py is not part of the public copy")
+    spec = importlib.util.spec_from_file_location("export_public", root / "tools" / "export_public.py")
+    ep = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ep)
+    for name in ("README.md", "README.pl.md"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert ep.SETUP_LINK.search(text), name
+    out = ep.setup_link("x releases/download/v0.31/MatteDesk-0.31-setup.exe y", "0.4")
+    assert out == "x releases/download/v0.4/MatteDesk-0.4-setup.exe y"
