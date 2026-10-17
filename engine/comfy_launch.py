@@ -36,6 +36,7 @@ STATE: Dict[str, Any] = {"state": "idle"}
 _LOCK = threading.Lock()
 
 HOW_GIT = "ComfyUI z gita"
+HOW_PORTABLE = "ComfyUI portable"
 HOW_DESKTOP2 = "Comfy Desktop 2 (serwer bez okna aplikacji)"
 HOW_DESKTOP = "ComfyUI Desktop"
 
@@ -147,9 +148,14 @@ def _launch_cmd(cfg: Dict[str, Any]):
         d = Path(cfg.get("comfy_dir") or "")
         if not (d / "main.py").exists():
             raise RuntimeError(f"Nie ma {d / 'main.py'} – ustaw folder ComfyUI z gita w Doktorze.")
+        from engine.comfy_portable import embedded_python
         from engine.installer import comfy_python
+        port = ["--port", str(int(cfg.get("comfy_port") or 8188))]
+        emb = None if cfg.get("comfy_python") else embedded_python(d)
+        if emb is not None:   # official portable package: the same flags as its run_nvidia_gpu.bat
+            return [str(emb), "-s", "main.py", "--windows-standalone-build"] + port, str(d), HOW_PORTABLE
         py = comfy_python(cfg)
-        return [str(py) if py else "python", "main.py", "--port", str(int(cfg.get("comfy_port") or 8188))], str(d), HOW_GIT
+        return [str(py) if py else "python", "main.py"] + port, str(d), HOW_GIT
     inst = desktop2_install(cfg)
     if inst is not None:
         return _desktop2_argv(cfg, inst), str(inst["comfy_dir"]), HOW_DESKTOP2

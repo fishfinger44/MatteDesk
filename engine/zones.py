@@ -310,6 +310,28 @@ def zone_keys(z: Zone) -> Dict[int, Dict[str, Any]]:
     return dict(sorted(out.items()))
 
 
+def zone_feather_px(z: "Zone") -> float:
+    """Feather (px) of a matte zone over its base inside its area – the core inset blends into the core over this many px
+    instead of a hard step (user request 2026-10-17); default = the former fixed value."""
+    from engine.refine import ZONE_FEATHER_PX
+    v = (z.params or {}).get("inset_feather_px")
+    try:
+        return max(0.5, float(v)) if v is not None else float(ZONE_FEATHER_PX)
+    except (TypeError, ValueError):
+        return float(ZONE_FEATHER_PX)
+
+
+def outline_without_drawing(z: Zone) -> bool:
+    """A `matte` zone in „whole outline” mode with nothing painted in any key (no exclusion, no background stroke):
+    its area is the core outline ± the band in every frame – nothing to track (2026-10-17)."""
+    try:
+        if z.criterion != "matte" or region_mode(z) != "outline":
+            return False
+    except ValueError:
+        return False
+    return not any(k["polygon"] or k["strokes"] or k["bg_strokes"] for k in zone_keys(z).values())
+
+
 def zone_hints(z: Zone) -> Optional[Dict[str, float]]:
     """Routing multipliers of a `matte` zone = prompt rules (`localmatte_prompt.interpret_prompt(z.prompt)`, step 9)
     x explicit `engine_hints`; None when neither says anything (the presets decide)."""
@@ -544,6 +566,7 @@ class ZoneResult:
     soft: Dict[int, Tuple[np.ndarray, np.ndarray]]  # frame -> (soft alpha, area where it wins)
     flags: Dict[int, List[str]] = field(default_factory=dict)   # frame -> zone QA hints (engines disagree, no holdout…)
     stats: Dict[str, Any] = field(default_factory=dict)         # zone id -> summary for run.json / the UI card
+    feather_px: Optional[float] = None   # feather of the soft zones over the base (max of the matte zones' inset_feather_px)
 
 
 MA_ZONE_TARGET_PX = 1008     # MatAnyone zone engine: crop side scaled up to this (<= MA_ZONE_MAX_UP x)
@@ -1339,6 +1362,8 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
             for f, fl in zflags.items():
                 result.flags.setdefault(f, []).extend(fl)
             result.stats[z.zone_id] = zstats
+            fz = zone_feather_px(z)
+            result.feather_px = fz if result.feather_px is None else max(result.feather_px, fz)
             continue
         # stage-2 brush correction (params.source = brush, 2026-10-15): the painted region itself (criterion "all",
         # already coherent in time – propagated by CoTracker3 from the zone keys), applied in EVERY frame: it corrects

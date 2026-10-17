@@ -272,7 +272,7 @@ def test_stage_layout_2026_10_15():
                for k in ("SAM3", "BRUSH", "MATANYONE", "VIDEOMAMA", "VITMATTE", "EXPERIMENTS", "LTX", "EXPORT"))
     assert src.count("desc: '<b>Co robi:</b>") == 8 and src.count("<b>Najlepsze do:</b>") >= 7
     # stage VideoMaMa: its own pane + palette, export source, ViTMatte base
-    assert "/videomama`" in src and 'id="vmRun"' in src and 'id="vmRefinish"' in src and "videomama_preview" in src
+    assert "/videomama`" in src and 'id="vmRun"' in src and 'id="vmStagePv"' in src and "videomama_preview" in src
     assert '<option value="videomama"' in src and src.count('<option value="videomama"') >= 2
     # stage LTX: its own pane + export source; no longer an edge mode of the experiments
     assert "/ltx`" in src and 'id="lx6Run"' in src and '<option value="ltx"' in src

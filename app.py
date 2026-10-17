@@ -389,8 +389,8 @@ def get_doctor_report():
 
 
 class ComfyFlavorRequest(BaseModel):
-    flavor: str                                   # desktop | git (ComfyUI from git; old name "portable" accepted)
-    comfy_dir: Optional[str] = None               # git: folder with main.py
+    flavor: str                                   # desktop | git (ComfyUI from git or the portable package)
+    comfy_dir: Optional[str] = None               # git / portable: folder with main.py
     comfy_port: Optional[int] = None
     shared_models: Optional[bool] = None          # git: use ComfyUI Desktop's models folder
     autostart: Optional[bool] = None              # start ComfyUI with MatteDesk (comfy_autostart)
@@ -401,9 +401,13 @@ def get_comfy_config():
     """Doctor: which ComfyUI is used (Desktop / from git), its folders, port and autostart."""
     cfg = load_config()
     local = engine_config._read(engine_config.LOCAL)
-    return {"flavor": cfg.get("comfy_flavor"), "comfy_dir": cfg.get("comfy_dir"), "models_dir": cfg.get("models_dir"),
+    from engine.comfy_portable import kind
+    return {"flavor": cfg.get("comfy_flavor"), "kind": kind(cfg), "comfy_dir": cfg.get("comfy_dir"),
+            "models_dir": cfg.get("models_dir"),
             "comfy_port": cfg.get("comfy_port"), "git": local.get("comfy_git") or {},
-            "autostart": bool(cfg.get("comfy_autostart", True))}
+            "autostart": bool(cfg.get("comfy_autostart", True)),
+            "update_check": cfg.get("update_check", True) is not False,
+            "app_browser": "edge" if str(cfg.get("app_browser") or "") == "edge" else "default"}
 
 
 @app.post("/api/config/comfy")
@@ -419,6 +423,76 @@ def set_comfy_config(req: ComfyFlavorRequest):
     if req.autostart is not None:
         engine_config.write_local({"comfy_autostart": bool(req.autostart)})
     return get_comfy_config()
+
+
+class UpdateSkipRequest(BaseModel):
+    version: str
+
+
+class UpdateSettingsRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/update")
+def update_check(force: bool = False):
+    """Newer MatteDesk in the public GitHub releases? (at most once a day unless force; engine/updates.py)"""
+    from engine import updates
+    return updates.check(APP_VERSION, load_config(), engine_config.REPO_DIR, force=force, save=engine_config.write_local)
+
+
+@app.post("/api/update/skip")
+def update_skip(req: UpdateSkipRequest):
+    engine_config.write_local({"update_skip": req.version})
+    return {"ok": True}
+
+
+@app.post("/api/update/settings")
+def update_settings(req: UpdateSettingsRequest):
+    engine_config.write_local({"update_check": bool(req.enabled)})
+    return {"ok": True, "enabled": bool(req.enabled)}
+
+
+class AppBrowserRequest(BaseModel):
+    app_browser: str                              # default (system default browser) | edge
+
+
+@app.post("/api/config/app_browser")
+def set_app_browser(req: AppBrowserRequest):
+    """Where the desktop shortcut opens MatteDesk (tools/launch_app.py reads it at the next start)."""
+    if req.app_browser not in ("default", "edge"):
+        raise HTTPException(status_code=400, detail="app_browser: default | edge")
+    engine_config.write_local({"app_browser": req.app_browser})
+    return {"ok": True, "app_browser": req.app_browser}
+
+
+@app.get("/api/update/progress")
+def update_progress():
+    from engine import updates
+    return dict(updates.STATE)
+
+
+@app.post("/api/update/install")
+@when_idle("Aktualizacja MatteDesk")
+def update_install():
+    """Installer copy only: download the new setup, start it, then stop this server (the setup replaces the files)."""
+    from engine import updates
+    info = updates.check(APP_VERSION, load_config(), engine_config.REPO_DIR, force=True)
+    if not info.get("can_install"):
+        raise HTTPException(status_code=409, detail="Brak instalatora do pobrania (kopia z gita: git pull).")
+
+    import threading
+    import time as _t
+
+    def work():
+        try:
+            updates.download_and_run(info["setup"])
+        except Exception as e:
+            updates.STATE.update(state="failed", error=str(e))
+            return
+        _t.sleep(2)
+        os._exit(0)
+    threading.Thread(target=work, daemon=True).start()
+    return {"ok": True, "version": info["version"]}
 
 
 @app.get("/api/comfy/launch")
@@ -815,6 +889,18 @@ async def generate_proxies(plate: str = "beauty", max_side: int = 1920):
     return {"success": True, "rendered_count": len(proxies), "proxy_dir": str(proxy_dir)}
 
 
+def _is_aux_plate(name: str) -> bool:
+    return name.startswith(("cleanplate", "clean_plate", "backlit"))
+
+
+def _aux_mismatch(name: str, pattern: str, manifest: Dict[str, Any]) -> Optional[str]:
+    """Reason a backlit / clear plate cannot be used (resolution != beauty), None = fine / not an aux plate."""
+    if not _is_aux_plate(name) or not manifest.get("plate_w") or not manifest.get("plate_h"):
+        return None
+    from engine.pipeline import aux_plate_mismatch
+    return aux_plate_mismatch(pattern, int(manifest["plate_w"]), int(manifest["plate_h"]))
+
+
 @app.get("/api/project/plates")
 def get_project_plates():
     if not STATE.get("manifest"):
@@ -854,7 +940,9 @@ def get_project_plates():
             "exists": exists,
             "frame_count": frame_count,
             "proxy_count": proxy_count,
-            "is_primary": (name == "beauty")
+            "is_primary": (name == "beauty"),
+            # backlit / clear plate of another resolution = a wrong plate, not used by any stage (engine/pipeline.py)
+            "mismatch": _aux_mismatch(name, pattern_str, manifest) if exists else None,
         })
 
     return {"success": True, "shot": shot, "plates": results}
@@ -878,6 +966,13 @@ async def update_project_plate(req: UpdatePlateRequest):
 
     pattern = req.pattern.strip()
     info = MediaInspector.resolve_sequence_pattern(pattern)
+    m0 = STATE["manifest"]
+    if _is_aux_plate(plate_name) and info.get("width") and info.get("height") and m0.get("plate_w") and \
+            (int(info["width"]), int(info["height"])) != (int(m0["plate_w"]), int(m0["plate_h"])):
+        # 2026-10-17: SH010 4096x2731 plates set in a 1440x2560 project broke QA of every stage
+        raise HTTPException(status_code=400, detail=(
+            f"{plate_name}: rozdzielczość {info['width']}x{info['height']} ≠ beauty {m0['plate_w']}x{m0['plate_h']} – "
+            "to plate z innego ujęcia (backlit / clear plate muszą być z tej samej kamery i rozdzielczości)"))
     # Plates added in the tool go to project.json – the shot manifest is never written.
     STATE["shot_project"].set_plate(plate_name, info.get("pattern", pattern))
     manifest = _refresh_manifest_view()
@@ -2692,15 +2787,15 @@ def ltx_preview(name: str, frame: int, what: str = "band", region_px: Optional[f
 
 
 @app.post("/api/object/{name}/ltx/refinish")
-@long_job("LTX – suwaki na wynik: {name}")
-async def ltx_refinish(name: str):
+@long_job("LTX – suwaki na wynik: {name}", quiet=True)
+async def ltx_refinish(name: str, auto: bool = False):
     """„Zastosuj suwaki na wynik” (2026-10-16): the current LTX version's raw mattes limited again with the saved
     region / mask settings -> a new version (no model run)."""
     name = _objects().get(name).get("part_of") or name
     pipe = _pipeline()
     cb = _ws_progress("object_progress", name)
     try:
-        run = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.ltx_refinish(name, _work_frames(), progress_cb=cb))
+        run = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.ltx_refinish(name, _work_frames(), progress_cb=cb, auto=auto))
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"success": True, "run": run, "object": name}
@@ -2740,6 +2835,8 @@ class VmmSettingsRequest(BaseModel):
     reach_px: Optional[float] = None
     protect_px: Optional[float] = None
     protect_auto: Optional[bool] = None  # True = protect band by base (0 core / 3 matanyone)
+    inset_px: Optional[float] = None     # unified sliders (2026-10-17): VideoMaMa replaces the base this far inside
+    feather_px: Optional[float] = None   # ... blended into the deeper base over this many px
     max_side: Optional[int] = None
     batch: Optional[int] = None
     overlap: Optional[int] = None
@@ -2793,13 +2890,15 @@ def vmm_set(name: str, req: VmmSettingsRequest):
 
 @app.get("/api/object/{name}/videomama_preview/{frame}")
 def vmm_preview(name: str, frame: int, what: str = "band", base: Optional[str] = None, reach_px: Optional[float] = None,
-                protect_px: Optional[float] = None, protect_auto: Optional[int] = None):
+                protect_px: Optional[float] = None, protect_auto: Optional[int] = None,
+                inset_px: Optional[float] = None, feather_px: Optional[float] = None):
     """VideoMaMa palette, live: what=band – 128 = where VideoMaMa adds, 255 = protect band (proxy PNG); what=alpha –
     the current VideoMaMa version's raw matte put over the base with these values (404 without a VideoMaMa version)."""
     from engine.videomama import object_settings, vmm_settings
     name = _objects().get(name).get("part_of") or name
     cur = {k: v for k, v in object_settings(_objects().get(name)).items() if k != "protect"}
-    cur.update({k: v for k, v in {"base": base, "reach_px": reach_px, "protect_px": protect_px}.items() if v is not None})
+    cur.update({k: v for k, v in {"base": base, "reach_px": reach_px, "protect_px": protect_px, "inset_px": inset_px,
+                                  "feather_px": feather_px}.items() if v is not None})
     if protect_auto:
         cur["protect_px"] = None
     s = vmm_settings({"videomama": cur})
@@ -2818,15 +2917,15 @@ def vmm_preview(name: str, frame: int, what: str = "band", base: Optional[str] =
 
 
 @app.post("/api/object/{name}/videomama/refinish")
-@long_job("VideoMaMa – suwaki na wynik: {name}")
-async def vmm_refinish(name: str):
+@long_job("VideoMaMa – suwaki na wynik: {name}", quiet=True)
+async def vmm_refinish(name: str, auto: bool = False):
     """„✚ Suwaki na wynik”: the current VideoMaMa version's raw mattes put over the base again with the saved base /
     reach / protect -> a new version (no model run)."""
     name = _objects().get(name).get("part_of") or name
     pipe = _pipeline()
     cb = _ws_progress("object_progress", name)
     try:
-        run = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.vmm_refinish(name, _work_frames(), progress_cb=cb))
+        run = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.vmm_refinish(name, _work_frames(), progress_cb=cb, auto=auto))
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"success": True, "run": run, "object": name}
@@ -3032,6 +3131,72 @@ def edge_preview_frame(name: str, frame: int, band_scale: Optional[float] = None
     return r
 
 
+# ---- stage preview (user request 2026-10-17): a few frames of stage 3 / 4 / 5 before the long run on the whole shot;
+# written to <object>/stage_preview/<stage>/, never a version / stage result (engine/stage_preview.py)
+def _preview_owner(name: str, stage: str) -> str:
+    """Stages 3 and 4 of a part are computed on its group (the parent), like the full run."""
+    return (_objects().get(name).get("part_of") or name) if stage in ("matanyone", "videomama") else name
+
+
+@app.post("/api/object/{name}/stage_preview/{frame}")
+@long_job("Podgląd klatek: {name}", quiet=True)
+async def stage_preview_compute(name: str, frame: int, stage: str):
+    from engine import stage_preview as sp
+    if stage not in sp.STAGES:
+        raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
+    name = _preview_owner(name, stage)
+    if stage == "videomama":
+        st = _vmm_status()
+        if st["missing_models"] or st["missing_nodes"]:
+            raise HTTPException(status_code=409, detail="VideoMaMa niezainstalowany – Doktor → „Zainstaluj VideoMaMa”")
+    pipe = _pipeline()
+    win = sp.window(pipe._visible(name, _shot_frames()), frame, sp.WINDOW[stage])
+    if not win:
+        raise HTTPException(status_code=409, detail="obiekt nie jest widoczny w tej klatce")
+    _require_core_on(name, win)
+    _require_stage(name, stage)
+    models_dir = load_config().get("models_dir")
+    from engine.zones import MissingFront
+    try:
+        meta = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: sp.run(pipe, name, stage, frame, win, Path(models_dir) if models_dir else None))
+    except MissingFront as e:
+        raise _missing_front_409(e)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"success": True, "object": name, **meta}
+
+
+@app.get("/api/object/{name}/stage_preview/{stage}")
+def stage_preview_info(name: str, stage: str):
+    """{exists, stage, center, frames, stale, seconds} of the last preview of this stage."""
+    from engine import stage_preview as sp
+    if stage not in sp.STAGES:
+        raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
+    m = sp.read_meta(_objects(), _preview_owner(name, stage), stage)
+    return {"exists": bool(m), **(m or {})}
+
+
+@app.get("/api/object/{name}/stage_preview/{stage}/{frame}")
+def stage_preview_frame(name: str, stage: str, frame: int):
+    """Proxy PNG of the preview alpha of `frame` (404 outside the preview window). Header X-MD-Stale: 1 = made with
+    other settings than the current ones."""
+    from engine import stage_preview as sp
+    if stage not in sp.STAGES:
+        raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
+    owner = _preview_owner(name, stage)
+    p = sp.frame_path(_objects(), owner, stage, frame)
+    a = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
+    if a is None:
+        raise HTTPException(status_code=404, detail="brak podglądu tej klatki")
+    s = _proxy_scale()
+    w, h = _plate_size()
+    r = _png_response(cv2.resize(a, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA))
+    m = sp.read_meta(_objects(), owner, stage) or {}
+    r.headers["X-MD-Stale"] = "1" if m.get("stale") else "0"
+    return r
+
+
 @app.get("/api/object/{name}/edge_pieces/{frame}")
 def edge_pieces_frame(name: str, frame: int, v: Optional[str] = None):
     """Stage-4 overlay: contour samples of the pieces to correct in this frame, in plate px
@@ -3207,6 +3372,12 @@ def object_frame(name: str, frame: int, view: str = "overlay", v: Optional[str] 
             raise HTTPException(status_code=404, detail="Brak wyniku jednej z wersji w tej klatce")
         alpha = np.clip(np.abs(a - b) * 3.0, 0, 1).astype(np.float32)   # x3: small soft differences stay visible
     elif view in ("alpha", "overlay") and run:
+        if v and view == "alpha":   # a chosen version outside its frames: 404, not an empty matte (bug 2026-10-17)
+            from engine.workarea import fmt_intervals, run_coverage, run_frames
+            rf = run_frames(store.dir(name), v)
+            if rf is not None and frame not in set(rf):
+                raise HTTPException(status_code=404, detail=f"Wersja {v} obejmuje {fmt_intervals(run_coverage(store.dir(name), v))} "
+                                                            f"– klatka {frame} jest poza jej wynikiem")
         alpha = _object_alpha_full(name, frame, run, bool(export))
     if view == "preview":
         pp = store.dir(name) / "preview" / f"p_{frame:04d}.png"
@@ -3796,6 +3967,13 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
         from engine.vitmatte import get_runner
         from engine.zones import vitmatte_tile_px, vitmatte_zone
         hold_m = hold_fn(frame) if z.holdout else None
+        # forced to 1 = the core eroded by the inset, as the full run passes it (engine/zones.py): without force_core
+        # ViTMatte pasted 1 into the WHOLE core – the hard SAM3 edge in the raw preview alpha (user report 2026-10-17)
+        fpx = int((kz.params or {}).get("force_core_erode_px", 0) or 0)
+        force_pv = cb.astype(bool)
+        if fpx > 0:
+            kf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fpx + 1, 2 * fpx + 1))
+            force_pv = cv2.erode(cb.astype(np.uint8), kf).astype(bool)
         bgm = zone_bg_mask_at(kz, cb.shape)
         pipe.release_comfy_gpu("podgląd ViTMatte")      # Comfy's models off the GPU first (idle queue only)
         from engine.vitmatte import model_id_for
@@ -3806,7 +3984,8 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
                                      model_px=int((kz.params or {}).get("model_px", 1008)),
                                      unknown_value=float((kz.params or {}).get("unknown_value", 0.5)),
                                      tile_px=vitmatte_tile_px(kz.params),
-                                     fg_sure={frame: fgm} if fg_fn is not None else None)
+                                     fg_sure={frame: fgm} if fg_fn is not None else None,
+                                     force_core={frame: force_pv} if fpx > 0 else None)
         a = al.get(frame, np.zeros(cb.shape, np.float32))
         res = LocalMatteResult(alpha=a, area=region, trimap=tris.get(frame, np.zeros(cb.shape, np.uint8)),
                                box=tuple(st.get("bbox", (0, 0, 0, 0))), scale=float(st.get("scale", 1.0)),
@@ -3821,11 +4000,23 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
     # live finish sliders in the UI (2026-10-16): the alpha BEFORE the finish + the area it acts on (0 = outside,
     # 128 = region, 255 = region ∩ core – forced to 1), so black / white / blur recompute in the browser without the model
     pvd = d / "preview"; pvd.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(pvd / f"zraw_{frame:04d}.png"), (np.clip(res.alpha, 0, 1) * 255).astype(np.uint8))
+    # the core interior outside the zone area is 1 in the preview images: the raw zone alpha is 0 there, and the proxy
+    # downscale mixed that 0 into the inner border of the area – a dotted light line in the cut-out (user report
+    # 2026-10-17); the full run lays the zone over the base (1 there) and never had it
+    inner = cb.astype(bool) & ~region.astype(bool)
+    raw_pv = np.clip(res.alpha, 0, 1).astype(np.float32)
+    raw_pv[inner] = 1.0
+    cv2.imwrite(str(pvd / f"zraw_{frame:04d}.png"), (raw_pv * 255).astype(np.uint8))
+    # forced to 1 = the core eroded by the inset (force_core_erode_px), exactly as the full run (engine/zones.py
+    # vitmatte_zone) – the preview forced the WHOLE core, so the inset rim ViTMatte computed was thrown away and the hard
+    # SAM3 core edge showed as a pixel staircase (user report 2026-10-17); the result itself was right
+    force = force_pv if eng == "vitmatte" else cb.astype(bool)
     area = region.astype(np.uint8) * 128
-    area[region.astype(bool) & cb.astype(bool)] = 255
+    area[region.astype(bool) & force] = 255
     cv2.imwrite(str(pvd / f"zarea_{frame:04d}.png"), area)
-    res.alpha = finish_zone_alpha(res.alpha, region, cb, kz.params or {})   # black / white / blur sliders, live on the key frame
+    res.alpha = finish_zone_alpha(res.alpha, region, force, kz.params or {})   # black / white / blur sliders, live on the key frame
+    res.alpha = res.alpha.astype(np.float32).copy()
+    res.alpha[inner] = 1.0
     return {**_write_matte_preview(d, frame, cb, res), "holdout_objects": used, "cleanplate": clean_src,
             "is_key": is_key, "frame": int(frame), "engine_used": eng, **({"note": note} if note else {})}
 
@@ -4067,8 +4258,17 @@ def object_runs(name: str):
                     "base_outdated": bool(rj.get("base_run") and rj.get("base_stage") in ("matanyone", "videomama", "vitmatte", "ltx", "core")
                                           and rj.get("base_run") not in cur_stage.values()),
                     "ltx_mask_run": (rj.get("ltx") or {}).get("mask_source")
-                    if re.fullmatch(r"v\d{3,}", str((rj.get("ltx") or {}).get("mask_source", ""))) else None})
+                    if re.fullmatch(r"v\d{3,}", str((rj.get("ltx") or {}).get("mask_source", ""))) else None,
+                    "coverage": _run_cov(d.parent.parent, d.name)})   # frames the version computed ([[a, b], ...])
     return {"object": name, "active_run": active, "runs": out}
+
+
+def _run_cov(obj_dir: Path, run: str):
+    from engine.workarea import run_coverage
+    try:
+        return run_coverage(obj_dir, run)
+    except (OSError, ValueError):
+        return None
 
 
 class ActiveRunRequest(BaseModel):
@@ -4122,6 +4322,7 @@ class ObjectSettingsRequest(BaseModel):
     vitmatte_base: Optional[str] = None  # stage 4 base (2026-10-15): "core" = mask 1+2 (stages 1+2) | "matanyone" = stage 3
     band_out_px: Optional[float] = None  # px mode of the edge band (2026-10-16): at least this far out of the mask 1+2 edge
     band_in_px: Optional[float] = None   # ... and into it; the adaptive width wins where larger; no shift of the mask
+    band_in_feather_px: Optional[float] = None   # feather of the inset into the core (0 = hard switch, 2026-10-17)
 
 
 @app.put("/api/object/{name}/settings")
@@ -4146,6 +4347,8 @@ def object_settings(name: str, req: ObjectSettingsRequest):
         upd["band_out_px"] = clamp_band_px(req.band_out_px)
     if req.band_in_px is not None:
         upd["band_in_px"] = clamp_band_px(req.band_in_px)
+    if req.band_in_feather_px is not None:
+        upd["band_in_feather_px"] = float(min(64.0, max(0.0, req.band_in_feather_px)))
     if req.temporal_smoothing is not None:
         if req.temporal_smoothing not in ("weak", "normal", "strong"):
             raise HTTPException(status_code=400, detail="wygładzanie: weak | normal | strong")

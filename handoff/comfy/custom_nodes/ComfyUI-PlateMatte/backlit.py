@@ -7,7 +7,7 @@ normalised blur at two scales (fills holes where objects cover the wall, also at
 Defocused near objects are not black in X2 (leaves transmit, trunks are partly front-lit), so the
 coverage is divided by its local maximum, and the interior is filled to 1 (eroded so soft edges stay).
 Physically correct defocus softness, no thresholds on the edge.
-Ported 1:1 from the Nuke branch BD_FG_DEFOCUS (SH010), where it was tuned.
+Ported 1:1 from the Nuke branch BD_FG_DEFOCUS (on a real backlit shot), where it was tuned.
 """
 import torch
 import torch.nn.functional as F

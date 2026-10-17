@@ -33,6 +33,9 @@ class MockComfyClient:
     def get_queue(self) -> Dict[str, Any]:
         return {"running": [], "pending": [], "busy": self.busy}
 
+    def busy_error(self) -> Optional[str]:
+        return "ComfyUI zajęte – poczekaj, aż skończy inne zadanie" if self.busy else None
+
     def free_vram(self, unload_models: bool = True, free_memory: bool = True) -> bool:
         self.freed += 1
         return True

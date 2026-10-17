@@ -484,9 +484,9 @@ def run_depth(client: Any, workflow: Union[str, Path, Dict[str, Any]], shot: str
     if progress_cb:
         progress_cb(f"DepthCrafter (ETA ~{cost['eta_s']:.0f} s, RAM ~{cost['ram_gb']} GB)", 0, len(frames))
 
-    q = client.get_queue()
-    if q.get("busy"):
-        raise RuntimeError("ComfyUI zajęte – poczekaj, aż skończy inne zadanie")
+    busy = client.busy_error()
+    if busy:
+        raise RuntimeError(busy)
     client.free_vram()
     sub = client.queue_prompt(graph)
     if not sub.get("success"):

@@ -5,7 +5,7 @@
 Separate package so updates of ComfyUI-MatAnyone2 don't overwrite it.
 Reuses the MATANYONE2_MODEL pipe from "Load MatAnyone2 Model".
 """
-__version__ = "1.2.0"   # 1.1.0 (2026-10-13): conditional VRAM release (vram_release_frac), max_mem_frames 0 = auto
+__version__ = "1.2.2"   # 1.2.2 (2026-10-17): stops between frames on ComfyUI interrupt ("Przerwij" in MatteDesk); 1.2.1 (2026-10-17): comments only (no shot names);  1.1.0 (2026-10-13): conditional VRAM release (vram_release_frac), max_mem_frames 0 = auto
                         # 1.1.1 (2026-10-13): alpha_only – matte_video / foreground outputs skipped (RAM: 2 x N x H x W x 3 float32)
                         # 1.1.2 (2026-10-15): CoreCombine core_mode = soft (SAM3 probabilities as the core, soft start of the band)
                         # 1.2.0 (2026-10-16): keyframe_anchor = soft – non-start key frames no longer as hard as the key mask
@@ -13,6 +13,7 @@ __version__ = "1.2.0"   # 1.1.0 (2026-10-13): conditional VRAM release (vram_rel
 import torch
 import torch.nn.functional as F
 import numpy as np
+import comfy.model_management as mm
 import comfy.utils
 
 from .vram import VramReleaser, resolve_max_mem_frames
@@ -166,6 +167,7 @@ class MatAnyone2RunKeyframes:
             perm = [0]   # permanent keyframes in this pass (each costs VRAM for the rest of the pass)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 for ti in range(len(order) + warmup_frames):
+                    mm.throw_exception_if_processing_interrupted()   # Cancel / /interrupt: stop now, not after the pass
                     fi = order[max(0, ti - warmup_frames)]
                     img = frame(fi)
                     soft_out = None
@@ -176,7 +178,7 @@ class MatAnyone2RunKeyframes:
                         prob = processor.step(img, first_frame_pred=True)
                     elif fi in kf_masks and keyframe_anchor == "soft":
                         # soft re-anchor (1.2.0): with the hard key as the output / last mask every non-start key frame
-                        # was as hard as SAM3 (CLIP2_A, keys F20 / F80: 13.5k / 16.5k soft px vs ~19k / ~21k around them).
+                        # was as hard as SAM3 (test clip, keys F20 / F80: 13.5k / 16.5k soft px vs ~19k / ~21k around them).
                         # Predict from memory first (soft edge), keep that alpha in a thin band around the key's edge and
                         # the key everywhere else, anchor the memory on this soft key and output it
                         pred = processor.step(img)

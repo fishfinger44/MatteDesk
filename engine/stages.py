@@ -56,8 +56,14 @@ BASE_LABEL = {"matanyone": "wynik MatAnyone, etap 3", "core": "maska 1+2, etapy 
 
 
 def vitmatte_base(obj: Dict[str, Any]) -> str:
-    b = obj.get("vitmatte_base") or "matanyone"
-    return b if b in VITMATTE_BASES else "matanyone"
+    """The base ViTMatte lays its zones on: the object's choice, else (nothing chosen yet, bug 2026-10-17: the stage
+    stayed locked behind MatAnyone while the mask 1+2 was ready) the best result that exists – MatAnyone, VideoMaMa,
+    otherwise the mask 1+2."""
+    b = obj.get("vitmatte_base")
+    if b in VITMATTE_BASES:
+        return b
+    sr = (obj.get("tool") or {}).get("stage_runs") or {}
+    return "matanyone" if sr.get("matanyone") else ("videomama" if sr.get("videomama") else "core")
 
 
 def vmm_base(obj: Dict[str, Any]) -> str:
@@ -67,11 +73,12 @@ def vmm_base(obj: Dict[str, Any]) -> str:
 
 
 def needs_of(obj: Dict[str, Any]) -> Dict[str, List[str]]:
-    """NEEDS of this object: ViTMatte on the mask 1+2 waits for stage 2 (done also without brush corrections), on
-    MatAnyone for stage 3, on VideoMaMa for that stage; VideoMaMa on the mask 1+2 for stage 2, on MatAnyone for stage 3."""
-    vb = vitmatte_base(obj)
-    return {**NEEDS, "vitmatte": ["cotracker"] if vb == "core" else [vb],
-            "videomama": ["cotracker"] if vmm_base(obj) == "core" else ["matanyone"]}
+    """NEEDS of this object: ViTMatte opens right after stage 2 whatever its base (the mask 1+2 is always a possible
+    base and the base selector lives inside the stage – locking it behind MatAnyone made the choice unreachable, bug
+    2026-10-17; a base without a result is refused when computing, with the reason); VideoMaMa on the mask 1+2 waits
+    for stage 2, on MatAnyone for stage 3."""
+    return {**NEEDS, "vitmatte": ["cotracker"],
+            "videomama": ["cotracker"]}   # same for VideoMaMa: its base selector is inside the stage (bug 2026-10-17)
 
 
 def _sha(obj: Any) -> str:
@@ -130,7 +137,7 @@ def mask_sig(store: Any, name: str) -> str:
 
 
 # px mode of the edge band (2026-10-16): part of the signature only when set – objects without it keep their signature
-EDGE_KEYS_OPT = ("band_out_px", "band_in_px")
+EDGE_KEYS_OPT = ("band_out_px", "band_in_px", "band_in_feather_px")
 
 
 def settings_sig(obj: Dict[str, Any]) -> str:
@@ -194,11 +201,11 @@ def stage_run(store: Any, name: str, stage: str, base: Optional[str] = None) -> 
             return run, False, "rdzeń albo poprawki pędzlem zmienione od ostatniego liczenia VideoMaMa"
         s = vmm_settings(obj)
         if rj.get("vmm_sig") != vmm_sig(s):
-            return run, False, "ustawienia VideoMaMa zmienione – „✚ Suwaki na wynik” albo „▶ Policz VideoMaMa”"
+            return run, False, "ustawienia VideoMaMa zmienione od tej wersji – „▶ Policz ponownie” (albo najpierw „👁 Podgląd klatek”)"
         if s["base"] == "matanyone":
             m_run, m_ok, _ = stage_run(store, name, "matanyone")
             if rj.get("applied_from") != m_run or not m_ok:
-                return run, False, "baza (wynik MatAnyone, etap 3) zmieniona od tej wersji – „✚ Suwaki na wynik”"
+                return run, False, "baza (wynik MatAnyone, etap 3) zmieniona od tej wersji – „▶ Policz ponownie”"
         return run, True, ""
     if stage in ("matanyone", "core_base"):
         core_t = _mtime(od / "core" / "core.json") or 0.0
@@ -455,14 +462,20 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
     vv_run, vv_ok, vv_why = stage_run(store, name, "videomama")
     st["videomama"] = "done" if vv_ok else ("stale" if vv_run else "todo")
     why["videomama"] = vv_why or ("" if vv_run else "opcjonalny – „▶ Policz VideoMaMa” (kosmyki włosów, detal krawędzi)")
+    if not vv_ok and vmm_base(obj) == "matanyone" and st["matanyone"] != "done":
+        why["videomama"] = "baza VideoMaMa = wynik MatAnyone, a etap 3 nie jest policzony – najpierw MatAnyone albo baza „maska 1+2”"
     vbase = vitmatte_base(obj)
     vm_run, vm_ok, vm_why = stage_run(store, name, "vitmatte")
     st["vitmatte"] = "done" if vm_ok else ("stale" if vm_run else "todo")
+    base_ok = vbase == "core" or (st["matanyone"] == "done" if vbase == "matanyone" else st["videomama"] == "done")
     if vm_why:
         why["vitmatte"] = vm_why
+    elif not base_ok:   # the stage is open (2026-10-17), but the chosen base has no current result
+        why["vitmatte"] = (f"baza {BASE_LABEL[vbase]} nie jest policzona – najpierw "
+                           f"{'etap 3 MatAnyone' if vbase == 'matanyone' else 'etap VideoMaMa'} albo baza ViTMatte = maska 1+2")
     elif not vm_run:
         why["vitmatte"] = ("dodaj strefę ViTMatte (🖌 malowany pas albo cały obrys) i „Zastosuj na ujęcie”"
-                           if not zone_dicts(od, ("matte",)) else "„✚ Zastosuj na ujęcie” – strefy ViTMatte na wyniku MatAnyone")
+                           if not zone_dicts(od, ("matte",)) else f"„✚ Zastosuj na ujęcie” – strefy ViTMatte na bazie: {BASE_LABEL[vbase]}")
     # stage 6 LTX Alpha-Gen (optional, generative): its own version on the mask 1+2
     lx_run, lx_ok, lx_why = stage_run(store, name, "ltx")
     st["ltx"] = "done" if lx_ok else ("stale" if lx_run else "todo")

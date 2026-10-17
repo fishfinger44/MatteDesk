@@ -63,6 +63,46 @@ class MatteDeskViewer {
     // Check environment & current project
     this.checkDoctorStatus();
     this.loadCurrentProject();
+    setTimeout(() => this.checkUpdate(), 4000);
+  }
+
+  // Newer MatteDesk in the public GitHub releases (at most once a day; engine/updates.py): short list of changes,
+  // link to the full changelog; installer copy -> download + start the new setup, git copy -> "git pull"
+  async checkUpdate(force = false, pre = null) {
+    let u = pre;
+    if (!u) {
+      try { u = await (await fetch('/api/update' + (force ? '?force=1' : ''))).json(); } catch (e) { return null; }
+    }
+    if (!u || !u.available || (u.skipped && !force)) return u;
+    const notes = this.esc(u.notes || '').replace(/\n/g, '<br>');
+    const inst = u.can_install;
+    const html = `<div>Masz wersję <b>${this.esc(u.current)}</b>.</div>
+      ${notes ? `<div style="margin:10px 0;padding:8px 10px;background:#141416;border:1px solid #2a2a2e;border-radius:6px;max-height:40vh;overflow-y:auto;">${notes}</div>` : ''}
+      <div><a href="${this.esc(u.changelog)}" target="_blank" rel="noopener" style="color:#e8a33d;">Pełna lista zmian (CHANGELOG)</a> ·
+        <a href="${this.esc(u.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">strona wydania</a></div>
+      <div style="margin-top:8px;color:#9a9aa0;">${inst ? 'Zaktualizuj = pobranie instalatora i jego uruchomienie; MatteDesk się zamknie, ustawienia zostają.'
+        : 'Kopia z gita: zaktualizuj przez <code>git pull</code> w folderze MatteDesk i uruchom MatteDesk ponownie.'}</div>
+      <label style="display:block;margin-top:8px;"><input type="checkbox" id="updSkip"> Nie przypominaj o tej wersji</label>`;
+    const yes = await this.uiDialog({ title: `Nowa wersja MatteDesk ${u.version}`, html, ok: inst ? 'Zaktualizuj' : 'OK', cancel: 'Później', tone: 'info' });
+    const skip = document.getElementById('updSkip');
+    if (!yes && skip && skip.checked) {
+      fetch('/api/update/skip', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version: u.version }) });
+    }
+    if (yes && inst) {
+      const r = await fetch('/api/update/install', { method: 'POST' });
+      if (!r.ok) { await this.uiDialog({ title: 'Aktualizacja niemożliwa', tone: 'error', html: this.esc((await r.json()).detail || '') }); return u; }
+      for (let i = 0; i < 1800; i++) {      // up to ~30 min
+        await new Promise((res) => setTimeout(res, 1000));
+        let st;
+        try { st = await (await fetch('/api/update/progress')).json(); } catch (e) { break; }   // server stopped: setup runs
+        if (st.state === 'failed') { await this.uiDialog({ title: 'Aktualizacja nie powiodła się', tone: 'error', html: this.esc(st.error || '') }); return u; }
+        if (st.state === 'downloading' && st.total) this.showToast(`Pobieranie aktualizacji: ${Math.round(100 * st.done / st.total)} %`);
+        if (st.state === 'started') break;
+      }
+      document.body.innerHTML = '<div style="padding:40px;font:16px sans-serif;color:#dcdcdf;background:#19191b;height:100vh;">Instalator aktualizacji działa – to okno można zamknąć.</div>';
+      window.close();
+    }
+    return u;
   }
 
   bindElements() {
@@ -846,6 +886,15 @@ class MatteDeskViewer {
     this.syncCompareUi();
     this.loadCompareRef(this.currentFrame);
     this.render();
+    this.notifyCompare();
+  }
+  // objects.js / zones.js: the cut-out view switches the band / alpha previews off (they looked like an error over it,
+  // user report 2026-10-17) and back on when leaving it
+  notifyCompare() {
+    const covers = !!this.compareCoversView();
+    if (covers === this._coversWas) return;
+    this._coversWas = covers;
+    window.dispatchEvent(new CustomEvent('md-compare', { detail: { covers } }));
   }
   setCompareRef(name) {
     if (!name) return;
@@ -865,6 +914,7 @@ class MatteDeskViewer {
     this.syncCompareUi();
     this.loadCompareRef(this.currentFrame);
     this.render();
+    this.notifyCompare();
     window.dispatchEvent(new CustomEvent('md-plate', { detail: { plate: this.activePlate, prev: this.activePlate } }));
   }
   // buttons / extra controls of the comparison next to the plate pair
@@ -910,7 +960,7 @@ class MatteDeskViewer {
       if (names[this.compare.mode]) parts.push(names[this.compare.mode]);
     }
     el.style.display = parts.length ? '' : 'none';
-    el.textContent = parts.join(' · ');
+    el.textContent = parts.join(' · ');    this.notifyCompare && this.notifyCompare();
   }
   nearWipe(e) {
     const img = this.getCurrentImage(); if (!img) return false;
@@ -1434,7 +1484,7 @@ class MatteDeskViewer {
     const obj = window.MD_OBJ;
     const m = obj && obj.matteFor ? obj.matteFor(f) : null;
     if (m === 'loading') { this._cmpNote = 'Wczytywanie maski…'; return null; }
-    if (!m) this._cmpNote = obj && obj.name ? `„${obj.name}”: brak alpha i rdzenia w F${f} – samo tło` : 'Wybierz obiekt (lista Obiekt) – bez maski widać samo tło';
+    if (!m) this._cmpNote = obj && obj.name ? (obj.matteNote || `„${obj.name}”: brak alpha i rdzenia w F${f} – samo tło`) : 'Wybierz obiekt (lista Obiekt) – bez maski widać samo tło';
     else {   // which mask the cut-out uses (it follows the selected stage, objects.js matteFor)
       const src = { core: 'rdzeń SAM3', key: 'klucz SAM3', core_fix: 'maska 1+2' }[m.kind] || (m.run ? `wersja ${m.run}` : 'alpha');
       this._cmpNote = `„${m.group || obj.name}”${m.group ? ' (grupa ze szwem)' : ''} F${f}: wycięcie – ${src}`;
@@ -1561,7 +1611,7 @@ class MatteDeskViewer {
       b.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:20000;background:#7f1d1d;color:#fff;padding:10px 44px 10px 16px;font-size:14px;font-weight:600;text-align:center;box-shadow:0 -2px 12px rgba(0,0,0,.5);';
       document.body.appendChild(b);
     }
-    b.innerHTML = `⚠ ${msg} Zamknij okno konsoli MatteDesk i uruchom ponownie <code>start_v….bat</code>, potem odśwież stronę (Ctrl+F5).`
+    b.innerHTML = `⚠ ${msg} Zamknij MatteDesk i uruchom go ponownie: skrót z menu Start / pulpitu sam zaproponuje zatrzymanie starego serwera (kopia z gita: zamknij okno konsoli i uruchom <code>start_v….bat</code>).`
       + '<button type="button" title="Ukryj" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:0;color:#fff;font-size:18px;cursor:pointer;">✕</button>';
     b.querySelector('button').addEventListener('click', () => b.remove());
     this.serverStale = msg;
@@ -1809,15 +1859,17 @@ class MatteDeskViewer {
         const inp = 'style="background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-radius:4px;padding:2px 6px;font-size:12px;"';
         html = `<div style="margin-bottom:12px;padding:10px;border:1px solid #3c3c42;border-radius:6px;font-size:12px;">
           <b>Używany ComfyUI:</b>
-          <select id="comfyFlavorSel" ${inp}><option value="desktop"${isP ? '' : ' selected'}>ComfyUI Desktop</option><option value="git"${isP ? ' selected' : ''}>ComfyUI z gita</option></select>
+          <select id="comfyFlavorSel" ${inp}><option value="desktop"${isP ? '' : ' selected'}>ComfyUI Desktop</option><option value="git"${isP ? ' selected' : ''}>ComfyUI z gita / portable</option></select>
           <span id="comfyGitBox" style="display:${isP ? 'inline' : 'none'};margin-left:8px;">
             folder (z main.py): <input id="comfyPortDir" size="38" value="${(pf.comfy_dir || '').replace(/"/g, '&quot;')}" ${inp}>
             port: <input id="comfyPortPort" size="5" value="${pf.comfy_port || 8188}" ${inp}>
             <label><input type="checkbox" id="comfyPortShared"${pf.shared_models ? ' checked' : ''}> modele wspólne z Desktopem</label>
           </span>
           <label style="margin-left:10px;"><input type="checkbox" id="comfyAutostart"${cc.autostart === false ? '' : ' checked'}> uruchamiaj ComfyUI razem z MatteDesk</label>
+          <label style="margin-left:10px;">okno MatteDesk: <select id="appBrowserSel" ${inp}><option value="default"${cc.app_browser === 'edge' ? '' : ' selected'}>domyślna przeglądarka</option><option value="edge"${cc.app_browser === 'edge' ? ' selected' : ''}>Edge</option></select></label>
+          <label style="margin-left:10px;"><input type="checkbox" id="updCheckBox"${cc.update_check === false ? '' : ' checked'}> sprawdzaj aktualizacje MatteDesk przy starcie</label>
           <button class="btn btn-secondary" id="comfySaveBtn" style="margin-left:8px;padding:2px 10px;font-size:12px;">Zapisz</button>
-          <div style="margin-top:6px;color:#9a9aa0;">Aktywny: ${cc.comfy_dir || '(nie ustawiony)'} · modele: ${cc.models_dir || '-'} · port ${cc.comfy_port}. „Zainstaluj” działa na aktywnym.</div>
+          <div style="margin-top:6px;color:#9a9aa0;">Aktywny${cc.kind === 'portable' ? ' (ComfyUI portable)' : ''}: ${cc.comfy_dir || '(nie ustawiony)'} · modele: ${cc.models_dir || '-'} · port ${cc.comfy_port}. „Zainstaluj” działa na aktywnym.</div>
         </div>` + html;
       } catch (e) { /* config endpoint unavailable: report only */ }
       // ComfyUI restart needed: nodes installed but not loaded yet (or an install asked for it in this session)
@@ -1846,6 +1898,8 @@ class MatteDeskViewer {
             body.comfy_port = parseInt(document.getElementById('comfyPortPort').value, 10) || 8188;
             body.shared_models = document.getElementById('comfyPortShared').checked;
           }
+          fetch('/api/config/app_browser', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ app_browser: document.getElementById('appBrowserSel').value }) });
+          fetch('/api/update/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: document.getElementById('updCheckBox').checked }) });
           const r = await fetch('/api/config/comfy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
           if (!r.ok) { await this.uiDialog({ title: 'Nie zapisano', tone: 'error', html: this.esc((await r.json()).detail) }); return; }
           this.fetchDoctorReport(); this.checkDoctorStatus();
@@ -2198,6 +2252,13 @@ class MatteDeskViewer {
       fileStat.className = `plate-stat-pill ${p.exists ? 'success' : 'warning'}`;
       fileStat.textContent = p.exists ? `✓ ${p.frame_count} kl.` : '⚠️ Brak plików';
       stats.appendChild(fileStat);
+      if (p.mismatch) {   // backlit / clear plate of another resolution: not used by any stage
+        const mm = document.createElement('span');
+        mm.className = 'plate-stat-pill warning';
+        mm.textContent = `⚠️ ${p.mismatch}`;
+        mm.title = 'Inna rozdzielczość niż beauty – ten plate nie jest używany w żadnym etapie (pewnie z innego ujęcia). Podmień go albo usuń.';
+        stats.appendChild(mm);
+      }
 
       const proxyStat = document.createElement('span');
       proxyStat.className = `plate-stat-pill ${p.proxy_count > 0 ? 'success' : ''}`;

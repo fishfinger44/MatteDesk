@@ -13,6 +13,7 @@ import os
 import zlib
 from datetime import datetime
 from pathlib import Path
+import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -75,6 +76,36 @@ def identity_display(x: np.ndarray) -> np.ndarray:
 
 
 identity_display.elementwise = True
+
+
+logger = logging.getLogger(__name__)
+_AUX_SIZE: Dict[str, Optional[Tuple[int, int]]] = {}
+
+
+def plate_size(pattern: str) -> Optional[Tuple[int, int]]:
+    """(w, h) of the first existing frame of a #### / %04d sequence (cached per pattern); None = no frame readable."""
+    if pattern in _AUX_SIZE:
+        return _AUX_SIZE[pattern]
+    import glob
+    size = None
+    files = sorted(glob.glob(pattern.replace("####", "[0-9]" * 4).replace("%04d", "[0-9]" * 4)))
+    if files:
+        img = cv2.imread(files[0], cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            size = (int(img.shape[1]), int(img.shape[0]))
+    _AUX_SIZE[pattern] = size
+    return size
+
+
+def aux_plate_mismatch(pattern: Optional[str], w: int, h: int) -> Optional[str]:
+    """A backlit / clear plate whose resolution is not the beauty's (2026-10-17: SH010 4096x2731 plates were set in a
+    1440x2560 project -> QA of every stage crashed on the shapes) -> the reason it is not used; None = usable."""
+    if not pattern:
+        return None
+    size = plate_size(pattern)
+    if size is None or size == (int(w), int(h)):
+        return None
+    return f"{size[0]}x{size[1]} ≠ beauty {int(w)}x{int(h)}"
 
 
 class PlateCropLoader:
@@ -242,6 +273,18 @@ class ObjectPipeline:
         self.w, self.h = plate_w, plate_h
         self.client = client
         self.shutter = shutter_deg
+        # backlit / clear plate of another resolution than the beauty = a wrong plate: not used anywhere (QA of every
+        # stage, auto edge mode, backlit edge, matte zones' clean plate), the reason in `plates_skipped` -> run.json / UI
+        self.plates_skipped: Dict[str, str] = {}
+        for kind, pat in (("cleanplate", cleanplate_pattern), ("backlit", backlit_pattern)):
+            why = aux_plate_mismatch(pat, plate_w, plate_h)
+            if why:
+                self.plates_skipped[kind] = why
+                logger.warning("%s %s not used: %s", kind, pat, why)
+        if "cleanplate" in self.plates_skipped:
+            cleanplate_pattern = None
+        if "backlit" in self.plates_skipped:
+            backlit_pattern = None
         self.clean = PlateCropLoader(cleanplate_pattern, display) if cleanplate_pattern else None
         self.point_tracker = None   # injectable (tests); default make_point_tracker() = CoTracker3 or LK fallback
         self.zone_tracker = None    # injectable (tests); default: CoTracker3 when installed, else core bbox shift
@@ -761,6 +804,7 @@ class ObjectPipeline:
         rj = {"schema": "matte_desk/run@1.0", "run": run_dir.name, "edge_mode": "core_fix", "stage": "core",
               "frames": [int(frames[0]), int(frames[-1])], "segments_def": [s.to_dict() for s in segs],
               "core_stabilize": core_stabilize_on(obj), "core_fix_sig": mask_sig(self.store, name),
+              **({"plates_skipped": self.plates_skipped} if self.plates_skipped else {}),
               "settings_sig": settings_sig(obj), "created_at": datetime.now().isoformat(timespec="seconds")}
         if members:
             rj.update(group=members, group_seam_px=self.store.get(name).get("part_seam_px"),
@@ -876,6 +920,7 @@ class ObjectPipeline:
         rj = {"schema": "matte_desk/run@1.0", "run": run_dir.name, "edge_mode": "ltx", "stage": "ltx",
               "frames": [int(frames[0]), int(frames[-1])], "segments_def": [sg.to_dict() for sg in segs],
               "core_stabilize": core_stabilize_on(obj), "core_fix_sig": mask_sig(self.store, name),
+              **({"plates_skipped": self.plates_skipped} if self.plates_skipped else {}),
               "settings_sig": settings_sig(obj), "ltx": s, "ltx_sig": ltx_sig(s), "ltx_batches": gen.log,
               "seconds": round(time.time() - t0, 1), "created_at": datetime.now().isoformat(timespec="seconds")}
         if members:
@@ -890,8 +935,44 @@ class ObjectPipeline:
             progress_cb("LTX Alpha-Gen", len(frames), len(frames))
         return run_dir.name
 
+    def run_referenced(self, name: str, run: str) -> bool:
+        """Something builds on this version: the active run, another version (applied_from / base_run / refinished_from /
+        LTX mask), a stage result other than the one being redone, or the object's last export (outputs.json)."""
+        obj = self.store.get(name)
+        tool = obj.get("tool") or {}
+        if tool.get("active_run") == run:
+            return True
+        od = self.store.dir(name)
+        for rj_p in (od / "runs").glob("v*/run.json"):
+            if rj_p.parent.name == run:
+                continue
+            try:
+                rj = json.loads(rj_p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if run in (rj.get("applied_from"), rj.get("base_run"), rj.get("refinished_from"),
+                       (rj.get("ltx") or {}).get("mask_source")):
+                return True
+        try:
+            out = json.loads((self.work / "outputs.json").read_text(encoding="utf-8"))
+            if any(e.get("name") == name and e.get("version") == run for e in out.get("objects", [])):
+                return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    def _refinish_dir(self, name: str, src: str, srj: Dict[str, Any], auto: bool) -> Tuple[Path, str]:
+        """(run_dir, refinished_from) for „sliders on the result”. `auto` (sliders applied by themselves, user decision
+        2026-10-17): the previous automatic sliders version is overwritten in place – one version per model run, not one
+        per slider move – unless something builds on it (then a new version, the old one untouched). The raw model
+        matte is copied into the version, so overwriting never loses it."""
+        od = self.store.dir(name)
+        if auto and srj.get("auto_refinish") and srj.get("refinished_from") and not self.run_referenced(name, src):
+            return od / "runs" / src, srj["refinished_from"]
+        return next_run_dir(od), src
+
     def ltx_refinish(self, name: str, frames: Sequence[int], settings: Optional[Dict[str, Any]] = None,
-                     progress_cb=None) -> str:
+                     progress_cb=None, auto: bool = False) -> str:
         """„Zastosuj suwaki na wynik” of stage LTX (2026-10-16): the RAW LTX mattes of the current LTX version
         (runs/<v>/ltx_raw) limited again with the current region / mask settings -> a new version, no model run."""
         import time
@@ -918,7 +999,7 @@ class ObjectPipeline:
         zres = self.apply_zones(name, frames, core, keys, probs=soft, kinds=("brush",))
         mask = self.ltx_mask(name, frames, s, zres.core if zres else core)
         raw = run_alpha_loader(od, src, self.w, self.h, sub="ltx_raw")
-        run_dir = next_run_dir(od)
+        run_dir, from_run = self._refinish_dir(name, src, srj, auto)
         n = 0
         for seg in segs:
             for f in [x for x in frames if seg.first <= x <= seg.last]:
@@ -936,8 +1017,9 @@ class ObjectPipeline:
         rj = {"schema": "matte_desk/run@1.0", "run": run_dir.name, "edge_mode": "ltx", "stage": "ltx",
               "frames": [int(frames[0]), int(frames[-1])], "segments_def": srj["segments_def"],
               "core_stabilize": core_stabilize_on(obj), "core_fix_sig": mask_sig(self.store, name),
+              **({"plates_skipped": self.plates_skipped} if self.plates_skipped else {}),
               "settings_sig": settings_sig(obj), "ltx": s, "ltx_sig": ltx_sig(s), "ltx_batches": srj.get("ltx_batches"),
-              "refinished_from": src, "seconds": round(time.time() - t0, 1),
+              "refinished_from": from_run, "auto_refinish": bool(auto), "seconds": round(time.time() - t0, 1),
               "created_at": datetime.now().isoformat(timespec="seconds")}
         for k in ("group", "group_seam_px", "group_outside_crop_px", "coverage"):
             if k in srj:
@@ -989,7 +1071,7 @@ class ObjectPipeline:
                    guide_c: np.ndarray, s: Dict[str, Any]) -> None:
         from engine.refine import write_alpha_exr
         from engine.videomama import compose
-        a = compose(base_c, raw, s["protect"], s["reach_px"])
+        a = compose(base_c, raw, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0))
         write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
         write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
         write_alpha_exr(run_dir / "vmm_raw" / seg.seg_id / f"a_{f:04d}.exr", raw)
@@ -1007,6 +1089,7 @@ class ObjectPipeline:
         rj = {"schema": "matte_desk/run@1.0", "run": run_dir.name, "edge_mode": "videomama", "stage": "videomama",
               "frames": [int(frames[0]), int(frames[-1])], "segments_def": [sg.to_dict() for sg in segs],
               "core_stabilize": core_stabilize_on(obj), "core_fix_sig": mask_sig(self.store, name),
+              **({"plates_skipped": self.plates_skipped} if self.plates_skipped else {}),
               "settings_sig": settings_sig(obj), "videomama": {k: v for k, v in s.items()},
               "vmm_sig": vmm_sig(s), "vmm_model_sig": model_sig(s), "base": s["base"], "applied_from": base_run,
               "vmm_batches": log, "seconds": round(time.time() - t0, 1),
@@ -1063,7 +1146,7 @@ class ObjectPipeline:
         return run_dir.name
 
     def vmm_refinish(self, name: str, frames: Sequence[int], settings: Optional[Dict[str, Any]] = None,
-                     progress_cb=None) -> str:
+                     progress_cb=None, auto: bool = False) -> str:
         """„Suwaki na wynik” of stage VideoMaMa: the RAW mattes of the current VideoMaMa version (vmm_raw/) put over the
         base again with the current base / reach / protect -> a new version, no model run."""
         import time
@@ -1090,7 +1173,7 @@ class ObjectPipeline:
         core2 = zres.core if zres else core
         base, base_run = self.vmm_base(name, frames, s, core2)
         raw = run_alpha_loader(od, src, self.w, self.h, sub="vmm_raw")
-        run_dir = next_run_dir(od)
+        run_dir, from_run = self._refinish_dir(name, src, srj, auto)
         n = 0
         for seg in segs:
             for f in [x for x in frames if seg.first <= x <= seg.last]:
@@ -1099,7 +1182,8 @@ class ObjectPipeline:
                 self._vmm_write(run_dir, seg, f, extract_crop(raw(f).astype(np.float32), seg), extract_crop(base[f], seg),
                                 extract_crop(core2[f].astype(np.float32), seg), s)
         extra = {k: srj[k] for k in ("coverage",) if k in srj}
-        extra["refinished_from"] = src
+        extra["refinished_from"] = from_run
+        extra["auto_refinish"] = bool(auto)
         self._vmm_run_json(run_dir, name, obj, frames, segs, s, base_run, srj.get("vmm_batches"), t0,
                            srj.get("group"), None, extra)
         if progress_cb:
@@ -1119,7 +1203,7 @@ class ObjectPipeline:
         if src and (od / "runs" / src / "vmm_raw").exists():
             try:
                 raw = run_alpha_loader(od, src, self.w, self.h, sub="vmm_raw")(f)
-                alpha = compose(base, raw, s["protect"], s["reach_px"])
+                alpha = compose(base, raw, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0))
             except (OSError, KeyError, ValueError):
                 alpha = None
         return band_u8(base, s), alpha
@@ -1156,13 +1240,15 @@ class ObjectPipeline:
         return info
 
     def finalize(self, name: str, frames: Sequence[int], edge_mode: Optional[str] = None, progress_cb=None,
-                 stage: Optional[str] = None):
+                 stage: Optional[str] = None, preview_dir: Optional[Path] = None):
         """'Przelicz finalnie': one pass + the edge position report (qa.json -> edge). The edge correction is NOT
         applied automatically (Z27 pkt 1, user decision) – stage 4 shows the pieces and `apply_edge_fix` makes it
         a new version on demand.
         `stage="matanyone"` (stage 3 of the 2026-10-15 layout): edge mode MatAnyone2 on the mask 1+2 (SAM3 core + brush
         corrections), WITHOUT the matte (ViTMatte) and threshold zones -> the base version stage 4 applies its zones on
-        (alpha_base for every frame, tool.stage_runs.matanyone)."""
+        (alpha_base for every frame, tool.stage_runs.matanyone).
+        `preview_dir` (stage preview, engine/stage_preview.py): the same edge pass written into that scratch folder –
+        no version, no QA, nothing in the object state; returns {frame: full-frame alpha}."""
         from engine.stages import mask_sig, settings_sig
         obj = self.store.get(name)
         frames = self._visible(name, frames)      # object life range: only the visible frames are computed
@@ -1190,6 +1276,10 @@ class ObjectPipeline:
             core2, zres = self._final_core(name, frames, obj, keys, kinds=("brush",) if stage == "matanyone" else None)
             keys = self._keys_with_brush(name, keys, core2)   # stage-2 corrections reach the key frames of the edge pass
         attempts0 = int(obj["tool"].get("auto_attempts", 0))
+        if preview_dir is not None:
+            full, _, _, _ = self._finalize_once(name, obj, segs, frames, core2, keys, start, mode, progress_cb, zres,
+                                                run_dir=preview_dir, with_qa=False)
+            return full
         full, rep, run_dir, qa = self._finalize_once(name, obj, segs, frames, core2, keys, start, mode, progress_cb, zres)
         if stage == "matanyone":
             import shutil
@@ -1445,8 +1535,9 @@ class ObjectPipeline:
                     out[int(f)] = core[f]
         return out
 
-    def _finalize_once(self, name, obj, segs, frames, core, keys, start, mode, progress_cb, zres, attempts=None):
-        run_dir = next_run_dir(self.store.dir(name))
+    def _finalize_once(self, name, obj, segs, frames, core, keys, start, mode, progress_cb, zres, attempts=None,
+                       run_dir: Optional[Path] = None, with_qa: bool = True):
+        run_dir = run_dir if run_dir is not None else next_run_dir(self.store.dir(name))
         fin = self._finalizer()
         fin.extra_anchors = self._brush_anchors(name, frames, core) if mode == "matanyone" else {}
         keep = None
@@ -1457,9 +1548,13 @@ class ObjectPipeline:
             # the maps follow the core actually passed (zones, shrink / grow, edge fix win with a hard 0 / 1)
             from engine.corestab import consistent_soft
             core_soft = {f: consistent_soft(p, core[f]) for f, p in self._final_soft.items() if f in core and f not in keys}
+        from engine.refine import ZONE_FEATHER_PX
         full, rep = fin.finalize(obj, segs, frames, core, keys, start, run_dir, mode, progress_cb,
                                  exclude=zres.removed if zres else None, soft_override=zres.soft if zres else None,
-                                 band_fn=self._band_fn(obj), keep_holes=keep, core_soft=core_soft)
+                                 band_fn=self._band_fn(obj), keep_holes=keep, core_soft=core_soft,
+                                 soft_feather=(zres.feather_px if zres and zres.feather_px else ZONE_FEATHER_PX))
+        if not with_qa:   # stage preview: the alpha only
+            return full, rep, run_dir, None
         qa = self.run_qa(name, frames, full, segs, run_dir, removed=zres.removed if zres else None, attempts=attempts,
                          soft_areas={f: a for f, (_, a) in zres.soft.items()} if zres and zres.soft else None)
         qa.hygiene = rep.hygiene
@@ -1893,7 +1988,8 @@ class ObjectPipeline:
         transforms are cached per (keys, core signature) in zones_cache/<zone>/transforms_<hash>.npz."""
         from engine.zonecache import ZoneCache, _sha
         from engine.stages import zone_kind
-        from engine.zones import LocalWarp, outline_regions, propagate_regions, region_mode, track_mode, zone_keys
+        from engine.zones import (LocalWarp, outline_without_drawing, propagate_regions, region_mode, track_mode,
+                                  zone_keys)
         shape = core[frames[0]].shape
         cache = ZoneCache(self.store.dir(name), z.zone_id)
         matte = z.criterion == "matte"
@@ -1916,6 +2012,13 @@ class ObjectPipeline:
             sig.update(track="local" if local else "rigid", point_exclude=excl_names)
         tr_sig = _sha(sig)[:16]
         tcache: Dict[str, Dict[int, Any]] = {}
+        if outline_without_drawing(z):
+            # „whole outline” with nothing painted (user report 2026-10-17): no exclusion to follow, the area is the core
+            # outline ± the band in every frame – no CoTracker, nothing to propagate
+            regions = {f: np.zeros(shape, bool) for f in frames}
+            bgs = {f: np.zeros(shape, bool) for f in frames}
+            return self._zone_regions_finish(name, z, frames, core, only, regions, bgs,
+                                             {"keys": sorted(zone_keys(z)), "tracked": False}, fg_fn, fg_names, matte)
         tracker = self._zone_tracker()
         if local:
             for k, d in (cache.get_tracks(tr_sig) or {}).items():
@@ -1942,6 +2045,11 @@ class ObjectPipeline:
                                               for k, v in tr.items()})
         if excl_names:
             info = {**info, "point_exclude": excl_names}
+        return self._zone_regions_finish(name, z, frames, core, only, regions, bgs, info, fg_fn, fg_names, matte)
+
+    def _zone_regions_finish(self, name: str, z, frames, core, only, regions, bgs, info, fg_fn, fg_names, matte):
+        """The outline band and the part subtraction on top of the (propagated or empty) drawing."""
+        from engine.zones import outline_regions, region_mode
         # `only` (zone previews, 2026-10-16): the propagation needs every frame, the outline band and the part
         # subtraction only the frames shown – the other frames keep the propagated drawing (not used by the caller)
         out_frames = [f for f in frames if f in set(only)] if only is not None else list(frames)
@@ -2102,8 +2210,12 @@ class ObjectPipeline:
         if z is None:
             raise ValueError(f"Brak strefy {zone_id}")
         frames = list(frames)
+        from engine.zones import outline_without_drawing
+        if outline_without_drawing(z):   # nothing to propagate: only this frame's core (fast, no CoTracker)
+            frames = [f]
         core = self.preview_core(name, frames)   # a group: its whole (members + seam), as the zone computes
-        self.release_comfy_gpu("obszar strefy: śledzenie CoTracker3")
+        if len(frames) > 1:
+            self.release_comfy_gpu("obszar strefy: śledzenie CoTracker3")
         regions, bgs, info = self.zone_regions(name, z, frames, core)
         reg = regions.get(f)
         out: Dict[str, Any] = {"zone_id": zone_id, "frame": f, "keys": info["keys"], "is_key": f in zone_keys(z), "contours": [],
@@ -2193,7 +2305,7 @@ class ObjectPipeline:
         MatAnyone version (tool.stage_runs.matanyone, must be current) or the mask 1+2 written as a version
         (core_base_run) – only the brush + matte zones -> tool.stage_runs["vitmatte@<base>"] (+ "vitmatte")."""
         import shutil
-        from engine.refine import apply_soft_override, next_run_dir, read_alpha, write_alpha_exr
+        from engine.refine import ZONE_FEATHER_PX, apply_soft_override, next_run_dir, read_alpha, write_alpha_exr
         from engine.stages import matte_sig, stage_run, vitmatte_base
         from engine.zones import MissingFront  # noqa: F401  (raised by apply_zones -> 409 in the API)
         obj = self.store.get(name)
@@ -2260,7 +2372,8 @@ class ObjectPipeline:
                 if zres and f in zres.soft:
                     sa, sarea = zres.soft[f]
                     area = extract_crop(sarea.astype(np.float32), seg) > 0.5
-                    a = apply_soft_override(base, extract_crop(sa.astype(np.float32), seg), area)
+                    a = apply_soft_override(base, extract_crop(sa.astype(np.float32), seg), area,
+                                            zres.feather_px or ZONE_FEATHER_PX)
                 res[f] = a
                 write_alpha_exr(new_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
                 (new_dir / "alpha_base" / seg.seg_id).mkdir(parents=True, exist_ok=True)

@@ -1126,7 +1126,7 @@ kbd {
 .tab-btn.disabled, .tab-btn:disabled { opacity: .4; cursor: not-allowed; }
 
 /* canvas note + HUD mode */
-.canvas-note { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); background: rgba(120,53,15,.85); color: #fde68a;
+.canvas-note { position: absolute; left: 50%; top: 46px;   /* below the HUD row (zoom · coords · mode · mask) – they overlapped, 2026-10-17 */ transform: translateX(-50%); background: rgba(120,53,15,.85); color: #fde68a;
   border: 1px solid #f0703a; padding: 5px 12px; border-radius: 2px; font-size: 12px; pointer-events: none; }
 .hud-item.hud-mode { color: #fde68a; border-color: rgba(240,112,58,.5); }
 /* Z27 pkt 1: legend of the edge-correction pieces drawn on the viewer */
@@ -1536,3 +1536,7 @@ canvas.edge-hot { cursor: pointer !important; }
 .about-links { margin: 6px 0 0; padding-left: 18px; }
 .about-links a { color: var(--accent-primary); }
 .ol-rename { padding: 1px 4px; font-size: 12px; height: auto; width: 140px; }
+
+/* which mask the preview shows (user request 2026-10-17): always visible, stands out */
+.hud-mask { border: 1px solid #e8a33d; color: #f3c46b; font-weight: 600; }
+.hud-mask.warn { border-color: #ef4444; color: #fca5a5; }

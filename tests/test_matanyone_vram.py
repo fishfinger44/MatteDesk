@@ -161,7 +161,7 @@ def node_pkg(monkeypatch, tmp_path):
 
     comfy = types.ModuleType("comfy")
     comfy.utils = types.SimpleNamespace(ProgressBar=PB)
-    comfy.model_management = types.SimpleNamespace()
+    comfy.model_management = types.SimpleNamespace(throw_exception_if_processing_interrupted=lambda: None)
     mods = {
         "comfy": comfy, "comfy.utils": comfy.utils, "comfy.model_management": comfy.model_management,
         "folder_paths": types.SimpleNamespace(models_dir=str(tmp_path / "models")),
@@ -206,7 +206,7 @@ def test_node_inputs_version_and_old_graph_compat(node_pkg):
     it = pkg.MatAnyone2RunKeyframes.INPUT_TYPES()
     assert it["required"]["max_mem_frames"][1]["min"] == 0 and it["required"]["max_mem_frames"][1]["default"] == 5
     assert it["optional"]["vram_release_frac"][1]["default"] == 0.85
-    assert pkg.__version__ == "1.2.0"
+    assert pkg.__version__ == "1.2.2"
     old = _run(pkg, Cfg, max_mem_frames=5)                          # graph of an old MatteDesk: no new input
     assert calls["cfg"][-1] == 5 and calls["release"][-1] == (0.85, False)   # CPU: release disabled
     every = _run(pkg, Cfg, max_mem_frames=5, vram_release_frac=0.0)
@@ -219,12 +219,12 @@ def test_node_inputs_version_and_old_graph_compat(node_pkg):
 
 def test_installer_reads_package_version(tmp_path):
     from engine import installer
-    assert installer.package_version(PKG) == "1.2.0"
+    assert installer.package_version(PKG) == "1.2.2"
     old = tmp_path / "custom_nodes" / "ComfyUI-MatAnyone2-Keyframes"
     old.mkdir(parents=True)
     (old / "__init__.py").write_text("# old copy without a version\n")
     v = installer.node_versions(str(tmp_path))
-    assert v["ComfyUI-MatAnyone2-Keyframes"] == {"installed": None, "repo": "1.2.0"}
+    assert v["ComfyUI-MatAnyone2-Keyframes"] == {"installed": None, "repo": "1.2.2"}
     assert installer.node_status(str(tmp_path))["ComfyUI-MatAnyone2-Keyframes"] == "different"   # Doctor offers it
 
 
@@ -251,8 +251,8 @@ def test_doctor_message_shows_versions(tmp_path):
     doc = EnvironmentDoctor(simulation={"simulate_comfy_offline": True})
     doc.config.update({"comfy_dir": str(tmp_path)})
     it = doc.check_node_files()
-    assert it.action == "install_nodes" and "→ repo 1.2.0" in it.message
-    assert it.details["versions"]["ComfyUI-MatAnyone2-Keyframes"]["repo"] == "1.2.0"
+    assert it.action == "install_nodes" and "→ repo 1.2.2" in it.message
+    assert it.details["versions"]["ComfyUI-MatAnyone2-Keyframes"]["repo"] == "1.2.2"
 
 
 # ------------------------------------------------------------------------------------------- refine graph
@@ -342,7 +342,7 @@ def test_node_alpha_only_returns_same_alpha_and_dummies(node_pkg):
     assert tuple(full[1].shape) == (n, 32, 32, 3) and tuple(full[2].shape) == (n, 32, 32, 3)
     assert tuple(lean[1].shape) == (1, 1, 1, 3) and tuple(lean[2].shape) == (1, 1, 1, 3)
     it = pkg.MatAnyone2RunKeyframes.INPUT_TYPES()
-    assert it["optional"]["alpha_only"][1]["default"] is False and pkg.__version__ == "1.2.0"
+    assert it["optional"]["alpha_only"][1]["default"] is False and pkg.__version__ == "1.2.2"
 
 
 # ------------------------------------------------------------------------------------------- ma_scale_mode (pipeline)

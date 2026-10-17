@@ -38,8 +38,8 @@ def test_stage_progression_and_staleness(tmp_path):
     st = _st(store, work)
     assert st["core"] == "done" and st["final"] == "todo"
     # 2026-10-15: export right after the core; CoTracker without brush zones = done (optional); MatAnyone todo,
-    # ViTMatte waits for MatAnyone
-    assert st["export"] == "todo" and st["cotracker"] == "done" and st["matanyone"] == "todo" and st["vitmatte"] == "locked"
+    # ViTMatte open too (2026-10-17: its base defaults to the mask 1+2 while there is no MatAnyone result)
+    assert st["export"] == "todo" and st["cotracker"] == "done" and st["matanyone"] == "todo" and st["vitmatte"] == "todo"
     # a new user key after the core -> core stale, final/export locked again
     time.sleep(0.01)
     store.save_key("obj", 9, m, author="user")

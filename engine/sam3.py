@@ -161,8 +161,9 @@ class Sam3Runner:
 
     def _run_nodes(self, graph: Dict[str, Any], raw: bool, nodes: Sequence[str]) -> Dict[str, List[np.ndarray]]:
         """Images of the given SaveImage nodes in file order: float 0..1, or (raw) the decoded uint8 PNGs."""
-        if self.client.get_queue().get("busy"):
-            raise RuntimeError("ComfyUI zajęte – poczekaj, aż skończy inne zadanie")
+        busy = self.client.busy_error()
+        if busy:
+            raise RuntimeError(busy)
         sub = self.client.queue_prompt(graph)
         if not sub.get("success"):
             raise RuntimeError(f"Comfy odrzucił graf SAM3: {sub.get('error')}")

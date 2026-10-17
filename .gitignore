@@ -35,3 +35,8 @@ backups/
 
 # Tools installed by the Doctor (portable ffmpeg)
 bin/
+
+# Windows installer build output (tools/build_installer.py)
+build/
+dist/
+logs/

@@ -10,6 +10,10 @@ Repair the plates once. Generate alpha mattes for multiple objects – the tool 
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
+[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/latest)
+
+Windows 10 / 11 · NVIDIA GPU · `MatteDesk-<version>-setup.exe` from [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
+
 **English** · [Polski](README.pl.md) · UI language: English by default, 🌐 switch to Polish in the header
 
 Version: file [`VERSION`](VERSION) (also shown in the top-left corner of the UI) · history: [CHANGELOG.md](CHANGELOG.md)
@@ -145,7 +149,8 @@ whether an edge is good) stay with the artist in the UI. Exports and other write
 | Area | Status |
 |---|---|
 | 🩺 **Doctor + installer** (since v0.1) | ✅ works: finds what is missing, **installs** nodes and models with a progress bar, opens by itself at start-up |
-| 🔀 **ComfyUI Desktop 2 / ComfyUI from git** | ✅ auto-detection of folders, models and port; switch in the Doctor; shared-models option |
+| 📦 **Windows installer** (since v0.31) | ✅ one setup file: bundled Python, Start-menu / desktop shortcut opening an app window, uninstall; asks whether you have ComfyUI, otherwise downloads ComfyUI portable; update check at start |
+| 🔀 **ComfyUI Desktop 2 / portable / from git** | ✅ auto-detection of folders, models and port; switch in the Doctor; shared-models option |
 | 🏷 **Versioning** | ✅ `VERSION`, tag in the UI, `start_v<version>.bat`, `CHANGELOG.md`, `tools/bump_version.py` |
 | 🌐 **UI language** | ✅ English (default) / Polish, switch in the header |
 | 🩹 Plate check and repair | ✅ in the code and in the UI (stage 0) |
@@ -192,7 +197,7 @@ It does not install ComfyUI itself (when it is missing, the Doctor shows a "Comf
 |---|---|
 | System | Windows 10 / 11 |
 | GPU | NVIDIA (tested on an RTX 4090 24 GB; with 12 GB MatAnyone2 needs a VRAM patch – the Doctor will tell you) |
-| Software | **ComfyUI Desktop** (or ComfyUI from git) – you install it; **Python 3.11** is installed by `start_v….bat`; **ffmpeg** and **Git** are installed by the Doctor |
+| Software | **ComfyUI** (Desktop, portable or from git) – the installer can download ComfyUI portable for you; **Python** comes with the installer (from source: `start_v….bat` installs Python 3.11); **ffmpeg** and **Git** are installed by the Doctor |
 | Disk space | about 3 GB for models + plenty for shot data (≥ 50 GB free recommended) |
 
 You only install **ComfyUI** by hand (Desktop – recommended – or from git). **Python 3.11** is installed by `start_v<version>.bat` on the first start
@@ -202,6 +207,37 @@ The Doctor needs Git for the nodes from GitHub – a zip download is enough to g
 ---
 
 ## 🚀 Installation
+
+### Windows installer (recommended)
+
+1. Download **`MatteDesk-<version>-setup.exe`** from [Releases](https://github.com/fishfinger44/MatteDesk/releases) and run it.
+   It installs for your user only (no admin rights) into `%LOCALAPPDATA%\Programs\MatteDesk`, with its own Python and all
+   dependencies (nothing goes into your system Python, no internet needed for this part).
+2. **"Where should MatteDesk get ComfyUI from?"**
+   - **Download ComfyUI portable** (default) → the installer downloads the official **ComfyUI portable** (NVIDIA, ~2 GB download,
+     ~6.5 GB on disk) into a folder you choose – resumable, SHA-256 checked. It can be extended later as usual (ComfyUI-Manager, models).
+   - **I already have ComfyUI** → MatteDesk finds it by itself – ComfyUI Desktop, the portable package or ComfyUI from git (a running
+     one with its port and Python). Your models stay where they are. Only if it is not found, point to its folder (optional field).
+   - **Later** → set it up in the Doctor (choose this when updating an install that already has ComfyUI set up).
+3. Start **MatteDesk** from the Start menu or the desktop: it opens in its own window (Edge app mode, no address bar) and starts
+   the server in the background. Closing the window stops MatteDesk (it asks first when something is being computed).
+4. The **Doctor** opens by itself and installs our nodes and the models into your ComfyUI (step 4 below); then restart ComfyUI.
+
+**Updates:** at start MatteDesk checks (at most once a day) whether a newer version is in Releases and shows a short list of
+changes with a link to the full changelog: **Update** downloads the new setup and runs it (settings stay), **Later**, or
+"do not remind me about this version". Can be switched off in the Doctor.
+**Uninstall:** Windows Settings → Apps → MatteDesk. Removes the program and its settings; your shots and ComfyUI (also a portable
+one downloaded by the installer) stay.
+
+<details>
+<summary><b>Building the installer yourself</b></summary>
+
+Needs Inno Setup 6 (`winget install JRSoftware.InnoSetup`) and git. `python tools/build_installer.py` → `dist/MatteDesk-<version>-setup.exe`:
+public copy of the committed code, Python 3.11 (python-build-standalone, with tkinter) + `requirements.txt`, `7zr.exe`; downloads are
+SHA-256 checked. The installer script is `installer/MatteDesk.iss`.
+</details>
+
+### From source (git)
 
 **1. ComfyUI Desktop.** Install it ([docs.comfy.org](https://docs.comfy.org/installation/desktop/overview)) and run it once.
 The tool finds its folders and port (usually 8188) by itself, and later starts ComfyUI together with MatteDesk.
@@ -229,9 +265,11 @@ Check the licence shown next to each component – some models are for non-comme
 **6. Open a shot.** The **📁 Project** button → a shot manifest, or a video file / sequence folder (the wizard creates a project).
 
 <details>
-<summary><b>ComfyUI from git instead of Desktop</b></summary>
+<summary><b>ComfyUI portable or from git instead of Desktop</b></summary>
 
-In the Doctor choose **"ComfyUI from git"** at the top and give the folder with `main.py` and the port. The **"models shared with Desktop"** option
+In the Doctor choose **"ComfyUI from git / portable"** at the top and give the folder with `main.py` and the port (portable package:
+`ComfyUI_windows_portable\ComfyUI`; MatteDesk recognises `python_embeded` next to it, installs node requirements with that Python
+and starts ComfyUI the same way as `run_nvidia_gpu.bat`). The **"models shared with Desktop"** option
 downloads weights into one folder – ComfyUI from git then has to point to it in its `extra_model_paths.yaml`.
 The "Install" buttons act on the active ComfyUI. The paths of both variants are stored separately in `config.local.json`
 (a file for this computer only, outside git; template: `config.local.example.json`).
@@ -265,11 +303,11 @@ After UI changes refresh the browser (Ctrl+F5).
 **Later**
 - 🐧 **Linux and macOS versions** – start script, installer and Doctor without Windows assumptions.
 - 🌐 **ComfyUI on another machine in the LAN** – MatteDesk on a laptop / Linux box, ComfyUI on any GPU machine in the network.
-- 📦 **One-click installer** with a portable ComfyUI and a "lite" profile for 8 GB GPUs.
+- 🪶 **"Lite" profile for 8 GB GPUs** – smaller models / crops chosen by the installer and the Doctor.
 - 🎬 **After Effects export** (masks + comp).
 - 🗺 **Specification roadmap** – depth (E1e), cropping and objects (E2–E3b), keys and propagation (E4), QA and edge accuracy (E5–E5b), export and data contract (E6).
 - 🌍 **Generalisation (E7)** – shots without a backlit plate and 8-bit video with people (commercials), with no code changes.
-- 🧙 **Finishing the installer** – the Doctor already installs nodes and models; what remains is installing ComfyUI itself (from git), the DepthCrafter and MiniMax-Remover nodes, checksums and resumable downloads, and finally a first-run wizard.
+- 🧙 **Finishing the installer** – the DepthCrafter and MiniMax-Remover nodes in "Install all" and a first-run wizard.
 
 **Separate tools on a shared core** *(not built without a decision)*
 - 🎥 **Camera3D + Mesh** – 3D camera solve and mesh in Blender, fed by MatteDesk mattes.

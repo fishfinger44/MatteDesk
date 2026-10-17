@@ -23,6 +23,30 @@
   modal.addEventListener('click', (e) => { if (e.target === modal) show(false); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal.style.display !== 'none') show(false); });
 
+  // "Sprawdź aktualizacje": forced check (ignores the once-a-day cache and a skipped version); a newer version opens
+  // the update window of app.js (short notes, changelog link, Update / Later)
+  const upBtn = document.getElementById('aboutUpdateBtn');
+  const upStatus = document.getElementById('aboutUpdateStatus');
+  if (upBtn) upBtn.addEventListener('click', async () => {
+    if (!window.viewer || !window.viewer.checkUpdate) return;
+    upBtn.disabled = true;
+    upStatus.textContent = 'Sprawdzam…';
+    let u = null;
+    try { u = await (await fetch('/api/update?force=1')).json(); } catch (e) { u = null; }
+    upBtn.disabled = false;
+    if (u && u.available) { show(false); window.viewer.checkUpdate(true, u); }
+    const v = window.viewer;
+    if (!u || u.error) {
+      upStatus.textContent = 'Nie udało się sprawdzić (brak internetu?)';
+      v.uiDialog({ title: 'Nie udało się sprawdzić aktualizacji', tone: 'warn',
+        html: 'Brak połączenia z GitHubem (internet, zapora albo limit zapytań). Spróbuj później.' });
+    } else if (!u.available) {
+      upStatus.textContent = `Masz najnowszą wersję (${u.current}).`;
+      v.uiDialog({ title: 'Masz najnowszą wersję', tone: 'ok',
+        html: `MatteDesk ${v.esc(u.current)} – nowszej wersji nie ma.` });
+    } else upStatus.textContent = `Dostępna wersja ${u.version}.`;
+  });
+
   for (const [key, url] of Object.entries(LINKS)) {
     const a = document.getElementById(`aboutLink_${key}`);
     if (!a) continue;

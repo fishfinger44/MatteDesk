@@ -1,0 +1,23 @@
+MatteDesk – Windows
+
+Looking for the installer?
+  Download MatteDesk-<version>-setup.exe from:
+  https://github.com/fishfinger44/MatteDesk/releases/latest
+  (one file: own Python, Start-menu / desktop shortcut, app window, asks about ComfyUI, uninstall)
+
+This folder (ZIP from GitHub "Code -> Download ZIP" or git clone) is the SOURCE CODE.
+  It also runs without the installer: double-click start_v<version>.bat
+  (first start installs Python 3.11 if missing and creates the .venv environment).
+  Details: README.md -> Installation.
+
+---
+
+Szukasz instalatora?
+  Pobierz MatteDesk-<wersja>-setup.exe z:
+  https://github.com/fishfinger44/MatteDesk/releases/latest
+  (jeden plik: własny Python, skrót w menu Start / na pulpicie, okno aplikacji, pytanie o ComfyUI, deinstalacja)
+
+Ten folder (ZIP z GitHuba „Code -> Download ZIP” albo git clone) to KOD ŹRÓDŁOWY.
+  Działa też bez instalatora: kliknij dwukrotnie start_v<wersja>.bat
+  (przy pierwszym starcie doinstaluje Pythona 3.11, jeśli go brak, i utworzy środowisko .venv).
+  Szczegóły: README.pl.md -> Instalacja.

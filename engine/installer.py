@@ -166,26 +166,17 @@ def install_nodes(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.run)
     return {"success": ok, "log": log, "status": node_status(comfy_dir), "restart_comfy": True}
 
 
+def _progress_cb(dst: Path) -> Callable[[int, int], None]:
+    def progress(done: int, total: int) -> None:
+        if PROGRESS.get("active"):
+            PROGRESS.update(step="pobieranie", file=dst.name, done=done, total=total)
+    return progress
+
+
 def _download(url: str, dst: Path, progress: Optional[Callable[[int, int], None]] = None) -> None:
-    tmp = dst.with_suffix(dst.suffix + ".part")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if progress is None:
-        def progress(done: int, total: int) -> None:
-            if PROGRESS.get("active"):
-                PROGRESS.update(step="pobieranie", file=dst.name, done=done, total=total)
-    req = urllib.request.Request(url, headers={"User-Agent": "MatteDeskInstaller"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            done += len(chunk)
-            if progress:
-                progress(done, total)
-    tmp.replace(dst)
+    """Resumable download with a SHA-256 check when the server publishes one (Hugging Face LFS) – engine/download.py."""
+    from engine.download import download
+    download(url, dst, progress=progress or _progress_cb(dst))
 
 
 # --- model weights and third-party node packs (Doctor buttons) -------------------------------------------------
@@ -264,45 +255,10 @@ def hf_token() -> Optional[str]:
 
 
 def _download_hf(url: str, dst: Path, token: Optional[str], progress: Optional[Callable[[int, int], None]] = None) -> None:
-    """Download with the HF login (gated repos) and resume: a `.part` left by an interrupted download is continued
-    (Range). 20 GB files – an interruption must not start from zero."""
-    tmp = dst.with_suffix(dst.suffix + ".part")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    have = tmp.stat().st_size if tmp.exists() else 0
-    hdr = {"User-Agent": "MatteDeskInstaller"}
-    if token:
-        hdr["Authorization"] = f"Bearer {token}"
-    if have:
-        hdr["Range"] = f"bytes={have}-"
-    try:
-        r = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=60)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            raise RuntimeError("Hugging Face odmówił dostępu (401/403): zaloguj się („hf auth login”) i kliknij „Agree and "
-                               "Access” na stronie modelu (repo gated).") from None
-        if e.code == 416 and have:      # .part already complete
-            tmp.replace(dst)
-            return
-        raise
-    with r:
-        if have and r.status != 206:    # server ignored the Range: start over
-            have = 0
-        total = int(r.headers.get("Content-Length") or 0) + have
-        done = have
-        with open(tmp, "ab" if have else "wb") as f:
-            while True:
-                chunk = r.read(8 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(done, total)
-                elif PROGRESS.get("active"):
-                    PROGRESS.update(step="pobieranie", file=dst.name, done=done, total=total)
-    if total and tmp.stat().st_size != total:
-        raise RuntimeError(f"{dst.name}: pobrane {tmp.stat().st_size} z {total} B – kliknij ponownie (wznowi)")
-    tmp.replace(dst)
+    """Download with the HF login (gated repos), resume (`.part` + Range – 20 GB files must not start from zero) and
+    the SHA-256 Hugging Face publishes for LFS files."""
+    from engine.download import download
+    download(url, dst, token=token, progress=progress or _progress_cb(dst))
 
 
 def install_ltx(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,

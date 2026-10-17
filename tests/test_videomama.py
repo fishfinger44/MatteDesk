@@ -56,6 +56,28 @@ def test_compose_reach_and_protect():
     assert (band[(d < -4) & (d > -9)] == 128).all() and (band[np.abs(d) < 2] == 255).all() and (band[d < -12] == 0).all()
 
 
+def test_compose_unified_inset_and_feather():
+    """User decision 2026-10-17: the same sliders as MatAnyone / ViTMatte – VideoMaMa replaces the base from reach px
+    outside to inset px inside its edge, blended into the deeper base over feather px; inset None = the former result."""
+    base = _disc()
+    d = V.sdf_px(base)
+    vmm = np.full(base.shape, 0.4, np.float32)
+    a = V.compose(base, vmm, protect=0.0, reach=10.0, inset=6.0, feather=0.0)
+    assert np.allclose(a[(d > 0.5) & (d < 5.5)], 0.4)          # inside the base, within the inset: VideoMaMa replaces it
+    assert np.allclose(a[d > 6.5], 1.0) and np.allclose(a[d < -10.5], 0.0)
+    af = V.compose(base, vmm, protect=0.0, reach=10.0, inset=6.0, feather=4.0)
+    near = (d > 4.5) & (d < 5.5)                                # ~1 px from the deep base: mostly the base
+    assert (af[near] > 0.7).all() and np.allclose(af[(d < -1) & (d >= -10)], 0.4)
+    # inset 0 on the mask 1+2 base = the former composition exactly
+    assert np.allclose(V.compose(base, vmm, 0.0, 10.0, inset=0.0), V.compose(base, vmm, 0.0, 10.0))
+    s_old = V.vmm_settings({"videomama": {"reach_px": 10}})
+    s_new = V.vmm_settings({"videomama": {"reach_px": 10, "inset_px": 0}})
+    assert s_old["inset_px"] is None                            # never touched: the former signature (results stay current)
+    assert V.settings_sig(s_old) != V.settings_sig(s_new)       # the unified sliders are part of the result
+    band = V.band_u8(base, V.vmm_settings({"videomama": {"reach_px": 10, "inset_px": 6}}))
+    assert (band[(d > 1) & (d < 5)] == 128).all() and (band[d > 7] == 255).all() and (band[d < -12] == 0).all()
+
+
 def test_offload_auto_by_vram():
     s = V.vmm_settings()
     assert V.offload_on(s, {"devices": [{"vram_total": 12e9}]}) and not V.offload_on(s, {"devices": [{"vram_total": 25e9}]})
@@ -164,10 +186,13 @@ def test_stage_videomama_api_base_export(proj, tmp_path, monkeypatch):
     assert r.status_code == 409 and "6.1 GB" in r.json()["detail"]
     monkeypatch.setattr(app_module, "_vmm_status", lambda: {"missing_models": [], "missing_gb": 0, "missing_nodes": [],
                                                             "models": [], "ready": True})
-    # base MatAnyone without a stage-3 result: the stage waits for it
+    # base MatAnyone without a stage-3 result: the stage stays open (its base selector is inside, bug 2026-10-17),
+    # says why and refuses to compute
     assert api.put("/api/object/obj/videomama", json={"base": "matanyone"}).status_code == 200
     stg = next(s for s in api.get("/api/object/obj/stages").json()["stages"] if s["id"] == "videomama")
-    assert stg["state"] == "locked"
+    assert stg["state"] == "todo" and "MatAnyone" in stg["why"]
+    r = api.post("/api/object/obj/videomama")
+    assert r.status_code == 409 and "MatAnyone" in r.json()["detail"]
     assert api.put("/api/object/obj/videomama", json={"base": "core", "batch": 4, "overlap": 2}).status_code == 200
     info = api.get("/api/object/obj/videomama").json()
     assert info["settings"]["base"] == "core" and info["settings"]["batch"] == 4 and info["run"] is None

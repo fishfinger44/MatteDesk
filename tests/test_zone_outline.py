@@ -102,6 +102,12 @@ def test_api_outline_zone_needs_no_drawing_and_excludes_objects(tmp_path, monkey
     assert st.get("tiles", 0) > 0 and r.json()["preview"]["soft_px"] > 0
     reg = api.get(f"/api/object/obj/zones/{zid}/region/{start}").json()
     assert reg["area_px"] > 0 and reg["contours"]
+    # nothing painted (2026-10-17): the area of any frame comes straight from its core – no CoTracker, no propagation
+    from engine.pipeline import ObjectPipeline
+    monkeypatch.setattr(ObjectPipeline, "_zone_tracker", lambda self: pytest.fail("tracker started for an outline without drawing"))
+    other = next(f for f in frames if f != start)
+    reg_o = api.get(f"/api/object/obj/zones/{zid}/region/{other}").json()
+    assert reg_o["area_px"] > 0 and reg_o["region_mode"] == "outline"
     # an object to exclude (core only) cuts its area out of the band
     store = pipe.store
     store.create("hand", ["hand"], depth_order=5)
@@ -118,3 +124,48 @@ def test_api_outline_zone_needs_no_drawing_and_excludes_objects(tmp_path, monkey
     api.patch(f"/api/object/obj/zones/{zid}", json={"params": {**body["params"], "exclude_objects": ["nobody"]}})
     e = api.post(f"/api/object/obj/zones/{zid}/preview/{start}")
     assert e.status_code == 409 and "nobody" in e.text
+
+
+def test_preview_forces_only_the_eroded_core(tmp_path, monkeypatch):
+    """User report 2026-10-17: the frame preview forced the WHOLE core to 1 (pixel staircase of the SAM3 edge), the full
+    run only the core eroded by force_core_erode_px – the preview now does the same."""
+    import engine.vitmatte as vm
+    from test_zone_matte import _api_project
+    from test_zone_vitmatte import MockRunner
+
+    class Half(MockRunner):        # unknown = 0.5 everywhere: a pasted 1 in the core rim is then unmistakable
+        def run(self, img, tri, unknown_value=0.5):
+            a = np.full(tri.shape, 0.5, np.float32)
+            a[tri == 255] = 1.0
+            a[tri == 0] = 0.0
+            return a
+    app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(vm, "get_runner", lambda model_id=None: Half())
+    params = {"region": "outline", "outline_out_px": 30, "tile_px": 160, "temporal": "none", "alpha_black": 0.05}
+    body = {"mode": "add", "criterion": "matte", "frame": start, "polygon": [], "matting": "vitmatte", "preset": "hair",
+            "params": params}
+    zid = api.post("/api/object/obj/zones/new", json=body).json()["zone"]["zone_id"]
+    od = pipe.store.dir("obj")
+
+    core = pipe.load_core("obj", [start])[start].astype(bool)
+
+    def forced():
+        assert api.post(f"/api/object/obj/zones/{zid}/preview/{start}").status_code == 200
+        a = cv2.imread(str(od / "preview" / f"zarea_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
+        raw = cv2.imread(str(od / "preview" / f"zraw_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
+        ring = core & (a > 0) & (a < 255)                      # the core rim the zone decides (inside the inset)
+        return int((a == 255).sum()), int((a > 0).sum()), raw, ring
+    whole, _, _, _ = forced()
+    api.patch(f"/api/object/obj/zones/{zid}", json={"params": {**params, "fg_erode_px": 8, "force_core_erode_px": 8}})
+    eroded, region, raw, ring = forced()
+    assert 0 < eroded < whole and region > eroded
+    # the raw ViTMatte alpha in the core rim is the engine's, not a pasted 1 (the hard SAM3 edge, 2026-10-17)
+    assert ring.any() and (raw[ring] < 200).mean() > 0.5
+
+
+def test_zone_feather_px():
+    from engine.refine import ZONE_FEATHER_PX
+    from engine.zones import Zone, zone_feather_px
+    assert zone_feather_px(Zone("z", "add", "matte", 1)) == ZONE_FEATHER_PX              # default = the former fixed value
+    assert zone_feather_px(Zone("z", "add", "matte", 1, params={"inset_feather_px": 3})) == 3.0
+    assert zone_feather_px(Zone("z", "add", "matte", 1, params={"inset_feather_px": 0})) == 0.5   # never a hard 0

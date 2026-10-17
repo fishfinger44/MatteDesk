@@ -6,6 +6,10 @@ set /p MD_VER=<VERSION
 title MatteDesk v%MD_VER%
 if exist .venv\Scripts\python.exe goto :run
 
+echo [MatteDesk] First start from the source code. Easier: the Windows installer (own Python, shortcut, app window):
+echo [MatteDesk]   https://github.com/fishfinger44/MatteDesk/releases/latest
+echo [MatteDesk] Continuing with the source setup ...
+
 call :findpy
 if not defined MD_PY (
   echo [MatteDesk] Python 3.11+ not found. Installing Python 3.11 with winget ^(about 30 MB, current user only^) ...

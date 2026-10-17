@@ -273,3 +273,20 @@ def test_install_minimax_weights_downloads_all_files(tmp_path):
     assert r["success"] and len(got) == 5 and all("zibojia/minimax-remover" in u for u in got)
     assert (tmp_path / "MiniMax-Remover" / "transformer" / "diffusion_pytorch_model.safetensors").exists()
     assert (tmp_path / "MiniMax-Remover" / "vae" / "config.json").exists()
+
+
+def test_node_packages_survive_public_export_unchanged():
+    """tools/export_public.py renames shot names in text files; inside our Comfy node packages that would make the
+    public copy differ from nodes installed from the dev repo (Doctor: "different version than in the repo")."""
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("export_public", root / "tools" / "export_public.py")
+    ep = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ep)
+    changed = []
+    for p in sorted((root / "handoff" / "comfy" / "custom_nodes").rglob("*")):
+        if p.is_file() and p.suffix in ep.TEXT_EXT and "__pycache__" not in p.parts:
+            text = p.read_text(encoding="utf-8")
+            if ep.neutralize(text) != text:
+                changed.append(str(p.relative_to(root)))
+    assert not changed, changed

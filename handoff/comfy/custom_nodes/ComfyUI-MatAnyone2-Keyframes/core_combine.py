@@ -83,6 +83,7 @@ class MatAnyone2CoreCombine:
         out = torch.empty((N, H, W), dtype=torch.float16)
         band = torch.empty((N, H, W), dtype=torch.bool)
         for i in range(0, N, B):
+            mm.throw_exception_if_processing_interrupted()
             a = alpha[i:i + B].float().to(dev)[:, None]
             cb = c[i:i + B].to(dev).float()[:, None]
             core = _blur(_erode((cb > 0.5).float(), core_erode_px), core_feather_px)

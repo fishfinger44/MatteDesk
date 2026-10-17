@@ -59,6 +59,11 @@ VMM_DEFAULTS: Dict[str, Any] = {
     "base": "core",           # core = mask 1+2 | matanyone = stage-3 result (CLIP2_A: the MA base keeps MA's boiling edge)
     "reach_px": 40.0,         # how far out of the base edge VideoMaMa may add (strands); beyond = base
     "protect_px": None,       # band around the base edge where the base wins (ramp); None = auto: 0 core / 3 matanyone
+    # the sliders of the other edge stages (user decision 2026-10-17): VideoMaMa REPLACES the base from reach_px outside
+    # to inset_px inside its edge, blended into the deeper base over feather_px. None = the former composition
+    # (VideoMaMa only adds outside the base, protect band) – objects saved before keep their results
+    "inset_px": None,
+    "feather_px": 0.0,
     "max_side": 1280,         # long side VideoMaMa works at (the crop is scaled DOWN only; multiples of 8)
     "batch": 24,              # frames per UNet pass
     "overlap": 8,             # frames shared by neighbouring batches (linear crossfade)
@@ -73,11 +78,13 @@ def vmm_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[s
     = the effective protect band (auto by base)."""
     s = dict(VMM_DEFAULTS)
     for src in (defaults or {}, (obj or {}).get("videomama") or {}):
-        s.update({k: v for k, v in src.items() if k in VMM_DEFAULTS and (v is not None or k == "protect_px")})
+        s.update({k: v for k, v in src.items() if k in VMM_DEFAULTS and (v is not None or k in ("protect_px", "inset_px"))})
     s["base"] = s["base"] if s["base"] in BASES else "core"
     s["offload"] = s["offload"] if s["offload"] in OFFLOADS else "auto"
     s["reach_px"] = float(min(400.0, max(0.0, float(s["reach_px"]))))
     s["protect_px"] = None if s["protect_px"] in (None, "", "auto") else float(min(40.0, max(0.0, float(s["protect_px"]))))
+    s["inset_px"] = None if s["inset_px"] in (None, "", "auto") else float(min(200.0, max(0.0, float(s["inset_px"]))))
+    s["feather_px"] = float(min(64.0, max(0.0, float(s["feather_px"] or 0.0))))
     s["max_side"] = int(min(2048, max(256, int(s["max_side"]) // 8 * 8)))
     s["batch"] = int(min(64, max(4, int(s["batch"]))))
     s["overlap"] = int(max(0, min(int(s["overlap"]), s["batch"] // 2)))
@@ -104,6 +111,8 @@ def model_sig(s: Dict[str, Any]) -> str:
 def settings_sig(s: Dict[str, Any]) -> str:
     """The whole stage result: the model run + the composition (base, reach, protect)."""
     d = {k: s.get(k) for k in ("base", "reach_px", "protect", "max_side", "batch", "overlap", "seed")}
+    if s.get("inset_px") is not None:   # the unified sliders (absent = the former signature: old results stay current)
+        d.update(inset_px=s["inset_px"], feather_px=s.get("feather_px", 0.0))
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -143,11 +152,18 @@ def work_side(w: int, h: int, max_side: int) -> int:
 
 
 # ----------------------------------------------------------------------------- composition
-def compose(base: np.ndarray, vmm: np.ndarray, protect: float, reach: float) -> np.ndarray:
-    """Base (0..1, the mask 1+2 or the stage-3 alpha) + VideoMaMa matte -> the stage alpha (see the module doc)."""
+def compose(base: np.ndarray, vmm: np.ndarray, protect: float, reach: float, inset: Optional[float] = None,
+            feather: float = 0.0) -> np.ndarray:
+    """Base (0..1, the mask 1+2 or the stage-3 alpha) + VideoMaMa matte -> the stage alpha (see the module doc).
+    `inset` given (the unified sliders, 2026-10-17): VideoMaMa replaces the base in the band reach px outside .. inset px
+    inside the base edge, blended into the deeper base over `feather` px; beyond the band = the base."""
     b = np.clip(base.astype(np.float32), 0, 1)
     v = np.clip(vmm.astype(np.float32), 0, 1)
     d = sdf_px(b)                       # > 0 inside the base
+    if inset is not None:
+        band = (d >= -reach) & (d <= inset)
+        w = np.clip((inset - d) / feather, 0.0, 1.0) if feather > 0 else np.ones_like(d)
+        return np.where(band, w * v + (1.0 - w) * b, b).astype(np.float32)
     mx = np.maximum(b, v)
     a = b.copy()
     add = (d < -protect) & (d >= -reach)
@@ -163,6 +179,10 @@ def band_u8(base: np.ndarray, s: Dict[str, Any]) -> np.ndarray:
     """Band preview of the palette: 128 = where VideoMaMa adds (max), 255 = the protect band (base wins at the edge)."""
     d = sdf_px(np.clip(base.astype(np.float32), 0, 1))
     out = np.zeros(d.shape, np.uint8)
+    if s.get("inset_px") is not None:   # unified sliders: 128 = VideoMaMa decides, 255 = the base stays (deeper inside)
+        out[(d >= -s["reach_px"]) & (d <= s["inset_px"])] = 128
+        out[d > s["inset_px"]] = 255
+        return out
     out[(d < -s["protect"]) & (d >= -s["reach_px"])] = 128
     if s["protect"] > 0:
         out[np.abs(d) <= s["protect"]] = 255
@@ -212,9 +232,9 @@ class VideoMaMa:
         self.offload = offload_on(settings, stats)
 
     def _run(self, g: Dict[str, Any]) -> Dict[str, Any]:
-        q = self.client.get_queue() or {}
-        if q.get("busy"):
-            raise RuntimeError("ComfyUI zajęte – poczekaj, aż skończy inne zadanie")
+        busy = self.client.busy_error()
+        if busy:
+            raise RuntimeError(busy)
         sub = self.client.queue_prompt(g)
         if not sub.get("success"):
             raise RuntimeError(f"Comfy odrzucił graf VideoMaMa: {sub.get('error')}")

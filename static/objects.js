@@ -19,7 +19,7 @@
     { key: 'MATANYONE', id: 'matanyone', label: 'MatAnyone', hint: 'Miękka krawędź MatAnyone2 z maski 1+2 (bez stref ViTMatte)',
       desc: '<b>Co robi:</b> MatAnyone2 liczy miękką krawędź alfy w paśmie wokół maski 1+2 (rdzeń SAM3 + poprawki pędzlem), w czasie, bez stref ViTMatte – to wersja bazowa. Obiekt połączony z częściami (warstwy) liczy się raz jako całość ze szwem; części dostają swój udział w eksporcie. <b>Najlepsze do:</b> naturalnej krawędzi postaci i obiektów (rozmycie ruchu, nieostrość, miękkie kontury); MatAnyone nie dodaje ani nie usuwa większych fragmentów – tylko krawędź.' },
     { key: 'VIDEOMAMA', id: 'videomama', label: 'VideoMaMa', hint: 'VideoMaMa: kosmyki włosów i detal krawędzi z maski 1+2, nałożone na bazę (maska 1+2 albo wynik MatAnyone)',
-      desc: '<b>Co robi:</b> model VideoMaMa (na priorze Stable Video Diffusion) liczy alfę całego obiektu z obrazu i maski 1+2, w paczkach klatek z przenikaniem. Wynik nakłada się na bazę: maskę 1+2 (domyślnie – VideoMaMa robi wtedy całą krawędź) albo wynik MatAnyone (twarda krawędź MatAnyone zostaje w pasie ochrony); dalej niż „zasięg” od krawędzi bazy nic nie dochodzi (wysepki w tle odcięte). Suwaki zmieniasz bez liczenia modelu („✚ Suwaki na wynik”). <b>Najlepsze do:</b> włosów, kosmyków, futra – pojedyncze odstające włosy, których MatAnyone nie rozdziela. Wynik może być bazą ViTMatte i źródłem eksportu.' },
+      desc: '<b>Co robi:</b> model VideoMaMa (na priorze Stable Video Diffusion) liczy alfę całego obiektu z obrazu i maski 1+2, w paczkach klatek z przenikaniem. Wynik nakłada się na bazę: maskę 1+2 (domyślnie – VideoMaMa robi wtedy całą krawędź) albo wynik MatAnyone (twarda krawędź MatAnyone zostaje w pasie ochrony); dalej niż „zasięg” od krawędzi bazy nic nie dochodzi (wysepki w tle odcięte). Suwaki działają na żywo w podglądzie, bez liczenia modelu; „👁 Podgląd klatek” i „▶ Policz” biorą ich bieżące wartości. <b>Najlepsze do:</b> włosów, kosmyków, futra – pojedyncze odstające włosy, których MatAnyone nie rozdziela. Wynik może być bazą ViTMatte i źródłem eksportu.' },
     { key: 'VITMATTE', id: 'vitmatte', label: 'ViTMatte', hint: 'Strefy ViTMatte (malowany pas / cały obrys) na wyniku MatAnyone',
       desc: '<b>Co robi:</b> ViTMatte liczy półprzezroczystą alfę tylko w strefach (pas namalowany pędzlem albo cały obrys − wykluczenia), które jadą za obiektem; wynik nakłada się na bazę do wyboru: wersję MatAnyone z etapu 3 albo maskę 1+2 (wtedy etap działa zaraz po etapach 1 + 2). Grupę (obiekt + części) liczy obiekt główny jako całość ze szwem. Porównanie A / B / różnica – niżej. <b>Najlepsze do:</b> włosów, futra, kosmyków, dymu, włókien – detali, których MatAnyone nie rozdziela od tła.' },
     { key: 'EXPERIMENTS', id: 'final', label: 'Eksperymenty', hint: 'Tryby krawędzi, strefy progowe, poprawka krawędzi, wersje, QA, mapa migotania',
@@ -238,6 +238,36 @@
     S.overlay[key] = startOverlay(key, url, false);
     evictOverlays();
     return null;
+  }
+
+  // Live server previews (edge band, VideoMaMa, LTX, motion blur) take seconds per frame and the browser runs 6 requests
+  // at a time, so scrubbing queued a request for every frame passed and the frame you stop on waited behind them – the
+  // preview "disappeared" (bug 2026-10-17). A frame is requested only once the playhead rests on it (~0.2 s).
+  function settledOverlay(key, url, f) {
+    const now = performance.now();
+    if (S.pvFrame !== f) { S.pvFrame = f; S.pvFrameT = now; }
+    if (S.overlay[key] === undefined && now - S.pvFrameT < 200) {
+      clearTimeout(S.pvSettleT); S.pvSettleT = setTimeout(() => V().render(), 220);
+      return null;
+    }
+    return loadOverlay(key, url);
+  }
+  // A band preview still loading: the last band of the same layer and settings stays on screen, dimmed (not for alpha
+  // previews – an alpha of another frame would sit in the wrong place). Returns true when something was drawn.
+  function drawBand(ctx, img, layer, q, ov, key) {
+    S.pvLast = S.pvLast || {};
+    if (ov && ov !== 'missing') {
+      const c = edgePvCanvas(ov, key);
+      ctx.drawImage(c, 0, 0, img.width, img.height);
+      S.pvLast[layer] = { obj: S.obj, q, c };
+      return true;
+    }
+    const l = S.pvLast[layer];
+    if (!ov && l && l.obj === S.obj && l.q === q) {
+      ctx.save(); ctx.globalAlpha = 0.45; ctx.drawImage(l.c, 0, 0, img.width, img.height); ctx.restore();
+      return true;
+    }
+    return false;
   }
 
   // Stage 3 local correction: a click changes ONLY the hole (+) / leak (−) under it; the key is saved at once.
@@ -679,7 +709,8 @@
           : `<span class="ol-status" title="${cur ? 'Wybrany obiekt – wygląd nakładki (całej grupy) ustawiasz w górnym pasku' : inherit ? `Część „${esc(g)}” – kolor i krycie jak „${esc(g)}”` : selIn ? 'Grupa wybranego obiektu – wygląd z górnego paska' : 'Brak policzonego wyniku'}">${cur ? esc((o.tool && o.tool.status) || 'wybrany') : inherit ? `jak „${esc(g)}”` : selIn ? 'grupa wybranego' : 'brak wyniku'}</span>`;
         const eye = own
           ? `<button type="button" class="ol-eye" title="Pokaż / ukryj maskę obiektu ${esc(o.name)}${g ? ' z częściami' : ''}">${st.vis ? '👁' : '◌'}</button><input type="color" class="ol-color" value="${st.c}" title="Kolor maski ${esc(o.name)}${g ? ' i jego części' : ''}">`
-          : `<span class="ol-eye ol-eye-off" title="${cur ? 'Wybrany obiekt' : inherit ? `Kolor jak „${esc(g)}”` : 'Brak wyniku – nie ma czego pokazać'}">${cur ? '✎' : ''}</span>` +
+          : cur ? `<button type="button" class="ol-eye ol-eye-sel" title="Pokaż / ukryj maskę wybranego obiektu na podglądzie (narzędzia – punkty, pędzel, strefy – zostają)">${S.hideSel ? '◌' : '👁'}</button>` + '<span></span>'
+          : `<span class="ol-eye ol-eye-off" title="${inherit ? `Kolor jak „${esc(g)}”` : 'Brak wyniku – nie ma czego pokazać'}"></span>` +
             (inherit && has && !selIn ? `<span class="ol-swatch" style="background:${st.c}" title="Kolor jak „${esc(g)}”"></span>` : '<span></span>');
         return `<div class="ol-row ${cur ? 'cur' : ''} ${g ? 'grp' : ''} ${offRow ? 'off' : ''}" data-o="${esc(o.name)}" draggable="true"
             title="Klik = wybierz obiekt · przeciągnij na środek innego = jego część · na górną / dolną krawędź = kolejność głębi (0 = najbliżej kamery)">
@@ -693,7 +724,9 @@
     $('olNew').addEventListener('click', () => newObjectDialog());
     box.querySelectorAll('.ol-row').forEach((row) => {
       const o = all.find((x) => x.name === row.dataset.o);
-      const eye = row.querySelector('button.ol-eye');
+      const selEye = row.querySelector('button.ol-eye-sel');   // the selected object's own mask on / off (user request 2026-10-17)
+      if (selEye) selEye.addEventListener('click', (e) => { e.stopPropagation(); S.hideSel = !S.hideSel; renderOthersPanel(); V() && V().render(); });
+      const eye = row.querySelector('button.ol-eye:not(.ol-eye-sel)');
       if (eye) {
         const st = otherStyle(o);
         eye.addEventListener('click', (e) => { e.stopPropagation(); st.vis = !st.vis; renderOthersPanel(); redraw(); });
@@ -724,7 +757,14 @@
     });
     wireObjDrag(box, '.ol-row', 'o');
   }
-  function note(t) { const n = $('canvasNote'); if (!n) return; n.style.display = t ? '' : 'none'; n.textContent = t || ''; }
+  function note(t) {
+    const n = $('canvasNote'); if (!n) return;
+    n.style.display = t ? '' : 'none'; n.textContent = t || '';
+    if (t) {   // always below the HUD row, also when it wraps (long „Maska: …”) – they overlapped (2026-10-17)
+      const hud = $('canvasHud'), w = $('canvasWrapper');
+      if (hud && w) n.style.top = `${Math.max(14, hud.getBoundingClientRect().bottom - w.getBoundingClientRect().top + 8)}px`;
+    }
+  }
 
   function plateSize() { const p = V() && V().projectData; return p ? [p.plate_w, p.plate_h] : null; }
 
@@ -745,6 +785,7 @@
       }
       // cut-out on a comp background: the mask layers are skipped (they would tint the comp), the tools are still drawn –
       // brush strokes, polygons, zones, points, brush cursor (user report 2026-10-16: painting showed nothing in „Na tle”)
+      updateMaskHud(f);   // „Maska: …” – also in the comp-background view
       const covers = !!(v.compareCoversView && v.compareCoversView());
       if (!covers) {
       if (!S.auxMode) drawOthers(ctx, img, f);   // other computed objects, under the selected one
@@ -757,6 +798,8 @@
           else drawTinted(ctx, ov, 'alpha', `${S.obj}_mb@${base}x${s}_${f}`, img.width, img.height);
         }
         noteTxt = noteTxt || `Podgląd: ${base} + motion blur ×${mbStrength()}, shutter ${mbShutter()}° (wyłącz „👁 podgląd” w palecie Motion blur, żeby zobaczyć bez)`;
+      } else if (S.hideSel && S.obj && !S.auxMode) {   // 👁 off in the Objects palette: no mask of the selected object
+        noteTxt = noteTxt || 'Maska wybranego obiektu ukryta – 👁 w palecie Obiekty';
       } else if (sw) {   // linked objects: one layer (whole + filled seam) in the selected layer's colour
         const src = selWholeSrc(), vr = src === 'alpha' && S.viewRun ? S.viewRun : '';
         const ov = wholeOverlay(sw, f, src, vr, S.obj);
@@ -793,6 +836,7 @@
       { const t = drawEdgePreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }   // stage 3 / 5: edge band before computing
       { const t = drawLtxPreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }    // stage LTX: band / re-limited result
       { const t = drawVmmPreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }    // stage VideoMaMa: band / recomposed result
+      { const t = drawStagePreview(ctx, img, f); if (t) noteTxt = t; }               // stages 3 / 4 / 5: preview of a few frames
       if (S.obj && !S.auxMode && S.cmpDiff && (S.view === 'alpha' || S.view === 'comp')) {   // stage-4 comparison |A − B|
         const c = S.cmpDiff;
         const d = loadOverlay(`${S.obj}_adiff@${c.a}~${c.b}_${f}`, `/api/object/${S.obj}/frame/${f}?view=alpha_diff&v=${c.a}&v2=${c.b}`);
@@ -815,6 +859,14 @@
         else if (fm) { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.85; ctx.drawImage(fm, 0, 0, img.width, img.height); ctx.globalAlpha = pa; noteTxt = noteTxt || 'Mapa migotania wersji (INFERNO: jaśniej = krawędź bardziej migocze; M wyłącza)'; }
       }
       drawCandidates(ctx, img, k, f);   // Z10
+      } else {   // cut-out on a background: the edge bands stay visible over it (user report 2026-10-17), no tinted alpha
+        { const t = drawEdgePreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }
+        { const t = drawLtxPreview(ctx, img, f, true); if (t) noteTxt = noteTxt || t; }
+        { const t = drawVmmPreview(ctx, img, f, true); if (t) noteTxt = noteTxt || t; }
+        if (S.obj && !S.auxMode && S.flicker && versionStage()) {   // the flicker map, when ticked in this view
+          const fm = loadOverlay(`${S.obj}_flicker@${S.viewRun || S.activeRun || 'cur'}_all`, `/api/object/${S.obj}/frame/${f}?view=flicker${S.viewRun ? '&v=' + S.viewRun : ''}`);
+          if (fm && fm !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.85; ctx.drawImage(fm, 0, 0, img.width, img.height); ctx.globalAlpha = pa; }
+        }
       }   // !covers
       if (window.MD_ZONES && window.MD_ZONES.ready) window.MD_ZONES.draw(ctx, img, k, f);   // zone keys / region / preview overlays
       if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.draw(ctx, img, k, f);   // stage 2: brush corrections
@@ -909,6 +961,7 @@
     renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderMbPalette(); renderLtxPalette(); renderExpPalette();
     if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.onStages();
     if (window.MD_ZONES && window.MD_ZONES.ready && window.MD_ZONES.onStages) window.MD_ZONES.onStages();
+    loadStagePreviews();
     window.dispatchEvent(new CustomEvent('md-object-stages', { detail: { name: S.obj, info: S.info } }));   // static/life.js
   }
   // matte of the selected object in frame f for the comp-background comparison (app.js bgComp): the final alpha, else
@@ -926,6 +979,38 @@
     if (S.stage === ST.LTX) return sr.ltx || '';
     if (S.stage === ST.VIDEOMAMA) return sr.videomama || '';
     return null;   // not a stage with its own version
+  }
+  // „Maska: …” next to the HUD mode (user request 2026-10-17): which mask the preview shows right now – the stage's
+  // version with its frames, the mask 1+2 / SAM3 core, or a stage preview – and when the version misses this frame
+  const STAGE_NAME = () => ({ [ST.MATANYONE]: 'MatAnyone', [ST.VIDEOMAMA]: 'VideoMaMa', [ST.VITMATTE]: 'ViTMatte', [ST.LTX]: 'LTX' });
+  function updateMaskHud(f) {
+    const el = $('hudMask');
+    if (!el) return;
+    let txt = '', warn = false;
+    if (S.obj && !S.auxMode && V() && V().projectLoaded) {
+      const has12 = S.info && S.info.has && S.info.has.core_fix;
+      const st = spvStage(); const m = st && S.spv && S.spv[st];
+      const ss = st && stageState(st);
+      const run = stageAlphaRun();
+      if (m && (m.frames || []).includes(f) && !(ss && ss.state === 'done')) {
+        txt = `Maska: podgląd ${SPV_LABEL[st]} F${m.frames[0]}–${m.frames[m.frames.length - 1]} (nie wynik etapu)${m.stale ? ' · nieaktualny' : ''}`;
+        warn = !!m.stale;
+      } else if (S.stage === ST.SAM3) txt = 'Maska: rdzeń SAM3';
+      else if (S.stage === ST.BRUSH) txt = has12 ? 'Maska: maska 1+2 (rdzeń + poprawki)' : 'Maska: rdzeń SAM3';
+      else if (run === '') txt = `Maska: ${has12 ? 'maska 1+2' : 'rdzeń SAM3'} – ${STAGE_NAME()[S.stage] || 'etap'} jeszcze niepoliczony`;
+      else if (run) {
+        const r = (S.runs || []).find((x) => x.run === run);
+        const cov = r && r.coverage ? r.coverage : null;
+        const covTxt = cov ? cov.map(([a, b]) => (a === b ? `F${a}` : `F${a}–${b}`)).join(', ') : '';
+        const inCov = !cov || cov.some(([a, b]) => f >= a && f <= b);
+        const who = S.stage === ST.VITMATTE && r && r.stage !== 'vitmatte' ? `baza ViTMatte: ${r.stage === 'videomama' ? 'VideoMaMa' : 'MatAnyone'}` : (STAGE_NAME()[S.stage] || 'wersja');
+        txt = `Maska: ${who} ${run}${covTxt ? ` (${covTxt})` : ''}${inCov ? '' : ` – BRAK w F${f}`}`;
+        warn = !inCov;
+      } else if (S.viewRun || S.activeRun) txt = `Maska: wersja ${S.viewRun || S.activeRun}`;
+    }
+    el.style.display = txt ? '' : 'none';
+    el.textContent = txt;
+    el.classList.toggle('warn', warn);
   }
   function matteFor(f) {
     if (!S.obj) return null;
@@ -958,26 +1043,48 @@
         g.drawImage(m.img, 0, 0, W, Hh); const bd = g.getImageData(0, 0, W, Hh);
         g.clearRect(0, 0, W, Hh); g.drawImage(pm.area, 0, 0, W, Hh); const ad = g.getImageData(0, 0, W, Hh).data;
         const zd = pm.canvas.getContext('2d').getImageData(0, 0, W, Hh).data; const p = bd.data;
-        for (let i = 0; i < p.length; i += 4) { if (ad[i] > 64) { p[i] = p[i + 1] = p[i + 2] = zd[i]; } p[i + 3] = 255; }
+        const wd = pm.weight ? (() => { g.clearRect(0, 0, W, Hh); g.drawImage(pm.weight, 0, 0, W, Hh); return g.getImageData(0, 0, W, Hh).data; })() : null;
+        for (let i = 0; i < p.length; i += 4) {
+          if (wd) { const w = wd[i] / 255; if (w > 0) p[i] = p[i + 1] = p[i + 2] = Math.round(w * zd[i] + (1 - w) * p[i]); }   // feather (2026-10-17)
+          else if (ad[i] > 64) { p[i] = p[i + 1] = p[i + 2] = zd[i]; }
+          p[i + 3] = 255;
+        }
         g.putImageData(bd, 0, 0);
         S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
       }
       return { img: S.compCache[ck], key, kind: 'alpha', run: `${m.run || 'baza'} + podgląd strefy F${f}` };
     };
+    {   // „👁 Podgląd klatek” of this stage covers the frame (and the stage has no current result): the cut-out shows it
+        // (user report 2026-10-17: the MatAnyone preview was computed but the cut-out still showed the SAM3 core)
+      const st = spvStage(); const pv = st && S.spv && S.spv[st];
+      const ss = st && stageState(st);
+      if (pv && (pv.frames || []).includes(f) && !(ss && ss.state === 'done')) {
+        const key = `${S.obj}_spv_${st}_${pv.created_at}_${f}`;
+        const al = settledOverlay(key, `/api/object/${S.obj}/stage_preview/${st}/${f}?c=${encodeURIComponent(pv.created_at)}`, f);
+        if (al && al !== 'missing') return { img: al, key, kind: 'alpha', run: `podgląd ${SPV_LABEL[st]} F${pv.frames[0]}–${pv.frames[pv.frames.length - 1]}` };
+        if (!al) return 'loading';
+      }
+    }
     if (run === '') return withZonePv(sw ? wholeMatte(has12 ? 'core_fix' : 'core') : coreMatte(has12 ? 'core_fix' : (keyOf(f) ? 'key' : 'core')));
     if (run) {
       const key = `${S.obj}_alpha@${run}_${f}`;
       const al = loadOverlay(key, `/api/object/${S.obj}/frame/${f}?view=alpha&v=${encodeURIComponent(run)}`);
-      if (al && al !== 'missing') return withZonePv({ img: al, key, kind: 'alpha', run });
+      if (al && al !== 'missing') { S.matteNote = ''; return withZonePv({ img: al, key, kind: 'alpha', run }); }
       if (!al) return 'loading';
-      return coreMatte(keyOf(f) ? 'key' : 'core');
+      // bug 2026-10-17: the stage's version does not cover this frame – say so (it showed the bare background)
+      const r = (S.runs || []).find((x) => x.run === run);
+      const cov = r && r.coverage ? r.coverage.map(([a, b]) => (a === b ? `F${a}` : `F${a}–${b}`)).join(', ') : '';
+      S.matteNote = `Wersja ${run}${cov ? ` obejmuje ${cov}` : ''} – klatka ${f} jest poza wynikiem tego etapu (policz etap na tym zakresie albo przejdź do policzonych klatek)`;
+      return null;
     }
     const al = overlayFor('alpha', f);
     if (al && al !== 'missing') return { img: al, key: overlayKey('alpha', f), kind: 'alpha' };
     if (!al) return 'loading';
     return coreMatte(keyOf(f) ? 'key' : 'core');
   }
-  window.MD_OBJ = { get name() { return S.obj; }, reload: () => loadStages().then(() => renderKeysLane()), matteFor };   // static/life.js, app.js
+  window.MD_OBJ = { get name() { return S.obj; }, reload: () => loadStages().then(() => renderKeysLane()), matteFor,
+                    get matteNote() { return S.matteNote || ''; },
+                    stagePreview: (stage, btn) => stagePreview(stage, btn) };   // static/life.js, app.js
   function updateStageButtons() {
     const st = (id) => stageState(id).state;
     const set = (id, state, primaryWhen) => { const b = $(id); if (!b) return; b.disabled = !S.obj || state === 'locked'; b.classList.toggle('btn-primary', !!primaryWhen); b.classList.toggle('btn-secondary', !primaryWhen); };
@@ -988,6 +1095,18 @@
     set('st4Final', st('final'), st('final') !== 'done');
     set('lx6Run', st('ltx'), st('ltx') !== 'done');
     set('vmRun', st('videomama'), st('videomama') !== 'done');
+    {   // a stage that already has a result: „Policz ponownie” – a new version replaces the stage result (the old one stays
+        // on the version list) – user request 2026-10-17
+      const sr = (S.info && S.info.stage_runs) || {};
+      for (const [id, k, first] of [['st3Ma', 'matanyone', '▶ Przelicz MatAnyone'], ['vmRun', 'videomama', '▶ Policz VideoMaMa'],
+                                     ['lx6Run', 'ltx', '▶ Policz LTX']]) {
+        const b = $(id); if (!b) continue;
+        if (b.dataset.t0 == null) { b.dataset.t0 = b.title; b.dataset.l0 = b.textContent; }
+        const prev = sr[k];
+        b.textContent = prev ? '▶ Policz ponownie' : (b.dataset.l0 || first);
+        b.title = prev ? `Policz etap od nowa – nowa wersja zastąpi wynik etapu ${prev} (${prev} zostaje na liście wersji, można do niego wrócić)` : b.dataset.t0;
+      }
+    }
     const ex = $('st5Export'); if (ex) ex.disabled = false;
     const one = $('st5ExportOne'); if (one) { one.disabled = !S.obj || st('export') === 'locked'; one.title = one.disabled ? (stageState('export').why || 'najpierw rdzeń (etap 1)') : 'Tylko wybrany obiekt (liczony jak w pełnym eksporcie), z wybranego źródła'; }
     const canCore = st('core') !== 'locked';
@@ -1266,7 +1385,7 @@
   }
   async function loadObject() {
     renderOrder();
-    clearOverlays(); S.preview = {}; S.points = {}; S.strokes = {}; S.polys = {}; S.poly = null; S.crops = null; S.keys = []; S.viewRun = null; S.runs = []; S.cmpDiff = null; S.cmpUser = false; S.edgePv = null; S.epvParams = null;
+    clearOverlays(); S.preview = {}; S.points = {}; S.strokes = {}; S.polys = {}; S.poly = null; S.crops = null; S.keys = []; S.viewRun = null; S.runs = []; S.cmpDiff = null; S.cmpUser = false; S.edgePv = null; S.epvParams = null; S.pvLast = {};
     if (window.MD_ZONES && window.MD_ZONES.ready) window.MD_ZONES.reset();
     if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.reset();
     S.exportSourceUser = false;
@@ -1417,7 +1536,7 @@
     const o = S.objects.find((x) => x.name === S.obj) || {};
     S.edgeLegacy = (o.band_out_px == null && o.band_in_px == null) ? { b: o.band_scale ?? 1, s: o.shift_px ?? 0 } : null;
     S.edgePxTouched = false;
-    for (const [id, k] of [['o4Out', 'band_out_px'], ['o4In', 'band_in_px']]) { $(id).value = o[k] ?? 0; $(`${id}V`).value = o[k] ?? 0; }
+    for (const [id, k] of [['o4Out', 'band_out_px'], ['o4In', 'band_in_px'], ['o4Feather', 'band_in_feather_px']]) { $(id).value = o[k] ?? 0; $(`${id}V`).value = o[k] ?? 0; }
     const lg = S.edgeLegacy && (+S.edgeLegacy.b !== 1 || +S.edgeLegacy.s !== 0);
     $('o4PxHint').textContent = lg ? `Obiekt ma stare ustawienie (szerokość ×${S.edgeLegacy.b}, środek ${S.edgeLegacy.s} px) – ruszenie suwaka przełącza na px`
       : '0 / 0 = sam automat (pas wg rozmycia, 3–24 px w każdą stronę)';
@@ -1901,6 +2020,7 @@
       <div class="pp-sec edge-settings" id="edgeSettings">
       <label class="edge-px" title="Jak daleko poza krawędź maski 1+2 sięga żółty pas, w którym MatAnyone liczy miękką alfę (kosmyki, rozmycie). To minimum: tam, gdzie automat mierzy większe rozmycie ostrości / ruchu, pas sam jest szerszy. Maska się nie przesuwa. Suwak 0–60 px, w polu dowolna wartość (do 200 px)">Pas na zewnątrz <input id="o4Out" type="range" min="0" max="60" step="1" value="0"><input id="o4OutV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
       <label class="edge-px" title="Ile px w głąb maski 1+2 oddajemy MatAnyone (żółte do środka); dalej w środku alfa = 1 (niebieskie). Minimum jak wyżej – automat może dać więcej przy rozmyciu. 0 = sam automat (3–24 px). Suwak 0–30 px, w polu do 200 px">Wcięcie w rdzeń <input id="o4In" type="range" min="0" max="30" step="1" value="0"><input id="o4InV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
+      <label class="edge-px" title="Na ilu px wynik MatAnyone przenika się z wnętrzem rdzenia na wewnętrznym brzegu pasa (wcięcia). 0 = twarde przejście (jak dotąd) – może zostać widoczna linia na granicy wcięcia; kilka px = miękkie wtopienie">Wtopienie wcięcia <input id="o4Feather" type="range" min="0" max="24" step="1" value="0" title="Wtopienie wcięcia (px)"><input id="o4FeatherV" type="number" class="form-input edge-num" min="0" max="64" step="1" value="0" title="Wtopienie wcięcia (px, 0–64)"> px</label>
       <div class="muted pp-hint" id="o4PxHint">0 / 0 = sam automat (pas wg rozmycia, 3–24 px w każdą stronę)</div>
       <div class="row">
         <label title="Migotanie vs duchy przy ruchu">Wygładzanie<select id="o4Smooth" class="form-input"><option value="weak">słabe</option><option value="normal">normalne</option><option value="strong">mocne</option></select></label>
@@ -1908,7 +2028,7 @@
       </div>
       <label id="o4MaScaleL" title="Rozdzielczość, w której liczy MatAnyone2">Skala MatAnyone<select id="o4MaScale" class="form-input"><option value="auto">auto</option><option value="1.0">1.0</option><option value="0.75">0.75</option><option value="0.5">0.5</option></select></label>
       </div>
-      <div class="pp-btns"><button type="button" class="btn btn-primary btn-sm" id="epCompute" title="Policz z tymi ustawieniami (etap ${ST.MATANYONE}: „▶ Przelicz MatAnyone”, etap ${ST.EXPERIMENTS}: „✔ Przelicz finalnie”)">▶ Przelicz</button></div>
+      <div class="pp-btns"><button type="button" class="btn btn-secondary btn-sm" id="epStagePv" title="Policz MatAnyone tylko na kilku klatkach wokół bieżącej (±4 kl.) – szybkie sprawdzenie ustawień przed długim liczeniem całości. To NIE jest wynik etapu: nic się nie zapisuje jako wersja i nic się nie odblokowuje. Modele czasowe dostają mniej kontekstu niż w pełnym przebiegu – krawędź może się trochę różnić">👁 Podgląd klatek</button><button type="button" class="btn btn-primary btn-sm" id="epCompute" title="Policz z tymi ustawieniami (etap ${ST.MATANYONE}: „▶ Przelicz MatAnyone”, etap ${ST.EXPERIMENTS}: „✔ Przelicz finalnie”)">▶ Przelicz</button></div>
     </div>`;
   }
   const epPos = {
@@ -1930,7 +2050,9 @@
     if (S.edgePv == null) S.edgePv = stageState('matanyone').state !== 'done';   // on until a MatAnyone result exists
     $('ePv').checked = !!S.edgePv;
     const b = $('epCompute');
-    b.textContent = S.stage === ST.MATANYONE ? '▶ Przelicz MatAnyone' : '✔ Przelicz finalnie';
+    const maPrev = S.info && S.info.stage_runs && S.info.stage_runs.matanyone;
+    b.textContent = S.stage === ST.MATANYONE ? (maPrev ? '▶ Policz ponownie' : '▶ Przelicz MatAnyone') : '✔ Przelicz finalnie';
+    if (S.stage === ST.MATANYONE && maPrev) b.title = `Policz MatAnyone od nowa – nowa wersja zastąpi wynik etapu ${maPrev} (zostaje na liście wersji)`;
     const src = S.stage === ST.MATANYONE ? $('st3Ma') : $('st4Final');
     b.disabled = !src || src.disabled || document.body.classList.contains('job-busy');
     b.classList.toggle('btn-cta', S.stage === ST.MATANYONE && stageState('matanyone').state === 'todo');
@@ -1954,14 +2076,67 @@
     S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
     return c;
   }
+  // ---- stage preview (user request 2026-10-17): stages 3 MatAnyone / 4 VideoMaMa / 5 ViTMatte on a few frames around
+  // the current one before the long run (engine/stage_preview.py). Never a stage result: drawn green only on the frames
+  // of the window and only in its stage, dimmed when the settings changed, hidden once the stage itself is computed.
+  const SPV_LABEL = { matanyone: 'MatAnyone', videomama: 'VideoMaMa', vitmatte: 'ViTMatte' };
+  const spvStage = () => ({ [ST.MATANYONE]: 'matanyone', [ST.VIDEOMAMA]: 'videomama', [ST.VITMATTE]: 'vitmatte' })[S.stage];
+  async function loadStagePreviews() {
+    const obj = S.obj; S.spv = {};
+    if (!obj) return;
+    for (const st of Object.keys(SPV_LABEL)) {
+      try { const d = await api('GET', `/api/object/${obj}/stage_preview/${st}`); if (S.obj === obj && d.exists) S.spv[st] = d; } catch (e) { /* none */ }
+    }
+    if (S.obj === obj && V()) V().render();
+  }
+  async function stagePreview(stage, btnId) {
+    if (!S.obj) return;
+    const f = V().currentFrame;
+    await run(btnId, async () => {
+      status(`Podgląd ${SPV_LABEL[stage]}: liczę kilka klatek wokół F${f}…`);
+      const d = await api('POST', `/api/object/${S.obj}/stage_preview/${f}?stage=${stage}`);
+      S.spv = { ...(S.spv || {}), [stage]: d };
+      status(`Podgląd ${SPV_LABEL[stage]}: F${d.frames[0]}–${d.frames[d.frames.length - 1]} (${d.seconds} s) – zielone na obrazie. ` +
+        'To nie jest wynik etapu: nic nie zostało zapisane jako wersja i nic się nie odblokowało.', 'ok');
+      V().render();
+    });
+  }
+  function drawStagePreview(ctx, img, f) {
+    const st = spvStage(); const m = st && S.spv && S.spv[st];
+    if (!m || !S.obj || S.auxMode || !(m.frames || []).includes(f)) return '';
+    const ss = stageState(st);
+    if (ss && ss.state === 'done') return '';   // the stage result is there – show it, not the preview
+    const key = `${S.obj}_spv_${st}_${m.created_at}_${f}`;
+    const al = settledOverlay(key, `/api/object/${S.obj}/stage_preview/${st}/${f}?c=${encodeURIComponent(m.created_at)}`, f);
+    if (al && al !== 'missing') {
+      ctx.save(); ctx.globalAlpha = m.stale ? 0.35 : 0.75;
+      ctx.drawImage(tintCanvas(al, [60, 255, 90], key), 0, 0, img.width, img.height); ctx.restore();
+    }
+    return `Podgląd ${SPV_LABEL[st]} F${m.frames[0]}–${m.frames[m.frames.length - 1]} (zielone) – nie jest wynikiem etapu` +
+      (m.stale ? ' · NIEAKTUALNY: zmieniono ustawienia – „👁 Podgląd klatek” jeszcze raz' : '');
+  }
   function drawEdgePreview(ctx, img, f) {
-    if (!(S.edgePv && edgeStage() && S.obj && !S.auxMode)) return '';
-    const p = S.epvParams || edgePvParams();
+    if (!((S.edgePv || S.pvDrag === 'edge') && edgeStage() && S.obj && !S.auxMode)) return '';
+    const dragging = S.pvDrag === 'edge';
+    const p = dragging ? edgePvParams() : (S.epvParams || edgePvParams());
     const q = p.px ? `band_out_px=${p.o}&band_in_px=${p.i}` : `band_scale=${p.b}&shift_px=${p.s}`;
-    const key = `${S.obj}_epv_${q}_${f}`;
-    const ov = loadOverlay(key, `/api/object/${S.obj}/edge_preview/${f}?${q}`);
-    if (ov === 'missing') return `Podgląd krawędzi F${f}: brak rdzenia / kadru w tej klatce`;
-    if (ov) ctx.drawImage(edgePvCanvas(ov, key), 0, 0, img.width, img.height);
+    // instant band from the mask 1+2 in the browser (fixed px, no adaptive widening): while the slider is dragged and
+    // until the server's exact band is loaded – the server needs ~seconds per frame (user report 2026-10-17)
+    const live = () => {
+      if (!p.px || !(window.MD_ZONES && window.MD_ZONES.liveBand)) return null;
+      const kind = S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core';
+      const m = overlayFor(kind, f);
+      return m && m !== 'missing' ? window.MD_ZONES.liveBand(m, `${S.obj}_${kind}_${f}`, p.i, p.o) : null;
+    };
+    if (dragging) {
+      const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height);
+    } else {
+      const key = `${S.obj}_epv_${q}_${f}`;
+      const ov = settledOverlay(key, `/api/object/${S.obj}/edge_preview/${f}?${q}`, f);
+      if (ov === 'missing') return `Podgląd krawędzi F${f}: brak rdzenia / kadru w tej klatce`;
+      if (ov) drawBand(ctx, img, 'edge', q, ov, key);
+      else { const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height); else drawBand(ctx, img, 'edge', q, ov, key); }
+    }
     const info = $('ePvInfo');
     const desc = p.px ? `na zewnątrz ≥ ${p.o} px, w rdzeń ≥ ${p.i} px (więcej, gdzie rozmycie)` : `stare: ×${p.b}, środek ${p.s} px`;
     if (info) info.textContent = `F${f}: ${desc} – żółte = MatAnyone decyduje, niebieskie = maska zostaje`;
@@ -2071,8 +2246,7 @@
         <label class="edge-px" title="Miękkie przejście na końcu pasa na zewnątrz (px)">Miękkość <input id="lx6SoftS" type="range" min="0" max="40" step="1" title="Miękkość końca pasa (px)"><input id="lx6Soft" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Miękkość końca pasa (px)"> px</label>
         <label class="edge-px" title="Wynik „+ wnętrze”: maska zwężona o tyle px jest wymuszona na 1 (dziury LTX w obiekcie zamknięte); bliżej krawędzi decyduje LTX">Wcięcie w rdzeń <input id="lx6ErodeS" type="range" min="0" max="40" step="1" title="Wcięcie w rdzeń (px), wynik „+ wnętrze”"><input id="lx6Erode" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wcięcie w rdzeń (px)"> px</label>
       </div>
-      <div class="pp-btns"><button type="button" class="btn btn-primary btn-sm" id="lx6Run" title="LTX-2.5 Alpha-Gen na zakresie pracy (oś czasu) → nowa wersja (wynik etapu ${ST.LTX}, źródło eksportu „LTX”)">▶ Policz LTX</button>
-        <button type="button" class="btn btn-secondary btn-sm" id="lx6Refinish" title="Nowa wersja z SUROWEJ alfy bieżącego wyniku LTX przyciętej obecnymi suwakami (maska, pas, wcięcie) – bez liczenia modelu">✚ Suwaki na wynik</button></div>
+      <div class="pp-btns"><button type="button" class="btn btn-primary btn-sm" id="lx6Run" title="LTX-2.5 Alpha-Gen na zakresie pracy (oś czasu) → nowa wersja (wynik etapu ${ST.LTX}, źródło eksportu „LTX”)">▶ Policz LTX</button></div>
     </div>`;
   }
   const ltxPos = {
@@ -2089,7 +2263,6 @@
     $('lxPvBand').checked = ltxPvGet('band', true);
     $('lxPvAlpha').checked = ltxPvGet('alpha', true);
     const has = !!(S.ltx && S.ltx.run);
-    $('lx6Refinish').disabled = !has || document.body.classList.contains('job-busy');
     {   // + versions of stage Eksperymenty (stage 6 may use them; origin kept, 2026-10-16)
       const sel = $('lx6Mask'); const cur = (S.ltx && S.ltx.settings && S.ltx.settings.mask_source) || sel.value;
       sel.querySelectorAll('option[data-exp]').forEach((o) => o.remove());
@@ -2111,18 +2284,18 @@
   function ltxAlphaOverlay(f) {   // the live re-limited LTX matte of frame f (Image), 'missing' or null (loading)
     if (!(S.ltx && S.ltx.run) || !ltxPvGet('alpha', true)) return 'missing';
     const q = ltxQuery(S.ltxPv || ltxPvParams());
-    return loadOverlay(`${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`, `/api/object/${S.obj}/ltx_preview/${f}?what=alpha&${q}`);
+    return settledOverlay(`${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`, `/api/object/${S.obj}/ltx_preview/${f}?what=alpha&${q}`, f);
   }
-  function drawLtxPreview(ctx, img, f) {
+  function drawLtxPreview(ctx, img, f, bandsOnly = false) {   // bandsOnly: the cut-out (comp) view – no tinted alpha
     if (!(S.stage === ST.LTX && S.obj && !S.auxMode)) return '';
     const p = S.ltxPv || ltxPvParams(); const q = ltxQuery(p);
     let note = '';
-    const al = ltxAlphaOverlay(f);
+    const al = bandsOnly ? null : ltxAlphaOverlay(f);
     if (al && al !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.75; ctx.drawImage(tintCanvas(al, [60, 255, 90], `${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`), 0, 0, img.width, img.height); ctx.globalAlpha = pa; note = `Wynik LTX ${S.ltx.run} z bieżącymi suwakami (zielone)`; }
-    if (ltxPvGet('band', true)) {
+    if (ltxPvGet('band', true) || S.pvDrag === 'ltx') {
       const key = `${S.obj}_ltxb_${q}_${f}`;
-      const ov = loadOverlay(key, `/api/object/${S.obj}/ltx_preview/${f}?what=band&${q}`);
-      if (ov && ov !== 'missing') ctx.drawImage(edgePvCanvas(ov, key), 0, 0, img.width, img.height);
+      const ov = settledOverlay(key, `/api/object/${S.obj}/ltx_preview/${f}?what=band&${q}`, f);
+      drawBand(ctx, img, 'ltx', q, ov, key);
       note = note ? `${note} · pas: żółte = alfa LTX zostaje, niebieskie = 1` : 'Pas LTX: żółte = alfa LTX zostaje, niebieskie = wymuszone 1';
     }
     const info = $('lxPvInfo');
@@ -2140,17 +2313,16 @@
         <label class="chk" title="Wynik VideoMaMa tej klatki nałożony na bazę bieżącymi suwakami (z zapisanej surowej alfy – bez liczenia modelu)"><input type="checkbox" id="vmPvAlpha" title="Wynik VideoMaMa z bieżącymi suwakami (wł. / wył.)"> 👁 wynik</label></div>
       <div class="muted pp-hint" id="vmPvInfo"></div>
       <div class="pp-sec">
-        <label class="edge-px" title="Jak daleko od krawędzi bazy VideoMaMa może dokładać (kosmyki, odstające włosy); dalej zostaje baza – wysepki w tle odcięte. Suwak 0–120, w polu do 400">Zasięg <input id="vmReachS" type="range" min="0" max="120" step="1" title="Zasięg od krawędzi bazy (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmReach" type="number" min="0" max="400" step="1" class="form-input edge-num" title="Zasięg od krawędzi bazy (px)"> px</label>
-        <label class="edge-px" title="Pas wokół krawędzi bazy, w którym wygrywa baza (płynne przejście do VideoMaMa na końcu pasa). Auto: 0 px przy masce 1+2, 3 px przy MatAnyone">Ochrona <input id="vmProtS" type="range" min="0" max="12" step="0.5" title="Pas ochrony krawędzi bazy (px)"><input id="vmProt" type="number" min="0" max="40" step="0.5" class="form-input edge-num" title="Pas ochrony krawędzi bazy (px)"> px
-          <button type="button" class="btn btn-ghost btn-xs" id="vmProtAuto" title="Ochrona wg bazy: 0 px (maska 1+2) / 3 px (MatAnyone)">auto</button></label>
+        <label class="edge-px" title="Jak daleko od krawędzi bazy VideoMaMa może dokładać (kosmyki, odstające włosy); dalej zostaje baza – wysepki w tle odcięte. Suwak 0–120, w polu do 400">Pas na zewnątrz <input id="vmReachS" type="range" min="0" max="120" step="1" title="Zasięg od krawędzi bazy (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmReach" type="number" min="0" max="400" step="1" class="form-input edge-num" title="Zasięg od krawędzi bazy (px)"> px</label>
+        <label class="edge-px" title="Ile px w głąb bazy VideoMaMa ZASTĘPUJE bazę (żółte do środka); dalej w środku zostaje baza (niebieskie). 0 = VideoMaMa tylko od krawędzi bazy na zewnątrz. Suwak 0–30, w polu do 200">Wcięcie w rdzeń <input id="vmInsetS" type="range" min="0" max="30" step="1" title="Wcięcie w rdzeń (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmInset" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wcięcie w rdzeń (px)"> px</label>
+        <label class="edge-px" title="Na ilu px wynik VideoMaMa przenika się z głębszą bazą na wewnętrznym brzegu pasa. 0 = twarde przejście">Wtopienie wcięcia <input id="vmFeatherS" type="range" min="0" max="24" step="1" title="Wtopienie wcięcia (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmFeather" type="number" min="0" max="64" step="1" class="form-input edge-num" title="Wtopienie wcięcia (px)"> px</label>
       </div>
       <div class="pp-sec">
         <label title="Dłuższy bok kadru dla VideoMaMa (tylko w dół – kadr nigdy nie jest powiększany). Więcej = więcej detalu, więcej VRAM / czasu (1280 px: ~16 GB, 448 px: ~8 GB)">Rozdzielczość<select id="vmSide" class="form-input" title="Dłuższy bok kadru dla VideoMaMa"><option value="512">512 px</option><option value="768">768 px</option><option value="1024">1024 px</option><option value="1280">1280 px</option><option value="1536">1536 px</option><option value="2048">2048 px</option></select></label>
         <label title="Klatki w jednym przebiegu modelu. Sąsiednie paczki zachodzą na siebie o „zakładkę” z przenikaniem – bez zakładki początek każdej paczki skacze">Paczka<select id="vmBatch" class="form-input" title="Klatki w jednym przebiegu modelu"><option value="12">12 kl.</option><option value="16">16 kl.</option><option value="24">24 kl.</option><option value="32">32 kl.</option></select></label>
         <label title="Klatki wspólne sąsiednich paczek (płynne przejście). 8 przy paczce 24: szwy praktycznie znikają (+35 % czasu)">Zakładka<select id="vmOverlap" class="form-input" title="Klatki wspólne sąsiednich paczek"><option value="0">0 (bez)</option><option value="4">4 kl.</option><option value="8">8 kl.</option><option value="12">12 kl.</option></select></label>
       </div>
-      <div class="pp-btns"><button type="button" class="btn btn-primary btn-sm" id="vmRun" title="VideoMaMa na zakresie pracy (oś czasu) → nowa wersja (wynik etapu ${ST.VIDEOMAMA}: baza ViTMatte do wyboru, źródło eksportu „VideoMaMa”)">▶ Policz VideoMaMa</button>
-        <button type="button" class="btn btn-secondary btn-sm" id="vmRefinish" title="Nowa wersja z SUROWEJ alfy bieżącego wyniku VideoMaMa nałożonej na bazę bieżącymi suwakami (baza, zasięg, ochrona) – bez liczenia modelu">✚ Suwaki na wynik</button></div>
+      <div class="pp-btns"><button type="button" class="btn btn-secondary btn-sm" id="vmStagePv" title="Policz VideoMaMa tylko na kilku klatkach wokół bieżącej (±6 kl., jedna paczka) – szybkie sprawdzenie ustawień przed długim liczeniem całości. To NIE jest wynik etapu: nic się nie zapisuje jako wersja i nic się nie odblokowuje. Modele czasowe dostają mniej kontekstu niż w pełnym przebiegu – krawędź może się trochę różnić">👁 Podgląd klatek</button><button type="button" class="btn btn-primary btn-sm" id="vmRun" title="VideoMaMa na zakresie pracy (oś czasu) → nowa wersja (wynik etapu ${ST.VIDEOMAMA}: baza ViTMatte do wyboru, źródło eksportu „VideoMaMa”)">▶ Policz VideoMaMa</button></div>
     </div>`;
   }
   const vmmPos = {
@@ -2167,36 +2339,47 @@
     $('vmPvBand').checked = vmmPvGet('band', true);
     $('vmPvAlpha').checked = vmmPvGet('alpha', true);
     const has = !!(S.vmm && S.vmm.run);
-    $('vmRefinish').disabled = !has || document.body.classList.contains('job-busy');
     $('vmPvAlpha').disabled = !has;
     placeFloating(box, w, vmmPos.get());
   }
-  // the palette values (also while dragging, before they are saved); protect '' = auto (by base)
+  // the palette values (also while dragging, before they are saved)
   function vmmPvParams() {
     const n = (id, d) => { const v = +$(id).value; return isFinite(v) && $(id).value !== '' ? Math.max(0, v) : d; };
-    const p = { base: $('vmBase').value, reach_px: n('vmReach', 40) };
-    if (S.vmmProtAuto) p.protect_auto = 1; else p.protect_px = n('vmProt', 0);
-    return p;
+    // the unified sliders: inset / feather are sent (and saved) as soon as they exist in the palette – an object never
+    // touched still shows inset 0, feather 0, which for the mask 1+2 base is the former composition exactly
+    return { base: $('vmBase').value, reach_px: n('vmReach', 40), inset_px: n('vmInset', 0), feather_px: n('vmFeather', 0) };
   }
   const vmmQuery = (p) => Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
-  function drawVmmPreview(ctx, img, f) {
+  function drawVmmPreview(ctx, img, f, bandsOnly = false) {
     if (!(S.stage === ST.VIDEOMAMA && S.obj && !S.auxMode && $('vmBase'))) return '';
     const p = S.vmmPv || vmmPvParams(); const q = vmmQuery(p);
     let note = '';
-    if (S.vmm && S.vmm.run && vmmPvGet('alpha', true)) {
+    if (!bandsOnly && S.vmm && S.vmm.run && vmmPvGet('alpha', true)) {
       const key = `${S.obj}_vmma_${S.vmm.run}_${q}_${f}`;
-      const al = loadOverlay(key, `/api/object/${S.obj}/videomama_preview/${f}?what=alpha&${q}`);
+      const al = settledOverlay(key, `/api/object/${S.obj}/videomama_preview/${f}?what=alpha&${q}`, f);
       if (al && al !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.75; ctx.drawImage(tintCanvas(al, [60, 255, 90], key), 0, 0, img.width, img.height); ctx.globalAlpha = pa; note = `Wynik VideoMaMa ${S.vmm.run} na bazie, bieżące suwaki (zielone)`; }
     }
-    if (vmmPvGet('band', true)) {
-      const key = `${S.obj}_vmmb_${q}_${f}`;
-      const ov = loadOverlay(key, `/api/object/${S.obj}/videomama_preview/${f}?what=band&${q}`);
-      if (ov && ov !== 'missing') ctx.drawImage(edgePvCanvas(ov, key), 0, 0, img.width, img.height);
-      note = note ? `${note} · pas: żółte = VideoMaMa dokłada, niebieskie = ochrona` : 'Pas VideoMaMa: żółte = dokłada (max z bazą), niebieskie = ochrona krawędzi bazy';
+    if (vmmPvGet('band', true) || S.pvDrag === 'vmm') {
+      // instant band in the browser while dragging / until the server band is loaded (2026-10-17): reach outside,
+      // inset inside the mask 1+2 edge (the MatAnyone base is approximated by the mask 1+2 here)
+      const lp = S.pvDrag === 'vmm' ? vmmPvParams() : p;
+      const live = () => {
+        if (!(window.MD_ZONES && window.MD_ZONES.liveBand)) return null;
+        const kind = S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core';
+        const m = overlayFor(kind, f);
+        return m && m !== 'missing' ? window.MD_ZONES.liveBand(m, `${S.obj}_${kind}_${f}`, +lp.inset_px || 0, +lp.reach_px || 0) : null;
+      };
+      if (S.pvDrag === 'vmm') { const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height); }
+      else {
+        const key = `${S.obj}_vmmb_${q}_${f}`;
+        const ov = settledOverlay(key, `/api/object/${S.obj}/videomama_preview/${f}?what=band&${q}`, f);
+        if (ov) drawBand(ctx, img, 'vmm', q, ov, key);
+        else { const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height); }
+      }
+      note = note ? `${note} · pas: żółte = decyduje VideoMaMa, niebieskie = zostaje baza` : 'Pas VideoMaMa: żółte = decyduje VideoMaMa (pas na zewnątrz + wcięcie), niebieskie = zostaje baza';
     }
     const info = $('vmPvInfo');
-    const prot = p.protect_auto ? `auto (${p.base === 'matanyone' ? 3 : 0})` : p.protect_px;
-    if (info) info.textContent = `F${f}: baza ${p.base === 'matanyone' ? 'MatAnyone' : 'maska 1+2'}, zasięg ${p.reach_px} px, ochrona ${prot} px`;
+    if (info) info.textContent = `F${f}: baza ${p.base === 'matanyone' ? 'MatAnyone' : 'maska 1+2'}, pas na zewnątrz ${p.reach_px} px, wcięcie ${p.inset_px} px, wtopienie ${p.feather_px} px`;
     return note;
   }
   // stage VideoMaMa: settings (object field `videomama`), weights / nodes, the stage result
@@ -2206,14 +2389,21 @@
     S.vmm = d;
     const s = d.settings;
     $('vmBase').value = s.base;
-    {   // base MatAnyone: unavailable without its model and without a stage-3 result (user rule 2026-10-16)
+    {   // base MatAnyone: only with a stage-3 result (user rule 2026-10-16; bug 2026-10-17: it was offered without one –
+        // the band preview stayed empty). A saved base without its result falls back to the mask 1+2, with a note.
       const mm = (S.info && S.info.models_missing) || {}, sr = (S.info && S.info.stage_runs) || {};
       const o = [...$('vmBase').options].find((x) => x.value === 'matanyone');
-      if (o) { o.disabled = !!mm.matanyone && !sr.matanyone && s.base !== 'matanyone'; o.title = o.disabled ? mm.matanyone : ''; }
+      if (o) {
+        o.disabled = !sr.matanyone;
+        o.title = o.disabled ? (mm.matanyone || `najpierw etap ${ST.MATANYONE} MatAnyone („▶ Przelicz MatAnyone”)`) : '';
+      }
+      if (s.base === 'matanyone' && !sr.matanyone) {
+        $('vmBase').value = 'core';
+        vmmSetting({ base: 'core' }).catch((er) => status(`Błąd: ${er.message}`, 'err'));
+        status(`Baza VideoMaMa: maska 1+2 – wyniku MatAnyone (etap ${ST.MATANYONE}) jeszcze nie ma`, 'warn');
+      }
     }
-    S.vmmProtAuto = s.protect_px == null;
-    for (const [id, v] of [['vmReach', s.reach_px], ['vmProt', s.protect]]) { $(id).value = v; $(`${id}S`).value = v; }
-    $('vmProtAuto').classList.toggle('on', S.vmmProtAuto);
+    for (const [id, v] of [['vmReach', s.reach_px], ['vmInset', s.inset_px ?? 0], ['vmFeather', s.feather_px ?? 0]]) { $(id).value = v; $(`${id}S`).value = v; }
     S.vmmPv = null;
     for (const [id, v] of [['vmSide', s.max_side], ['vmBatch', s.batch], ['vmOverlap', s.overlap]]) {
       const sel = $(id);
@@ -2289,7 +2479,7 @@
   }
   function mbOverlay(f) {   // Image | 'missing' | null – the preview alpha of frame f (same format as view=alpha)
     const base = mbBase(), s = mbStrength(), sh = mbShutter();
-    return loadOverlay(`${S.obj}_mb@${base}x${s}s${sh}_${f}`, `/api/object/${S.obj}/motion_blur/${f}?v=${encodeURIComponent(base)}&strength=${s}&shutter=${sh}`);
+    return settledOverlay(`${S.obj}_mb@${base}x${s}s${sh}_${f}`, `/api/object/${S.obj}/motion_blur/${f}?v=${encodeURIComponent(base)}&strength=${s}&shutter=${sh}`, f);
   }
 
   function buildPanes() {
@@ -2483,12 +2673,15 @@
       const base = (S.info && S.info.vitmatte_base) || 'matanyone';
       const bs = $('st4BaseSel'); if (bs && document.activeElement !== bs) bs.value = base;
       // user rule 2026-10-16: a base whose stage has no model (and no result) cannot be chosen
+      // bug 2026-10-17: also a base whose stage has no result yet (MatAnyone / VideoMaMa not computed) is not offered
       const mm = (S.info && S.info.models_missing) || {};
+      const noRes = { matanyone: `najpierw etap ${ST.MATANYONE} MatAnyone („▶ Przelicz MatAnyone”)`,
+                      videomama: `najpierw etap ${ST.VIDEOMAMA} VideoMaMa („▶ Policz VideoMaMa”)` };
       if (bs) for (const o of bs.options) {
-        const off = o.value !== 'core' && !!mm[o.value] && !runs[o.value];
+        const off = o.value !== 'core' && !runs[o.value];
         if (o.dataset.t == null) o.dataset.t = o.title;
         o.disabled = off && o.value !== bs.value;
-        o.title = off ? mm[o.value] : o.dataset.t;
+        o.title = off ? (mm[o.value] || noRes[o.value] || o.dataset.t) : o.dataset.t;
       }
       const vs = stageState('vitmatte');
       const res = runs.vitmatte ? ` · wynik ViTMatte: ${runs.vitmatte} ${vs.state === 'done' ? '✔' : '↻ ' + (vs.why || '')}` : '';
@@ -2771,6 +2964,8 @@
       loadRuns().catch(() => {}); renderStageInfo(); renderMbPalette();
     }));
     $('ePv').addEventListener('change', () => { S.edgePv = $('ePv').checked; if (S.edgePv && S.mbPv) { S.mbPv = false; renderMbPalette(); } S.epvParams = edgePvParams(); renderEdgePalette(); V().render(); });
+    $('epStagePv').addEventListener('click', () => stagePreview('matanyone', 'epStagePv'));
+    $('vmStagePv').addEventListener('click', () => stagePreview('videomama', 'vmStagePv'));
     $('epCompute').addEventListener('click', () => {
       const b = S.stage === ST.MATANYONE ? $('st3Ma') : $('st4Final');
       if (!b) return;
@@ -2781,11 +2976,32 @@
     // px sliders: moving one switches a legacy object (×scale / shift) to the px mode – scale 1, no shift, both px saved
     const pxSave = () => setting({ band_out_px: Math.max(0, +$('o4OutV').value || 0), band_in_px: Math.max(0, +$('o4InV').value || 0),
                                    ...(S.edgeLegacy ? { band_scale: 1, shift_px: 0 } : {}) });
+    // band preview while a slider is held (user request 2026-10-17): with the preview switched off, grabbing an edge
+    // slider shows the band until it is released; then the preview is back to what was set (on / off)
+    const pvHold = (key, ids) => ids.forEach((id) => {
+      const e = $(id); if (!e) return;
+      const on = () => { S.pvDrag = key; clearTimeout(S.pvDragT); V() && V().render(); };
+      const off = () => { clearTimeout(S.pvDragT); S.pvDragT = setTimeout(() => { if (S.pvDrag === key && !S.pvHeld) { S.pvDrag = null; V() && V().render(); } }, 500); };
+      e.addEventListener('pointerdown', () => { S.pvHeld = true; on(); });
+      e.addEventListener('input', () => { on(); off(); });
+      e.addEventListener('change', off);
+    });
+    window.addEventListener('pointerup', () => { if (S.pvHeld) { S.pvHeld = false; clearTimeout(S.pvDragT); S.pvDragT = setTimeout(() => { S.pvDrag = null; V() && V().render(); }, 250); } });
+    pvHold('edge', ['o4Out', 'o4In', 'o4OutV', 'o4InV']);
+    pvHold('vmm', ['vmReachS', 'vmReach', 'vmInsetS', 'vmInset', 'vmFeatherS', 'vmFeather']);
+    pvHold('ltx', ['lx6RegionS', 'lx6Region', 'lx6SoftS', 'lx6Soft', 'lx6ErodeS', 'lx6Erode']);
     for (const id of ['o4Out', 'o4In']) {
       $(id).addEventListener('input', () => { $(`${id}V`).value = $(id).value; S.edgePxTouched = true; epvLive(); });
       $(id).addEventListener('change', pxSave);
       $(`${id}V`).addEventListener('input', () => { $(id).value = $(`${id}V`).value; S.edgePxTouched = true; epvLive(); });
       $(`${id}V`).addEventListener('change', () => { const v = $(`${id}V`).value; if (v !== '' && isFinite(+v) && +v >= 0) pxSave(); });
+    }
+    {   // feather of the core inset (user request 2026-10-17): saved on release, used by „▶ Podgląd klatek” / „Run”
+      const featherSave = () => { const v = +$('o4FeatherV').value; if (isFinite(v) && v >= 0) setting({ band_in_feather_px: v }); };
+      $('o4Feather').addEventListener('input', () => { $('o4FeatherV').value = $('o4Feather').value; });
+      $('o4Feather').addEventListener('change', featherSave);
+      $('o4FeatherV').addEventListener('input', () => { $('o4Feather').value = $('o4FeatherV').value; });
+      $('o4FeatherV').addEventListener('change', featherSave);
     }
     $('o4Smooth').addEventListener('change', () => setting({ temporal_smoothing: $('o4Smooth').value }));
     $('o4MaScale').addEventListener('change', () => setting({ ma_scale_mode: $('o4MaScale').value }));
@@ -2853,11 +3069,6 @@
     $('lx6Mask').addEventListener('change', (e) => { ltxLive(); ltxSave({ mask_source: e.target.value }); });
     $('lxPvBand').addEventListener('change', (e) => { ltxPvSet('band', e.target.checked); V().render(); });
     $('lxPvAlpha').addEventListener('change', (e) => { ltxPvSet('alpha', e.target.checked); V().render(); });
-    $('lx6Refinish').addEventListener('click', () => run('lx6Refinish', async () => {
-      const d = await api('POST', `/api/object/${S.obj}/ltx/refinish`);
-      clearOverlays(); await loadStages(); await loadRuns().catch(() => {}); showRun(d.run); await loadLtx(); renderLtxPalette();
-      status(`Wersja ${d.run} (LTX z surowej alfy, bieżące suwaki – bez liczenia modelu)`, 'ok');
-    }));
     $('lx6Run').addEventListener('click', () => run('lx6Run', async () => {
       status('LTX-2.5 Alpha-Gen… (pierwsza paczka ładuje model 22B – kilka minut)');
       await ensurePointsSaved();
@@ -2877,24 +3088,19 @@
     const vmmLive = () => { clearTimeout(S.vmmTimer); S.vmmTimer = setTimeout(() => { S.vmmPv = vmmPvParams(); V().render(); }, 200); };
     const vmmSave = (body) => vmmSetting(body).catch((er) => status(`Błąd: ${er.message}`, 'err'));
     $('vmBase').addEventListener('change', (e) => { vmmLive(); vmmSave({ base: e.target.value }); });
-    for (const [id, k] of [['vmReach', 'reach_px'], ['vmProt', 'protect_px']]) {
-      const manual = () => { if (k === 'protect_px') { S.vmmProtAuto = false; $('vmProtAuto').classList.remove('on'); } };
-      $(`${id}S`).addEventListener('input', () => { $(id).value = $(`${id}S`).value; manual(); vmmLive(); });
-      $(`${id}S`).addEventListener('change', () => vmmSave({ [k]: +$(id).value }));
-      $(id).addEventListener('input', () => { $(`${id}S`).value = $(id).value; manual(); vmmLive(); });
-      $(id).addEventListener('change', () => { const v = +$(id).value; if (isFinite(v) && v >= 0) vmmSave({ [k]: v }); });
+    // saving one of them saves the three together (inset_px present = the unified composition)
+    const vmmEdgeSave = () => vmmSave({ reach_px: +$('vmReach').value || 0, inset_px: +$('vmInset').value || 0, feather_px: +$('vmFeather').value || 0 });
+    for (const id of ['vmReach', 'vmInset', 'vmFeather']) {
+      $(`${id}S`).addEventListener('input', () => { $(id).value = $(`${id}S`).value; vmmLive(); });
+      $(`${id}S`).addEventListener('change', vmmEdgeSave);
+      $(id).addEventListener('input', () => { $(`${id}S`).value = $(id).value; vmmLive(); });
+      $(id).addEventListener('change', () => { const v = +$(id).value; if (isFinite(v) && v >= 0) vmmEdgeSave(); });
     }
-    $('vmProtAuto').addEventListener('click', () => { S.vmmProtAuto = true; vmmLive(); vmmSave({ protect_auto: true }); });
     $('vmSide').addEventListener('change', (e) => vmmSave({ max_side: +e.target.value }));
     $('vmBatch').addEventListener('change', (e) => vmmSave({ batch: +e.target.value }));
     $('vmOverlap').addEventListener('change', (e) => vmmSave({ overlap: +e.target.value }));
     $('vmPvBand').addEventListener('change', (e) => { vmmPvSet('band', e.target.checked); V().render(); });
     $('vmPvAlpha').addEventListener('change', (e) => { vmmPvSet('alpha', e.target.checked); V().render(); });
-    $('vmRefinish').addEventListener('click', () => run('vmRefinish', async () => {
-      const d = await api('POST', `/api/object/${S.obj}/videomama/refinish`);
-      clearOverlays(); await loadStages(); await loadRuns().catch(() => {}); showRun(d.run); await loadVmm(); renderVmmPalette();
-      status(`Wersja ${d.run} (VideoMaMa z surowej alfy, bieżące suwaki – bez liczenia modelu)`, 'ok');
-    }));
     $('vmRun').addEventListener('click', () => run('vmRun', async () => {
       status('VideoMaMa… (pierwsza paczka ładuje model – ok. 10–30 s)');
       await ensurePointsSaved();
@@ -2973,6 +3179,9 @@
       const v = $('st4BaseSel').value;
       await api('PUT', `/api/object/${S.obj}/settings`, { vitmatte_base: v });
       await loadStages();
+      // the frame preview and the cut-out follow the new base at once (user report 2026-10-17)
+      if (window.MD_ZONES && window.MD_ZONES.refreshPreview) window.MD_ZONES.refreshPreview(true);
+      V().render();
       status(`Baza ViTMatte: ${v === 'core' ? 'maska 1+2 (etapy ' + ST.SAM3 + ' + ' + ST.BRUSH + ')' : 'MatAnyone (etap ' + ST.MATANYONE + ')'} – „Zastosuj na ujęcie” zrobi wynik na tej bazie (drugi wynik zostaje do porównania)`, 'ok');
     }));
     $('st4CmpShowA').addEventListener('click', () => cmpShow('a'));
@@ -3248,6 +3457,22 @@
     window.addEventListener('resize', () => renderLoadBar());
     window.addEventListener('md-plate', (e) => setAuxMode(e.detail.plate !== 'beauty'));
     window.addEventListener('md-work-area', () => { const o = $('e5Scope') && $('e5Scope').querySelector('option[value="work_area"]'); if (o) o.textContent = `work area (${window.MD_WA.label()})`; loadStages().catch(() => {}); });
+    // cut-out on a background (user request 2026-10-17): band / alpha previews off when entering it (they look like an
+    // error over the cut-out), what the user ticks there is shown; leaving the view restores the previous state
+    window.addEventListener('md-compare', (e) => {
+      if (e.detail.covers) {
+        S.pvBeforeComp = { edge: S.edgePv, vb: vmmPvGet('band', true), va: vmmPvGet('alpha', true), lb: ltxPvGet('band', true), la: ltxPvGet('alpha', true),
+                           xe: expPvGet('edge', true), fl: !!S.flicker };
+        S.edgePv = false; vmmPvSet('band', false); vmmPvSet('alpha', false); ltxPvSet('band', false); ltxPvSet('alpha', false);
+        expPvSet('edge', false); S.flicker = false;
+      } else if (S.pvBeforeComp) {
+        const b = S.pvBeforeComp; S.pvBeforeComp = null;
+        S.edgePv = b.edge; vmmPvSet('band', b.vb); vmmPvSet('alpha', b.va); ltxPvSet('band', b.lb); ltxPvSet('alpha', b.la);
+        expPvSet('edge', b.xe); S.flicker = b.fl;
+      }
+      if (window.MD_ZONES && window.MD_ZONES.compareMode) window.MD_ZONES.compareMode(e.detail.covers);
+      renderEdgePalette(); renderVmmPalette(); renderLtxPalette(); renderExpPalette(); if (V()) V().render();
+    });
     window.addEventListener('md-project', () => { S.projectGen = (S.projectGen || 0) + 1; clearOverlays(); S.obj = null; refreshList().then(() => { setAuxMode((V().activePlate || 'beauty') !== 'beauty'); }); });
     window.addEventListener('matte-job-finished', (e) => {
       if (!S.obj) return;

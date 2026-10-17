@@ -10,6 +10,10 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/latest)
+
+Windows 10 / 11 · karta NVIDIA · `MatteDesk-<wersja>-setup.exe` z [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
+
 [English](README.md) · **Polski** · język interfejsu: domyślnie angielski, 🌐 przełącznik na polski w nagłówku
 
 Wersja: plik [`VERSION`](VERSION) (widoczna też w lewym górnym rogu UI) · historia: [CHANGELOG.md](CHANGELOG.md)
@@ -143,7 +147,8 @@ dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej 
 | Obszar | Status |
 |---|---|
 | 🩺 **Doktor + instalator** (od v0.1) | ✅ działa: wykrywa braki, **instaluje** węzły i modele z paskiem postępu, otwiera się sam przy starcie |
-| 🔀 **ComfyUI Desktop 2 / ComfyUI z gita** | ✅ autodetekcja folderów, modeli i portu; przełącznik w Doktorze; opcja wspólnych modeli |
+| 📦 **Instalator Windows** (od v0.31) | ✅ jeden plik setup: wbudowany Python, skrót w menu Start / na pulpicie otwierający okno aplikacji, deinstalacja; pyta, czy masz ComfyUI, inaczej pobiera ComfyUI portable; sprawdzanie aktualizacji przy starcie |
+| 🔀 **ComfyUI Desktop 2 / portable / z gita** | ✅ autodetekcja folderów, modeli i portu; przełącznik w Doktorze; opcja wspólnych modeli |
 | 🏷 **Wersjonowanie** | ✅ `VERSION`, znacznik w UI, `start_v<wersja>.bat`, `CHANGELOG.md`, `tools/bump_version.py` |
 | 🩹 Kontrola i naprawa plate'ów | ✅ w kodzie i w UI (etap 0) |
 | 🧰 Wyrównanie, deflicker, kamera 2D | ✅ w kodzie; testy na prawdziwych ujęciach w toku |
@@ -190,7 +195,7 @@ Nie instaluje: samego ComfyUI (gdy go brak, Doktor pokazuje pozycję „ComfyUI 
 |---|---|
 | System | Windows 10 / 11 |
 | GPU | NVIDIA (testowane na RTX 4090 24 GB; przy 12 GB MatAnyone2 wymaga łatki VRAM – Doktor o tym powie) |
-| Oprogramowanie | **ComfyUI Desktop** (lub ComfyUI z gita) – instalujesz sam; **Python 3.11** instaluje `start_v….bat`; **ffmpeg** i **Git** instaluje Doktor |
+| Oprogramowanie | **ComfyUI** (Desktop, portable albo z gita) – instalator może sam pobrać ComfyUI portable; **Python** jest w instalatorze (ze źródeł: `start_v….bat` instaluje Pythona 3.11); **ffmpeg** i **Git** instaluje Doktor |
 | Miejsce | ok. 3 GB na modele + dużo na dane ujęć (zalecane ≥ 50 GB wolnego) |
 
 Ręcznie instalujesz tylko **ComfyUI** (Desktop – zalecane – albo z gita). **Python 3.11** instaluje `start_v<wersja>.bat` przy pierwszym starcie
@@ -200,6 +205,37 @@ Git jest potrzebny Doktorowi do węzłów z GitHuba – do pobrania samego Matte
 ---
 
 ## 🚀 Instalacja
+
+### Instalator Windows (zalecane)
+
+1. Pobierz **`MatteDesk-<wersja>-setup.exe`** z [Releases](https://github.com/fishfinger44/MatteDesk/releases) i uruchom.
+   Instaluje się tylko dla Ciebie (bez uprawnień administratora) do `%LOCALAPPDATA%\Programs\MatteDesk`, z własnym Pythonem
+   i wszystkimi zależnościami (nic nie trafia do systemowego Pythona, ta część nie potrzebuje internetu).
+2. **„Skąd MatteDesk ma wziąć ComfyUI?”**
+   - **Pobierz ComfyUI portable** (domyślnie) → instalator pobierze oficjalne **ComfyUI portable** (NVIDIA, ok. 2 GB do pobrania,
+     ok. 6,5 GB na dysku) do wybranego folderu – ze wznawianiem i sprawdzeniem SHA-256. Rozbudowujesz go potem normalnie (ComfyUI-Manager, modele).
+   - **Mam już ComfyUI** → MatteDesk sam go znajdzie – ComfyUI Desktop, paczkę portable albo ComfyUI z gita (działający – z jego
+     portem i Pythonem). Modele zostają tam, gdzie są. Tylko gdy nie znajdzie, wskaż folder (pole opcjonalne).
+   - **Później** → ustawisz to w Doktorze (wybierz przy aktualizacji instalacji, która ma już ustawione ComfyUI).
+3. Uruchom **MatteDesk** z menu Start albo z pulpitu: otwiera się we własnym oknie (tryb aplikacji Edge, bez paska adresu),
+   a serwer startuje w tle. Zamknięcie okna zatrzymuje MatteDesk (gdy coś się liczy – najpierw pyta).
+4. **Doktor** otworzy się sam i zainstaluje nasze węzły i modele w Twoim ComfyUI (krok 4 niżej), potem restart ComfyUI.
+
+**Aktualizacje:** przy starcie MatteDesk sprawdza (najwyżej raz dziennie), czy w Releases jest nowsza wersja, i pokazuje krótką
+listę zmian z linkiem do pełnego changelogu: **Zaktualizuj** pobiera nowy setup i go uruchamia (ustawienia zostają), **Później**
+albo „nie przypominaj o tej wersji”. Można wyłączyć w Doktorze.
+**Deinstalacja:** Ustawienia Windows → Aplikacje → MatteDesk. Usuwa program i jego ustawienia; Twoje ujęcia i ComfyUI (także
+portable pobrane przez instalator) zostają.
+
+<details>
+<summary><b>Budowanie instalatora samemu</b></summary>
+
+Potrzebny Inno Setup 6 (`winget install JRSoftware.InnoSetup`) i git. `python tools/build_installer.py` → `dist/MatteDesk-<wersja>-setup.exe`:
+publiczna kopia zacommitowanego kodu, Python 3.11 (python-build-standalone, z tkinterem) + `requirements.txt`, `7zr.exe`; pobrania
+sprawdzane SHA-256. Skrypt instalatora: `installer/MatteDesk.iss`.
+</details>
+
+### Ze źródeł (git)
 
 **1. ComfyUI Desktop.** Zainstaluj go ([docs.comfy.org](https://docs.comfy.org/installation/desktop/overview)) i uruchom raz.
 Narzędzie samo znajdzie jego foldery i port (zwykle 8188), a później samo uruchomi ComfyUI przy starcie MatteDesk.
@@ -225,9 +261,11 @@ i otwiera http://127.0.0.1:8765. Zamknięcie okna konsoli zatrzymuje serwer.
 **6. Otwórz ujęcie.** Przycisk **📁 Projekt** → manifest ujęcia albo plik wideo / folder sekwencji (kreator utworzy projekt).
 
 <details>
-<summary><b>ComfyUI z gita zamiast Desktopa</b></summary>
+<summary><b>ComfyUI portable albo z gita zamiast Desktopa</b></summary>
 
-W Doktorze wybierz u góry **„ComfyUI z gita”**, podaj folder z `main.py` i port. Opcja **„modele wspólne z Desktopem”** każe
+W Doktorze wybierz u góry **„ComfyUI z gita / portable”**, podaj folder z `main.py` i port (paczka portable:
+`ComfyUI_windows_portable\ComfyUI`; MatteDesk rozpoznaje `python_embeded` obok, instaluje wymagania węzłów tym Pythonem
+i uruchamia ComfyUI tak jak `run_nvidia_gpu.bat`). Opcja **„modele wspólne z Desktopem”** każe
 pobierać wagi do jednego folderu – wtedy ComfyUI z gita musi wskazywać go w swoim `extra_model_paths.yaml`.
 Przyciski „Zainstaluj” działają na aktywnym ComfyUI. Ścieżki obu wariantów są zapisane osobno w `config.local.json`
 (plik tylko dla tego komputera, poza gitem; wzór: `config.local.example.json`).
@@ -262,11 +300,11 @@ Po zmianach w interfejsie odśwież przeglądarkę (Ctrl+F5).
 **Dalej**
 - 🐧 **Wersje na Linuxa i macOS** – skrypt startowy, instalator i Doktor bez założeń Windowsa.
 - 🌐 **ComfyUI na innej maszynie w LAN-ie** – MatteDesk na laptopie / Linuxie, ComfyUI na dowolnej maszynie z GPU w sieci.
-- 📦 **Instalator jednym kliknięciem** z przenośnym ComfyUI i profilem „lite” dla kart 8 GB.
+- 🪶 **Profil „lite” dla kart 8 GB** – mniejsze modele / kadry dobierane przez instalator i Doktora.
 - 🎬 **Eksport do After Effects** (maski + comp).
 - 🗺 **Mapa drogowa specyfikacji** – głębia (E1e), kadrowanie i obiekty (E2–E3b), klucze i propagacja (E4), QA i dokładność krawędzi (E5–E5b), eksport i kontrakt danych (E6).
 - 🌍 **Generalizacja (E7)** – ujęcia bez backlitu i wideo 8-bit z człowiekiem (reklamy), bez zmian w kodzie.
-- 🧙 **Dokończenie instalatora** – Doktor już instaluje węzły i modele; zostaje instalacja samego ComfyUI (z gita), węzłów DepthCrafter i MiniMax-Remover, sumy kontrolne i wznawianie pobierania, a na końcu kreator pierwszego uruchomienia.
+- 🧙 **Dokończenie instalatora** – węzły DepthCrafter i MiniMax-Remover w „Zainstaluj wszystkie” i kreator pierwszego uruchomienia.
 - 💬 **Polecenia tekstowe po polsku** (opcjonalnie) – „dodaj / usuń X”, tłumaczone na frazę dla SAM3.
 
 **Osobne narzędzia na wspólnym rdzeniu** *(nie budowane bez decyzji)*

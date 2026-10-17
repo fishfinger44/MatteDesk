@@ -24,6 +24,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+# prompts interrupted by "Przerwij" (process-wide): a node without an interrupt check keeps running them
+INTERRUPTED_PROMPTS: set = set()
+
 logger = logging.getLogger("matte_desk.comfy")
 
 
@@ -110,6 +113,18 @@ class ComfyClient:
         endpoint = f"/object_info/{node_class}" if node_class else "/object_info"
         status, data = self._request(endpoint, timeout=15.0)
         return data if status == 200 and isinstance(data, dict) else None
+
+    def busy_error(self) -> Optional[str]:
+        """None when Comfy's queue is empty, else the message for the user. A queue still running a prompt we interrupted
+        ("Przerwij") = an older node that does not check the interrupt finishes its pass first."""
+        q = self.get_queue() or {}
+        if not q.get("busy"):
+            return None
+        running = {p[1] for p in q.get("running", []) if isinstance(p, (list, tuple)) and len(p) > 1}
+        if running & INTERRUPTED_PROMPTS:
+            return ("ComfyUI kończy jeszcze przerwane wcześniej zadanie (węzeł nie zatrzymuje się w trakcie przebiegu) – "
+                    "poczekaj, aż skończy, albo zrestartuj ComfyUI; Doktor → zaktualizuj nasze węzły (przerywanie od razu)")
+        return "ComfyUI zajęte – poczekaj, aż skończy inne zadanie"
 
     def get_queue(self) -> Dict[str, Any]:
         """Returns {'running': [...], 'pending': [...]}."""
@@ -272,6 +287,7 @@ class ComfyClient:
             self._request("/queue", method="POST", data={"delete": [prompt_id]})
             if prompt_id in running:
                 self._request("/interrupt", method="POST", data={})
+                INTERRUPTED_PROMPTS.add(prompt_id)
         except Exception as e:  # Comfy gone: nothing to stop there
             logger.warning("cancel_prompt %s: %s", prompt_id, e)
 

@@ -73,7 +73,9 @@
   // band preview switch of the palette (user request 2026-10-16, like the MatAnyone palette): remembered in this browser
   const bandPvGet = () => { try { return localStorage.getItem('md_zone_bandpv') !== '0'; } catch (e) { return true; } };
   const bandPvSet = (on) => { try { localStorage.setItem('md_zone_bandpv', on ? '1' : '0'); } catch (e) { /* storage blocked */ } };
-  const isOutline = (z) => !!(z && z.params && z.params.region === 'outline');   // zone = band around the whole core minus exclusions
+  const isOutline = (z) => !!(z && z.params && z.params.region === 'outline');
+  // any painted key (exclusion / background stroke)? – engine/zones.py outline_without_drawing on the server
+  const hasDrawing = (z) => [z, ...Object.values(z.keys || {})].some((k) => k && ((k.polygon || []).length || (k.strokes || []).length || (k.bg_strokes || []).length));   // zone = band around the whole core minus exclusions
   const pval = (z, k) => (z && z.params && z.params[k] != null ? z.params[k] : PARAM_DEF[k]);
   const inZoneFlow = () => !!(H && obj() && !S().auxMode && S().stage === H.ST.VITMATTE);
   const curFrame = () => V().currentFrame;
@@ -140,8 +142,8 @@
       <div class="zp-pv"><label class="chk" title="Przerywany obrys obszaru ViTMatte (pas, w którym liczy) i podgląd „Wcięcie w rdzeń” przy przeciąganiu. Wyłącz, żeby oglądać sam wynik"><input type="checkbox" id="zpBandPv" title="Podgląd pasa ViTMatte na obrazie (wł. / wył.)"> 👁 podgląd pasa</label>
         <label class="chk" title="Zielona alfa podglądu strefy na obrazie (w wycięciu „Na tle” podgląd zostaje – to jest wynik)"><input type="checkbox" id="zpAlphaPv" title="Zielona alfa podglądu strefy (wł. / wył.)"> 👁 alfa strefy</label></div>
       <div class="zp-none" id="zpNone"><span class="muted">Brak aktywnej strefy „matte”.</span>
-        <button type="button" class="btn btn-primary btn-sm" id="zpNewPaint" title="Nowa strefa ViTMatte: namaluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń). Obszar idzie za obiektem (CoTracker, lokalnie); poprawka pędzlem w dowolnej klatce = klucz. Części obiektu (np. dłoń) są z obszaru wycinane same">🖌 Maluj obszar włosów (ViTMatte)</button>
-        <button type="button" class="btn btn-secondary btn-sm" id="zpNewOutline" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu (preset włosy). Potem zaznacz miejsca BEZ włosów tego obiektu (twarz, szyja, skóra) – ViTMatte ich nie liczy. Dłoń / obiekt z przodu: ustaw go w kolejności PRZED tym obiektem (holdout)">＋ Strefa ViTMatte: cały obrys</button>
+        <button type="button" class="btn btn-primary btn-sm" id="zpNewOutline" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu (preset włosy). Potem zaznacz miejsca BEZ włosów tego obiektu (twarz, szyja, skóra) – ViTMatte ich nie liczy. Dłoń / obiekt z przodu: ustaw go w kolejności PRZED tym obiektem (holdout)">＋ Strefa ViTMatte: cały obrys</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="zpNewPaint" title="Nowa strefa ViTMatte: namaluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń). Obszar idzie za obiektem (CoTracker, lokalnie); poprawka pędzlem w dowolnej klatce = klucz. Części obiektu (np. dłoń) są z obszaru wycinane same">🖌 Maluj obszar włosów (ViTMatte)</button>
         </div>
       <div class="zone-tune" id="z4Tune">
         <div class="zone-tune-sec" id="z4AreaSec"><span class="zp-sub">Obszar ViTMatte</span>
@@ -156,6 +158,7 @@
           <div class="zp-hint" id="z4RegionHint"></div>
           <label class="zone-slider" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="10" max="120" step="2" title="Jak daleko poza obrys rdzenia SAM3 liczy ViTMatte (px plate'u). Podgląd na masce przy przeciąganiu: żółte = pas ViTMatte"><b id="z4OutV"></b></label>
           <label class="zone-slider">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="30" step="1" title="Ile px w głąb rdzenia SAM3 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px. Podgląd na masce przy przeciąganiu: niebieskie = pewne (1), żółte = pas, o którym decyduje ViTMatte. 0–2 = twardy obrys SAM3"><b id="z4InsetV"></b></label>
+          <label class="zone-slider">Wtopienie wcięcia <input type="range" id="z4Feather" min="0" max="24" step="1" title="Na ilu px wynik ViTMatte przenika się z bazą (rdzeniem) przy granicach obszaru strefy – miękkie wtopienie wcięcia zamiast twardego przejścia. Działa na żywo w podglądzie (bez modelu) i przy „Zastosuj”. Domyślnie 8 px"><b id="z4FeatherV"></b></label>
           <div class="zp-excl" id="z4ExclRow"><span class="muted" title="Maski innych policzonych obiektów (alpha aktywnej wersji, bez niej rdzeń) wycinane z pasa ViTMatte – zostaje tam wynik bazowy. Dla części tego samego obiektu (twarz, szyja). Obiekt z przodu (dłoń) lepiej ustawić w kolejności przed tym obiektem: holdout = alfa 0 pod nim, a ViTMatte liczy włosy aż do jego krawędzi (CLIP2_A v069 vs v067)">Wyklucz obiekty</span><div id="z4Excl" class="zp-excl-list"></div></div></div>
         <div class="zone-tune-sec" id="z4TempSec"><span class="zp-sub">Wygładzanie w czasie</span>
           <label>Tryb<select id="z4Temporal" class="form-input" title="Wygładzanie alfy ViTMatte w czasie (cała strefa, przy „Zastosuj”). Średnia po przepływie: najpierw czerń / biel w każdej klatce, potem średnia ważona z ±promień klatek dopasowanych przepływem – śmieć z jednej klatki nie rozmazuje się na sąsiednie (CLIP2_A: −16 % / −18 % migotania)">${TEMPORAL.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></label>
@@ -180,6 +183,7 @@
           <button class="btn btn-ghost btn-xs" id="z4TuneReset" title="Przywróć wygładzanie i wykończenie z presetu strefy">↺ z presetu</button></div>
         <div class="zp-btns">
           <button type="button" class="btn btn-primary btn-sm" id="z4PvFrame" title="Policz ViTMatte w tej klatce z bieżącymi ustawieniami i wykluczeniami (bez wygładzania w czasie – ono działa przy „Zastosuj”)">▶ Przelicz klatkę</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="zpStagePv" title="Policz ViTMatte na wybranej bazie tylko na kilku klatkach wokół bieżącej (±2 kl.) – szybkie sprawdzenie ustawień przed długim liczeniem całości. To NIE jest wynik etapu: nic się nie zapisuje jako wersja i nic się nie odblokowuje. Modele czasowe dostają mniej kontekstu niż w pełnym przebiegu – krawędź może się trochę różnić">👁 Podgląd klatek</button>
           <button type="button" class="btn btn-secondary btn-sm" id="zpApply" title="Policz strefę na całym ujęciu (nowa wersja)">✚ Zastosuj na ujęcie</button></div>
       </div>
     </div>`;
@@ -300,7 +304,11 @@
       const ap = $(id); if (!ap) continue;
       if (ap.dataset.t0 == null) ap.dataset.t0 = ap.title;   // the button's own tooltip, back when unlocked
       ap.disabled = !Z.list.some((x) => x.enabled) || lock.state === 'locked';
-      ap.title = lock.state === 'locked' ? `Baza ViTMatte niegotowa – ${lock.why || 'najpierw etap ' + H.ST.MATANYONE + ' albo baza = maska 1+2'}` : ap.dataset.t0;
+      const vPrev = S().info && S().info.stage_runs && S().info.stage_runs.vitmatte;   // „again” when there is a result (2026-10-17)
+      if (ap.dataset.l0 == null) ap.dataset.l0 = ap.textContent;
+      ap.textContent = vPrev ? '✚ Zastosuj ponownie' : ap.dataset.l0;
+      ap.title = lock.state === 'locked' ? `Baza ViTMatte niegotowa – ${lock.why || 'najpierw etap ' + H.ST.MATANYONE + ' albo baza = maska 1+2'}`
+        : (vPrev ? `Policz strefy od nowa – nowa wersja zastąpi wynik etapu ${vPrev} (zostaje na liście wersji)` : ap.dataset.t0);
     }
   }
 
@@ -343,6 +351,10 @@
     set('z4TRadius', 'temporal_radius', (v) => `${v}`);
     if (!busy('z4Inset')) $('z4Inset').value = Math.max(+pval(z, 'force_core_erode_px'), +pval(z, 'fg_erode_px'));
     $('z4InsetV').textContent = `${$('z4Inset').value} px`;
+    if ($('z4Feather')) {
+      if (!busy('z4Feather')) $('z4Feather').value = z && z.params && z.params.inset_feather_px != null ? z.params.inset_feather_px : 8;
+      $('z4FeatherV').textContent = `${$('z4Feather').value} px`;
+    }
     $('z4TScale').checked = +pval(z, 'temporal_scale') > 1;
     set('z4Black', 'alpha_black', (v) => v.toFixed(2));
     set('z4BlackAfter', 'alpha_black_after', (v) => v.toFixed(2));
@@ -528,6 +540,7 @@
   function setActive(zid) {
     Z.active = zid;
     Z.preview = null;
+    Z.inset = null;   // the slider band belongs to the previous zone
     renderList();
     const z = activeMatte();
     if (z && z.prompt) api('POST', `/api/object/${obj()}/zones/interpret`, { prompt: z.prompt }).then((d) => { Z.plan = { ...d, f: null }; renderPlan(d.plan, null); }).catch(() => renderPlan(null));
@@ -542,9 +555,12 @@
       const d = await api('PATCH', `/api/object/${obj()}/zones/${zid}`, body);
       replaceZone(d.zone, d.status);
       renderList();
-      status(`Strefa ${zid}: ${what || d.changed.join(', ')} – etap ${H.ST.VITMATTE} ViTMatte do przeliczenia („Zastosuj na ujęcie”)`, 'ok');
+      // the model runs only on demand (user rule 2026-10-17: sliders never start the model – it loads the system):
+      // „▶ Przelicz klatkę” / „👁 Podgląd klatek” / a change of the ViTMatte base; finish sliders stay live without it
+      const pvNote = !opts.noPreview && Z.active === zid ? ' · podgląd modelu: „▶ Przelicz klatkę” albo „👁 Podgląd klatek”' : '';
+      status(`Strefa ${zid}: ${what || d.changed.join(', ')} – etap ${H.ST.VITMATTE} ViTMatte do przeliczenia („Zastosuj na ujęcie”)${pvNote}`, 'ok');
       H.loadStages().catch(() => {});
-      if (!opts.noPreview && Z.active === zid && (keyFrames(d.zone).includes(curFrame()) || isOutline(d.zone))) schedulePreview(curFrame(), 0);
+      if (opts.preview && Z.active === zid && (keyFrames(d.zone).includes(curFrame()) || isOutline(d.zone))) schedulePreview(curFrame(), 0);
       return d;
     } catch (e) { status(`Strefa ${zid} NIE zmieniona: ${e.message}`, 'err'); toast(e.message, 5000); throw e; }
   }
@@ -749,7 +765,16 @@
     const z = activeMatte(); if (!z || !inZoneFlow()) return;
     const f = curFrame();
     if ((keyFrames(z).includes(f) && !isOutline(z)) || (Z.regionCache[z.zone_id] || {})[f]) return;   // outline: the band also on keys
-    frameTimer = setTimeout(() => { if (curFrame() === f && !document.body.classList.contains('job-busy')) regionFor(z, f, false); }, 350);
+    // no automatic CoTracker run on every frame (user rule 2026-10-17: heavy work only on a click) – the area is computed
+    // by „▶ Przelicz klatkę” / „👁 Podgląd klatek” / painting a correction, and stays cached for the frames visited
+    // „whole outline” with nothing painted: the area comes straight from the core on the server (no CoTracker, a fraction
+    // of a second) – that one still follows the frame by itself
+    const cheap = isOutline(z) && !hasDrawing(z);
+    frameTimer = setTimeout(() => {
+      if (curFrame() !== f || !bandPvGet()) return;
+      if (cheap) { if (!document.body.classList.contains('job-busy')) regionFor(z, f, false); }
+      else status(`F${f}: obszar strefy ${z.zone_id} jeszcze niepoliczony w tej klatce – „▶ Przelicz klatkę” policzy go (CoTracker) razem z podglądem`);
+    }, 350);
   }
 
   // ------------------------------------------------------------------------------------------------ preview
@@ -770,6 +795,7 @@
     try {
       const d = await api('POST', `/api/object/${obj()}/zones/${z.zone_id}/preview/${f}`);
       setPreview(z.zone_id, f, d.preview);
+      if (!(Z.regionCache[z.zone_id] || {})[f] && (isOutline(z) || !keyFrames(z).includes(f))) regionFor(z, f, false);   // the band of this frame, on demand
     } catch (e) {
       const mf = missingFront(e);
       if (mf) { frontDialog(mf, { noHoldout: () => patchZone(z.zone_id, { holdout: false }, 'bez holdoutu') }); }
@@ -800,9 +826,9 @@
     if (pv && Z.ov === 'none' && !Z.ovUserOff) setOv('alpha');   // not when the user switched the overlay off (2026-10-16)
     V().render();
   }
-  function refreshPreview() {
+  function refreshPreview(silent = false) {   // silent: called by itself (ViTMatte base changed) – no warning without a zone
     const z = activeMatte();
-    if (!z) { status('Wybierz strefę „matte” (karta) albo narysuj nową', 'warn'); return; }
+    if (!z) { if (silent !== true) status('Wybierz strefę „matte” (karta) albo narysuj nową', 'warn'); return; }
     schedulePreview(curFrame(), 0);
   }
 
@@ -855,6 +881,8 @@
   // live finish (user decision 2026-10-16): black / white / blur act AFTER the model – recomputed here from the preview's
   // raw alpha (view zone_raw) and area (zone_area: 128 = region, 255 = region ∩ core = 1), the same formula as
   // engine/zones.finish_zone_alpha (levels, Gaussian blur, only inside the region, core forced to 1); no model call
+  // the SAVED feather of the active zone (not the slider while it is dragged)
+  const featherPx = () => { const z = activeMatte(); const v = z && z.params && z.params.inset_feather_px != null ? +z.params.inset_feather_px : 8; return isFinite(v) ? Math.max(0.5, v) : 8; };
   function finVals() {
     const w = $('z4White') ? +$('z4White').value : 1;
     return { b: Math.max(0, +($('z4Black') || {}).value || 0), w: isFinite(w) && w > 0 ? w : 1, s: Math.max(0, +($('z4Blur') || {}).value || 0) };
@@ -865,7 +893,8 @@
     if (!raw || raw === 'missing' || !area || area === 'missing') return null;
     const fv = finVals();
     const pd = V().projectData; const kpx = pd && pd.plate_w ? raw.naturalWidth / pd.plate_w : 1;
-    const key = `zfin_${obj()}_${f}_${Z.preview.seq || 0}_${fv.b}_${fv.w}_${fv.s}`;
+    const fe = featherPx();
+    const key = `zfin_${obj()}_${f}_${Z.preview.seq || 0}_${fv.b}_${fv.w}_${fv.s}_${fe}`;
     const c = cachedCanvas(key, () => {
       const W = raw.naturalWidth, Hh = raw.naturalHeight;
       const cv = document.createElement('canvas'); cv.width = W; cv.height = Hh; const g = cv.getContext('2d');
@@ -893,7 +922,18 @@
       g.putImageData(out, 0, 0);
       return cv;
     });
-    return { canvas: c, key, area };
+    // feather weight inside the area (like apply_soft_override of the result): 0 at its border -> 1 after `fe` px
+    const weight = cachedCanvas(`${key}_w`, () => {
+      const W = area.naturalWidth, Hh = area.naturalHeight;
+      const cv = document.createElement('canvas'); cv.width = W; cv.height = Hh; const g = cv.getContext('2d');
+      g.drawImage(area, 0, 0); const ap = g.getImageData(0, 0, W, Hh).data;
+      const inside = new Uint8Array(W * Hh); for (let i = 0; i < inside.length; i++) inside[i] = ap[i * 4] > 64 ? 1 : 0;
+      const d = chamfer(inside, 1, W, Hh); const lim = 3 * fe * kpx;
+      const out = g.createImageData(W, Hh); const op = out.data;
+      for (let i = 0; i < inside.length; i++) { const w = inside[i] ? Math.min(1, d[i] / lim) : 0; op[i * 4] = op[i * 4 + 1] = op[i * 4 + 2] = Math.round(w * 255); op[i * 4 + 3] = 255; }
+      g.putImageData(out, 0, 0); return cv;
+    });
+    return { canvas: c, key, area, weight };
   }
   function previewMatte(f) {   // for the cut-out „Na tle” (objects.js matteFor): {canvas, key, area} of the active zone's preview
     const z = activeMatte();
@@ -952,10 +992,13 @@
           ctx.setLineDash([]);
         }
       }
-      if (Z.inset && Z.inset.f === f && bandPvGet()) {   // live "Wcięcie w rdzeń" preview while dragging (blue = sure 1, yellow = ViTMatte's band)
+      if (Z.inset && (bandPvGet() || Z.inset.live)) {   // "Pas na zewnątrz" / "Wcięcie w rdzeń" band (blue = sure 1, yellow = ViTMatte's band), any frame; while dragging also with the band preview off (2026-10-17)
         const core = H.overlayFor('core', f);
         const dist = core && core !== 'missing' ? coreDistance(core, `${obj()}_${f}`) : null;
-        if (dist) { ctx.drawImage(insetCanvas(dist, Z.inset.n, Z.inset.out || 0), 0, 0, img.width, img.height); return; }
+        if (dist) {
+          ctx.drawImage(insetCanvas(dist, Z.inset.n, Z.inset.out || 0), 0, 0, img.width, img.height);
+          if (Z.inset.live) return;   // while dragging: the band alone; after release the zone preview is drawn too
+        }
       }
       if (Z.preview && Z.preview.f === f && Z.preview.zid === z.zone_id && Z.ov !== 'none') {
         const o = obj();
@@ -1107,6 +1150,10 @@
     const body = { mode: 'add', criterion: 'matte', frame: f, polygon: [], strokes: [], bg_strokes: [], preset: 'hair', matting: 'vitmatte',
                    prompt: Z.prompt, holdout: Z.holdout, static: false, bg_static: true, params: { ...def, region: 'outline' } };
     let d;
+    // creating the zone computes its first preview (ViTMatte on this frame): say so – it looked frozen (2026-10-17)
+    status(`Tworzę strefę ViTMatte wzdłuż całego obrysu i liczę podgląd F${f} (ViTMatte, kilka sekund)…`);
+    toast(`Tworzę strefę ViTMatte wzdłuż całego obrysu i liczę podgląd F${f} (ViTMatte, kilka sekund)…`, 6000);
+    const info = $('z4PvInfo'); if (info) info.textContent = `⏳ liczę podgląd F${f} (ViTMatte)…`;
     try { d = await api('POST', `/api/object/${obj()}/zones/new?preview_frame=${f}`, body); }
     catch (e) {
       const mf = missingFront(e);
@@ -1234,21 +1281,30 @@
       $(id).addEventListener('change', () => patchTune({ [k]: +$(id).value }, `${l} ${fmt(+$(id).value)}`, { noPreview: fin }));
     });
     // live band preview on the mask while dragging "Pas na zewnątrz" / "Wcięcie w rdzeń" (blue = sure 1, yellow = ViTMatte)
-    const livePreview = () => {
+    const livePreview = (live = true) => {
       const z = activeMatte();
-      Z.inset = { f: curFrame(), n: +$('z4Inset').value, out: isOutline(z) ? +$('z4Out').value : 0 }; V().render();
+      Z.inset = { f: curFrame(), n: +$('z4Inset').value, out: isOutline(z) ? +$('z4Out').value : 0, live }; V().render();
     };
     $('z4Inset').addEventListener('input', () => { $('z4InsetV').textContent = `${$('z4Inset').value} px`; livePreview(); });
+    // feather: only the number while dragging (the live recompute of the blend weights lagged, 2026-10-17); applied to the
+    // preview cut-out once on release – no model
+    $('z4Feather').addEventListener('input', () => { $('z4FeatherV').textContent = `${$('z4Feather').value} px`; });
+    $('z4Feather').addEventListener('change', () => patchTune({ inset_feather_px: +$('z4Feather').value }, `wtopienie wcięcia ${$('z4Feather').value} px`, { noPreview: true }).then(() => V().render()));
+    // the live band of „Pas na zewnątrz” / „Wcięcie” ends with the pointer – also when no „change” comes (a click
+    // without moving, release outside the slider): it stayed on with the band preview off (2026-10-17)
+    window.addEventListener('pointerup', () => { if (Z.inset && Z.inset.live) { Z.inset.live = false; V().render(); } });
     $('z4Out').addEventListener('input', () => { $('z4OutV').textContent = `${$('z4Out').value} px`; livePreview(); });
     $('z4Inset').addEventListener('change', async () => {
       const n = +$('z4Inset').value;
       await patchTune({ fg_erode_px: n, force_core_erode_px: n }, `wcięcie w rdzeń ${n} px`);
-      Z.inset = null; if (bandPvGet() && !Z.ovUserOff) setOv('trimap'); else V().render();   // the server trimap of the recomputed preview shows the new sure core
+      // the model does not run on a slider (2026-10-17): keep the live band with the saved values (it vanished waiting
+      // for a server trimap that is no longer recomputed)
+      livePreview(false);
     });
     $('z4Out').addEventListener('change', async () => {
       const n = +$('z4Out').value;
       await patchTune({ outline_out_px: n }, `pas ViTMatte ${n} px poza obrysem`);
-      Z.inset = null; if (bandPvGet() && !Z.ovUserOff) setOv('trimap'); else V().render();
+      livePreview(false);
     });
     $('z4Region').querySelectorAll('button').forEach((b) => b.addEventListener('click', () => H.run('z4Region', () => setRegionMode(b.dataset.r))));
     $('z4Excl').addEventListener('change', (e) => {
@@ -1267,6 +1323,7 @@
     });
     $('z4PvFrame').addEventListener('click', refreshPreview);
     $('zpApply').addEventListener('click', () => H.run('zpApply', applyShot));
+    $('zpStagePv').addEventListener('click', () => window.MD_OBJ && window.MD_OBJ.stagePreview('vitmatte', 'zpStagePv'));
     $('z4TScale').addEventListener('change', () => patchTune({ temporal_scale: $('z4TScale').checked ? 2 : 1 }, $('z4TScale').checked ? 'wygładzanie ×2' : 'wygładzanie ×1'));
     $('z4TuneReset').addEventListener('click', async () => {
       const z = activeMatte(); if (!z) return;
@@ -1327,7 +1384,15 @@
   const hasKeyAt = (f) => !!zoneWithKeyAt(f);
   async function deleteKeyAt(f) { const z = zoneWithKeyAt(f); if (!z) { toast(`F${f}: brak klucza strefy`); return false; } await deleteKey(z.zone_id, f); return true; }
   window.MD_ZONES = {
-    hasKeyAt, deleteKeyAt, previewMatte,
+    hasKeyAt, deleteKeyAt, previewMatte, refreshPreview,
+    // instant band from a mask (blue = stays, yellow = the model decides): objects.js uses it for the MatAnyone band
+    // while its slider is dragged – the exact (adaptive) band comes from the server after the release (2026-10-17)
+    liveBand(maskImg, key, inPx, outPx) { const d = coreDistance(maskImg, key); return d ? insetCanvas(d, inPx, outPx) : null; },
+    compareMode(covers) {   // objects.js 'md-compare': band / zone alpha off in the cut-out view, previous state back after it
+      if (covers) { Z.beforeComp = { band: bandPvGet(), ov: Z.ov, off: Z.ovUserOff }; bandPvSet(false); if (Z.ov !== 'none') setOv('none'); }
+      else if (Z.beforeComp) { const b = Z.beforeComp; Z.beforeComp = null; bandPvSet(b.band); Z.ovUserOff = b.off; setOv(b.ov || 'none'); }
+      if ($('zpBandPv')) { $('zpBandPv').checked = bandPvGet(); $('zpAlphaPv').checked = Z.ov !== 'none'; }
+    },
     init, load, reset, draw, drawLoupe, renderLane, onFrame, wantsDraw, onDraw, undo, runDetailsHtml,
     onShow() { loadCleanplate().catch(() => {}); renderList(); onFrame(); },
     onStage() { renderLane(); renderPalette(); },

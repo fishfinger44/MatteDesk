@@ -315,6 +315,11 @@ class EnvironmentDoctor:
 
     def check_venv(self) -> CheckItem:
         venv_dir = self.repo_dir / ".venv"
+        if Path(sys.executable).resolve().parent == Path(__file__).resolve().parent / "python":
+            # Windows installer: MatteDesk's own Python next to the code, no .venv needed
+            return CheckItem(name="Virtual Environment", category="Runtime", status="ok",
+                             message="Wbudowany Python MatteDesk (instalator) – .venv niepotrzebny",
+                             details={"prefix": sys.prefix})
         in_venv = (sys.prefix != sys.base_prefix) or venv_dir.exists()
         if in_venv:
             return CheckItem(
@@ -409,10 +414,10 @@ class EnvironmentDoctor:
         if flavor == "git":
             if str(d) and (d / "main.py").exists():
                 return None
-            msg = (f"Folder ComfyUI z gita nie zawiera main.py ({d})." if str(d) else
-                   "Wybrano ComfyUI z gita, ale nie podano folderu.")
-            tip = ("Podaj u góry folder z main.py i port, albo przełącz na ComfyUI Desktop (zalecane) i zainstaluj go "
-                   "z linku niżej.")
+            msg = (f"Folder ComfyUI z gita / portable nie zawiera main.py ({d})." if str(d) else
+                   "Wybrano ComfyUI z gita / portable, ale nie podano folderu.")
+            tip = ("Podaj u góry folder z main.py (w paczce portable: ComfyUI_windows_portable\\ComfyUI) i port, albo "
+                   "przełącz na ComfyUI Desktop i zainstaluj go z linku niżej.")
         else:
             if str(d) and d.is_dir():
                 return None
@@ -472,7 +477,9 @@ class EnvironmentDoctor:
             msg = "Wykryto ComfyUI Desktop (restart i zarządzanie procesem po stronie użytkownika)"
         else:
             flavor = "git"
-            msg = "Wykryto ComfyUI z gita (katalog z main.py)"
+            from engine.comfy_portable import embedded_python
+            msg = ("Wykryto ComfyUI portable (katalog z main.py, python_embeded obok)" if embedded_python(comfy_dir)
+                   else "Wykryto ComfyUI z gita (katalog z main.py)")
 
         return CheckItem(
             name="ComfyUI Flavor",

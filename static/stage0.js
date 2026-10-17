@@ -90,6 +90,7 @@
         <span class="plate-name">${label(p.name)}</span>
         <span class="pill ${p.exists ? 'ok' : 'warn'}">${p.exists ? `${p.frame_count} kl.` : 'brak plików'}</span>
         <span class="pill ${p.proxy_count ? 'ok' : ''}" title="proxy 1920 px">${p.proxy_count ? `proxy ${p.proxy_count}` : 'bez proxy'}</span>
+        ${p.mismatch ? `<span class="pill warn" title="Inna rozdzielczość niż beauty – ten plate nie jest używany w żadnym etapie (pewnie z innego ujęcia). Podmień go albo usuń.">⚠ ${p.mismatch}</span>` : ''}
       </div>`).join('');
     $('p0Plates').querySelectorAll('.plate-row').forEach((r) => r.addEventListener('click', () => V().setActivePlate(r.dataset.p)));
 

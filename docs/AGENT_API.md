@@ -86,23 +86,29 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 `when_idle` = only when nothing is being computed.
 
 <!-- routes:begin (python tools/md.py api-doc --write) -->
-| Method | Path | Kind | Description |
+| Metoda | Ścieżka | Rodzaj | Opis |
 |---|---|---|---|
 | GET | `/api/version` | – | Running version + whether the server runs older code than on disk (the UI then asks for a restart). |
 | GET | `/api/jobs` | – | What is being computed now (status bar). |
-| GET | `/api/jobs/details` | – | 'Details' ('Szczegóły') of the running job (Z19): GPU (nvidia-smi; null without it), Comfy RAM / VRAM / queue (foreign prompts), our step with frames and ETA, Comfy state o |
-| POST | `/api/jobs/cancel` | – | 'Abort': stop the running job(s) at the next safe point; our Comfy prompt is removed / interrupted. |
+| GET | `/api/jobs/details` | – | 'Szczegóły' of the running job (Z19): GPU (nvidia-smi; null without it), Comfy RAM / VRAM / queue (foreign prompts), our step with frames and ETA, Comfy state o |
+| POST | `/api/jobs/cancel` | – | 'Przerwij': stop the running job(s) at the next safe point; our Comfy prompt is removed / interrupted. |
 | GET | `/api/doctor` | – |  |
 | GET | `/api/config/comfy` | – | Doctor: which ComfyUI is used (Desktop / from git), its folders, port and autostart. |
 | POST | `/api/config/comfy` | when_idle | Doctor's switch: ComfyUI Desktop <-> ComfyUI from git |
+| GET | `/api/update` | – | Newer MatteDesk in the public GitHub releases? (at most once a day unless force; engine/updates.py) |
+| POST | `/api/update/skip` | – |  |
+| POST | `/api/update/settings` | – |  |
+| POST | `/api/config/app_browser` | – | Where the desktop shortcut opens MatteDesk (tools/launch_app.py reads it at the next start). |
+| GET | `/api/update/progress` | – |  |
+| POST | `/api/update/install` | when_idle | Installer copy only: download the new setup, start it, then stop this server (the setup replaces the files). |
 | GET | `/api/comfy/launch` | – | State of the ComfyUI start by MatteDesk: idle / starting / running / failed (+ how / error). |
-| POST | `/api/comfy/start` | – | Doctor button "Start ComfyUI" ("Uruchom ComfyUI"): start the chosen ComfyUI (Desktop app / ComfyUI from git) in the background. |
-| GET | `/api/install/progress` | – | Live state of the running "Install" ("Zainstaluj") (step, file, done/total bytes) - the Doctor polls it for the progress bar. |
-| POST | `/api/install/{what}` | when_idle | Doctor's "Install" button (user-triggered): our Comfy node packages, third-party packs, weights, CoTracker3. |
+| POST | `/api/comfy/start` | – | Doctor button "Uruchom ComfyUI": start the chosen ComfyUI (Desktop app / ComfyUI from git) in the background. |
+| GET | `/api/install/progress` | – | Live state of the running "Zainstaluj" (step, file, done/total bytes) - the Doctor polls it for the progress bar. |
+| POST | `/api/install/{what}` | when_idle | Doctor's "Zainstaluj" button (user-triggered): our Comfy node packages, third-party packs, weights, CoTracker3. |
 | POST | `/api/project/open` | when_idle |  |
 | POST | `/api/project/new` | when_idle |  |
 | POST | `/api/dialog/pick_folder` | – |  |
-| POST | `/api/dialog/pick_file` | – | Native file picker (single image / video: target background BG, MP4 plates). |
+| POST | `/api/dialog/pick_file` | – | Native file picker (a single image / video: target background BG, MP4 plates); "" when cancelled. |
 | POST | `/api/project/inspect_working_dir` | – |  |
 | POST | `/api/project/open_or_create` | when_idle |  |
 | GET | `/api/project/recent` | – | Recently opened shot folders (config.local.json, newest first) for the project dialog. |
@@ -114,7 +120,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | DELETE | `/api/project/plate/{plate_name}` | when_idle |  |
 | GET | `/api/frame/{frame_num}` | – | Proxy JPEG of a frame |
 | GET | `/api/frame/{frame_num}/tile` | – | Z8: full-resolution crop [x, y, w, h] (plate px) of a plate frame for zoom > 100 % of the proxy – the same display conversion as the proxy |
-| GET | `/api/project/stages` | – | Stage 0 (Plates, „Plate'y”) of the shot: what exists for the stage bar / panel – plates & proxies, alignment reports of the auxiliary plates (backlit / cleanplate: the on |
+| GET | `/api/project/stages` | – | Stage 0 (Plate'y) of the shot: what exists for the stage bar / panel – plates & proxies, alignment reports of the auxiliary plates (backlit / cleanplate: the on |
 | POST | `/api/plate/align/measure` | long_job |  |
 | POST | `/api/plate/align/export_nk` | – |  |
 | POST | `/api/plate/align/apply` | long_job |  |
@@ -128,36 +134,39 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/depth/compute` | long_job |  |
 | GET | `/api/depth/report` | – |  |
 | POST | `/api/depth/export_nk` | – |  |
-| POST | `/api/object/{name}/preview_frame` | long_job (quiet) | SAM3_Detect on the crop of one frame (SPEC 6 item 2, < 3 s): quick loop before computing the shot. |
-| POST | `/api/object/{name}/points/{frame}` | long_job (quiet), object_edit | Stage 1 (Detect, „Wykryj”): the points of a frame ARE its key |
-| GET | `/api/object/{name}/edge_modes` | – | 'Edge' ('Krawędź') list (SPEC 5.5): Backlit only when a backlit plate exists |
+| POST | `/api/object/{name}/preview_frame` | long_job (quiet) | SAM3_Detect on the crop of one frame (SPEC 6 pkt 2, < 3 s): quick loop before computing the shot. |
+| POST | `/api/object/{name}/points/{frame}` | long_job (quiet), object_edit | Stage 1 (Wykryj): the points of a frame ARE its key |
+| GET | `/api/object/{name}/edge_modes` | – | 'Krawędź' list (SPEC 5.5): Backlit only when a backlit plate exists |
 | PUT | `/api/object/{name}/edge_mode` | object_edit |  |
-| GET | `/api/project/work_area` | – | Work area (AE / Nuke style, user request 2026-10-15): `range` = [first, last] or None (whole shot), `shot`, `effective` = the frames "▶▶ Recompute whole", „Prze |
+| GET | `/api/project/work_area` | – | Work area (AE / Nuke style, user request 2026-10-15): `range` = [first, last] or None (whole shot), `shot`, `effective` = the frames „▶▶ Przelicz całość”, „Prze |
 | PUT | `/api/project/work_area` | – | Stored in project.json -> work_area (the shot manifest is never written) |
 | GET | `/api/object/{name}/life` | – | Object life range (zakres życia, user request 2026-10-15): `life` = visible intervals [[a, b], ...] or None (the whole shot), `shot`, `hints` = suggestions from |
 | PUT | `/api/object/{name}/life` | object_edit | Stored in objects/<name>/object.json -> life (the shot manifest is never written) |
 | GET | `/api/object/{name}/stages` | – | Stage strip of the objects panel: done / stale / todo / locked + the next action. |
-| POST | `/api/object/{name}/compute_all` | long_job | "▶▶ Recompute whole" (user decision 2026-10-15): crops only when missing or when a user key no longer fits its crop, then the core on the whole shot (unchanged  |
+| POST | `/api/object/{name}/compute_all` | long_job | „▶▶ Przelicz całość” (user decision 2026-10-15): crops only when missing or when a user key no longer fits its crop, then the core on the whole shot (unchanged  |
 | POST | `/api/object/{name}/run` | long_job | Core SAM3 on the whole shot from the keys (7.2); intervals with unchanged inputs come from cache. |
-| POST | `/api/object/{name}/core_fix` | long_job | Stage 2 "▶▶ Apply corrections" (2026-10-15): the mask 1+2 (SAM3 core + brush corrections propagated by CoTracker3) on every frame the core covers -> core_fix/ ( |
-| POST | `/api/object/{name}/finalize` | long_job | 'Compute final' (7.3a) -> runs/v### on the work area (whole shot without one); the core must cover it |
-| GET | `/api/object/{name}/ltx` | – | Stage "LTX Alpha-Gen": the object's settings (defaults.json "ltx" <- object `ltx`), the stage result, models. |
+| POST | `/api/object/{name}/core_fix` | long_job | Stage 2 „▶▶ Zastosuj poprawki” (2026-10-15): the mask 1+2 (SAM3 core + brush corrections propagated by CoTracker3) on every frame the core covers -> core_fix/ ( |
+| POST | `/api/object/{name}/finalize` | long_job | 'Przelicz finalnie' (7.3a) -> runs/v### on the work area (whole shot without one); the core must cover it |
+| GET | `/api/object/{name}/ltx` | – | Stage „LTX Alpha-Gen”: the object's settings (defaults.json "ltx" <- object `ltx`), the stage result, models. |
 | PUT | `/api/object/{name}/ltx` | object_edit |  |
 | GET | `/api/object/{name}/ltx_preview/{frame}` | – | LTX palette (2026-10-16), live: what=band – 128 = where the LTX matte is kept, 255 = forced 1 (proxy PNG); what=alpha – the current LTX version's raw matte re-l |
-| POST | `/api/object/{name}/ltx/refinish` | long_job | "Apply sliders to result" („Zastosuj suwaki na wynik”) (2026-10-16): the current LTX version's raw mattes limited again with the saved region / mask settings -> a new version (no model run |
-| POST | `/api/object/{name}/ltx` | long_job | Stage "LTX Alpha-Gen" (user decision 2026-10-16): LTX-2.5 IC-LoRA Alpha-Gen on the work area, guided by the mask 1+2 (other objects painted out of the guide), l |
-| GET | `/api/object/{name}/videomama` | – | Stage "VideoMaMa" (2026-10-16): the object's settings (defaults.json "videomama" <- object `videomama`), the stage result, weights / nodes. |
+| POST | `/api/object/{name}/ltx/refinish` | long_job (quiet) | „Zastosuj suwaki na wynik” (2026-10-16): the current LTX version's raw mattes limited again with the saved region / mask settings -> a new version (no model run |
+| POST | `/api/object/{name}/ltx` | long_job | Stage „LTX Alpha-Gen” (user decision 2026-10-16): LTX-2.5 IC-LoRA Alpha-Gen on the work area, guided by the mask 1+2 (other objects painted out of the guide), l |
+| GET | `/api/object/{name}/videomama` | – | Stage „VideoMaMa” (2026-10-16): the object's settings (defaults.json "videomama" <- object `videomama`), the stage result, weights / nodes. |
 | PUT | `/api/object/{name}/videomama` | object_edit | Stage VideoMaMa settings of the object (base, reach / protect px, resolution, batch / overlap); protect_auto = the protect band by base again. |
 | GET | `/api/object/{name}/videomama_preview/{frame}` | – | VideoMaMa palette, live: what=band – 128 = where VideoMaMa adds, 255 = protect band (proxy PNG); what=alpha – the current VideoMaMa version's raw matte put over |
-| POST | `/api/object/{name}/videomama/refinish` | long_job | "✚ Sliders on result" („✚ Suwaki na wynik”): the current VideoMaMa version's raw mattes put over the base again with the saved base / reach / protect -> a new version (no model run). |
-| POST | `/api/object/{name}/videomama` | long_job | Stage "VideoMaMa" (user decision 2026-10-16): VideoMaMa on the work area guided by the mask 1+2, put over the base (mask 1+2 or the stage-3 result) -> runs/v### |
-| POST | `/api/object/{name}/analyze` | long_job | Stage Experiments (2026-10-16): QA + edge-correction proposals of the chosen base version (measured once). |
+| POST | `/api/object/{name}/videomama/refinish` | long_job (quiet) | „✚ Suwaki na wynik”: the current VideoMaMa version's raw mattes put over the base again with the saved base / reach / protect -> a new version (no model run). |
+| POST | `/api/object/{name}/videomama` | long_job | Stage „VideoMaMa” (user decision 2026-10-16): VideoMaMa on the work area guided by the mask 1+2, put over the base (mask 1+2 or the stage-3 result) -> runs/v### |
+| POST | `/api/object/{name}/analyze` | long_job | Stage Eksperymenty (2026-10-16): QA + edge-correction proposals of the chosen base version (measured once). |
 | GET | `/api/object/{name}/edge_recount` | – | Live count of the proposals with other thresholds (saved measurements only; nothing written). |
-| POST | `/api/object/{name}/experiment` | long_job | Stage Experiments (2026-10-16): "Recompute from this base" („Przelicz z tej bazy”) – the base version's mask -> threshold zones -> optional edge correction of the base -> edge engine -> a  |
-| POST | `/api/object/{name}/edge_fix` | long_job | 'Apply edge correction' (Z27 item 1): the former automatic second round, as a new runs/v###. |
-| GET | `/api/object/{name}/motion_blur/{frame}` | – | Stage Experiments "Alpha motion blur" (2026-10-16): preview of one frame – the version `v` (default the active one) with the object's motion blur at `strength`  |
-| POST | `/api/object/{name}/motion_blur` | long_job, object_edit | "Apply motion blur" („Zastosuj motion blur”) (stage Experiments, 2026-10-16): new runs/v### = the base version with the object's motion blur in every frame (alpha only). |
+| POST | `/api/object/{name}/experiment` | long_job | Stage Eksperymenty (2026-10-16): „Przelicz z tej bazy” – the base version's mask -> threshold zones -> optional edge correction of the base -> edge engine -> a  |
+| POST | `/api/object/{name}/edge_fix` | long_job | 'Zastosuj poprawkę krawędzi' (Z27 pkt 1): the former automatic second round, as a new runs/v###. |
+| GET | `/api/object/{name}/motion_blur/{frame}` | – | Stage Eksperymenty „Motion blur alfy” (2026-10-16): preview of one frame – the version `v` (default the active one) with the object's motion blur at `strength`  |
+| POST | `/api/object/{name}/motion_blur` | long_job, object_edit | „Zastosuj motion blur” (stage Eksperymenty, 2026-10-16): new runs/v### = the base version with the object's motion blur in every frame (alpha only). |
 | GET | `/api/object/{name}/edge_preview/{frame}` | – | Stage 3 palette: preview of the MatAnyone edge before computing – proxy PNG, 255 = mask kept (mask 1+2 + shrink / grow), 128 = adaptive band where MatAnyone dec |
+| POST | `/api/object/{name}/stage_preview/{frame}` | long_job (quiet) |  |
+| GET | `/api/object/{name}/stage_preview/{stage}` | – | {exists, stage, center, frames, stale, seconds} of the last preview of this stage. |
+| GET | `/api/object/{name}/stage_preview/{stage}/{frame}` | – | Proxy PNG of the preview alpha of `frame` (404 outside the preview window) |
 | GET | `/api/object/{name}/edge_pieces/{frame}` | – | Stage-4 overlay: contour samples of the pieces to correct in this frame, in plate px (kind halo = red / shrink, cut = blue / grow). |
 | GET | `/api/object/{name}/frame/{frame}` | – | Proxy-size PNG of the object in a frame: view=core / alpha / overlay (contour on the plate proxy) |
 | GET | `/api/object/{name}/frame/{frame}/tile` | – | Z8 / plan step 7: full-resolution crop [x, y, w, h] (plate px) of a mask of the object in `frame` as an 8-bit PNG: view=core (core/c_####.png) / key (keys/k_### |
@@ -169,21 +178,21 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/object/{name}/redo` | object_edit |  |
 | POST | `/api/object/{name}/rerun_from/{frame}` | long_job | Incremental core (7.3): only intervals whose inputs changed are recomputed (cache hash), the rest is reused. |
 | GET | `/api/object/{name}/zones` | – |  |
-| GET | `/api/zones/preset_defaults/{preset}` | – | Default engine and params of a zone preset (defaults.json) – the zone card's "↺ from preset" ("↺ z presetu"). |
+| GET | `/api/zones/preset_defaults/{preset}` | – | Default engine and params of a zone preset (defaults.json) – the zone card's "↺ z presetu". |
 | POST | `/api/object/{name}/zones/interpret` | – | Plan step 9: what the zone description means without a VLM – preset, SAM3 phrase (`fg_en`), distractors, routing multipliers, warnings; with `frame`: proposed " |
-| POST | `/api/object/{name}/zones/propose` | long_job (quiet) | Plan step 9 "Propose zone": SAM3_Detect with the prompt's subject on the crop around the core, minus the core, plus soft edge pixels outside the core -> zo |
+| POST | `/api/object/{name}/zones/propose` | long_job (quiet) | Plan step 9 „Zaproponuj strefę”: SAM3_Detect with the prompt's subject on the crop around the core, minus the core, plus soft edge pixels outside the core -> zo |
 | POST | `/api/object/{name}/zones/{zone_id}` | object_edit | Create (zone_id='new') or update a zone (SPEC 7.7) |
-| PATCH | `/api/object/{name}/zones/{zone_id}` | object_edit | Zone card (plan step 5): enable / disable, description (prompt; the previous one goes to prompt_history), preset, engine, holdout ("Compute anyway without holdout", "Licz mimo to bez holdoutu") |
+| PATCH | `/api/object/{name}/zones/{zone_id}` | object_edit | Zone card (plan step 5): enable / disable, description (prompt; the previous one goes to prompt_history), preset, engine, holdout ("Licz mimo to bez holdoutu") |
 | POST | `/api/object/{name}/zones/{zone_id}/preview/{frame}` | – | Automatic preview of the panel (plan step 5, debounce in the UI): the `matte` zone as saved, in `frame` (its key there when one exists) – nothing is written to  |
 | PUT | `/api/object/{name}/zones/{zone_id}/keys/{frame}` | object_edit | Zone key (plan step 4): the drawing of the zone in `frame` (polygon / '+' strokes / '-' strokes) |
 | DELETE | `/api/object/{name}/zones/{zone_id}/keys/{frame}` | object_edit |  |
 | GET | `/api/object/{name}/zones/{zone_id}/keys` | – |  |
 | GET | `/api/object/{name}/zones/{zone_id}/region/{frame}` | long_job (quiet) | The propagated region of the zone in `frame` (contours in plate px, bbox) – the starting point of a correction |
-| POST | `/api/object/{name}/zones/{zone_id}/apply` | long_job | "Apply" (plan step 4): only the zones are recomputed (cache) on the base alpha of the active version -> a new version runs/v### (QA + edge report); 409 with  |
+| POST | `/api/object/{name}/zones/{zone_id}/apply` | long_job | „Zastosuj” (plan step 4): only the zones are recomputed (cache) on the base alpha of the active version -> a new version runs/v### (QA + edge report); 409 with  |
 | GET | `/api/object/{name}/color_lab/{frame}` | – | Pipette of the "color" zone criterion (Z24): median Lab of 5 x 5 px of the plate-to-mask display image (the image the zone key is computed on) around (x, y) in  |
 | DELETE | `/api/object/{name}/zones/{zone_id}` | object_edit |  |
 | GET | `/api/object/{name}/runs` | – | Versions of the final result (Z2): runs/v### with run.json + qa.json summary; `active` = tool.active_run. |
-| PUT | `/api/object/{name}/active_run` | object_edit | 'Set as active' ('Ustaw jako aktywną') (Z2): export and dependent objects use this version; final_valid from its qa.json. |
+| PUT | `/api/object/{name}/active_run` | object_edit | 'Ustaw jako aktywną' (Z2): export and dependent objects use this version; final_valid from its qa.json. |
 | GET | `/api/object/{name}/qa` | – |  |
 | PUT | `/api/object/{name}/settings` | object_edit | Object panel options (SPEC 1.2); any change invalidates the final result (new version on recompute). |
 | GET | `/api/project/export_dir` | – |  |
@@ -192,33 +201,33 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | PUT | `/api/project/export_format` | when_idle | Export format stored in project.json -> export_format (the shot manifest is never written). |
 | GET | `/api/project/mask_plate_denoise` | – | Plate-to-mask denoise (SPEC 4b, stage 0): auto = on for EXR / > 8-bit sources, off for 8-bit; `effective` used by the core and the final pass; defaults.json mpl |
 | PUT | `/api/project/mask_plate_denoise` | when_idle | Stored in project.json -> mask_plate_denoise (never in the shot manifest) |
-| POST | `/api/export/nk` | – | '.nk only' ('Tylko .nk') (Z29): the Nuke script for the existing export (outputs.json), without writing EXR again. |
+| POST | `/api/export/nk` | – | 'Tylko .nk' (Z29): the Nuke script for the existing export (outputs.json), without writing EXR again. |
 | POST | `/api/export` | long_job | Export (SPEC 9): full-frame alpha per object (front-to-back subtraction), multi-EXR, outputs.json |
 | POST | `/api/object/{name}/export` | – |  |
-| POST | `/api/object/{name}/recompute_dependents` | long_job | 'Recompute dependents' ('Przelicz zależne') (7.3): objects behind `name` marked 'to recompute' are recomputed (core + final). |
+| POST | `/api/object/{name}/recompute_dependents` | long_job | 'Przelicz zależne' (7.3): objects behind `name` marked 'do przeliczenia' are recomputed (core + final). |
 | POST | `/api/library` | – |  |
 | GET | `/api/library` | – |  |
 | POST | `/api/library/add` | – |  |
-| POST | `/api/object/{name}/import_review` | object_edit | Strokes from 'Frame review' ('Przegląd klatek') (r = remove, g = add) -> user keys (core +/- strokes). |
+| POST | `/api/object/{name}/import_review` | object_edit | Strokes from 'Przegląd klatek' (r = remove, g = add) -> user keys (core +/- strokes). |
 | POST | `/api/queue` | – |  |
-| POST | `/api/project/cleanplate_auto` | long_job | "Compute from shot (auto)" („Policz z ujęcia (auto)”) (docs/PLAN_CLEANPLATE.md): median of the uncovered pixels of the shot (cores of ALL objects needed -> 409 with the missing ones), holes |
-| GET | `/api/project/cleanplate_auto` | – | Clean plate state for the zone card: source (project / auto / none), stats of the auto plate when built. |
-| POST | `/api/queue/preset/all` | – | "Compute all" (plan section 6): every object of the open project without a valid final result, front to back (depth_order) – core + "Compute final" each |
+| POST | `/api/project/cleanplate_auto` | long_job | „Policz z ujęcia (auto)” (docs/PLAN_CLEANPLATE.md): median of the uncovered pixels of the shot (cores of ALL objects needed -> 409 with the missing ones), holes |
+| GET | `/api/project/cleanplate_auto` | – | Clean plate state for the zone card: source (projekt / auto / brak), stats of the auto plate when built. |
+| POST | `/api/queue/preset/all` | – | „Policz wszystko” (plan section 6): every object of the open project without a valid final result, front to back (depth_order) – core + „Przelicz finalnie” each |
 | GET | `/api/queue` | – |  |
 | POST | `/api/queue/run` | – |  |
-| PUT | `/api/object/{name}/interval_engine` | object_edit | Propagation engine of the key interval containing `frame` (7.2 item 7): SAM3 or CoTracker3 points. API / CLI only – not in the UI since 2026-10-16 (CoTracker3 = stage 2). |
+| PUT | `/api/object/{name}/interval_engine` | object_edit | Propagation engine of the key interval containing `frame` (7.2 pkt 7): SAM3 or CoTracker3 points. |
 | GET | `/api/objects` | – | Objects in depth order; `has` = results on disk (core / final alpha of the active version) – the UI shows the masks of the OTHER computed objects as extra overl |
-| PUT | `/api/objects/order` | when_idle | Depth order by drag & drop (spec 6 item 2, Z3): depth_order = index, atomically, no gaps / duplicates |
+| PUT | `/api/objects/order` | when_idle | Depth order by drag & drop (spec 6 pkt 2, Z3): depth_order = index, atomically, no gaps / duplicates |
 | POST | `/api/object` | – |  |
 | GET | `/api/object/{name}/delete_info` | – | What deleting the object removes (for the confirmation dialog): its folder (-> project trash) and, optionally, its exported masks (outputs.json). |
-| PUT | `/api/object/{name}/rename` | when_idle | Rename an object: folder objects/<name> -> objects/<new_name> and every exact reference (parts, holdouts, groups). Exported masks keep their old file names. |
-| DELETE | `/api/object/{name}` | object_edit | Delete an object: folder -> <work>/trash/objects/ (recoverable), entry removed from outputs.json, objects behind it that used it as a front object get 'to recompute |
-| POST | `/api/object/{name}/detect` | long_job (quiet) | Instance choice (SPEC 5.2 item 0): SAM3_Detect on the letterboxed proxy, candidates stored as PNG. |
+| PUT | `/api/object/{name}/rename` | when_idle | Rename an object: folder objects/<name> -> objects/<new_name> and every exact reference (parts, holdouts, groups) |
+| DELETE | `/api/object/{name}` | object_edit | Delete an object: folder -> <work>/trash/objects/ (recoverable), entry removed from outputs.json, objects behind it that used it as a front object get 'do przel |
+| POST | `/api/object/{name}/detect` | long_job (quiet) | Instance choice (SPEC 5.2 pkt 0): SAM3_Detect on the letterboxed proxy, candidates stored as PNG. |
 | GET | `/api/object/{name}/candidate/{index}` | – | Z10: thumbnail of SAM3 candidate `index` – the proxy crop of its bbox with the mask as alpha (BGRA PNG, longer side <= `side` px) for the candidate list of stag |
 | POST | `/api/object/{name}/choose` | object_edit | Chosen candidate -> automatic key (author=auto) at full plate resolution. |
 | POST | `/api/object/{name}/crops` | long_job |  |
 | GET | `/api/object/{name}/crops` | – |  |
-| PUT | `/api/object/{name}/crops/{seg_id}` | object_edit | Manual frame of a segment (SPEC 5.2 item 8): stored with manual=true, snapped square, padding recomputed. |
+| PUT | `/api/object/{name}/crops/{seg_id}` | object_edit | Manual frame of a segment (SPEC 5.2 pkt 8): stored with manual=true, snapped square, padding recomputed. |
 | GET | `/` | – |  |
 | POST | `/api/plate/qa` | long_job (quiet) | Z26: control of damaged frames of a plate (missing / unreadable / NaN / size / exposure jump / image jump / duplicate) -> matte_desk/plate_qa/<plate>.json with  |
 | GET | `/api/plate/qa/{plate}` | – |  |

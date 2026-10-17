@@ -327,9 +327,9 @@ class AlphaGen:
         self.log: List[Dict[str, Any]] = []
 
     def _run(self, g: Dict[str, Any]) -> Dict[str, Any]:
-        q = self.client.get_queue() or {}
-        if q.get("busy"):
-            raise RuntimeError("ComfyUI zajęte – poczekaj, aż skończy inne zadanie")
+        busy = self.client.busy_error()
+        if busy:
+            raise RuntimeError(busy)
         sub = self.client.queue_prompt(g)
         if not sub.get("success"):
             raise RuntimeError(f"Comfy odrzucił graf LTX Alpha-Gen: {sub.get('error')}")

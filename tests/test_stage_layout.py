@@ -34,9 +34,9 @@ def test_stage_layout_brush_matanyone_export(proj):
     store = pipe.store
     od = store.dir("obj")
     st, d = _steps(api)
-    # right after the core: export open, CoTracker optional (done), MatAnyone to do, ViTMatte waits for it
+    # right after the core: export open, CoTracker optional (done), MatAnyone to do, ViTMatte open on the mask 1+2
     assert [s["n"] for s in d["steps"]] == [1, 2, 3, 4, 5, 6, 7, 8]    # 4 = VideoMaMa, 7 = LTX Alpha-Gen (2026-10-16)
-    assert st == {"sam3": "done", "cotracker": "done", "matanyone": "todo", "videomama": "todo", "vitmatte": "locked", "final": "todo",
+    assert st == {"sam3": "done", "cotracker": "done", "matanyone": "todo", "videomama": "todo", "vitmatte": "todo", "final": "todo",
                   "ltx": "todo", "export": "todo"}
     assert "etap opcjonalny" in next(s for s in d["steps"] if s["id"] == "cotracker")["why"]
 
@@ -91,19 +91,25 @@ def test_stage_layout_brush_matanyone_export(proj):
     r = api.post("/api/export", json={"objects": ["obj"], "source": "version", "run": run, "format": "png"})
     assert r.status_code == 200 and r.json()["runs"] == {"obj": run}
 
-    # a change of the brush correction: the mask 1+2 and the MatAnyone result are stale, ViTMatte locked again
+    # a change of the brush correction: the mask 1+2 and the MatAnyone result are stale; ViTMatte stays open (2026-10-17)
+    # but its MatAnyone base is not current – it says so
     assert api.patch(f"/api/object/obj/zones/{zid}", json={"enabled": False}).status_code == 200
     st, d = _steps(api)
-    assert st["matanyone"] == "stale" and st["vitmatte"] == "locked" and st["export"] == "stale"
+    assert st["matanyone"] == "stale" and st["vitmatte"] == "todo" and st["export"] == "stale"
+    assert "MatAnyone" in next(s for s in d["steps"] if s["id"] == "vitmatte")["why"]
     r = api.post("/api/export", json={"objects": ["obj"], "source": "matanyone", "format": "png"})
     assert r.status_code == 409
 
 
 def test_vitmatte_requires_a_current_matanyone_base(proj):
+    """Bug 2026-10-17: the stage is open after stages 1 + 2 (the base selector lives inside it); the MatAnyone base
+    without a stage-3 result is refused when computing, and the stage says why."""
     from engine.stages import require
     app_module, api, shot, pipe, frames, start = proj
-    with pytest.raises(ValueError, match="MatAnyone"):
-        require(pipe.store, "obj", pipe.store.root.parent, "vitmatte")
+    assert api.put("/api/object/obj/settings", json={"vitmatte_base": "matanyone"}).status_code == 200
+    require(pipe.store, "obj", pipe.store.root.parent, "vitmatte")              # open
+    st, d = _steps(api)
+    assert st["vitmatte"] == "todo" and "MatAnyone" in next(s for s in d["steps"] if s["id"] == "vitmatte")["why"]
     with pytest.raises(ValueError, match="etap 3 MatAnyone"):
         pipe.apply_zone("obj", frames, None, stage="vitmatte")
     r = api.post("/api/object/obj/finalize", json={"stage": "other"})
@@ -135,7 +141,7 @@ def test_vitmatte_base_mask_1_2_and_the_comparison(proj):
     from engine.stages import require
     app_module, api, shot, pipe, frames, start = proj
     st, d = _steps(api)
-    assert st["vitmatte"] == "locked" and d["vitmatte_base"] == "matanyone"
+    assert st["vitmatte"] == "todo" and d["vitmatte_base"] == "core"           # no MatAnyone result: default = mask 1+2
     r = api.put("/api/object/obj/settings", json={"vitmatte_base": "core"})
     assert r.status_code == 200 and r.json()["object"]["vitmatte_base"] == "core"
     assert api.put("/api/object/obj/settings", json={"vitmatte_base": "x"}).status_code == 400
@@ -164,10 +170,10 @@ def test_vitmatte_base_mask_1_2_and_the_comparison(proj):
     # comparison view |A − B| of two versions
     assert api.get(f"/api/object/obj/frame/{start}?view=alpha_diff&v={core_run}&v2={vm}").status_code == 200
     assert api.get(f"/api/object/obj/frame/{start}?view=alpha_diff&v={core_run}").status_code == 400
-    # back to the MatAnyone base: locked until stage 3, the result on the mask 1+2 stays listed for the comparison
+    # back to the MatAnyone base: open but "todo" until stage 3, the result on the mask 1+2 stays listed for the comparison
     api.put("/api/object/obj/settings", json={"vitmatte_base": "matanyone"})
     st, d = _steps(api)
-    assert st["vitmatte"] == "locked" and d["stage_runs"]["vitmatte@core"] == vm
+    assert st["vitmatte"] == "todo" and d["stage_runs"]["vitmatte@core"] == vm
 
 
 def test_whole_of_a_group_follows_the_view_layer(proj):

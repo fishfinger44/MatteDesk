@@ -650,8 +650,9 @@ class Finalizer:
         return self._soft_ok
 
     def _run_graph(self, g: Dict[str, Any]) -> Dict[str, Any]:
-        if self.client.get_queue().get("busy"):
-            raise RuntimeError("ComfyUI zajęte – poczekaj, aż skończy inne zadanie")
+        busy = self.client.busy_error()
+        if busy:
+            raise RuntimeError(busy)
         sub = self.client.queue_prompt(g)
         if not sub.get("success"):
             raise RuntimeError(f"Comfy odrzucił graf MatAnyone2: {sub.get('error')}")
@@ -813,6 +814,7 @@ class Finalizer:
                  exclude: Optional[Dict[int, np.ndarray]] = None,
                  soft_override: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
                  band_fn: Optional[Callable[[int, CropSegment, np.ndarray, float], np.ndarray]] = None,
+                 soft_feather: float = ZONE_FEATHER_PX,
                  keep_holes: Optional[Dict[int, np.ndarray]] = None,
                  core_soft: Optional[Dict[int, np.ndarray]] = None
                  ) -> Tuple[Dict[int, np.ndarray], FinalizeReport]:
@@ -894,7 +896,15 @@ class Finalizer:
                 band = band_fn(f, seg, c, bw) if adaptive else edge_band(c, bw)
                 if exclude and f in exclude:
                     band &= ~(extract_crop(exclude[f].astype(np.float32), seg) > 0.5)
-                res[f] = np.where(band, soft[f], c.astype(np.float32))
+                fe = float(obj.get("band_in_feather_px") or 0.0)
+                if fe > 0:
+                    # feather of the core inset (user request 2026-10-17): near the deep core the edge result fades into
+                    # the core over `fe` px instead of a hard switch (a visible line at the inner band edge)
+                    deep = c & ~band
+                    w = np.clip(cv2.distanceTransform((~deep).astype(np.uint8), cv2.DIST_L2, 5) / fe, 0.0, 1.0)
+                    res[f] = np.where(band, w * soft[f] + (1.0 - w) * c.astype(np.float32), c.astype(np.float32))
+                else:
+                    res[f] = np.where(band, soft[f], c.astype(np.float32))
                 bands.append(band)
             arr = np.stack([res[f] for f in sf])
             arr = temporal_median(arr, radius, mlimit, np.stack(bands),
@@ -922,7 +932,7 @@ class Finalizer:
                     arr[i] = np.clip(arr[i], 0, 1).astype(np.float16).astype(np.float32)
                     sa, sarea = soft_override[f]
                     area = extract_crop(sarea.astype(np.float32), seg) > 0.5
-                    arr[i] = apply_soft_override(arr[i], extract_crop(sa.astype(np.float32), seg), area)
+                    arr[i] = apply_soft_override(arr[i], extract_crop(sa.astype(np.float32), seg), area, soft_feather)
             per_seg[seg.seg_id] = {f: arr[i] for i, f in enumerate(sf)}
             # write crop-only alpha + core (runs/v###/alpha/<seg>/a_####.exr)
             for i, f in enumerate(sf):
