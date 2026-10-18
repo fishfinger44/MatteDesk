@@ -288,6 +288,31 @@ def decode_video(path: Union[str, Path], out_dir: Union[str, Path], first_frame:
     return info
 
 
+def is_video_file(path: Union[str, Path]) -> bool:
+    p = Path(str(path))
+    return p.suffix.lower() in VIDEO_EXT and p.is_file()
+
+
+def video_to_sequence(path: Union[str, Path], work_dir: Union[str, Path], first_frame: int = 1) -> Dict[str, Any]:
+    """Video plate -> PNG sequence in <work_dir>/source/<stem>/ (decoded once: an existing complete sequence newer
+    than the video is reused). Plates are always read as sequences (proxies, QA, Comfy), never as the video."""
+    path = Path(str(path))
+    out = Path(work_dir) / "source" / path.stem
+    stem = path.stem
+    if out.is_dir():
+        frames = sorted(x for x in out.iterdir() if x.name.startswith(stem + "_") and x.suffix == ".png")
+        if frames and frames[0].name == f"{stem}_{first_frame:04d}.png" and \
+                min(x.stat().st_mtime for x in frames) >= path.stat().st_mtime:
+            info = probe_video(path)
+            if len(frames) == info["frame_count"]:
+                info.update({"pattern": str(out / f"{stem}_####.png").replace("\\", "/"), "first_frame": first_frame,
+                             "last_frame": first_frame + len(frames) - 1, "source_video": str(path)})
+                return info
+        for x in frames:   # stale / partial decode of this video only
+            x.unlink()
+    return decode_video(path, out, first_frame=first_frame)
+
+
 class ProjectCreator:
     """Initializes a MatteDesk project inside <work>/matte_desk/ (manifest is read-only)."""
 

@@ -46,7 +46,11 @@ def install_kind(app_dir: Path) -> str:
 
 def short_notes(body: str, n: int = NOTES_LINES) -> str:
     """The release text, at most `n` non-empty lines (the window links the full changelog)."""
-    lines = [ln.rstrip() for ln in (body or "").replace("\r", "").split("\n") if ln.strip()]
+    # plain text for the window: markdown links / bold removed, the release page's "⬇ Download" line skipped (the window
+    # has its own Update button)
+    def plain(ln: str) -> str:
+        return re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", ln).replace("**", "").rstrip()
+    lines = [plain(ln) for ln in (body or "").replace("\r", "").split("\n") if ln.strip() and "⬇" not in ln]
     out = lines[:n]
     if len(lines) > n:
         out.append("…")

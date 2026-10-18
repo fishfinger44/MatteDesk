@@ -465,7 +465,7 @@ class MatteDeskViewer {
     document.querySelectorAll('.btn-browse-plate').forEach((btn) => {
       btn.addEventListener('click', () => {
         const targetId = btn.getAttribute('data-target');
-        this.browsePlateFolder(targetId);
+        this.browsePlateFolder(targetId, btn.hasAttribute('data-file'));
       });
     });
 
@@ -690,18 +690,20 @@ class MatteDeskViewer {
     }
   }
 
-  async browsePlateFolder(targetInputId) {
+  // project wizard: 📁 = sequence folder, 🎞️ = a file (one frame of a sequence, or a video – decoded to a sequence on open)
+  async browsePlateFolder(targetInputId, file = false) {
     try {
-      const res = await fetch('/api/dialog/pick_folder', {
+      const res = await fetch(file ? '/api/dialog/pick_file' : '/api/dialog/pick_folder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'Wybierz folder sekwencji plate' })
+        body: JSON.stringify({ title: window.mdT(file ? 'Wybierz plik (klatka albo wideo)' : "Wybierz folder sekwencji plate'u") })
       });
       const data = await res.json();
-      if (data.folder) {
+      const picked = file ? data.path : data.folder;
+      if (picked) {
         const input = document.getElementById(targetInputId);
         if (input) {
-          input.value = data.folder;
+          input.value = picked;
         }
       }
     } catch (e) {

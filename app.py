@@ -39,7 +39,7 @@ from doctor import EnvironmentDoctor
 from engine.coords import CoordTransformer, FrameMapper
 from engine.clean import CleanReport, DeflickerMetrics, NukeDeflickerGroupGenerator, PlateCleaner
 from engine.camera import Camera2DData, Camera2DTracker, NukeCamera2DGroupGenerator
-from engine.ingest import VIDEO_EXT, MediaInspector, ProjectCreator, ProxyGenerator, decode_video
+from engine.ingest import VIDEO_EXT, MediaInspector, ProjectCreator, ProxyGenerator, is_video_file, video_to_sequence
 from engine.project import ShotProject
 
 logging.basicConfig(level=logging.INFO)
@@ -700,7 +700,10 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
         manifest_plates = proj.manifest.get("plates") or {}
         for k, v in req.plates.items():
             if v and v.strip():
-                resolved = MediaInspector.resolve_sequence_pattern(v.strip()).get("pattern", v.strip())
+                v = v.strip()
+                if k != "bg" and is_video_file(v):   # video plate -> decoded sequence in the work folder
+                    v = video_to_sequence(v, proj.work_dir, int(proj.manifest.get("first", 1)))["pattern"]
+                resolved = MediaInspector.resolve_sequence_pattern(v).get("pattern", v)
                 if manifest_plates.get(k) != resolved:
                     proj.set_plate(k, resolved)
         data["manifest"] = proj.effective_manifest()
@@ -713,7 +716,7 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
         if Path(beauty_raw).suffix.lower() in VIDEO_EXT and Path(beauty_raw).is_file():
             # video -> sequence in the shot work folder (ffmpeg), bit depth from the header (SPEC 1.0)
             from engine.project import work_subdir_name
-            beauty_info = decode_video(beauty_raw, work_p / work_subdir_name() / "source" / Path(beauty_raw).stem)
+            beauty_info = video_to_sequence(beauty_raw, work_p / work_subdir_name())
             if not req.fps or req.fps == 24.0:
                 req.fps = beauty_info["fps"]
             if not req.colorspace or req.colorspace == "ACES2065-1":
@@ -732,12 +735,20 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
         source_type = beauty_info.get("source_type", "exr_seq")
         bit_depth = beauty_info.get("bit_depth", 16)
 
+        def _aux_video_seq(pat: str) -> str:   # aux plate given as a video -> decoded sequence, beauty frame numbers
+            if not is_video_file(pat):
+                return pat
+            from engine.project import work_subdir_name
+            return video_to_sequence(pat, work_p / work_subdir_name(), int(first_f))["pattern"]
+
         cleanplate_pat = req.plates.get("cleanplate", "").strip()
         if cleanplate_pat:
+            cleanplate_pat = _aux_video_seq(cleanplate_pat)
             cleanplate_pat = MediaInspector.resolve_sequence_pattern(cleanplate_pat).get("pattern", cleanplate_pat)
 
         backlit_pat = req.plates.get("backlit", "").strip()
         if backlit_pat:
+            backlit_pat = _aux_video_seq(backlit_pat)
             backlit_pat = MediaInspector.resolve_sequence_pattern(backlit_pat).get("pattern", backlit_pat)
 
         creator.create_manifest(
@@ -760,6 +771,7 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
         data = creator.init_project_from_manifest(manifest_file)
         depth_pat = req.plates.get("depth", "").strip()
         if depth_pat:
+            depth_pat = _aux_video_seq(depth_pat)
             depth_pat = MediaInspector.resolve_sequence_pattern(depth_pat).get("pattern", depth_pat)
             data["shot_project"].set_plate("depth", depth_pat)
             data["manifest"] = data["shot_project"].effective_manifest()
@@ -860,6 +872,12 @@ async def generate_proxies(plate: str = "beauty", max_side: int = 1920):
     proxy_dir = Path(STATE["work_dir"]) / "proxy" / plate
 
     loop = asyncio.get_running_loop()
+    if is_video_file(plate_pattern):
+        # projects saved before 0.32 kept the video path itself as the plate -> decode it now and keep the sequence
+        plate_pattern = (await loop.run_in_executor(
+            None, lambda: video_to_sequence(plate_pattern, STATE["work_dir"], int(first_f))))["pattern"]
+        STATE["shot_project"].set_plate(plate, plate_pattern)
+        _refresh_manifest_view()
 
     def on_progress(done: int, total: int):
         JOBS.progress(done, total)
@@ -965,8 +983,13 @@ async def update_project_plate(req: UpdatePlateRequest):
         raise HTTPException(status_code=400, detail="Nazwa warstwy nie może być pusta")
 
     pattern = req.pattern.strip()
-    info = MediaInspector.resolve_sequence_pattern(pattern)
     m0 = STATE["manifest"]
+    if plate_name != "bg" and is_video_file(pattern) and STATE.get("work_dir"):
+        # plates are always sequences (proxies, QA, Comfy): a video is decoded once into <work>/source/<name>/
+        first_v = int(m0.get("first", 1))
+        pattern = (await asyncio.get_running_loop().run_in_executor(
+            None, lambda: video_to_sequence(pattern, STATE["work_dir"], first_v)))["pattern"]
+    info = MediaInspector.resolve_sequence_pattern(pattern)
     if _is_aux_plate(plate_name) and info.get("width") and info.get("height") and m0.get("plate_w") and \
             (int(info["width"]), int(info["height"])) != (int(m0["plate_w"]), int(m0["plate_h"])):
         # 2026-10-17: SH010 4096x2731 plates set in a 1440x2560 project broke QA of every stage

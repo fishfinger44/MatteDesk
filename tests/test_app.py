@@ -595,3 +595,64 @@ def test_last_project_reopens_on_startup(tmp_path, monkeypatch):
     finally:
         STATE.clear()
         STATE.update(saved)
+
+
+def _tiny_video(path, n=5, size=(64, 32)):
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 24, size)
+    for i in range(n):
+        vw.write(np.full((size[1], size[0], 3), 40 * i, np.uint8))
+    vw.release()
+
+
+def test_video_plate_is_decoded_to_sequence(client, tmp_path):
+    """A .mp4/.mov given as a plate (Manage plates, or an old project that stored the video path) becomes a PNG
+    sequence in <work>/source/<stem>/ before proxies are made (2026-10-18: proxies of an .mp4 plate -> HTTP 500)."""
+    import shutil
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH")
+    work_dir = tmp_path / "shot_vid"
+    work_dir.mkdir()
+    for f in range(1, 6):
+        cv2.imwrite(str(work_dir / f"seq_{f:04d}.png"), np.zeros((32, 64, 3), np.uint8))
+    manifest = {"shot": "VID", "fps": 24, "first": 1, "last": 5, "plate_w": 64, "plate_h": 32, "colorspace": "sRGB",
+                "plates": {"beauty": str(work_dir / "seq_####.png")}, "work": str(work_dir)}
+    mf = work_dir / "shot_manifest_VID.json"
+    mf.write_text(json.dumps(manifest), encoding="utf-8")
+    assert client.post("/api/project/open", json={"manifest_path": str(mf)}).status_code == 200
+    vid = work_dir / "clip.mp4"
+    _tiny_video(vid)
+
+    # Manage plates -> the stored plate is the decoded sequence, never the video
+    res = client.post("/api/project/plate/update", json={"plate_name": "beauty", "pattern": str(vid)})
+    assert res.status_code == 200, res.text
+    pat = res.json()["pattern"]
+    assert pat.endswith("clip_####.png") and "/source/clip/" in pat.replace("\\", "/")
+    assert client.post("/api/project/generate_proxies?plate=beauty").json()["rendered_count"] == 5
+
+    # an old project that kept the video path itself: generate_proxies decodes it (reusing the sequence)
+    STATE["shot_project"].set_plate("beauty", str(vid).replace("\\", "/"))
+    from app import _refresh_manifest_view
+    _refresh_manifest_view()
+    res = client.post("/api/project/generate_proxies?plate=beauty")
+    assert res.status_code == 200, res.text
+    assert res.json()["rendered_count"] == 5
+    assert client.get("/api/project/current").json()["manifest"]["plates"]["beauty"].endswith("clip_####.png")
+
+
+def test_wizard_video_plates_new_shot(client, tmp_path):
+    """Project wizard: beauty and backlit given as video files -> both decoded into <work>/matte_desk/source/."""
+    import shutil
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH")
+    work_dir = tmp_path / "shot_wiz"
+    work_dir.mkdir()
+    _tiny_video(work_dir / "beauty.mp4")
+    _tiny_video(work_dir / "backlit.mov")
+    res = client.post("/api/project/open_or_create", json={
+        "work_dir": str(work_dir), "shot_name": "WIZ",
+        "plates": {"beauty": str(work_dir / "beauty.mp4"), "backlit": str(work_dir / "backlit.mov")}})
+    assert res.status_code == 200, res.text
+    plates = client.get("/api/project/current").json()["manifest"]["plates"]
+    assert plates["beauty"].endswith("source/beauty/beauty_####.png")
+    assert plates["backlit"].endswith("source/backlit/backlit_####.png")
+    assert len(list((work_dir / "matte_desk" / "source" / "backlit").glob("backlit_*.png"))) == 5

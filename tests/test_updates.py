@@ -94,3 +94,9 @@ def test_api_update_endpoints(monkeypatch, tmp_path):
     assert c.post("/api/update/skip", json={"version": "0.4"}).json()["ok"]
     assert c.post("/api/update/settings", json={"enabled": False}).json()["enabled"] is False
     assert ec._read(ec.LOCAL)["update_skip"] == "0.4" and ec._read(ec.LOCAL)["update_check"] is False
+
+
+def test_short_notes_plain_text_without_download_line():
+    from engine.updates import short_notes
+    body = "**⬇ Download: [MatteDesk-0.31-setup.exe](https://x/y.exe)** (Windows)\n\nIntro\n\n- New: [docs](https://d) **bold**\n"
+    assert short_notes(body) == "Intro\n- New: docs bold"

@@ -1,5 +1,13 @@
 # MatteDesk – changelog
 
+## 0.32 – 2026-10-18
+- **Video plates:** an .mp4 / .mov / .mkv / .avi / .mxf file given as a plate (project wizard, Manage plates, reopening a project)
+  is decoded once into a PNG sequence in `<shot>/matte_desk/source/<name>/` (8- or 16-bit like the source) and used everywhere.
+  Before, "Proxy" of a video plate failed with "SyntaxError … is not valid JSON". Projects that stored the video path are fixed at "Proxy".
+- **Project wizard:** a file button 🎞️ next to every plate's folder button – pick a video, or one frame of a sequence (the whole
+  sequence is used). Clear plate, backlit and depth can be videos too.
+- **Update window:** the release notes are plain text and scroll (at most 40 % of the window height).
+
 ## 0.31 – 2026-10-17
 - **Windows installer** (`MatteDesk-0.31-setup.exe` in Releases): one file with its own Python and all dependencies, installs for
   your user only (no admin rights), Start-menu / desktop shortcut, uninstall in Windows Settings → Apps.
