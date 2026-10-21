@@ -195,6 +195,15 @@ def interquartile_mean(stack: np.ndarray) -> np.ndarray:
 # Flicker Metrics (flow-aligned, as in measure_flow.py)
 # -----------------------------------------------------------------------------
 
+def as_bgr(img: np.ndarray) -> np.ndarray:
+    """Image as H x W x 3: grayscale is replicated, alpha / extra channels are dropped."""
+    if img.ndim == 2:
+        return np.repeat(img[..., None], 3, axis=2)
+    if img.shape[2] == 1:
+        return np.repeat(img, 3, axis=2)
+    return img[..., :3]
+
+
 class DeflickerMetrics:
     """Computes flow-aligned frame-to-frame flicker and temporal variance."""
 
@@ -215,6 +224,9 @@ class DeflickerMetrics:
         if n < 2:
             return ChannelFlickerMetric(r=0.0, g=0.0, b=0.0, mean=0.0, p95=0.0)
 
+        frames = [as_bgr(f) for f in frames]   # grayscale / RGBA plates: the per-channel metric needs exactly 3 channels
+        if flow_ref is not None:
+            flow_ref = [as_bgr(f) for f in flow_ref]
         h, w = frames[0].shape[:2]
         eval_h = round(h * eval_w / w)
         dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)

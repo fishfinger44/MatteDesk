@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import app, STATE
+from engine.clean import DeflickerMetrics
 
 
 @pytest.fixture
@@ -402,6 +403,49 @@ def test_api_plate_clean_lifecycle(tmp_path):
     assert res_rep.status_code == 200
     assert res_rep.json()["exists"] is True
     assert "report" in res_rep.json()
+
+
+def _open_clean_project(client, tmp_path, name, ext, make_frame, n=5):
+    work_dir = tmp_path / name
+    plates_dir = work_dir / "plates_beauty"
+    plates_dir.mkdir(parents=True)
+    for f in range(1, n + 1):
+        assert cv2.imwrite(str(plates_dir / f"b_{f:04d}.{ext}"), make_frame(f))
+    manifest_file = work_dir / f"shot_manifest_{name}.json"
+    manifest_file.write_text(json.dumps({
+        "shot": name, "first": 1, "last": n, "plate_w": 64, "plate_h": 64, "colorspace": "ACES2065-1",
+        "source_type": "exr_seq", "plates": {"beauty": str(plates_dir / f"b_####.{ext}")}, "work": str(work_dir)}))
+    assert client.post("/api/project/open", json={"manifest_path": str(manifest_file)}).status_code == 200
+
+
+@pytest.mark.parametrize("channels", [1, 4])
+def test_api_plate_clean_non_rgb_plate(tmp_path, channels):
+    """Deflicker measure + run on grayscale / RGBA plates (measure used to crash with an IndexError -> HTTP 500)."""
+    def frame(f):
+        v = np.full((64, 64), int(100 + 30 * (f % 2)), np.uint8)
+        return v if channels == 1 else np.dstack([v, v, v, np.full_like(v, 255)])
+
+    client = TestClient(app)
+    _open_clean_project(client, tmp_path, f"CLEAN_CH{channels}", "png", frame)
+    res_m = client.post("/api/plate/clean/measure", json={"plate": "beauty", "max_frames": 5})
+    assert res_m.status_code == 200, res_m.text
+    assert res_m.json()["success"] is True
+    res_r = client.post("/api/plate/clean/run", json={"plate": "beauty", "export_mode": "nuke_group"})
+    assert res_r.status_code == 200, res_r.text
+
+
+def test_unhandled_error_is_json_detail(tmp_path, monkeypatch):
+    """An unhandled exception must come back as JSON {"detail": ...} (the UI shows it), not plain-text 'Internal Server Error'."""
+    client = TestClient(app, raise_server_exceptions=False)
+    _open_clean_project(client, tmp_path, "CLEAN_BOOM", "png", lambda f: np.full((64, 64, 3), 100 + f, np.uint8))
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic failure")
+    monkeypatch.setattr(DeflickerMetrics, "measure_flow_aligned", staticmethod(boom))
+    res = client.post("/api/plate/clean/measure", json={"plate": "beauty", "max_frames": 5})
+    assert res.status_code == 500
+    assert res.headers["content-type"].startswith("application/json")
+    assert "RuntimeError: synthetic failure" in res.json()["detail"]
 
 
 def test_api_camera_lifecycle(tmp_path):

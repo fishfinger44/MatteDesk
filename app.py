@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -108,6 +108,14 @@ async def _api_no_heuristic_cache(request, call_next):
     if (path.startswith("/api/") or path.startswith("/static/") or path == "/") and "cache-control" not in response.headers:
         response.headers["Cache-Control"] = "no-cache"
     return response
+
+@app.exception_handler(Exception)
+async def _unhandled_error_as_json(request, exc):
+    """An unhandled exception in an /api/* handler used to give a plain-text "Internal Server Error", which the UI
+    failed to parse. Same shape as HTTPException ({"detail": ...}) so the UI can show the real reason."""
+    logging.getLogger(__name__).error("Unhandled error in %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
 
 REPO_DIR = Path(__file__).resolve().parent
 STATIC_DIR = REPO_DIR / "static"
