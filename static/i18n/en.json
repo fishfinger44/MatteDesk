@@ -2993,6 +2993,10 @@
   "F{0}: baza {1}, pas na zewnątrz {2} px, wcięcie {3} px, wtopienie {4} px": "F{0}: base {1}, outer band {2} px, inset {3} px, feather {4} px",
   "Inna rozdzielczość niż beauty – ten plate nie jest używany w żadnym etapie (pewnie z innego ujęcia). Podmień go albo usuń.": "Different resolution than the beauty – this plate is not used in any stage (probably from another shot). Replace or remove it.",
   "{0}: rozdzielczość {1}x{2} ≠ beauty {3}x{4} – to plate z innego ujęcia (backlit / clear plate muszą być z tej samej kamery i rozdzielczości)": "{0}: resolution {1}x{2} ≠ beauty {3}x{4} – this plate is from another shot (backlit / clear plate must come from the same camera and resolution)",
-  "ComfyUI kończy jeszcze przerwane wcześniej zadanie (węzeł nie zatrzymuje się w trakcie przebiegu) – poczekaj, aż skończy, albo zrestartuj ComfyUI; Doktor → zaktualizuj nasze węzły (przerywanie od razu)": "ComfyUI is still finishing a job cancelled earlier (the node does not stop mid-pass) – wait until it ends or restart ComfyUI; Doctor → update our nodes (immediate cancel)"
- }
+  "ComfyUI kończy jeszcze przerwane wcześniej zadanie (węzeł nie zatrzymuje się w trakcie przebiegu) – poczekaj, aż skończy, albo zrestartuj ComfyUI; Doktor → zaktualizuj nasze węzły (przerywanie od razu)": "ComfyUI is still finishing a job cancelled earlier (the node does not stop mid-pass) – wait until it ends or restart ComfyUI; Doctor → update our nodes (immediate cancel)",
+    "Brak pamięci RAM przy {0}x{1}, {2} klatek. Odszumianie i etap 3 trzymają całą sekwencję w pamięci – wyłącz je lub skróć zakres.": "Out of RAM at {0}x{1}, {2} frames. Denoise and stage 3 keep the whole sequence in memory – turn them off or shorten the range.",
+    "Brak pamięci RAM przy {0}x{1}, {2} klatek. Skróć zakres klatek.": "Out of RAM at {0}x{1}, {2} frames. Shorten the frame range.",
+    "Brak pamięci RAM przy {0}x{1}, {2} klatek. Zmniejsz liczbę próbkowanych klatek.": "Out of RAM at {0}x{1}, {2} frames. Reduce the number of sampled frames.",
+    "Nie udało się wczytać klatki {0}": "Could not read frame {0}"
+  }
 }

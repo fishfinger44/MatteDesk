@@ -37,7 +37,7 @@ from engine.config import load_config
 from engine.jobs import JOBS, JobBusy, JobCancelled
 from doctor import EnvironmentDoctor
 from engine.coords import CoordTransformer, FrameMapper
-from engine.clean import CleanReport, DeflickerMetrics, NukeDeflickerGroupGenerator, PlateCleaner
+from engine.clean import CleanReport, DeflickerMetrics, LazyFrames, NukeDeflickerGroupGenerator, PlateCleaner
 from engine.camera import Camera2DData, Camera2DTracker, NukeCamera2DGroupGenerator
 from engine.ingest import VIDEO_EXT, MediaInspector, ProjectCreator, ProxyGenerator, is_video_file, video_to_sequence
 from engine.project import ShotProject
@@ -1596,6 +1596,12 @@ class CleanExportNkRequest(BaseModel):
     plate: str = "beauty"
 
 
+def _clean_oom_message(w: int, h: int, n: int, req: "CleanRunRequest") -> str:
+    if req.enable_denoise or req.enable_stage3:
+        return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Odszumianie i etap 3 trzymają całą sekwencję w pamięci – wyłącz je lub skróć zakres."
+    return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Skróć zakres klatek."
+
+
 @app.post("/api/plate/clean/measure")
 @long_job("Pomiar migotania")
 async def measure_plate_clean(req: CleanMeasureRequest):
@@ -1627,8 +1633,12 @@ async def measure_plate_clean(req: CleanMeasureRequest):
         raise HTTPException(status_code=400, detail=f"Nie udało się wczytać klatek z {pat}")
 
     loop = asyncio.get_running_loop()
-    flicker = await loop.run_in_executor(None, lambda: DeflickerMetrics.measure_flow_aligned(frames))
-    variance = await loop.run_in_executor(None, lambda: DeflickerMetrics.measure_temporal_variance(frames))
+    try:
+        flicker = await loop.run_in_executor(None, lambda: DeflickerMetrics.measure_flow_aligned(frames))
+        variance = await loop.run_in_executor(None, lambda: DeflickerMetrics.measure_temporal_variance(frames))
+    except MemoryError:
+        h0, w0 = frames[0].shape[:2]
+        raise HTTPException(status_code=507, detail=f"Brak pamięci RAM przy {w0}x{h0}, {len(frames)} klatek. Zmniejsz liczbę próbkowanych klatek.")
 
     return {
         "success": True,
@@ -1661,21 +1671,28 @@ async def run_plate_clean(req: CleanRunRequest):
     work_dir = Path(STATE["work_dir"])
     plate_w, plate_h = _plate_size()
 
-    # Read frames (RGB only, BGR order; alpha / other layers are copied untouched on export)
+    # Frames are read from disk on demand (RGB only, BGR order; alpha / other layers are copied untouched on export):
+    # a 4K float32 frame is ~134 MB, so the whole sequence is never held in RAM (the cleaner passes over it a few times)
     from engine.exr_io import read_rgb
-    frames = []
     file_paths = []
     for fn in range(first_f, last_f + 1):
         f_path = ProxyGenerator.resolve_frame_path(pat, fn)
         if not f_path.exists():
             break
-        img = read_rgb(f_path) if f_path.suffix.lower() == ".exr" else cv2.imread(str(f_path), cv2.IMREAD_COLOR)
-        if img is not None:
-            frames.append(img.astype(np.float32))
-            file_paths.append(f_path)
+        file_paths.append(f_path)
 
-    if len(frames) < 2:
-        raise HTTPException(status_code=400, detail=f"Brak wystarczającej liczby klatek ({len(frames)}) dla plate'u {req.plate}")
+    if len(file_paths) < 2:
+        raise HTTPException(status_code=400, detail=f"Brak wystarczającej liczby klatek ({len(file_paths)}) dla plate'u {req.plate}")
+
+    def load_frame(i: int) -> np.ndarray:
+        f_path = file_paths[i]
+        img = read_rgb(f_path) if f_path.suffix.lower() == ".exr" else cv2.imread(str(f_path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=400, detail=f"Nie udało się wczytać klatki {f_path}")
+        return img.astype(np.float32)
+
+    frames = LazyFrames(len(file_paths), load_frame)
+    load_frame(0)   # unreadable first frame -> clear error before the long run
 
     loop = asyncio.get_running_loop()
 
@@ -1692,20 +1709,23 @@ async def run_plate_clean(req: CleanRunRequest):
             loop
         )
 
-    cleaned, gains, report, residuals = await loop.run_in_executor(
-        None,
-        lambda: PlateCleaner.process_sequence(
-            frames=frames,
-            plate_name=req.plate,
-            target_reduction=req.target_reduction,
-            enable_stage1=req.stage1 if hasattr(req, "stage1") else req.enable_stage1,
-            enable_stage2=req.enable_stage2,
-            enable_stage3=req.enable_stage3,
-            enable_stage4=req.enable_stage4,
-            enable_denoise=req.enable_denoise,
-            progress_cb=on_progress
+    try:
+        cleaned, gains, report, residuals = await loop.run_in_executor(
+            None,
+            lambda: PlateCleaner.process_sequence(
+                frames=frames,
+                plate_name=req.plate,
+                target_reduction=req.target_reduction,
+                enable_stage1=req.enable_stage1,
+                enable_stage2=req.enable_stage2,
+                enable_stage3=req.enable_stage3,
+                enable_stage4=req.enable_stage4,
+                enable_denoise=req.enable_denoise,
+                progress_cb=on_progress
+            )
         )
-    )
+    except MemoryError:
+        raise HTTPException(status_code=507, detail=_clean_oom_message(plate_w, plate_h, len(file_paths), req))
 
     clean_dir = work_dir / "deflicker"
     clean_dir.mkdir(parents=True, exist_ok=True)
