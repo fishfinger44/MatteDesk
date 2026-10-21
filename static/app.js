@@ -5,6 +5,18 @@
  * Complies with SPEC_INTERACTIVE_MATTE_TOOL.md (Section 6, 12: Stage E1).
  */
 
+// Reads a fetch() response whose body should be JSON. A non-JSON body (e.g. a plain-text 500) or a non-OK status gives
+// a readable `error` (HTTP status + the server's `detail` / text) instead of a JSON.parse SyntaxError.
+async function readApiResponse(res) {
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+  if (res.ok && data !== null) return { ok: true, data, error: '' };
+  let msg = data && data.detail !== undefined ? data.detail : (data && data.error) || text.trim().slice(0, 300) || res.statusText;
+  if (msg && typeof msg === 'object') msg = msg.detail || JSON.stringify(msg);
+  return { ok: false, data: data || {}, error: `HTTP ${res.status}: ${msg}` };
+}
+
 class MatteDeskViewer {
   constructor() {
     this.canvas = document.getElementById('mainCanvas');
@@ -795,14 +807,15 @@ class MatteDeskViewer {
           plates: plates
         })
       });
-      const data = await res.json();
-      if (data.success) {
+      const api = await readApiResponse(res);
+      const data = api.data;
+      if (api.ok && data.success) {
         this.openProjectModal.style.display = 'none';
         this.currentWorkDir = workDir;
         this.applyProject(data);
         this.showToast(`Projekt ${data.manifest?.shot || ''} otwarty pomyślnie`);
       } else {
-        alert(`Błąd otwierania projektu: ${data.detail || data.error}`);
+        alert(`Błąd otwierania projektu: ${api.error}`);
       }
     } catch (e) {
       alert(`Błąd połączenia z serwerem: ${e}`);
@@ -2059,8 +2072,9 @@ class MatteDeskViewer {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plate: plate, max_frames: 16 })
       });
-      const data = await res.json();
-      if (data.success) {
+      const api = await readApiResponse(res);
+      const data = api.data;
+      if (api.ok && data.success) {
         const fl = data.flicker;
         this.cleanMetricsGrid.style.display = 'grid';
         this.metricCleanInit.textContent = `R ${fl.r}% / G ${fl.g}% / B ${fl.b}% (p95: ${fl.p95}%)`;
@@ -2079,7 +2093,7 @@ class MatteDeskViewer {
         }
         this.btnRunClean.disabled = false;
       } else {
-        alert(`Błąd pomiaru: ${data.detail || 'Nieznany błąd'}`);
+        alert(`Błąd pomiaru: ${api.error || 'Nieznany błąd'}`);
       }
     } catch (e) {
       alert(`Błąd połączenia z serwerem: ${e}`);
@@ -2119,15 +2133,16 @@ class MatteDeskViewer {
           confirmed: confirmed
         })
       });
-      const data = await res.json();
-      if (data.success && data.report) {
+      const api = await readApiResponse(res);
+      const data = api.data;
+      if (api.ok && data.success && data.report) {
         this.displayCleanReport(data.report);
         this.showToast(`Czyszczenie plate'u ${plate} zakończone sukcesem (-${data.report.reduction_pct}%)!`);
         if (data.nk_script_path) {
           alert(`Wygenerowano węzeł Nuke:\n${data.nk_script_path}\n\nGroup Deflicker_${plate} jest gotowy do podpięcia pod Read w Nuke.`);
         }
       } else {
-        alert(`Błąd: ${data.detail || 'Nie udało się zakończyć czyszczenia'}`);
+        alert(`Błąd: ${api.error || 'Nie udało się zakończyć czyszczenia'}`);
       }
     } catch (e) {
       alert(`Błąd połączenia z serwerem: ${e}`);
