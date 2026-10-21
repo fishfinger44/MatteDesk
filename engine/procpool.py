@@ -5,6 +5,8 @@
 Processes, not threads: alignment's residual checks and patch refinement are Python loops that hold the GIL.
 Each worker runs OpenCV and BLAS single-threaded so N processes use N cores instead of fighting over them.
 config.json / config.local.json -> `align_workers` (0 or missing = auto: cores - 4, at most 16).
+The worker count is also capped by the free RAM (`ram_workers`, `per_worker_bytes` of the caller) and a process that
+dies (the OS kills it when memory runs out) becomes a readable `PoolMemoryError` instead of a bare BrokenProcessPool.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 import os
 import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, List, Optional, Sequence
 
@@ -19,13 +22,58 @@ _SINGLE_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREAD
 _env_lock = threading.Lock()
 
 
-def default_workers() -> int:
+class RamLimitError(MemoryError):
+    """Not enough RAM for the job; the message is meant for the user (the API answers HTTP 507 with it)."""
+
+
+class PoolMemoryError(RamLimitError):
+    """A pool process died mid-job - almost always the OS killing it for lack of memory."""
+
+
+def available_ram_bytes() -> Optional[int]:
+    """Free physical RAM in bytes, None when it cannot be read."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("avail", ctypes.c_ulonglong), ("tpf", ctypes.c_ulonglong), ("apf", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ave", ctypes.c_ulonglong)]
+            m = _MS()
+            m.l = ctypes.sizeof(_MS)
+            return int(m.avail) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return None
+
+
+RAM_SHARE = 0.6   # of the free RAM the workers may plan to use (the rest: this process, the OS, other programs)
+
+
+def ram_workers(workers: int, per_worker_bytes: int) -> int:
+    """`workers` capped so that `per_worker_bytes` per process fits in RAM_SHARE of the free RAM (never below 1;
+    unknown RAM or per_worker_bytes <= 0: unchanged)."""
+    if per_worker_bytes <= 0 or workers <= 1:
+        return workers
+    avail = available_ram_bytes()
+    if avail is None:
+        return workers
+    return max(1, min(int(workers), int(avail * RAM_SHARE // per_worker_bytes)))
+
+
+def _died() -> PoolMemoryError:
+    return PoolMemoryError("Proces roboczy zakończył się nagle – najpewniej zabrakło pamięci RAM. "
+                           "Skróć zakres klatek albo ustaw mniejszą liczbę procesów (align_workers).")
+
+
+def default_workers(per_worker_bytes: int = 0) -> int:
     try:
         from engine.config import load_config
         n = int(load_config().get("align_workers") or 0)
     except Exception:
         n = 0
-    return n if n > 0 else max(1, min(16, (os.cpu_count() or 4) - 4))
+    return ram_workers(n if n > 0 else max(1, min(16, (os.cpu_count() or 4) - 4)), per_worker_bytes)
 
 
 def _worker_init() -> None:
@@ -93,18 +141,24 @@ def imap_frames(fn: Callable[[Any], Any], jobs: Sequence[Any], workers: int,
             while nxt < len(jobs) and len(futs) < window:
                 futs.append(submit(pool, fn, jobs[nxt]))
                 nxt += 1
-            yield i, futs.pop(0).result()
+            try:
+                res = futs.pop(0).result()
+            except BrokenProcessPool:
+                raise _died() from None
+            yield i, res
     finally:
         for f in futs:
             f.cancel()
 
 
 def run_frames(fn: Callable[[Any], Any], jobs: Sequence[Any], workers: Optional[int] = None,
-               on_done: Optional[Callable[[int, int], None]] = None) -> List[Any]:
+               on_done: Optional[Callable[[int, int], None]] = None, per_worker_bytes: int = 0) -> List[Any]:
     """fn(job) for every job; results in job order. on_done(n_done, job_index) after each finished job – an
     exception raised there (e.g. JobCancelled from "Przerwij") cancels the jobs not started yet and propagates.
-    workers <= 1 runs in this process (same results, used by tests and short sequences)."""
-    n_w = default_workers() if workers is None else int(workers)
+    workers <= 1 runs in this process (same results, used by tests and short sequences).
+    `per_worker_bytes`: the job's peak RAM per process - the worker count is capped by the free RAM (ram_workers); a
+    pool process that dies raises PoolMemoryError."""
+    n_w = default_workers(per_worker_bytes) if workers is None else ram_workers(int(workers), per_worker_bytes)
     if n_w <= 1 or len(jobs) <= 1:
         out = []
         for i, job in enumerate(jobs):
@@ -122,6 +176,9 @@ def run_frames(fn: Callable[[Any], Any], jobs: Sequence[Any], workers: Optional[
             out[i] = fut.result()
             if on_done:
                 on_done(n, i)
+    except BrokenProcessPool:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise _died() from None
     except BaseException:
         pool.shutdown(wait=True, cancel_futures=True)
         raise

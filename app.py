@@ -1345,6 +1345,14 @@ class AlignApplyRequest(BaseModel):
     confirmed: bool = False
 
 
+def _align_oom_message(e: BaseException, w: int, h: int, n: int) -> str:
+    """HTTP 507 text of the alignment endpoints: our own readable RamLimitError, else a generic hint."""
+    from engine.procpool import RamLimitError
+    if isinstance(e, RamLimitError):
+        return str(e)
+    return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Skróć zakres klatek albo ustaw mniejszą liczbę procesów (align_workers)."
+
+
 @app.post("/api/plate/align/measure")
 @long_job("Pomiar wyrównania")
 async def measure_plate_alignment(req: AlignMeasureRequest):
@@ -1392,24 +1400,27 @@ async def measure_plate_alignment(req: AlignMeasureRequest):
 
     from engine.align import AlignmentPipeline, NukeAlignGroupGenerator
 
-    report = await loop.run_in_executor(
-        None,
-        lambda: AlignmentPipeline.measure_sequence(
-            beauty_pattern=beauty_pat,
-            aux_pattern=aux_pat,
-            first_frame=first_f,
-            last_frame=last_f,
-            plate_name=req.plate,
-            aux_plate_type=req.aux_plate_type,
-            plate_w=w,
-            plate_h=h,
-            progress_cb=on_progress,
-            grid_dir=align_dir / f"grid_{req.plate}",
-            step_cb=JOBS.progress,
-            cancel_check=JOBS.check,
-            device=device,
+    try:
+        report = await loop.run_in_executor(
+            None,
+            lambda: AlignmentPipeline.measure_sequence(
+                beauty_pattern=beauty_pat,
+                aux_pattern=aux_pat,
+                first_frame=first_f,
+                last_frame=last_f,
+                plate_name=req.plate,
+                aux_plate_type=req.aux_plate_type,
+                plate_w=w,
+                plate_h=h,
+                progress_cb=on_progress,
+                grid_dir=align_dir / f"grid_{req.plate}",
+                step_cb=JOBS.progress,
+                cancel_check=JOBS.check,
+                device=device,
+            )
         )
-    )
+    except MemoryError as e:
+        raise HTTPException(status_code=507, detail=_align_oom_message(e, w, h, last_f - first_f + 1))
 
     # Save report JSON
     json_path = align_dir / f"Align_{req.plate}.json"
@@ -1531,16 +1542,19 @@ async def apply_plate_alignment(req: AlignApplyRequest):
             loop
         )
 
-    written = await loop.run_in_executor(
-        None,
-        lambda: PlateWarper.warp_sequence(
-            aux_pattern=aux_pat,
-            report=report,
-            dest_dir=align_dest_dir,
-            grid_dir=grid_dir if grid_dir.exists() else None,
-            progress_cb=on_progress
+    try:
+        written = await loop.run_in_executor(
+            None,
+            lambda: PlateWarper.warp_sequence(
+                aux_pattern=aux_pat,
+                report=report,
+                dest_dir=align_dest_dir,
+                grid_dir=grid_dir if grid_dir.exists() else None,
+                progress_cb=on_progress
+            )
         )
-    )
+    except MemoryError as e:
+        raise HTTPException(status_code=507, detail=_align_oom_message(e, *_plate_size(), len(report.frames)))
 
     # Register the aligned plate in project.json (manifest is read-only)
     align_pat = str(align_dest_dir / sample_path.name.replace("0001", "####"))

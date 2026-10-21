@@ -57,7 +57,7 @@ import scipy.interpolate as interp
 
 from engine import align_grid
 from engine.exr_io import imread_unchanged
-from engine.procpool import run_frames
+from engine.procpool import RamLimitError, available_ram_bytes, ram_workers, run_frames
 from engine.nuke_nk import (corner_pin_knobs, matrix_cv_to_nuke, scalar_knob, similarity_to_transform_knobs,
                             validate_nk, xy_knob)
 
@@ -1310,6 +1310,33 @@ Wygenerowano przez MatteDesk (Stage E1b) · {datetime.now().isoformat()}
         return written_files
 
 
+# Peak RAM of one pool process (measured on 4096x2731 float32 EXR pairs: global 0.53 GB, load pair 0.39 GB, local
+# 0.40 GB incl. the interpreter) with a margin, per plate pixel + the interpreter / OpenCV base.
+JOB_BYTES_PER_PX = 64
+JOB_BASE_BYTES = 200 * 2 ** 20
+
+
+def job_ram_bytes(plate_w: int, plate_h: int) -> int:
+    return int(plate_w) * int(plate_h) * JOB_BYTES_PER_PX + JOB_BASE_BYTES
+
+
+def local_model_ram_bytes(n_frames: int, plate_w: int, plate_h: int, work_scale: float = 0.5) -> int:
+    """RAM the local model keeps in THIS process: every frame's beauty + aux at work size (float32, 3 channels),
+    x1.3 for the tracker's working copies."""
+    ww, wh = max(16, round(plate_w * work_scale)), max(16, round(plate_h * work_scale))
+    return int(n_frames * 2 * ww * wh * 3 * 4 * 1.3)
+
+
+def check_local_model_ram(n_frames: int, plate_w: int, plate_h: int, work_scale: float = 0.5) -> None:
+    """Fail BEFORE the long measurement when the local model's frames cannot fit in the free RAM (unknown RAM: no check)."""
+    need, avail = local_model_ram_bytes(n_frames, plate_w, plate_h, work_scale), available_ram_bytes()
+    if avail is not None and need > avail * 0.8:
+        raise RamLimitError(
+            f"Dopasowanie lokalne potrzebuje ok. {need / 2 ** 30:.1f} GB RAM na {n_frames} klatek {plate_w}x{plate_h}, "
+            f"wolne jest {avail / 2 ** 30:.1f} GB. Skróć zakres klatek (zmieści się ok. "
+            f"{max(1, int(avail * 0.8 // max(1, need // max(1, n_frames))))}).")
+
+
 def _frame_path(pattern: str, f: int) -> str:
     return pattern.replace("####", f"{f:04d}").replace("%04d", f"{f:04d}")
 
@@ -1439,7 +1466,8 @@ class AlignmentPipeline:
         strict = device.lower() == "gpu"
         dev, note = align_gpu.resolve_device(device, gpu_python, gpu_env)
         gpu = align_gpu.open_aligner(gpu_python, gpu_env) if dev == "gpu" else None
-        n_dec = 1 if workers == 1 else min(align_gpu.decode_workers(), workers or 64)
+        job_bytes = job_ram_bytes(plate_w, plate_h)
+        n_dec = 1 if workers == 1 else ram_workers(min(align_gpu.decode_workers(), workers or 64), job_bytes)
         used: List[str] = []
         try:
             if step_cb:
@@ -1457,7 +1485,7 @@ class AlignmentPipeline:
                     align_gpu.close_aligner(gpu)
                     gpu = None
             if results is None:
-                results = run_frames(_global_frame_job, jobs, workers, on_done)
+                results = run_frames(_global_frame_job, jobs, workers, on_done, job_bytes)
                 used.append("cpu")
             frame_results: List[AlignmentFrameResult] = [r for r in results if r is not None]
 
@@ -1476,6 +1504,7 @@ class AlignmentPipeline:
                     exclude_box, Path(grid_dir), tracker, workers=workers, progress_cb=progress_cb, step_cb=step_cb,
                     cancel_check=cancel_check, gpu=g, decode_workers=n_dec)
                 local_engine = ""
+                check_local_model_ram(len(frame_results), plate_w, plate_h)
                 if gpu is not None:
                     try:
                         local_engine = run_local(gpu)
@@ -1574,7 +1603,7 @@ class AlignmentPipeline:
             load_workers = decode_workers
         step("Dopasowanie lokalne: wczytywanie klatek")
         small = run_frames(_load_pair_job, [(b, a, local.work_size(), m) for (b, a), m in zip(paths, mats)],
-                           load_workers, on_done)
+                           load_workers, on_done, job_ram_bytes(plate_w, plate_h))
         step(f"Dopasowanie lokalne: śledzenie punktów ({local.engine})")
         fields = local.measure([b for b, _ in small], [a for _, a in small], mask, cancel_check=cancel_check)
         del small
@@ -1589,7 +1618,7 @@ class AlignmentPipeline:
         else:
             jobs = [(b, a, aux_plate_type, plate_w, plate_h, local.grid_spacing, pts, disp, sp, m)
                     for (b, a), (pts, disp), sp, m in zip(paths, fields, grids, mats)]
-            results = run_frames(_local_frame_job, jobs, workers, on_done)
+            results = run_frames(_local_frame_job, jobs, workers, on_done, job_ram_bytes(plate_w, plate_h))
         for r, res in zip(frame_results, results):
             if res is None:
                 r.status = "uncertain"
