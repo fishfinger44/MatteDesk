@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -90,6 +91,51 @@ class CleanReport:
             "gain_map_pattern": self.gain_map_pattern,
             "export_dir": self.export_dir
         }
+
+
+# -----------------------------------------------------------------------------
+# Threads for the per-frame loops (OpenCV / numpy release the GIL, so no process pool and no frame copies)
+# -----------------------------------------------------------------------------
+
+def _available_ram_bytes() -> Optional[int]:
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("avail", ctypes.c_ulonglong), ("tpf", ctypes.c_ulonglong), ("apf", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ave", ctypes.c_ulonglong)]
+            m = _MS()
+            m.l = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.avail)
+            return None
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return None
+
+
+def clean_workers(per_worker_bytes: int = 0) -> int:
+    """Threads for the per-frame loops. `MD_CLEAN_THREADS` (>= 1) overrides; otherwise the CPU count, capped so that
+    `per_worker_bytes` of working memory per thread fits in half of the free RAM (1 thread when unknown / too tight)."""
+    env = os.environ.get("MD_CLEAN_THREADS", "").strip()
+    if env.isdigit() and int(env) >= 1:
+        return int(env)
+    n = max(1, min(os.cpu_count() or 1, 16))
+    if per_worker_bytes > 0:
+        avail = _available_ram_bytes()
+        n = min(n, 2) if avail is None else min(n, max(1, int(avail * 0.5 // per_worker_bytes)))
+    return n
+
+
+def _map_frames(fn: Callable[[int], Any], n: int, workers: int) -> List[Any]:
+    """[fn(0), ..., fn(n-1)] in order; fn calls run on `workers` threads (a plain loop for 1 worker / 1 frame)."""
+    workers = max(1, min(workers, n))
+    if workers == 1:
+        return [fn(i) for i in range(n)]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, range(n)))
 
 
 # -----------------------------------------------------------------------------
@@ -217,18 +263,16 @@ class DeflickerMetrics:
 
         h, w = frames[0].shape[:2]
         eval_h = round(h * eval_w / w)
-        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
         gx, gy = np.meshgrid(np.arange(eval_w, dtype=np.float32), np.arange(eval_h, dtype=np.float32))
 
         # Downscale and compute log-luma
-        smalls = []
-        grays = []
-        for f in frames:
+        def _small_gray(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
             sm = np.maximum(cv2.resize(f, (eval_w, eval_h), interpolation=cv2.INTER_AREA), 0.0)
-            smalls.append(sm)
             lg = np.log(sm.mean(axis=2) + 0.01) if sm.ndim == 3 else np.log(sm + 0.01)
-            g8 = cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            grays.append(g8)
+            return sm, cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        workers = clean_workers(eval_w * eval_h * 3 * 4 * 8)
+        smalls, grays = (list(x) for x in zip(*_map_frames(lambda i: _small_gray(frames[i]), n, workers)))
 
         if roi_slices is None:
             # Default central ROI: avoid outer 5% border
@@ -238,14 +282,11 @@ class DeflickerMetrics:
             ys, xs = roi_slices
 
         if flow_ref is not None:
-            grays = []
-            for f in flow_ref:
-                sm = np.maximum(cv2.resize(f, (eval_w, eval_h), interpolation=cv2.INTER_AREA), 0.0)
-                lg = np.log(sm.mean(axis=2) + 0.01) if sm.ndim == 3 else np.log(sm + 0.01)
-                grays.append(cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+            grays = [g for _, g in _map_frames(lambda i: _small_gray(flow_ref[i]), len(flow_ref), workers)]
 
-        diffs = []
-        for i in range(1, n):
+        def _diff(k: int) -> np.ndarray:
+            i = k + 1
+            dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)   # one per call: not shared between threads
             flow = dis.calc(grays[i], grays[i - 1], None)
             warped_prev = cv2.remap(
                 smalls[i - 1],
@@ -257,8 +298,9 @@ class DeflickerMetrics:
             cur_blur = cv2.GaussianBlur(smalls[i], (0, 0), 2.0)[ys, xs]
             prev_blur = cv2.GaussianBlur(warped_prev, (0, 0), 2.0)[ys, xs]
             ratio = np.log2((cur_blur + 0.02) / (prev_blur + 0.02))
-            diff_pct = np.abs(ratio).mean(axis=(0, 1)) * 100.0
-            diffs.append(diff_pct)
+            return np.abs(ratio).mean(axis=(0, 1)) * 100.0
+
+        diffs = _map_frames(_diff, n - 1, workers)
 
         diffs_arr = np.array(diffs)  # shape (N-1, 3) in BGR
         # OpenCV reads as BGR, so indices are 0: B, 1: G, 2: R
@@ -310,16 +352,13 @@ class DeflickerEngine:
     def build_homography_chain(frames: List[np.ndarray], track_w: int = 512) -> List[np.ndarray]:
         """Builds cumulative homography chain C[k] mapping frame k -> frame 0."""
         n = len(frames)
-        det = cv2.ORB_create(3000)
-        grays = []
-        for f in frames:
-            _, g = compute_log_luma_gray(f, track_w)
-            grays.append(g)
+        workers = clean_workers(track_w * track_w * 3 * 4 * 8)
+        grays = _map_frames(lambda i: compute_log_luma_gray(frames[i], track_w)[1], n, workers)
 
-        step = [np.eye(3, dtype=np.float32)]
-        for k in range(1, n):
-            Hk, _ = estimate_homography(grays[k - 1], grays[k], det)
-            step.append(Hk)
+        def _step(k: int) -> np.ndarray:
+            return estimate_homography(grays[k - 1], grays[k], cv2.ORB_create(3000))[0]   # one detector per call
+
+        step = [np.eye(3, dtype=np.float32)] + _map_frames(lambda i: _step(i + 1), n - 1, workers)
 
         C = [np.eye(3, dtype=np.float32)]
         for k in range(1, n):
@@ -372,7 +411,7 @@ class DeflickerEngine:
             cur_blurred = np.stack([_blur(cur_stack[i]) for i in range(n)], axis=0)
             new_total = np.empty_like(total_gain)
 
-            for i in range(n):
+            def _frame(i: int) -> None:
                 j_start = max(0, i - win_radius)
                 j_end = min(n, i + win_radius + 1)
                 Ci_inv = np.linalg.inv(C[i])
@@ -422,6 +461,7 @@ class DeflickerEngine:
                 fill = np.exp(_bw(np.log(r) * w_conf) / wf)
                 r_final = w_conf * r + (1.0 - w_conf) * fill
                 new_total[i] = total_gain[i] * r_final
+            _map_frames(_frame, n, clean_workers((2 * win_radius + 1) * lo_h * lo_w * 3 * 4 * 12))
 
             total_gain = np.clip(new_total, rmin, rmax)
             cur_stack = stack * total_gain
@@ -432,15 +472,18 @@ class DeflickerEngine:
         gh = round(h * gf_w / w)
         gain_maps = []
         out_frames = []
-        for i in range(n):
+        def _up(i: int) -> Tuple[np.ndarray, np.ndarray]:
             a = frames[i]
             small_a = np.maximum(cv2.resize(a, (gf_w, gh), interpolation=cv2.INTER_AREA), 0.0)
             guide = np.log(small_a.mean(axis=2) + 0.01).astype(np.float32)
             lr = np.log(cv2.resize(total_gain[i], (gf_w, gh), interpolation=cv2.INTER_CUBIC)).astype(np.float32)
             lr_guided = guided_filter(guide, lr, gf_r, gf_eps)
             full_gain = np.exp(cv2.resize(lr_guided, (w, h), interpolation=cv2.INTER_CUBIC))
+            return full_gain, a * full_gain
+
+        for full_gain, o in _map_frames(_up, n, clean_workers(h * w * 3 * 4 * 6)):
             gain_maps.append(full_gain)
-            out_frames.append(a * full_gain)
+            out_frames.append(o)
 
         return out_frames, gain_maps
 
@@ -501,7 +544,7 @@ class DeflickerEngine:
         gh = round(h * gf_w / w)
         gain_maps = []
         out_frames = []
-        for i in range(n):
+        def _up(i: int) -> Tuple[np.ndarray, np.ndarray]:
             a = frames[i]
             small_a = np.maximum(cv2.resize(a, (gf_w, gh), interpolation=cv2.INTER_AREA), 0.0)
             guide = np.log(small_a.mean(axis=2) + 0.01).astype(np.float32)
@@ -509,8 +552,11 @@ class DeflickerEngine:
             lg = cv2.GaussianBlur(lg, (0, 0), gf_w / gx / 3.0)
             lg_guided = guided_filter(guide, lg, gf_r, gf_eps)
             full_gain = np.exp(cv2.resize(lg_guided, (w, h), interpolation=cv2.INTER_CUBIC))
+            return full_gain, a * full_gain
+
+        for full_gain, o in _map_frames(_up, n, clean_workers(h * w * 3 * 4 * 6)):
             gain_maps.append(full_gain)
-            out_frames.append(a * full_gain)
+            out_frames.append(o)
 
         return out_frames, gain_maps
 
@@ -544,11 +590,10 @@ class DeflickerEngine:
             g = np.log(sm.mean(axis=2) + 0.01) if sm.ndim == 3 else np.log(sm + 0.01)
             return cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
         gx, gy = np.meshgrid(np.arange(fw, dtype=np.float32), np.arange(fh, dtype=np.float32))
 
-        out_frames = []
-        for i in range(n):
+        def _frame(i: int) -> np.ndarray:
+            dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)   # one per thread-call
             cur = frames[i]
             Lc = _logimg(cur)
             small_c = cv2.resize(cur, (fw, fh), interpolation=cv2.INTER_AREA)
@@ -602,7 +647,9 @@ class DeflickerEngine:
 
             out = np.exp(base_c + mid_median + fine_c) - leps
             out = np.where(cur < 0.0, cur, np.maximum(out, 0.0))
-            out_frames.append(out.astype(np.float32))
+            return out.astype(np.float32)
+
+        out_frames = _map_frames(_frame, n, clean_workers(h * w * 3 * 4 * 16))
 
         return out_frames
 
@@ -951,10 +998,11 @@ class PlateCleaner:
 
         # Re-apply the gain exactly as the Nuke Group will see it (stored low-res half map, cubic upscale)
         if stages_applied:
-            for i in range(n):
+            def _requant(i: int) -> None:
                 _, g_full = PlateCleaner.quantize_gain(combined_gains[i])
                 combined_gains[i] = g_full
                 cur_frames[i] = (frames[i].astype(np.float32) * g_full).astype(np.float32)
+            _map_frames(_requant, n, clean_workers(h * w * 3 * 4 * 5))
 
         # Stage 3: Detail / shading MC (only when requested, reconstructs pixels directly)
         if enable_stage3:
