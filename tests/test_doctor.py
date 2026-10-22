@@ -30,7 +30,7 @@ def test_doctor_current_environment_health():
     assert item_map["Virtual Environment"].status == "ok"
     assert item_map["ffmpeg"].status == "ok"
     assert item_map["MatAnyone2 VRAM Patch"].status == "ok"
-    assert item_map["Model: SAM3"].status == "ok"
+    assert item_map["Model: SAM 3.1"].status == "ok"
     assert item_map["Model: MatAnyone2"].status == "ok"
     assert item_map["Model: CoTracker3"].status == "ok"
     assert item_map["Disk Space"].status == "ok"
@@ -52,10 +52,10 @@ def test_doctor_altered_sam3_schema_detection():
     doc = EnvironmentDoctor(simulation={"simulate_altered_sam3": True})
     report = doc.run_all_checks()
 
-    sam3_sig_item = next((it for it in report.items if it.name == "SAM3 Node Signatures"), None)
+    sam3_sig_item = next((it for it in report.items if it.name == "SAM 3.1 Node Signatures"), None)
     assert sam3_sig_item is not None
     assert sam3_sig_item.status == "error"
-    assert "Niezgodność wejść węzłów SAM3" in sam3_sig_item.message
+    assert "Niezgodność wejść węzłów SAM 3.1" in sam3_sig_item.message
 
 
 def test_doctor_simulated_missing_components_and_install_instructions(tmp_path):
@@ -69,7 +69,7 @@ def test_doctor_simulated_missing_components_and_install_instructions(tmp_path):
     report = doc.run_all_checks()
 
     item_map = {item.name: item for item in report.items}
-    assert item_map["Model: SAM3"].status == "error"
+    assert item_map["Model: SAM 3.1"].status == "error"
     assert item_map["MatAnyone2 VRAM Patch"].status == "error"
     assert item_map["ComfyUI Service"].status == "warning"
     assert item_map["ffmpeg"].status == "error"
@@ -79,7 +79,7 @@ def test_doctor_simulated_missing_components_and_install_instructions(tmp_path):
     assert md_file is not None
     assert md_file.exists()
     content = md_file.read_text(encoding="utf-8")
-    assert "Model: SAM3" in content
+    assert "Model: SAM 3.1" in content
     assert "MatAnyone2 VRAM Patch" in content
     assert "ffmpeg" in content
     assert "PowerShell" in content or "powershell" in content
@@ -107,7 +107,7 @@ def test_doctor_gives_download_links_for_missing_items(tmp_path):
     doc = EnvironmentDoctor(simulation={"simulate_missing_model": True, "simulate_missing_nodes": True})
     report = doc.run_all_checks()
     by = {it.name: it for it in report.items}
-    sam3 = by["Model: SAM3"]
+    sam3 = by["Model: SAM 3.1"]
     assert sam3.status == "error" and "checkpoints" in sam3.message
     assert any("huggingface.co/Comfy-Org/sam3.1" in l for l in sam3.links)
     assert any("pq-yang/MatAnyone2" in l for l in by["Model: MatAnyone2"].links)
@@ -137,3 +137,15 @@ def test_doctor_desktop2_start_hint(monkeypatch):
     monkeypatch.setattr(comfy_launch, "desktop2_install", lambda cfg: None)
     item, _ = doc.check_comfy_connectivity()
     assert "Uruchom aplikację ComfyUI Desktop" in item.fix_suggestion
+
+
+def test_licence_summary_matches_licences():
+    """Doctor's licence summary (2026-10-21): every row's use agrees with the LICENSES non-commercial flag."""
+    import doctor
+    rows = doctor.licence_summary()
+    assert {r["name"] for r in rows} >= {"MatAnyone2", "CoTracker3", "ViTMatte", "BiRefNet_HR-matting / Lucida", "SAM 3.1"}
+    for name, key, use in doctor.LICENCE_SUMMARY:
+        nc = doctor.LICENSES[key][1]
+        assert (use == "research") == nc, name
+    assert {r["name"]: r["use"] for r in rows}["ViTMatte"] == "research"
+    assert {r["name"]: r["use"] for r in rows}["BiRefNet_HR-matting / Lucida"] == "commercial"

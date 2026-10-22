@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/mplate.py - Plate-to-mask (SPEC 4b): input of SAM3 / MatAnyone / LTX and of edge measurements only –
+"""engine/mplate.py - Plate-to-mask (SPEC 4b): input of SAM 3.1 / MatAnyone2 / LTX-2.5 and of edge measurements only –
 never RGB, never exported.
 
 1. display (PlateToDisplay for scene-linear) x the 4c gain maps (same deflicker as the comp) – or, when the user
@@ -152,7 +152,9 @@ class MaskPlate:
         rep.strength = chosen
         if chosen < 0:
             rep.log.append("bramka nie przeszła – plate do maskowania = display bez odszumienia")
+        from engine.comfy_io import job_progress
         for i, f in enumerate(self.frames):
+            job_progress(f"Plate do maskowania: odszumianie kadru {self.seg_id}", i + 1, len(self.frames))
             if chosen < 0:
                 out = get(f)
             else:
@@ -190,8 +192,10 @@ def resolve_mask_plate_denoise(setting: Optional[str], manifest: Optional[Dict],
     if s not in DENOISE_CHOICES:
         s = "auto"
     eight = io_mode_for(manifest) == PNG8
-    auto_on = not eight
-    src = "źródło 8-bit (MP4 / PNG / JPG)" if eight else "źródło EXR / > 8 bit"
+    # user decision 2026-10-22: the denoised plate enters the pipeline only when chosen in the Plates step (a plate
+    # denoised elsewhere must not be touched again) -> 'auto' = off for every source (was: on for EXR / > 8 bit)
+    auto_on = False
+    src = "auto = wył.: modele dostają plate z kroku Plates bez odszumiania (wł. tylko z wyboru)"
     if not global_enabled:
         eff, reason = False, "wyłączone globalnie (defaults.json → mplate.enabled = false)"
     elif s == "auto":

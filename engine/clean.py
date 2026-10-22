@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -265,6 +266,130 @@ class LazyFrames(Sequence):
         return self._getter(i)
 
 
+class PinnedFrameCache(Sequence):
+    """Frames read once and kept in RAM up to a fixed budget; the rest is read again on every access.
+
+    The cleaner sweeps the whole sequence ~10 times (measure, homographies, stages 1 / 2 / 4, combine, export – each
+    pass frame 1 .. N), so an LRU / sliding window would evict every frame before the next pass returns to it. The
+    first frames that fit the budget are pinned for the whole run instead (hit rate = budget / sequence, never 0).
+    Stored as float16 when that is lossless (half EXR plates: always), else as loaded; every access returns a fresh
+    float32 array, so the result is bit for bit the one of plain re-reading. Thread-safe (the per-frame loops run on
+    threads; two threads loading the same frame at once only waste one read)."""
+
+    def __init__(self, n: int, loader: Callable[[int], np.ndarray], budget_bytes: int):
+        self._n = n
+        self._loader = loader
+        self.budget = max(0, int(budget_bytes))
+        self.used = 0
+        self._pinned: Dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
+        self.reads = 0
+        self.hits = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[k] for k in range(*i.indices(self._n))]
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError(i)
+        with self._lock:
+            hit = self._pinned.get(i)
+            if hit is not None:
+                self.hits += 1
+        if hit is not None:
+            return hit.astype(np.float32)          # astype copies: callers never see the pinned array
+        img = np.asarray(self._loader(i), dtype=np.float32)
+        with self._lock:
+            self.reads += 1
+            if i not in self._pinned and self.used < self.budget:
+                small = img.astype(np.float16)
+                keep = small if np.array_equal(small.astype(np.float32), img, equal_nan=True) else img.copy()
+                if self.used + keep.nbytes <= self.budget:
+                    self._pinned[i] = keep
+                    self.used += keep.nbytes
+        return img
+
+    def stats(self) -> Dict[str, Any]:
+        return {"frames": self._n, "pinned": len(self._pinned), "pinned_gb": round(self.used / 2 ** 30, 2),
+                "budget_gb": round(self.budget / 2 ** 30, 2), "disk_reads": self.reads, "ram_hits": self.hits}
+
+
+CACHE_RAM_SHARE = 0.4   # of the free RAM when the run starts (the per-frame threads need their working memory too)
+
+
+def clean_cache_budget() -> int:
+    """RAM budget of PinnedFrameCache in bytes: `MD_CLEAN_CACHE_GB` (0 = off) or 40 % of the free RAM (0 when unknown)."""
+    env = os.environ.get("MD_CLEAN_CACHE_GB", "").strip()
+    if env:
+        try:
+            return max(0, int(float(env) * 2 ** 30))
+        except ValueError:
+            pass
+    avail = _available_ram_bytes()
+    return int(avail * CACHE_RAM_SHARE) if avail else 0
+
+
+class _MemoView(Sequence):
+    """Read-only view of a dict {frame: array} of length n (the input of the next streamed stage)."""
+
+    def __init__(self, n: int, memo: Dict[int, Any]):
+        self._n = n
+        self._memo = memo
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i):
+        return self._memo[i]
+
+
+def stream_pixel_stages(n: int, stages: List[Tuple[int, Callable[[Sequence], Callable[[int], Any]], int]],
+                        emit: Callable[[int, Any], None], block: int,
+                        on_value: Optional[List[Optional[Callable[[int, Any], None]]]] = None) -> None:
+    """Pixel stages (stage 3, denoise) of a whole sequence with only a few frames in RAM, results bit for bit those of
+    the stages run on full lists (every stage is a pure per-frame function of its input window).
+
+    `stages`: [(radius, make_fn, workers)] in order; make_fn(input) -> fn(i) where input is the previous stage's
+    frames (stage 0 gets None and must read its own source) and fn(i) reads input[i - radius .. i + radius] only.
+    Output frames are produced in blocks of `block` (each block on `workers` threads), passed to emit(i, value) in
+    order, and every stage keeps only what its next stage still needs. on_value[k](i, value): called once per new
+    value of stage k (e.g. low-res metrics of a stage's output)."""
+    m = len(stages)
+    memos: List[Dict[int, Any]] = [{} for _ in range(m)]
+    fns: List[Optional[Callable[[int], Any]]] = [None] * m
+    radii = [r for r, _, _ in stages]
+
+    def ensure(k: int, lo: int, hi: int) -> None:
+        lo, hi = max(0, lo), min(n, hi)
+        if lo >= hi:
+            return
+        if k > 0:
+            ensure(k - 1, lo - radii[k], hi + radii[k])
+        if fns[k] is None:   # built once its input holds frame 0 (fns read frames[0].shape)
+            fns[k] = stages[k][1](_MemoView(n, memos[k - 1]) if k > 0 else None)
+        todo = [i for i in range(lo, hi) if i not in memos[k]]
+        vals = _map_frames(lambda t: fns[k](todo[t]), len(todo), stages[k][2])
+        for i, v in zip(todo, vals):
+            memos[k][i] = v
+            if on_value and on_value[k]:
+                on_value[k](i, v)
+
+    for b0 in range(0, n, max(1, block)):
+        b1 = min(n, b0 + max(1, block))
+        ensure(m - 1, b0, b1)
+        for i in range(b0, b1):
+            emit(i, memos[m - 1].pop(i))
+        need = b1   # frames below `need` of stage k are not read any more
+        for k in range(m - 2, -1, -1):
+            need -= radii[k + 1]
+            for i in [i for i in memos[k] if i < need]:
+                del memos[k][i]
+
+
 def as_bgr(img: np.ndarray) -> np.ndarray:
     """Image as H x W x 3: grayscale is replicated, alpha / extra channels are dropped."""
     if img.ndim == 2:
@@ -418,9 +543,18 @@ class DeflickerEngine:
         gf_r: int = 16,
         gf_eps: float = 0.1,
         iterations: int = 2,
-        progress_cb: Optional[Callable[[int, int], None]] = None
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        sigma: float = 6.0,
+        content_check: float = 0.0
     ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """Stage 1: Motion-compensated local per-channel deflicker (deflicker_bg_mc2.py).
+        """Stage 1: Motion-compensated local per-channel deflicker (deflicker_bg_mc2.py). `sigma`: blur of the low-res
+        (512 px) comparison = size of the smallest brightness patch the stage corrects ("map smoothness" slider).
+        `content_check` (0 = off, else the minimum local correlation): a neighbour's sample enters the robust mean only
+        where its CONTENT matches the current frame – normalised correlation (9x9 px at 512) of the high-pass log detail
+        of the ORIGINAL low-res frames, independent of brightness. A moving object = different content -> left out; a
+        lamp footprint on a static surface = same texture, other brightness -> kept (a brightness / sharpness test cannot
+        tell the two apart: it removed the SH010 tree correction, 2.88 -> 3.10 %). E1c ghost at 15 / 3 / sigma 4:
+        0.0046 (without: 0.0063), SH010 tree 1.96 % (15 / 2 / sigma 6 without: 2.23 %) – PROGRESS 2026-10-22.
         
         Returns:
             (deflickered_frames, gain_maps)
@@ -436,7 +570,7 @@ class DeflickerEngine:
                                n, clean_workers(h * w * 3 * 4 * 4))
         stack = np.stack(lo_stack, axis=0).astype(np.float32)
 
-        sigma = 6.0
+        sigma = float(sigma)
         eps = 0.01
         min_ok = 10
         fill_sigma = 25.0
@@ -447,6 +581,12 @@ class DeflickerEngine:
 
         total_gain = np.ones_like(stack)
         cur_stack = stack.copy()
+        details: List[np.ndarray] = []
+        if content_check > 0:
+            def _detail(img: np.ndarray) -> np.ndarray:   # high-pass log luma = content, not brightness
+                lg = np.log(np.maximum(img, 0.0) + eps).mean(axis=2).astype(np.float32)
+                return lg - cv2.GaussianBlur(lg, (0, 0), 3.0, borderType=cv2.BORDER_REPLICATE)
+            details = [_detail(stack[k]) for k in range(n)]
 
         for it in range(iterations):
             cur_blurred = np.stack([_blur(cur_stack[i]) for i in range(n)], axis=0)
@@ -484,6 +624,25 @@ class DeflickerEngine:
                 sxy = np.where(ok, (x - xm) * (L - Lm), 0.0).sum(axis=0)
                 slope = np.where(sxx > 1e-6, sxy / np.maximum(sxx, 1e-6), 0.0)
                 A = (A + eps) * np.exp(-slope * x) - eps
+                if content_check > 0:
+                    # a neighbour's sample only where its content correlates with frame i (moving object -> out)
+                    di = details[i]
+                    box = (9, 9)
+                    mi = cv2.boxFilter(di, -1, box)
+                    vi = cv2.boxFilter(di * di, -1, box) - mi * mi
+                    for q in range(A.shape[0]):
+                        j = j_start + q
+                        if j == i:
+                            continue
+                        dj = cv2.warpPerspective(details[j], Ci_inv @ C[j], (lo_w, lo_h), flags=cv2.INTER_LINEAR,
+                                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+                        mj = cv2.boxFilter(dj, -1, box)
+                        vj = cv2.boxFilter(dj * dj, -1, box) - mj * mj
+                        ncc = (cv2.boxFilter(di * dj, -1, box) - mi * mj) / np.sqrt(np.maximum(vi * vj, 1e-12))
+                        bad = (vi > 1e-4) & (vj > 1e-4) & (ncc < content_check)   # flat areas: no evidence, kept
+                        if bad.any():
+                            bad = cv2.dilate(bad.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+                            A[q][bad] = np.nan
                 ref = interquartile_mean(A)
                 cnt = np.sum(~np.isnan(A).any(axis=-1), axis=0).astype(np.float32)
                 r = np.clip((ref + eps) / (cur_blurred[i] + eps), rmin, rmax)
@@ -598,17 +757,30 @@ class DeflickerEngine:
         s_base: float = 40.0
     ) -> List[np.ndarray]:
         """Stage 3: Shading/detail deflicker (mid-frequency band 2-40 px) with DIS flow.
-        
+
         Note: Reconstructs details directly; cannot be represented as low-res gain maps.
         """
+        if homography_chain is None:
+            homography_chain = DeflickerEngine.build_homography_chain(frames, 512)
+        fn = DeflickerEngine.stage3_frame_fn(frames, homography_chain, radius, fw, s_fine, s_base)
+        h, w = frames[0].shape[:2]
+        return _map_frames(fn, len(frames), clean_workers(h * w * 3 * 4 * 16))
+
+    @staticmethod
+    def stage3_frame_fn(
+        frames: Sequence[np.ndarray],
+        homography_chain: List[np.ndarray],
+        radius: int = 3,
+        fw: int = 1024,
+        s_fine: float = 2.0,
+        s_base: float = 40.0
+    ) -> Callable[[int], np.ndarray]:
+        """Stage 3 of one frame: fn(i) reads only frames[i - radius .. i + radius] (streamed in process_sequence)."""
         n = len(frames)
         h, w = frames[0].shape[:2]
         fh = round(h * fw / w)
         sx = w / fw
         leps = 0.01
-
-        if homography_chain is None:
-            homography_chain = DeflickerEngine.build_homography_chain(frames, 512)
         HCH = homography_chain
 
         def _logimg(img: np.ndarray) -> np.ndarray:
@@ -656,8 +828,12 @@ class DeflickerEngine:
                 mx = (Minv[0, 0] * px + Minv[0, 1] * py + Minv[0, 2]) / den
                 my = (Minv[1, 0] * px + Minv[1, 1] * py + Minv[1, 2]) / den
 
-                mapx = cv2.resize(mx * sx, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-                mapy = cv2.resize(my * sx, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                # small-grid coordinates -> full-size pixel coordinates with the pixel-centre convention
+                # ((x + 0.5) * s - 0.5); plain x * s sampled 1.5 px off at 4096 / 1024 and shifted the result
+                # ~0.25 px right / 0.2 px down (SH010 export 2026-10-22, also in the v10 script deflicker_detail_mc.py)
+                sy = h / fh
+                mapx = cv2.resize((mx + 0.5) * sx - 0.5, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                mapy = cv2.resize((my + 0.5) * sy - 0.5, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
                 Ln = cv2.remap(_logimg(nb), mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
                 mid_n = cv2.GaussianBlur(Ln, (0, 0), s_fine) - cv2.resize(
@@ -677,18 +853,19 @@ class DeflickerEngine:
             out = np.where(cur < 0.0, cur, np.maximum(out, 0.0))
             return out.astype(np.float32)
 
-        out_frames = _map_frames(_frame, n, clean_workers(h * w * 3 * 4 * 16))
-
-        return out_frames
+        return _frame
 
     @staticmethod
     def run_stage4_global_mc(
         frames: List[np.ndarray],
         homography_chain: Optional[List[np.ndarray]] = None,
         channels: str = "BGR",
-        time_sigma: float = 6.0
+        time_sigma: float = 6.0,
+        luma_only: bool = False
     ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """Stage 4: Final global per-frame scalar gain per channel (deflicker_global_mc.py)."""
+        """Stage 4: Final global per-frame scalar gain per channel (deflicker_global_mc.py). `luma_only`: one gain for
+        all channels (from the mean of the channel ratios) – when the lamp's colour is stable, per-channel gains only
+        chase colour noise."""
         n = len(frames)
         h, w = frames[0].shape[:2]
         lw, lh = 512, round(h * 512 / w)
@@ -722,6 +899,8 @@ class DeflickerEngine:
             logq.append(ratio)
 
         L = np.cumsum(np.array(logq, dtype=np.float32), axis=0)
+        if luma_only:
+            L = np.repeat(L.mean(axis=1, keepdims=True), 3, axis=1)
         effective_sigma = min(time_sigma, max(1.0, (n - 1) / 2.0))
         Ls = smooth_time_keep_trend(L, effective_sigma)
         gains = np.exp(Ls - L).astype(np.float32)
@@ -751,30 +930,39 @@ class DenoiseEngine:
         luminance_weight: float = 0.5
     ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """Applies motion-compensated temporal bilateral/weighted filtering.
-        
+
         Returns:
             (denoised_frames, noise_residuals)
         """
+        fn = DenoiseEngine.denoise_frame_fn(frames, radius, spatial_sigma, luminance_weight)
+        out = [fn(i) for i in range(len(frames))]
+        return [d for d, _ in out], [r for _, r in out]
+
+    @staticmethod
+    def denoise_frame_fn(
+        frames: Sequence[np.ndarray],
+        radius: int = 2,
+        spatial_sigma: float = 1.0,
+        luminance_weight: float = 0.5
+    ) -> Callable[[int], Tuple[np.ndarray, np.ndarray]]:
+        """Denoise of one frame: fn(i) -> (denoised, residual), reads only frames[i - radius .. i + radius]."""
         n = len(frames)
         h, w = frames[0].shape[:2]
-        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
         gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-
-        denoised = []
-        residuals = []
 
         # Convert to small luma for fast flow
         lw = min(1024, w)
         lh = round(h * lw / w)
         sx, sy = w / lw, h / lh
 
-        grays = []
-        for f in frames:
+        def _gray(f: np.ndarray) -> np.ndarray:
             sm = np.maximum(cv2.resize(f, (lw, lh), interpolation=cv2.INTER_AREA), 0.0)
             lg = np.log(sm.mean(axis=2) + 0.01) if sm.ndim == 3 else np.log(sm + 0.01)
-            grays.append(cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+            return cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        for i in range(n):
+        def _frame(i: int) -> Tuple[np.ndarray, np.ndarray]:
+            dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)   # one per call: not shared between threads
+            gray_i = _gray(frames[i])
             cur = frames[i].astype(np.float32)
             accum_weight = np.ones((h, w, 1), dtype=np.float32)
             accum_val = cur.copy()
@@ -782,7 +970,7 @@ class DenoiseEngine:
             for j in range(max(0, i - radius), min(n, i + radius + 1)):
                 if j == i:
                     continue
-                flow_small = dis.calc(grays[i], grays[j], None)
+                flow_small = dis.calc(gray_i, _gray(frames[j]), None)
                 flow_x = cv2.resize(flow_small[..., 0] * sx, (w, h), interpolation=cv2.INTER_LINEAR)
                 flow_y = cv2.resize(flow_small[..., 1] * sy, (w, h), interpolation=cv2.INTER_LINEAR)
 
@@ -808,11 +996,9 @@ class DenoiseEngine:
             # Optional subtle spatial filter if requested
             if spatial_sigma > 0:
                 filtered = cv2.GaussianBlur(filtered, (0, 0), spatial_sigma)
+            return filtered, cur - filtered
 
-            denoised.append(filtered)
-            residuals.append(cur - filtered)
-
-        return denoised, residuals
+        return _frame
 
 
 # -----------------------------------------------------------------------------
@@ -949,10 +1135,28 @@ class PlateCleaner:
         enable_stage3: bool = False,
         enable_stage4: bool = True,
         enable_denoise: bool = False,
-        progress_cb: Optional[Callable[[str, int, int], None]] = None
-    ) -> Tuple[List[np.ndarray], List[np.ndarray], CleanReport, Optional[List[np.ndarray]]]:
+        progress_cb: Optional[Callable[[str, int, int], None]] = None,
+        frame_sink: Optional[Callable[[int, np.ndarray], None]] = None,
+        stage1_window: int = 15,
+        stage1_iterations: int = 3,
+        stage3_radius: int = 4,
+        stage1_sigma: float = 4.0,
+        stage4_luma: bool = False,
+        stage1_content_check: float = 0.5
+    ) -> Tuple[Optional[Sequence[np.ndarray]], Sequence[np.ndarray], CleanReport, Optional[List[np.ndarray]]]:
         """Runs the deflicker and optional denoise pipeline on a list of image frames.
-        
+
+        `stage1_window` (+-frames compared), `stage1_iterations`, `stage3_radius` (+-frames of the texture median),
+        `stage1_sigma` (map smoothness at 512 px), `stage4_luma` (one gain for all channels instead of R / G / B):
+        defaults: window 15, 3 iterations, sigma 4, content check 0.5, texture +-4 (2026-10-22 night grid on the E1c
+        synthetic + SH010 X1 F90-109: ghost 0.0046 < 0.005 and better than the old 15 / 2 / sigma 6 on the tree 1.96 vs
+        2.23 %, figure 1.57 vs 1.65 %, whole frame 1.75 vs 1.81 %); more iterations remove a bit more but leave traces of
+        moving objects again (15 / 5: ghost 0.0066) – reachable through the palette; capped by the sequence length.
+        `frame_sink(i, frame)`: every cleaned frame in order (EXR export). With stage 3 / denoise the frames are then
+        streamed – computed in small blocks, handed to the sink and dropped (a 4K sequence never sits in RAM) – and
+        cleaned_frames / noise_residuals come back as None. Without a sink they are returned as lists (tests, small
+        sequences).
+
         Returns:
             (cleaned_frames, combined_gain_maps, report, noise_residuals)
         """
@@ -972,12 +1176,14 @@ class PlateCleaner:
         # Stage 1: Local level with MC
         if enable_stage1:
             if progress_cb:
-                progress_cb("Etap 1: Poziom lokalny", 10, 100)
+                progress_cb("Deflicker: obszary", 10, 100)
             cur_frames, g1 = DeflickerEngine.run_stage1_local_mc(
                 cur_frames,
                 homography_chain=homographies,
-                win_radius=min(15, max(3, n // 2)),
-                iterations=2
+                win_radius=min(int(stage1_window), max(3, n // 2)),
+                iterations=int(stage1_iterations),
+                sigma=float(stage1_sigma),
+                content_check=float(stage1_content_check)
             )
             stages_applied.append("stage1_local_mc")
             stage_gains.append(g1)
@@ -991,7 +1197,7 @@ class PlateCleaner:
         # Stage 2: Tiles MC
         if enable_stage2:
             if progress_cb:
-                progress_cb("Etap 2: Kafle 9x6", 40, 100)
+                progress_cb("Deflicker: kratka 9×6", 40, 100)
             cur_frames, g2 = DeflickerEngine.run_stage2_tiles_mc(
                 cur_frames,
                 homography_chain=homographies,
@@ -1005,12 +1211,13 @@ class PlateCleaner:
         # Stage 4: Global MC
         if enable_stage4:
             if progress_cb:
-                progress_cb("Etap 4: Korekta globalna", 60, 100)
+                progress_cb("Deflicker: cała klatka", 60, 100)
             cur_frames, g4 = DeflickerEngine.run_stage4_global_mc(
                 cur_frames,
                 homography_chain=homographies,
                 channels="BGR",
-                time_sigma=6.0
+                time_sigma=6.0,
+                luma_only=bool(stage4_luma)
             )
             stages_applied.append("stage4_global_mc")
             stage_gains.append(g4)
@@ -1032,37 +1239,75 @@ class PlateCleaner:
         else:
             combined_gains = LazyFrames(n, lambda i: np.ones((h, w, 3), dtype=np.float32))
 
-        # Stage 3 / denoise reconstruct pixels directly and need the cleaned frames in memory (not low-res gains)
-        if enable_stage3 or enable_denoise:
-            cur_frames = [np.array(f, dtype=np.float32) for f in cur_frames]
-
-        # Stage 3: Detail / shading MC (only when requested, reconstructs pixels directly)
-        if enable_stage3:
-            if progress_cb:
-                progress_cb("Etap 3: Cieniowanie pasmo średnie", 75, 100)
-            cur_frames = DeflickerEngine.run_stage3_detail_mc(
-                cur_frames,
-                homography_chain=homographies,
-                radius=min(3, max(1, n // 4))
-            )
-            stages_applied.append("stage3_detail_mc")
-
-        # Optional Denoise
+        # Stage 3 / denoise reconstruct pixels directly (not low-res gains). Each frame only reads its neighbours
+        # (stage 3: +-radius, denoise: +-2), so they are streamed in blocks: only a window of frames is in RAM and the
+        # metrics are taken from low-res copies made on the way (same numbers as on the full frames).
         residuals = None
         noise_red = 0.0
-        if enable_denoise:
+        flicker_final = None
+        if enable_stage3 or enable_denoise:
+            r3 = min(int(stage3_radius), max(1, n // 4))
+            fb = h * w * 3 * 4   # one full-res float32 frame
+            src = cur_frames
+            stages: List[Tuple[int, Callable[[Sequence], Callable[[int], Any]], int]] = [
+                (0, lambda _inp: (lambda i: np.array(src[i], dtype=np.float32)), clean_workers(fb * 4))]
+            if enable_stage3:
+                stages.append((r3, lambda inp: DeflickerEngine.stage3_frame_fn(inp, homographies, r3), clean_workers(fb * 16)))
+                stages_applied.append("stage3_detail_mc")
+            if enable_denoise:
+                stages.append((2, lambda inp: DenoiseEngine.denoise_frame_fn(inp, radius=2), clean_workers(fb * 12)))
+                stages_applied.append("denoise_mc")
+            eval_w = 1024
+            eval_size = (eval_w, round(h * eval_w / w))
+            var_w = min(512, w)
+            var_size = (var_w, round(h * var_w / w))
+            final_small: Dict[int, np.ndarray] = {}
+            var_out: Dict[int, np.ndarray] = {}
+            var_in: Dict[int, np.ndarray] = {}
+            out_list: Optional[List[np.ndarray]] = [] if frame_sink is None else None
+            res_list: Optional[List[np.ndarray]] = [] if (frame_sink is None and enable_denoise) else None
+            on_value: List[Optional[Callable[[int, Any], None]]] = [None] * len(stages)
+            if enable_denoise:   # input of the denoise = output of the stage before it
+                on_value[-2] = lambda i, f: var_in.__setitem__(i, cv2.resize(f, var_size, interpolation=cv2.INTER_AREA))
+            done = [0]
+
+            def emit(i: int, v: Any) -> None:
+                frame, res = v if enable_denoise else (v, None)
+                final_small[i] = cv2.resize(as_bgr(frame), eval_size, interpolation=cv2.INTER_AREA)
+                if enable_denoise:
+                    var_out[i] = cv2.resize(frame, var_size, interpolation=cv2.INTER_AREA)
+                if frame_sink is not None:
+                    frame_sink(i, frame)
+                else:
+                    out_list.append(frame)
+                    if res_list is not None:
+                        res_list.append(res)
+                done[0] += 1
+                if progress_cb:
+                    progress_cb("Faktura i cienie + odszumianie" if enable_stage3 and enable_denoise else
+                                ("Migotanie faktury i cieni" if enable_stage3 else "Odszumianie w czasie"),
+                                75 + int(23 * done[0] / n), 100)
+
+            block = max(st[2] for st in stages)
+            stream_pixel_stages(n, stages, emit, block, on_value)
+            if enable_denoise:
+                var_before = DeflickerMetrics.measure_temporal_variance([var_in[i] for i in range(n)])
+                var_after = DeflickerMetrics.measure_temporal_variance([var_out[i] for i in range(n)])
+                noise_red = max(0.0, (1.0 - var_after / (var_before + 1e-6)) * 100.0)
             if progress_cb:
-                progress_cb("Odszumianie w czasie", 90, 100)
-            var_before = DeflickerMetrics.measure_temporal_variance(cur_frames)
-            cur_frames, residuals = DenoiseEngine.denoise_temporal_mc(cur_frames, radius=2)
-            var_after = DeflickerMetrics.measure_temporal_variance(cur_frames)
-            noise_red = max(0.0, (1.0 - var_after / (var_before + 1e-6)) * 100.0)
-            stages_applied.append("denoise_mc")
+                progress_cb("Pomiar końcowy", 98, 100)
+            flicker_final = DeflickerMetrics.measure_flow_aligned([final_small[i] for i in range(n)], eval_w=eval_w)
+            cur_frames = out_list
+            residuals = res_list
 
         # Final Metrics
-        if progress_cb:
-            progress_cb("Pomiar końcowy", 98, 100)
-        flicker_final = DeflickerMetrics.measure_flow_aligned(cur_frames)
+        if flicker_final is None:
+            if progress_cb:
+                progress_cb("Pomiar końcowy", 98, 100)
+            flicker_final = DeflickerMetrics.measure_flow_aligned(cur_frames)
+            if frame_sink is not None:
+                for i in range(n):
+                    frame_sink(i, cur_frames[i])
         reduction_pct = max(0.0, (1.0 - flicker_final.mean / (flicker_init.mean + 1e-6)) * 100.0)
 
         # Gain limits

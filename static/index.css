@@ -1052,6 +1052,15 @@ kbd {
 }
 .stage-item .stage-n { width: 16px; height: 16px; border-radius: 50%; background: var(--bg-hover); font-size: 10px; display: flex; align-items: center; justify-content: center; font-weight: 600; }
 .stage-item .stage-ic { font-size: 11px; }
+/* stage 5 engine menu (ViTMatte / BiRefNet, user decision 2026-10-21) */
+.stage-item .stage-menu { margin-left: 2px; padding: 0 5px; border-radius: 3px; border: 1px solid var(--border-subtle);
+  font-size: 12px; line-height: 18px; color: var(--text-main); }
+.stage-item .stage-menu:hover { background: var(--bg-hover); border-color: var(--text-muted); }
+.stage-engine-menu { position: fixed; z-index: 1000; display: flex; flex-direction: column; min-width: 220px; padding: 4px;
+  background: var(--bg-panel, #1c1c1e); border: 1px solid var(--border-subtle); border-radius: 4px; box-shadow: 0 6px 18px rgba(0,0,0,.45); }
+.stage-engine-menu button { text-align: left; padding: 5px 8px; font-size: 12px; color: var(--text-main); background: none; border: 0; border-radius: 3px; cursor: pointer; }
+.stage-engine-menu button:hover { background: var(--bg-hover); }
+.stage-engine-menu button.active { font-weight: 600; }
 /* state = colour + icon (✔ computed, ↻ needs updating, ○ not computed); the current stage = amber frame, its state stays visible */
 .stage-item.done { border-color: rgba(52,211,153,.55); color: #a7f3d0; background: rgba(16,185,129,.10); }
 .stage-item.done .stage-n { background: rgba(16,185,129,.35); color: #d1fae5; }
@@ -1163,8 +1172,9 @@ canvas.edge-hot { cursor: pointer !important; }
 .ctrl-btn[id$="Key"] { width: auto; padding: 0 6px; font-size: 11px; }
 
 /* toast */
-.md-toast { position: fixed; left: 50%; top: 104px; transform: translateX(-50%); z-index: 960; display: none; padding: 8px 14px; border-radius: 2px;
-  background: rgba(31,31,34,.96); border: 1px solid var(--accent-primary); color: var(--text-main); font-size: 12px; max-width: 70vw; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
+.md-toast { position: fixed; left: 50%; bottom: 128px; transform: translateX(-50%); z-index: 960; display: none; padding: 10px 16px; border-radius: 2px;
+  background: rgba(31,31,34,.97); border: 1px solid var(--accent-primary); color: var(--text-main); font-size: 13px; max-width: 70vw; box-shadow: 0 6px 20px rgba(0,0,0,.5); }
+.md-toast.md-toast-err { background: #3a1414; border: 1px solid #ef4444; border-left-width: 4px; color: #fde2e2; font-weight: 500; }
 
 /* plate pair in the header + comparison buttons next to it (left plate vs right plate / comp background) */
 .plate-vs { color: var(--text-muted); font-size: 12px; }
@@ -1184,10 +1194,18 @@ canvas.edge-hot { cursor: pointer !important; }
 
 /* compact header on narrow windows */
 .shot-info-pill { white-space: nowrap; }
+/* in the compare row (2026-10-22): left, small; the comparison group keeps its place under the "Plate:" pill */
+.compare-bar .shot-info-pill { margin-left: 12px; padding: 2px 8px; font-size: 11px; gap: 6px; flex-shrink: 0; }
+.compare-right { display: flex; align-items: center; gap: 8px; margin-left: auto; margin-right: 12px; flex-shrink: 0; }
+.compare-right .btn { padding: 2px 8px; font-size: 11px; }
 .header-left, .header-center, .header-right { flex-shrink: 0; }
+/* the plate / view / overlay group sits next to the left group, the free room is on the right (user request 2026-10-22) */
+.header-center { margin-left: 24px; margin-right: auto; }
+/* a select is as wide as its longest option (background names) – the chosen one is short; the list shows all */
+.plate-selector-pill .plate-select-dropdown { max-width: 150px; text-overflow: ellipsis; }
 @media (max-width: 1500px) { #shotResDisplay, #shotResDisplay + .pill-divider { display: none; } }
 @media (max-width: 1440px) { .shot-info-pill .pill-label { display: none; } .status-indicator .status-text { display: none; } }
-@media (max-width: 1050px) { .shot-info-pill { display: none; } .logo-text { display: none; } }
+@media (max-width: 1050px) { .shot-info-pill .pill-divider, #shotRangeDisplay { display: none; } .logo-text { display: none; } }
 .tab-btn.stale { color: #f0703a; }   /* out-of-date view: warning orange, apart from the amber accent */
 .tab-btn.stale.active { color: var(--on-accent); box-shadow: inset 0 -2px 0 #f0703a; }
 
@@ -1274,6 +1292,12 @@ canvas.edge-hot { cursor: pointer !important; }
 .timeline-zones .zone-key.cur { box-shadow: 0 0 6px #fff; }
 .timeline-zones .zone-key:hover { transform: rotate(45deg) scale(1.3); }
 .timeline-zones .zone-pv { position: absolute; top: 0; width: 2px; height: 10px; margin-left: -1px; background: rgba(80,255,120,.8); pointer-events: none; }
+/* band control point keys (2026-10-21): yellow triangles under the zone keys */
+.timeline-zones .band-key { position: absolute; top: 2px; width: 0; height: 0; margin-left: -5px; cursor: pointer;
+  border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 8px solid #ffd400; }
+.timeline-zones .band-key.cur { filter: drop-shadow(0 0 4px #fff); }
+.zone-palette .zp-band { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.zone-palette .zp-band .btn.active { background: rgba(255,212,0,.22); border-color: #ffd400; color: #ffe680; }
 /* objects in front dialog */
 .zone-front { position: fixed; inset: 0; z-index: 1001; display: flex; align-items: center; justify-content: center; background: rgba(5,8,14,.6); }
 .zone-front-card { width: min(560px, calc(100vw - 32px)); padding: 16px 18px; border-radius: 3px; background: var(--bg-panel); border: 1px solid var(--border-subtle); color: var(--text-main); font-size: 13px; display: flex; flex-direction: column; gap: 8px; }
@@ -1451,6 +1475,7 @@ canvas.edge-hot { cursor: pointer !important; }
 .zone-palette .zp-sub { flex-basis: 100%; font-weight: 600; }
 .zone-palette .zp-hint { flex-basis: 100%; font-size: 10.5px; line-height: 1.35; color: var(--text-muted); }
 .zone-palette .zp-hint b { color: var(--text-main); }
+.zone-palette .zp-hint.zp-hint-nc { color: var(--accent-danger); }   /* non-commercial licence of the chosen edge model */
 .zone-palette .zone-region { flex-basis: 100%; display: flex; }
 .zone-palette .zone-region button { flex: 1; font-size: 10.5px; padding: 3px 4px; }
 .zone-palette .zone-brush { flex-basis: 100%; display: flex; }
@@ -1540,3 +1565,15 @@ canvas.edge-hot { cursor: pointer !important; }
 /* which mask the preview shows (user request 2026-10-17): always visible, stands out */
 .hud-mask { border: 1px solid #e8a33d; color: #f3c46b; font-weight: 600; }
 .hud-mask.warn { border-color: #ef4444; color: #fca5a5; }
+.hud-mask-alt { pointer-events: auto; cursor: pointer; border: 1px dashed rgba(232,163,61,.6); color: #c9b48a; }
+.hud-mask-alt:hover { color: #f3c46b; border-style: solid; }
+.hud-mask-alt:disabled { cursor: default; opacity: .55; }
+
+/* project wizard: frame numbering (keep file range / first frame N) */
+.frame-numbering-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.radio-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-main); cursor: pointer; }
+.form-input-narrow { width: 96px; }
+.form-input-narrow:disabled { opacity: 0.45; }
+/* shared object band badge (2026-10-22, static/bandpoints.js renderModeInto) */
+.band-mode { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 2px 0; font-size: 11px; }
+.band-mode:empty { display: none; }

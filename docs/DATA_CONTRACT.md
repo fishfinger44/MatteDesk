@@ -93,9 +93,9 @@ Generated from `engine/contract.py` (`python -m engine.contract docs`) – the s
 - `band_out_px` (number)
 - `band_in_px` (number)
 - `temporal_smoothing` (enum) ∈ ['weak', 'normal', 'strong']
-- `ma_scale_mode` (enum) ∈ ['auto', '1.0', '0.75', '0.5'] – MatAnyone scale in "Compute final" („Przelicz finalnie”): auto = 9-frame trial by VRAM (1.0 → 0.75 → 0.5), a number = fixed (no trial)
+- `ma_scale_mode` (enum) ∈ ['auto', '1.0', '0.75', '0.5'] – MatAnyone2 scale in "Compute final" („Przelicz finalnie”): auto = 9-frame trial by VRAM (1.0 → 0.75 → 0.5), a number = fixed (no trial)
 - `key_band_same` (boolean) – key frames get the same edge band as the other frames (instead of ±3 px from the spec); missing = on
-- `core_soft_start` (boolean) – the MatAnyone edge band starts from the SAM3 probability maps (CoreCombine core_mode=soft); missing = on
+- `core_soft_start` (boolean) – the MatAnyone2 edge band starts from the SAM 3.1 probability maps (CoreCombine core_mode=soft); missing = on
 - `tool` (object, required)
 
 ## `matte_desk/crops@1.0` – Crop segments (`objects/<obj>/crops.json`)
@@ -123,7 +123,7 @@ Generated from `engine/contract.py` (`python -m engine.contract docs`) – the s
 - `segments_def` (array, required)
 - `vram_log` (array)
 - `hygiene` (object)
-- `soft_start` (object) – soft start of the band from the SAM3 maps: frames (frames with a map in CoreCombine), maps, node (the node has core_mode), note; empty = no maps / disabled
+- `soft_start` (object) – soft start of the band from the SAM 3.1 maps: frames (frames with a map in CoreCombine), maps, node (the node has core_mode), note; empty = no maps / disabled
 
 ## `matte_desk/edge_fix@1.0` – Edge measurement / correction of a version (`objects/<obj>/runs/v###/edge/edge.json`; per-frame measurements `e_####.npz`)
 

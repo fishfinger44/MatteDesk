@@ -61,6 +61,7 @@ class ObjectStore:
             "ma_scale": defs.get("ma_scale", 1.0), "ma_scale_mode": defs.get("ma_scale_mode", "auto"),
             "core_stabilize": bool(defs.get("core_stabilize", True)),
             "correction_region_only": bool(defs.get("correction_region_only", True)),
+            "band": {"band_points": [], "band_ref_out": None, "band_ref_in": None}, "band_modes": {},   # engine/objband.py
             "tool": {"active_run": "", "final_valid": False, "auto_attempts": 0, "locked_frames": [],
                      "status": "nowy", "depends_on": [], "start_frame": None},
         }
@@ -73,7 +74,12 @@ class ObjectStore:
         p = self.dir(name) / "object.json"
         if not p.exists():
             raise FileNotFoundError(f"brak obiektu {name}")
-        return json.loads(p.read_text(encoding="utf-8"))
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(obj.get("band"), dict):   # the shared object band (2026-10-22): migrated on the first read
+            from engine.objband import migrate
+            migrate(self.root, name)
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj
 
     def update(self, name: str, **fields: Any) -> Dict[str, Any]:
         obj = self.get(name)
@@ -145,7 +151,8 @@ class ObjectStore:
         for d in sorted(self.root.iterdir()) if self.root.exists() else []:
             p = d / "object.json"
             if p.exists():
-                out.append(json.loads(p.read_text(encoding="utf-8")))
+                o = json.loads(p.read_text(encoding="utf-8"))
+                out.append(o if isinstance(o.get("band"), dict) else self.get(d.name))
         return sorted(out, key=lambda o: o.get("depth_order", 0))
 
     # ------------------------------------------------------------------ keys

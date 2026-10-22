@@ -35,7 +35,7 @@
   function panelHtml() {
     return `<div class="pane-section">
         <div class="sec-title">Pędzel poprawek maski</div>
-        <div class="muted">Popraw maskę SAM3 tam, gdzie się myli: <b class="ok">🖌 Dodaj (G)</b> domalowuje brakujący fragment (tylko piksele połączone z maską),
+        <div class="muted">Popraw maskę SAM 3.1 tam, gdzie się myli: <b class="ok">🖌 Dodaj (G)</b> domalowuje brakujący fragment (tylko piksele połączone z maską),
           <b class="err">🖌 Usuń (R)</b> zamalowuje wyciek na tło, <b>⌫ Zmaż (E)</b> cofa poprawkę w tym miejscu. Kreska = <b>klucz poprawki</b> tej klatki;
           między kluczami i poza nimi CoTracker3 przenosi poprawkę punktami na obiekcie (nigdy na częściach obiektu ani obiektach z przodu).
           Popraw kilka klatek (najlepiej na początku, w środku i na końcu ruchu), potem <b>„▶▶ Zastosuj poprawki”</b> i obejrzyj widok Rdzeń.
@@ -43,15 +43,15 @@
         <div class="row b2-tools">
           <button type="button" class="tool-btn" data-bt="brush_add" title="Dodaj do maski [G]: domaluj brakujący fragment obiektu (tylko piksele połączone z maską)"><span class="tool-icon">🖌+</span><span class="tool-label">Dodaj G</span></button>
           <button type="button" class="tool-btn" data-bt="brush_remove" title="Usuń z maski [R]: zamaluj wyciek na tło / fragment spoza obiektu"><span class="tool-icon">🖌−</span><span class="tool-label">Usuń R</span></button>
-          <button type="button" class="tool-btn" data-bt="brush_erase" title="Zmaż poprawkę [E]: cofa Dodaj / Usuń w tym miejscu tej klatki (maska wraca do SAM3)"><span class="tool-icon">⌫</span><span class="tool-label">Zmaż E</span></button>
+          <button type="button" class="tool-btn" data-bt="brush_erase" title="Zmaż poprawkę [E]: cofa Dodaj / Usuń w tym miejscu tej klatki (maska wraca do SAM 3.1)"><span class="tool-icon">⌫</span><span class="tool-label">Zmaż E</span></button>
         </div>
-        <label class="chk" title="Poprawka przenoszona między klatkami punktami CoTracker3 lokalnie (każdy fragment za najbliższymi punktami – nadąża za ruchem i odkształceniem); wyłączone = sztywny kształt jadący za obiektem. Dotyczy nowych poprawek i obu istniejących"><input type="checkbox" id="b2Track" checked title="Śledzenie lokalne poprawek (CoTracker3)"> śledzenie lokalne (CoTracker)</label>
+        <label class="chk" title="Poprawka przenoszona między klatkami punktami CoTracker3 lokalnie (każdy fragment za najbliższymi punktami – nadąża za ruchem i odkształceniem); wyłączone = sztywny kształt jadący za obiektem. Dotyczy nowych poprawek i obu istniejących"><input type="checkbox" id="b2Track" checked title="Śledzenie lokalne poprawek (CoTracker3)"> śledzenie lokalne (CoTracker3)</label>
       </div>
       <div class="pane-section"><div class="sec-title">Poprawki <span class="muted">(romby na osi czasu = klucze; PPM na rombie = usuń)</span></div><div id="b2List" class="zone-list"></div></div>
       <div class="row">
         <button type="button" class="btn btn-ghost btn-xs" id="b2EmptyKey" title="Pusty klucz w tej klatce: poprawki kończą się tutaj (między poprzednim kluczem a tą klatką obszar zanika, dalej brak poprawki)">⌀ Koniec poprawek w tej klatce</button>
         <button type="button" class="btn btn-ghost btn-xs" id="b2DelKey" title="Usuń klucze poprawek tej klatki (obszar w tej klatce znów z propagacji) [Delete]">🗑 Usuń klucze (ta klatka)</button></div>
-      <button type="button" class="btn btn-primary" id="b2Apply" title="Policz maskę 1+2 (rdzeń SAM3 + poprawki) na całym ujęciu – widok Rdzeń pokaże wynik w każdej klatce; ta sama maska idzie do MatAnyone (etap 3) i do eksportu „rdzeń (1+2)”">▶▶ Zastosuj poprawki na ujęcie</button>
+      <button type="button" class="btn btn-primary" id="b2Apply" title="Policz maskę 1+2 (rdzeń SAM 3.1 + poprawki) na całym ujęciu – widok Rdzeń pokaże wynik w każdej klatce; ta sama maska idzie do MatAnyone2 (etap 3) i do eksportu „rdzeń (1+2)”">▶▶ Zastosuj poprawki na ujęcie</button>
       <div class="muted" id="b2Info"></div>`;
   }
   function renderList() {
@@ -65,7 +65,7 @@
         <span class="zone-btns">
           <label class="chk" title="Włącz / wyłącz tę poprawkę (wyłączona nie działa w etapach 2, 3 i eksporcie)"><input type="checkbox" data-en="${esc(z.zone_id)}" ${z.enabled ? 'checked' : ''}></label>
           <button class="btn btn-ghost btn-xs" data-del="${esc(z.zone_id)}" title="Usuń całą poprawkę ${m.label} (wszystkie jej klucze)">✕</button></span></div>`;
-    }).join('') : '<div class="muted">brak poprawek – maska = rdzeń SAM3 (etap opcjonalny). Pierwsza kreska G / R tworzy poprawkę.</div>';
+    }).join('') : '<div class="muted">brak poprawek – maska = rdzeń SAM 3.1 (etap opcjonalny). Pierwsza kreska G / R tworzy poprawkę.</div>';
     box.querySelectorAll('.zone-card').forEach((c) => c.addEventListener('click', (e) => {
       if (e.target.closest('button') || e.target.closest('input')) return;
       const z = B.list.find((x) => x.zone_id === c.dataset.z); if (!z) return;
@@ -253,10 +253,10 @@
   }
   async function applyShot() {
     await flush();
-    status('Maska 1+2: rdzeń SAM3 + poprawki na całym ujęciu (CoTracker3 dla kluczy, które nie mają jeszcze torów)…');
+    status('Maska 1+2: rdzeń SAM 3.1 + poprawki na całym ujęciu (CoTracker3 dla kluczy, które nie mają jeszcze torów)…');
     const d = await api('POST', `/api/object/${obj()}/core_fix`);
     H.clearOverlays(); await H.loadStages(); H.setView('core');
-    status(`Maska 1+2 policzona F${d.frames[0]}–${d.frames[1]}: zmienione ${d.changed_px} px względem SAM3 (${(d.zones || []).length} poprawek). Widok Rdzeń pokazuje wynik; dalej etap ${H.ST.MATANYONE} (MatAnyone).`, 'ok');
+    status(`Maska 1+2 policzona F${d.frames[0]}–${d.frames[1]}: zmienione ${d.changed_px} px względem SAM 3.1 (${(d.zones || []).length} poprawek). Widok Rdzeń pokazuje wynik; dalej etap ${H.ST.MATANYONE} (MatAnyone2).`, 'ok');
   }
 
   // ------------------------------------------------------------------------------------------------ overlays (inside pan / zoom)

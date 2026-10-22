@@ -7,11 +7,14 @@
 - "png8" (8-bit sources: MP4 / PNG / JPG, sRGB): PNG 8-bit (the display values as they are, no colour transform)
   loaded with VideoHelperSuite `VHS_LoadImagesPath` (reads a whole folder, sorted -> every job folder holds only
   the frames of that job; masks go to their own subfolders) + core `ImageToMask` for masks. Frames larger than
-  SAM_RES sent to SAM3_VideoTrack are downscaled (INTER_AREA) – SAM3 works at 1008 internally anyway – and the
+  SAM_RES sent to SAM3_VideoTrack are downscaled (INTER_AREA) – SAM 3.1 works at 1008 internally anyway – and the
   masks are resized back (INTER_LINEAR).
 """
 
 from __future__ import annotations
+
+import contextlib
+import contextvars
 
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -101,20 +104,35 @@ def image_to_mask(image_ref) -> Dict[str, Any]:
     return {"class_type": "ImageToMask", "inputs": {"image": image_ref, "channel": "red"}}
 
 
-def fit_sam_res(img: np.ndarray, sam_res: int) -> np.ndarray:
-    """Downscale (INTER_AREA) so the longer side is <= sam_res; smaller frames are returned unchanged."""
+def fit_sam_res(img: np.ndarray, sam_res: int, interpolation: int = cv2.INTER_AREA) -> np.ndarray:
+    """Downscale so the longer side is <= sam_res (INTER_AREA by default); smaller frames are returned unchanged."""
     h, w = img.shape[:2]
     s = sam_res / float(max(h, w))
     if s >= 1.0:
         return img
-    return cv2.resize(img, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+    return cv2.resize(img, (max(1, round(w * s)), max(1, round(h * s))), interpolation=interpolation)
+
+
+_STEP_PREFIX: contextvars.ContextVar[str] = contextvars.ContextVar("md_step_prefix", default="")
+
+
+@contextlib.contextmanager
+def progress_prefix(label: str):
+    """Names the phase in front of the generic per-frame steps (e.g. the crop pass on the whole shot, so its frame
+    count is not read as the frames of the core run)."""
+    tok = _STEP_PREFIX.set(label)
+    try:
+        yield
+    finally:
+        _STEP_PREFIX.reset(tok)
 
 
 def job_progress(step: str, done: int, total: int) -> None:
     """Progress + 'Przerwij' inside per-frame write loops: JobCancelled after a cancel. No-op outside a job."""
     from engine.jobs import JOBS   # lazy: engine.jobs must not import the engine modules
     if JOBS.running():
-        JOBS.progress(step, done, total)
+        pre = _STEP_PREFIX.get()
+        JOBS.progress(f"{pre} – {step}" if pre else step, done, total)
 
 
 class LazySeq:

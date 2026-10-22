@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """engine/edge_mode.py - Automatic choice of the edge source (SPEC 5.5) + routing metrics (plan 5.2).
 
-Metrics on the SAM3 core and the plate-to-mask display image (sampled frames):
+Metrics on the SAM 3.1 core and the plate-to-mask display image (sampled frames):
 - soft_frac : share of edge normals whose 10-90 % transition on the plate is wider than 3 px (soft/blurred edges)
 - thin_score: share of the core area that disappears under an opening with a 3-px disc (antennae, wires, fingers)
 - motion_px : 95th percentile of the core centroid / bbox motion per frame
@@ -23,7 +23,7 @@ import numpy as np
 SOFT_THR = 0.25
 HUMAN = re.compile(r"\b(person|people|man|woman|men|women|girl|boy|child|kid|human|hair|fur|face|actor|actress|dancer)\b", re.I)
 LTX_FLAGS = {"semi_transparent", "volumetric", "defocused", "thin_parts"}
-MODE_LABEL = {"backlit": "Backlit", "matanyone": "MatAnyone", "core": "Ostra (rdzeń)", "ltx": "LTX (półprzezroczyste)"}
+MODE_LABEL = {"backlit": "Backlit", "matanyone": "MatAnyone2", "core": "Ostra (rdzeń)", "ltx": "LTX-2.5 (półprzezroczyste)"}
 
 
 def _edge_samples(core: np.ndarray, step: int = 4) -> Tuple[np.ndarray, np.ndarray]:
@@ -149,9 +149,9 @@ def choose_edge_mode(obj: Dict[str, Any], metrics: Dict[str, float], has_backlit
         note = f"backlit jest, ale obiekt go nie zasłania (pokrycie {cover * 100:.0f}%) · "
     if flags & {"semi_transparent", "volumetric", "defocused"} and ltx_available:
         f = ", ".join(sorted(flags & LTX_FLAGS))
-        return {"mode": "ltx", "reason": note + f"flagi {f} → LTX", "borderline": False}
+        return {"mode": "ltx", "reason": note + f"flagi {f} → LTX-2.5", "borderline": False}
     if HUMAN.search(prompt):
-        return {"mode": "matanyone", "reason": note + "człowiek / włosy w prompcie → MatAnyone", "borderline": False}
+        return {"mode": "matanyone", "reason": note + "człowiek / włosy w prompcie → MatAnyone2", "borderline": False}
     if "rigid" in flags:
         return {"mode": "core", "reason": note + "obiekt sztywny → ostra krawędź rdzenia", "borderline": False}
     border = abs(sf - SOFT_THR) <= 0.2 * SOFT_THR

@@ -156,7 +156,7 @@ def track_mode(z: "Zone") -> str:
 @dataclass
 class LocalWarp:
     """Local (non-rigid) motion of a zone drawing from its key frame to one frame (user decision 2026-10-15, rotobrush-
-    like painted band): CoTracker points `pts` (key frame, plate px) seen at `dst` (this frame), `vis` = visible; the
+    like painted band): CoTracker3 points `pts` (key frame, plate px) seen at `dst` (this frame), `vis` = visible; the
     drawing is warped by the Gaussian-weighted mean displacement of the visible points near each pixel. `fallback` (2x3)
     = the rigid / core-bbox transform for places no point reaches (and frames with < 6 visible points)."""
     pts: np.ndarray
@@ -310,6 +310,39 @@ def zone_keys(z: Zone) -> Dict[int, Dict[str, Any]]:
     return dict(sorted(out.items()))
 
 
+def zone_outer_feather_px(z: "Zone") -> float:
+    """Feather (px) of a whole-outline zone at its OUTER band edge (towards the background), separate from the inset
+    feather on the core side (user request 2026-10-21); 0 / absent = the inset feather everywhere, as before."""
+    try:
+        return max(0.0, float((z.params or {}).get("outer_feather_px") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def feather_maps(area: np.ndarray, core: np.ndarray, inner_px: float, outer_px: float):
+    """Distances to the inner / outer band edge and the local length of both feathers (user rule 2026-10-22): the inner
+    feather runs from the INNER band edge (the core outside the area) outwards, the outer feather from the OUTER band edge
+    inwards; they never overlap – at most they touch. The inner one keeps its length (up to the band width), the outer
+    one gets what is left of the band. -> (d_in, d_out, li, lo), all float32 maps."""
+    a = area.astype(bool)
+    c = core.astype(bool)
+    d_in = cv2.distanceTransform((~(c & ~a)).astype(np.uint8), cv2.DIST_L2, 5)
+    d_out = cv2.distanceTransform((~(~c & ~a)).astype(np.uint8), cv2.DIST_L2, 5)
+    width = d_in + d_out                                       # local band width across this pixel
+    li = np.minimum(max(0.5, float(inner_px)), width)
+    lo = np.minimum(max(0.5, float(outer_px)), np.maximum(0.0, width - li))
+    return d_in, d_out, np.maximum(0.5, li), np.maximum(0.5, lo)
+
+
+def feather_weight(area: np.ndarray, core: np.ndarray, inner_px: float, outer_px: float) -> np.ndarray:
+    """Blend weight (0..1) of a zone over its base inside `area`: ramps over the inner feather from the inner band edge
+    and over the outer feather from the outer band edge, never overlapping (feather_maps; user report 2026-10-22: a 51 px
+    outer feather on a 17 px band ran across the band into the core – the zone never reached full weight)."""
+    d_in, d_out, li, lo = feather_maps(area, core, inner_px, outer_px)
+    w = np.minimum(np.clip(d_in / li, 0, 1), np.clip(d_out / lo, 0, 1))
+    return np.where(area.astype(bool), w, 0.0).astype(np.float32)
+
+
 def zone_feather_px(z: "Zone") -> float:
     """Feather (px) of a matte zone over its base inside its area – the core inset blends into the core over this many px
     instead of a hard step (user request 2026-10-17); default = the former fixed value."""
@@ -422,7 +455,7 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
         missing = [f for f in sub if f not in have]
         if missing:
             zk = key_zone(z, k)
-            sub_all = sorted(set(list(sub) + [k]))
+            sub_all = list(range(min(min(sub), k), max(max(sub), k) + 1))   # continuous: a key outside `sub` too
             tf = (lambda: tracker_frames_for(sub_all)) if (tracker_frames_for is not None and tracker is not None) else None
             got = follow_transforms(zk, sub_all, cores, tf, tracker,
                                     point_exclude=point_exclude(k) if point_exclude is not None else None)
@@ -567,6 +600,9 @@ class ZoneResult:
     flags: Dict[int, List[str]] = field(default_factory=dict)   # frame -> zone QA hints (engines disagree, no holdout…)
     stats: Dict[str, Any] = field(default_factory=dict)         # zone id -> summary for run.json / the UI card
     feather_px: Optional[float] = None   # feather of the soft zones over the base (max of the matte zones' inset_feather_px)
+    # frame -> uint8 blend weight (255 = the zone) when a zone has its own outer-edge feather (outer_feather_px, 2026-10-21);
+    # frames without one keep the distance feather of apply_soft_override (bit-identical)
+    weights: Dict[int, np.ndarray] = field(default_factory=dict)
 
 
 MA_ZONE_TARGET_PX = 1008     # MatAnyone zone engine: crop side scaled up to this (<= MA_ZONE_MAX_UP x)
@@ -618,6 +654,25 @@ def outline_in_px(params: Optional[Dict[str, Any]]) -> int:
     return max(int(p.get("fg_erode_px", 2) or 0), int(p.get("force_core_erode_px", 0) or 0)) + OUTLINE_IN_MARGIN_PX
 
 
+def band_scales(params: Optional[Dict[str, Any]]) -> Tuple[float, float]:
+    """(outer, inner) scale of the band points' widths (user decision 2026-10-21: the sliders „Pas na zewnątrz” /
+    „Wcięcie w rdzeń” keep sizing the whole band, the points only shape it): the slider values now over their values
+    when the first point was set (params band_ref_out / band_ref_in); no reference = 1."""
+    p = params or {}
+    out_now = float(p.get("outline_out_px", OUTLINE_OUT_PX))
+    in_now = float(outline_in_px(p))
+    ro, ri = p.get("band_ref_out"), p.get("band_ref_in")
+    so = out_now / float(ro) if ro else 1.0
+    si = in_now / float(ri) if ri else 1.0
+    return so, si
+
+
+def band_refs(params: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """The slider values a new set of band points is measured against (see band_scales)."""
+    p = params or {}
+    return {"band_ref_out": float(p.get("outline_out_px", OUTLINE_OUT_PX)), "band_ref_in": float(outline_in_px(p))}
+
+
 def _disk_k(r: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
@@ -631,16 +686,23 @@ def outline_band(core: np.ndarray, out_px: int, in_px: int) -> np.ndarray:
 
 
 def outline_regions(z: "Zone", cores: Dict[int, np.ndarray], drawn: Dict[int, np.ndarray],
-                    exclude: Optional[Callable[[int], Optional[np.ndarray]]] = None) -> Dict[int, np.ndarray]:
+                    exclude: Optional[Callable[[int], Optional[np.ndarray]]] = None,
+                    band_at: Optional[Callable[[int], List[Any]]] = None) -> Dict[int, np.ndarray]:
     """Region of an outline-mode zone per frame: outline_band(core) minus the drawing (exclusion, propagated like any
-    zone drawing) minus the excluded objects' masks grown by exclude_grow_px."""
+    zone drawing) minus the excluded objects' masks grown by exclude_grow_px. `band_at(f)` (2026-10-21): the visible
+    control points of frame f (engine/bandmap.py) – the band width then varies along the outline; none = constant."""
     p = z.params or {}
     out_px = int(p.get("outline_out_px", OUTLINE_OUT_PX))
     in_px = outline_in_px(p)
     grow = int(p.get("exclude_grow_px", EXCLUDE_GROW_PX))
     out: Dict[int, np.ndarray] = {}
     for f, c in cores.items():
-        reg = outline_band(c, out_px, in_px)
+        pts = band_at(f) if band_at is not None else None
+        if pts:
+            from engine.bandmap import variable_band, width_maps
+            reg = variable_band(c, *width_maps(c, pts, out_px, in_px))
+        else:
+            reg = outline_band(c, out_px, in_px)
         d = drawn.get(f)
         if d is not None:
             reg &= ~d.astype(bool)
@@ -660,6 +722,8 @@ def vitmatte_tile_px(params: Optional[Dict[str, Any]]) -> int:
     p = params or {}
     if p.get("tile_px") is not None:
         return max(0, int(p["tile_px"]))
+    if str(p.get("vitmatte_model") or "") in BIREFNET_MODEL_PX:
+        return 0                       # BiRefNet: one crop, never tiles (see BIREFNET_MODEL_PX)
     return OUTLINE_TILE_PX if str(p.get("region", "draw")) == "outline" else -1
 
 
@@ -737,6 +801,30 @@ TEMPORAL_CONF_PARAMS = (("temporal_fb_sigma", "fb_sigma", float), ("temporal_pho
 HYBRID_BASES = ("", "matanyone")    # z.params["hybrid"] of the `vitmatte` engine (experiment 2026-10-15), "" = off
 
 
+def edge_model_runner(name: Optional[str]) -> Any:
+    """Runner of the per-frame `vitmatte` zone engine for z.params["vitmatte_model"] (key kept for saved projects):
+    a ViTMatte model (base / small / *-distinctions – Adobe-trained weights, non-commercial) or, since 2026-10-21,
+    `birefnet_hr_matting` / `lucida` (BiRefNet, MIT weights; engine/birefnet.py). Same contract: crop + trimap -> alpha."""
+    from engine import birefnet
+    if name and str(name) in birefnet.MODELS:
+        return birefnet.get_runner(birefnet.MODELS[str(name)])
+    from engine.vitmatte import get_runner, model_id_for
+    return get_runner(model_id_for(name))
+
+
+# BiRefNet sees the whole object (salient-object model): on 448 px tiles it lost the arm edges and let the sky into
+# the strands (station 2026-10-21, Woman_01 F56); one crop at about its own input side was clean -> its defaults
+BIREFNET_MODEL_PX = {"birefnet_hr_matting": 2016, "lucida": 1008}
+
+
+def edge_model_px(params: Optional[Dict[str, Any]]) -> int:
+    """Crop side the zone's edge model sees: params.model_px; default 1008 (ViTMatte) or BIREFNET_MODEL_PX."""
+    p = params or {}
+    if p.get("model_px") is not None:
+        return int(p["model_px"])
+    return BIREFNET_MODEL_PX.get(str(p.get("vitmatte_model") or ""), MA_ZONE_TARGET_PX)
+
+
 def ridge_map(a: np.ndarray, sigma: float, k: float = 0.1) -> np.ndarray:
     """Thin bright lines (strands) in an alpha: -(smaller Hessian eigenvalue) of the alpha smoothed at `sigma`, scaled by
     sigma^2 (scale-normalised) and / k -> 0..1, dilated 1 px (the response is narrower than the strand)."""
@@ -752,8 +840,8 @@ def ridge_map(a: np.ndarray, sigma: float, k: float = 0.1) -> np.ndarray:
 
 def hybrid_blend(vm: np.ndarray, ma: np.ndarray, lo: float = 0.05, hi: float = 0.25, ridge_px: float = 0.0,
                  blur_px: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Hybrid zone alpha (experiment 2026-10-15): the temporally stable MatAnyone alpha `ma` is the base, the ViTMatte
-    alpha `vm` takes over only where it is ABOVE the base – strands MatAnyone lost: weight w = linear ramp of (vm - ma)
+    """Hybrid zone alpha (experiment 2026-10-15): the temporally stable MatAnyone2 alpha `ma` is the base, the ViTMatte
+    alpha `vm` takes over only where it is ABOVE the base – strands MatAnyone2 lost: weight w = linear ramp of (vm - ma)
     from lo to hi (a continuous function of the two alphas -> no seam), optionally x ridge_map(vm, ridge_px) (only thin
     lines; spatial -> blur_px widens it: w = max(w, blur(w)), the strand itself stays at full weight);
     result = ma + w * max(vm - ma, 0) (between the two, never beyond). Returns (alpha, w)."""
@@ -772,6 +860,7 @@ def finish_params(params: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dic
     """(engine params without the finish keys, finish params)."""
     p = dict(params or {})
     fin = {k: p.pop(k) for k in FINISH_KEYS if k in p}
+    p.pop("outer_feather_px", None)       # only how the zone is laid over its base (apply_zones weights), not the engine
     return p, fin
 
 
@@ -823,8 +912,8 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
     (FG = core eroded, unknown = region ∪ core rim, forced BG = "-" strokes / holdout); result only inside the region,
     core = 1, forced BG / holdout = 0. `only` = frames to compute (the rest come from the cache); returns
     (alphas per computed frame, trimaps per computed frame (full-frame u8), stats).
-    `probs` (frame -> SAM3 probability map, uint8 full frame, consistent with the core; keys absent): those frames get
-    the trimap from SAM3's uncertainty (build_trimap prob=) instead of the eroded core. `force_core` (frame -> mask):
+    `probs` (frame -> SAM 3.1 probability map, uint8 full frame, consistent with the core; keys absent): those frames get
+    the trimap from SAM 3.1's uncertainty (build_trimap prob=) instead of the eroded core. `force_core` (frame -> mask):
     where the result is forced to 1 (default: the whole core; an eroded core leaves its rim to the model).
     `tile_px` > 0 (outline mode, 2026-10-15): per frame, square tiles of that side over the region's bbox (overlap 1/6,
     linear blend), each scaled up like the one crop (model_px / tile_px, <= 3x); tiles without unknown pixels skipped.
@@ -956,8 +1045,8 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     option, so none / median / flow share the cached frames), then the temporal smoothing chosen in
     z.params["temporal"]: `none`, `median` (refine.temporal_median, motion-gated, as the per-frame engines) or `flow`
     (refine.temporal_median_flow: ±2 frames warped by DIS flow to frame f, median) – only inside the region.
-    `hybrid_base` (params.hybrid = matanyone, experiment 2026-10-15): the MatAnyone zone alphas; the smoothed ViTMatte
-    alpha only adds what is above them (hybrid_blend), the rest of the zone is MatAnyone."""
+    `hybrid_base` (params.hybrid = matanyone, experiment 2026-10-15): the MatAnyone2 zone alphas; the smoothed ViTMatte
+    alpha only adds what is above them (hybrid_blend), the rest of the zone is MatAnyone2."""
     from engine.zonecache import frame_hash, zone_signature
     from engine.vitmatte import runner_info
     frames = list(frames)
@@ -975,7 +1064,7 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     # FG erosion of the trimap in plate px (default 2 as build_trimap): a larger value hides the per-frame jitter of the
     # SAM3 core edge inside the unknown band, so the model – not the core – decides the edge (CLIP2_A test 2026-10-13)
     fg_erode_px = int(params.get("fg_erode_px", 2))
-    model_px = int(params.get("model_px", MA_ZONE_TARGET_PX))          # Nuke "Downrez": 504 ~ 1/2 of the 1008 default
+    model_px = edge_model_px(params)          # Nuke "Downrez": 504 ~ 1/2 of the 1008 default; BiRefNet: its own side
     unknown_value = float(params.get("unknown_value", 0.5))           # Nuke "Fine Tune": trimap level of the unknown band
     # temporal_radius (default 2) and temporal_scale (default 1 = full resolution; e.g. 2 = the smoothing runs on the
     # bbox stack upscaled 2x, where strands are wider and the flow alignment holds – user decision 2026-10-13); both are
@@ -1226,7 +1315,6 @@ def _matte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], ima
                       else zone_bg_mask_at(z, shape, None if z.bg_static else transforms.get(f))) | removed[f])
     psig = plate_sig if plate_sig is not None else (lambda f: f)
     if z.matting == "vitmatte":
-        from engine.vitmatte import get_runner, model_id_for
         hyb_base = None
         if str((z.params or {}).get("hybrid", "") or "") == "matanyone":
             # hybrid (experiment 2026-10-15): MatAnyone in the zone with the key from ViTMatte = the stable base
@@ -1238,7 +1326,7 @@ def _matte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], ima
             hyb_base, _, _ = _matanyone_sequence(z_ma, frames, core, images, regions, bgm, holdout, None, clean, ma_run,
                                                  cache, psig, zone_signature({**z_ma.to_dict(), "params": zp}))
         alphas, flags, st = _vitmatte_sequence(z, frames, core, images, regions, bgm, holdout,
-                                               get_runner(model_id_for((z.params or {}).get("vitmatte_model"))), progress,
+                                               edge_model_runner((z.params or {}).get("vitmatte_model")), progress,
                                                cache, psig, probs=probs, base_alpha=base_alpha, hybrid_base=hyb_base,
                                                fg_extra=fg_extra)
         return alphas, flags, {**st, "cleanplate": clean is not None}
@@ -1327,14 +1415,15 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                 base_alpha: Optional[Callable[[int], np.ndarray]] = None,
                 fg_by_zone: Optional[Dict[str, Callable[[int], Optional[np.ndarray]]]] = None) -> ZoneResult:
     """Zones in creation order on the core (step 2 of the pipeline). `holdout(f)` = full-frame mask of the objects in
-    front (None = none) for `matte` zones; `progress(label, done, total)` for the task bar. `probs`: SAM3 probability
-    maps consistent with `cores` (ViTMatte zones: trimap from SAM3's uncertainty); frames whose core an earlier zone
+    front (None = none) for `matte` zones; `progress(label, done, total)` for the task bar. `probs`: SAM 3.1 probability
+    maps consistent with `cores` (ViTMatte zones: trimap from SAM 3.1's uncertainty); frames whose core an earlier zone
     changed fall back to the binary trimap."""
     frames = list(frames)
     core = {f: cores[f].copy() for f in frames}
     removed = {f: np.zeros_like(cores[f]) for f in frames}
     soft: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
     result = ZoneResult(core=core, removed=removed, soft=soft)
+    feathers: Dict[int, List[Tuple[np.ndarray, float, float, bool]]] = {}   # frame -> (area, inset / outer feather, outline)
     for z in [z for z in zones if z.enabled]:
         shape = cores[frames[0]].shape
         if regions_by_zone is not None and z.zone_id in regions_by_zone:
@@ -1354,11 +1443,13 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                                                  probs=({f: p for f, p in probs.items() if f in core and np.array_equal(core[f], cores[f])}
                                                         if probs else None),
                                                  base_alpha=base_alpha, fg_extra=(fg_by_zone or {}).get(z.zone_id))
+            fo = zone_outer_feather_px(z) if region_mode(z) == "outline" else 0.0
             for f, a in alphas.items():       # never skipped in user-key frames (plan section 12)
                 area = regions[f]
                 prev = soft.get(f)
                 merged = np.where(area, a, prev[0] if prev else 0.0).astype(np.float32)
                 soft[f] = (merged, area | (prev[1] if prev else np.zeros_like(area)))
+                feathers.setdefault(f, []).append((area, zone_feather_px(z), fo, region_mode(z) == "outline"))
             for f, fl in zflags.items():
                 result.flags.setdefault(f, []).extend(fl)
             result.stats[z.zone_id] = zstats
@@ -1391,4 +1482,31 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                 rm = core[f] & hit
                 core[f] = core[f] & ~hit
                 removed[f] |= cv2.dilate(rm.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & reg
+    # frames with an outer-edge feather: one weight map for the whole soft area (each zone its own feathers)
+    for f, lst in feathers.items():
+        if not any(fo > 0 or ol for _a, _fi, fo, ol in lst):
+            continue
+        w = np.zeros(soft[f][1].shape, np.float32)
+        sa = soft[f][0]
+        for area, fi, fo, ol in lst:
+            if ol:
+                # whole outline (user rule 2026-10-22): both feathers blend the zone's matte into max(core, base) –
+                # white where the core is (the inner side, and an outer edge that lies on the core), the stage base
+                # where it is not (user decision 2026-10-22, later that day: the outer edge stays continuous with a soft
+                # base such as MatAnyone2 / VideoMaMa – with the mask 1+2 as base this is black, as before); the area
+                # then wins outright
+                d_in, d_out, li, lo = feather_maps(area, cores[f], fi, fo if fo > 0 else fi)
+                w_in, w_out = np.clip(d_in / li, 0, 1), np.clip(d_out / lo, 0, 1)
+                zw = np.minimum(w_in, w_out)
+                partner = cores[f].astype(np.float32)
+                if base_alpha is not None:
+                    partner = np.maximum(partner, np.clip(base_alpha(f), 0.0, 1.0).astype(np.float32))
+                sa = np.where(area, zw * sa + (1.0 - zw) * partner, sa).astype(np.float32)
+                w = np.where(area, 1.0, w)
+                continue
+            zw = (feather_weight(area, cores[f], fi, fo) if fo > 0 else
+                  np.clip(cv2.distanceTransform(area.astype(np.uint8), cv2.DIST_L2, 5) / max(0.5, fi), 0, 1))
+            w = np.where(area, zw, w)
+        soft[f] = (sa, soft[f][1])
+        result.weights[f] = (np.clip(w, 0, 1) * 255).round().astype(np.uint8)
     return result

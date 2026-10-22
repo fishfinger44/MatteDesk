@@ -29,6 +29,27 @@ def test_progress_adapter_and_cancel():
     JOBS.finish(JOBS.snapshot()[-1]["id"])
 
 
+
+def test_percent_jobs_have_no_frame_count_eta():
+    """Deflicker reports stage milestones in % (0 / 10 / 40 ... of 100), not frames: unit "pct" -> no ETA from the jumps
+    (2026-10-21: the window showed "klatki 10/100 · ETA 48:39" on a 193-frame shot)."""
+    from engine.sysinfo import job_details
+    jid = JOBS.start("t", "Deflicker")
+    JOBS.bind(jid)
+    assert next(x for x in JOBS.snapshot() if x["id"] == jid)["unit"] == "frames"
+    JOBS.update(unit="pct")
+    JOBS.progress("Etap 1", 10, 100)
+    job = job_details(None, JOBS.snapshot())["job"]
+    assert job["unit"] == "pct" and job["eta_s"] is None and job["done"] == 10
+    JOBS.finish(jid)
+    jid = JOBS.start("t", "Frames")
+    JOBS.bind(jid)
+    JOBS.progress("MatAnyone2", 5, 20)
+    time.sleep(0.01)
+    job = job_details(None, JOBS.snapshot())["job"]
+    assert job["unit"] == "frames" and job["eta_s"] is not None
+    JOBS.finish(jid)
+
 def test_api_cancel_long_object_run(monkeypatch):
     seen = {}
 
@@ -263,3 +284,28 @@ def test_gpu_info_parses_nvidia_smi(monkeypatch):
     def boom(*a, **k):
         raise OSError("no device")
     assert si.gpu_info(run=boom) is None
+
+
+def test_comfy_busy_is_not_down_and_hung_after_the_limit():
+    """2026-10-21 SH010: Comfy blocked > 10 s while loading 96 frames of 2688 px float EXR – requests time out, the process
+    lives. That must not abort the run as "nie odpowiada"; only a refused connection is "down"."""
+    c = ComfyClient()
+    srv = FakeComfyServer(c, at={5.0: lambda s: setattr(s, "busy", True),
+                                 125.0: lambda s: (setattr(s, "busy", False), s.history.__setitem__("p2", {
+                                     "status": {"completed": True, "messages": []}, "outputs": {"8": {}}}))})
+    srv.running = ["p2"]
+    c.our_prompts.add("p2")
+    res, _ = _wait(c, "p2")
+    assert res["success"], res                                  # waited through 2 minutes of timeouts
+    assert srv.t >= 120.0
+
+    c2 = ComfyClient()
+    c2.busy_after_s = 60.0
+    srv2 = FakeComfyServer(c2, at={1.0: lambda s: setattr(s, "busy", True)})
+    srv2.running = ["p3"]
+    c2.our_prompts.add("p3")
+    res2, _ = _wait(c2, "p3")
+    assert not res2["success"] and res2["kind"] == "comfy_hung" and "zrestartuj" in res2["error"]
+    assert 60.0 <= srv2.t <= 90.0
+    assert ComfyClient.is_timeout("<urlopen error timed out>") and not ComfyClient.is_timeout("[WinError 10061] connection refused")
+

@@ -70,9 +70,9 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
                        "edge_mode": {"enum": ["auto", "backlit", "matanyone", "core", "ltx"]}, "edge_mode_auto": STR,
                        "part_of": {"type": ["string", "null"], "description": "parent, when the object is a part of another one (e.g. Figure's dress)"},
                        "band_scale": NUM, "shift_px": NUM, "band_out_px": NUM, "band_in_px": NUM, "temporal_smoothing": {"enum": ["weak", "normal", "strong"]},
-                       "ma_scale_mode": {"enum": ["auto", "1.0", "0.75", "0.5"], "description": "MatAnyone scale in \"Compute final\" („Przelicz finalnie”): auto = 9-frame trial by VRAM (1.0 → 0.75 → 0.5), a number = fixed (no trial)"},
+                       "ma_scale_mode": {"enum": ["auto", "1.0", "0.75", "0.5"], "description": "MatAnyone2 scale in \"Compute final\" („Przelicz finalnie”): auto = 9-frame trial by VRAM (1.0 → 0.75 → 0.5), a number = fixed (no trial)"},
                        "key_band_same": {"type": "boolean", "description": "key frames get the same edge band as the other frames (instead of ±3 px from the spec); missing = on"},
-                       "core_soft_start": {"type": "boolean", "description": "the MatAnyone edge band starts from the SAM3 probability maps (CoreCombine core_mode=soft); missing = on"},
+                       "core_soft_start": {"type": "boolean", "description": "the MatAnyone2 edge band starts from the SAM 3.1 probability maps (CoreCombine core_mode=soft); missing = on"},
                        "tool": {"type": "object", "required": ["active_run", "final_valid"]}},
     },
     "matte_desk/crops@1.0": {
@@ -92,7 +92,7 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
                        "ma_node": {"type": "object", "description": "inputs of MatAnyone2RunKeyframes >= 1.1.0 (vram_release_frac, max_mem_frames 0 = auto); empty = older node"},
                        "segments_def": {"type": "array"},
                        "vram_log": {"type": "array", "items": STR}, "hygiene": {"type": "object"},
-                       "soft_start": {"type": "object", "description": "soft start of the band from the SAM3 maps: frames (frames with a map in CoreCombine), maps, node (the node has core_mode), note; empty = no maps / disabled"}},
+                       "soft_start": {"type": "object", "description": "soft start of the band from the SAM 3.1 maps: frames (frames with a map in CoreCombine), maps, node (the node has core_mode), note; empty = no maps / disabled"}},
     },
     "matte_desk/edge_fix@1.0": {
         "title": "Edge measurement / correction of a version (`objects/<obj>/runs/v###/edge/edge.json`; per-frame measurements `e_####.npz`)",

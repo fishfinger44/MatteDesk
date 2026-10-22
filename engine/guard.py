@@ -1,12 +1,12 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-r"""engine/guard.py - Z22 stage A: SAM3 + CoTracker3 "guard" measurements (experiment, no change of results).
+r"""engine/guard.py - Z22 stage A: SAM 3.1 + CoTracker3 "guard" measurements (experiment, no change of results).
 
-SAM3 gives the shape and the edge; CoTracker3 keeps the identity of the object in time. Points seeded deep inside
+SAM 3.1 gives the shape and the edge; CoTracker3 keeps the identity of the object in time. Points seeded deep inside
 the key mask (>= `inset_px` from its edge) are tracked to every frame of the interval; per frame:
-- lost_frac       = visible points that fall OUTSIDE the SAM3 mask / visible points  (SAM3 drifted off the object,
+- lost_frac       = visible points that fall OUTSIDE the SAM 3.1 mask / visible points  (SAM 3.1 drifted off the object,
                     or the object moved out of the mask),
-- unsupported_frac = area of SAM3 mask components with NO visible point within R / mask area  (mask parts that no
+- unsupported_frac = area of SAM 3.1 mask components with NO visible point within R / mask area  (mask parts that no
                     tracked point supports: a jump onto another object, a leak),
 - occluded_frac   = 1 - visible / all points.
 R = 2 x the mean point spacing (sqrt(mask area / N)). Pure functions; the tracker is any engine/tracking tracker.
@@ -33,7 +33,7 @@ def guard_points(mask: np.ndarray, n: int = 120, inset_px: int = 6) -> np.ndarra
 
 
 def frame_metrics(points: np.ndarray, visible: np.ndarray, mask: np.ndarray, radius: float) -> Dict[str, float]:
-    """Metrics of one frame: `points` (N, 2) tracked positions, `visible` (N,) bool, `mask` = SAM3 mask of the frame."""
+    """Metrics of one frame: `points` (N, 2) tracked positions, `visible` (N,) bool, `mask` = SAM 3.1 mask of the frame."""
     h, w = mask.shape
     m = mask > 0.5
     n = int(len(points))

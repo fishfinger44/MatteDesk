@@ -17,6 +17,8 @@ import ref_clean_v1 as old
 from app import app
 from engine.clean import LazyFrames, PlateCleaner
 
+OLD_PARAMS = dict(stage1_window=15, stage1_iterations=2, stage3_radius=3, stage1_sigma=6.0, stage1_content_check=0.0)   # the first port's values: these tests check memory / threads / cache, not the defaults
+
 
 def _sequence(n=10, w=192, h=112):
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -28,7 +30,7 @@ def _sequence(n=10, w=192, h=112):
 @pytest.mark.parametrize("s1,s2,s4", [(True, True, True), (False, True, True), (True, False, False), (False, False, True)])
 def test_lowmem_matches_original(s1, s2, s4):
     frames = _sequence()
-    kw = dict(enable_stage1=s1, enable_stage2=s2, enable_stage4=s4, target_reduction=2.0)   # 2.0: never stop after stage 1
+    kw = dict(enable_stage1=s1, enable_stage2=s2, enable_stage4=s4, target_reduction=2.0, **OLD_PARAMS)   # 2.0: never stop after stage 1
     o_frames, o_gains, o_rep, _ = old.PlateCleaner.process_sequence([f.copy() for f in frames], **kw)
     # new engine on a lazy source, like the endpoint (frames re-read on every access)
     n_frames, n_gains, n_rep, _ = PlateCleaner.process_sequence(LazyFrames(len(frames), lambda i: frames[i].copy()), **kw)
@@ -44,8 +46,8 @@ def test_lowmem_matches_original(s1, s2, s4):
 
 def test_lowmem_gain_export_matches_original(tmp_path):
     frames = _sequence(n=6)
-    _, o_gains, _, _ = old.PlateCleaner.process_sequence([f.copy() for f in frames])
-    _, n_gains, _, _ = PlateCleaner.process_sequence(LazyFrames(6, lambda i: frames[i].copy()))
+    _, o_gains, _, _ = old.PlateCleaner.process_sequence([f.copy() for f in frames], **OLD_PARAMS)
+    _, n_gains, _, _ = PlateCleaner.process_sequence(LazyFrames(6, lambda i: frames[i].copy()), **OLD_PARAMS)
     old.PlateCleaner.export_gain_maps(o_gains, 1, tmp_path / "old")
     PlateCleaner.export_gain_maps(n_gains, 1, tmp_path / "new")
     for i in range(1, 7):

@@ -13,7 +13,7 @@
 - `warnings` for the UI (nothing here changes a zone by itself – the UI / API apply the plan, strokes are confirmed).
 
 `detect_bg_lines(img, region, core)` proposes "-" strokes along straight lines in the background of the zone (HoughLinesP
-on Canny edges outside the dilated core). `propose_zones(core, fg_mask, soft)` turns "SAM3 foreground outside the core"
+on Canny edges outside the dilated core). `propose_zones(core, fg_mask, soft)` turns "SAM 3.1 foreground outside the core"
 (+ soft edge pixels) into zone proposals (polygons) to accept in the UI. Pure functions, no I/O.
 """
 
@@ -295,7 +295,7 @@ def soft_edge_candidates(img: np.ndarray, core: np.ndarray, ring_px: int = 24, b
 
 def propose_zones(core: np.ndarray, fg_mask: Optional[np.ndarray], soft: Optional[np.ndarray] = None, min_area: int = 400,
                   grow_px: int = 6, max_props: int = 6) -> List[Dict[str, Any]]:
-    """Zone proposals = connected pieces of (SAM3 foreground ∪ soft edge pixels) outside the core, grown by `grow_px`
+    """Zone proposals = connected pieces of (SAM 3.1 foreground ∪ soft edge pixels) outside the core, grown by `grow_px`
     (the zone region should hold a margin around the strands). Each: polygon (plate px), bbox, area_px, where it lies
     relative to the core (lewo / prawo / góra / dół), source (sam3 / soft / both)."""
     cb = core.astype(bool)

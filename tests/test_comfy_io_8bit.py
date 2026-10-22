@@ -104,11 +104,13 @@ def test_png8_values_unchanged_and_small_frames_not_resized(tmp_path):
     assert seen["shape"][:2] == (600, 640) and masks[0].shape == (600, 640)
 
 
-def test_exr_track_graph_and_files_unchanged(tmp_path):
-    """EXR sources: float32 EXR frames at full size + PlateLoadEXR / PlateLoadMaskSeq, the pre-2026-10-13 graph."""
+def test_exr_track_graph_unchanged_frames_downscaled_masks_restored(tmp_path):
+    """EXR sources: float32 EXR + PlateLoadEXR / PlateLoadMaskSeq (the pre-2026-10-13 graph); since 2026-10-21 frames larger
+    than SAM_RES are downscaled like png8 (SAM 3.1 resizes to 1008² anyway) and the masks come back at the input size."""
     seen = {}
     frames = _square_frames(1920, n=2)
     runner, _ = _track_runner(tmp_path, "exr", seen)
+    assert runner.sam_downscale is True
     assert Sam3Runner(MockComfyClient(), tmp_path, ckpt="x").io_mode == "exr"   # default
     masks = runner.track(frames, (frames[0][..., 0] > 0.5).astype(np.float32))
     g = seen["graph"]
@@ -117,8 +119,30 @@ def test_exr_track_graph_and_files_unchanged(tmp_path):
                             g["8"]["inputs"]["filename_prefix"], "x")
     assert "VHS_LoadImagesPath" not in _classes(g)
     f0 = cv2.imread(str(job / "f_0000.exr"), cv2.IMREAD_UNCHANGED)
-    assert f0.dtype == np.float32 and f0.shape == (1920, 1920, 3) and np.array_equal(f0, frames[0])
+    assert f0.dtype == np.float32 and f0.shape == (SAM_RES, SAM_RES, 3)
+    assert np.allclose(f0, cv2.resize(frames[0], (SAM_RES, SAM_RES), interpolation=cv2.INTER_CUBIC), atol=1e-6)   # ComfyUI's own filter
+    assert seen["init_shape"] == (SAM_RES, SAM_RES)
     assert masks[0].shape == (1920, 1920)
+    ys, xs = np.nonzero(masks[1] > 0.5)                                         # object back where it was
+    assert abs(ys.min() - 384) <= 3 and abs(ys.max() - 1496) <= 3 and abs(xs.min() - (595 + 10)) <= 3
+
+
+def test_exr_track_full_resolution_switch_and_small_frames(tmp_path, monkeypatch):
+    monkeypatch.setenv("MD_SAM_FULLRES", "1")                                    # the old behaviour, for A/B
+    seen = {}
+    frames = _square_frames(1920, n=2)
+    runner, _ = _track_runner(tmp_path, "exr", seen)
+    masks = runner.track(frames, (frames[0][..., 0] > 0.5).astype(np.float32))
+    job = Path(seen["graph"]["2"]["inputs"]["path_pattern"]).parent
+    f0 = cv2.imread(str(job / "f_0000.exr"), cv2.IMREAD_UNCHANGED)
+    assert f0.shape == (1920, 1920, 3) and np.array_equal(f0, frames[0]) and masks[0].shape == (1920, 1920)
+    monkeypatch.delenv("MD_SAM_FULLRES")
+    seen2 = {}
+    small = _square_frames(800, n=2)                                              # <= SAM_RES: untouched
+    runner2, _ = _track_runner(tmp_path / "b", "exr", seen2)
+    m2 = runner2.track(small, (small[0][..., 0] > 0.5).astype(np.float32))
+    job2 = Path(seen2["graph"]["2"]["inputs"]["path_pattern"]).parent
+    assert np.array_equal(cv2.imread(str(job2 / "f_0000.exr"), cv2.IMREAD_UNCHANGED), small[0]) and m2[0].shape == (800, 800)
 
 
 def test_png8_detect_uses_vhs(tmp_path):
@@ -169,7 +193,7 @@ def test_cancel_inside_the_write_loop(tmp_path, mode):
     try:
         runner.track([np.zeros((64, 64, 3), np.float32)] * 4, np.zeros((64, 64), np.float32))
         j = next(x for x in JOBS.snapshot() if x["id"] == jid)
-        assert (j["step"], j["done"], j["total"]) == ("SAM3: zapis klatek do Comfy", 4, 4)
+        assert (j["step"], j["done"], j["total"]) == ("SAM 3.1: zapis klatek do Comfy", 4, 4)
     finally:
         JOBS.finish(jid)
 
@@ -342,3 +366,24 @@ def test_md_cli_export_format_flag():
     md.main(["export", "puppet", "--yes"], http=H(), out=lambda s: None)
     posts = [c for c in calls if c[0] == "POST"]
     assert posts[0][2] == {"objects": [], "format": "png"} and posts[1][2] == {"objects": ["puppet"]}
+
+
+@pytest.mark.parametrize("mode", ["png8", "exr"])
+def test_progress_prefix_names_the_phase(tmp_path, mode):
+    """The crop pass (whole shot) and the core run name their phase and frame range in front of the per-frame step,
+    so 180/180 of the crop pass is not read as frames of a 42-frame work area."""
+    from engine.comfy_io import progress_prefix
+    runner, _client = _track_runner(tmp_path, mode, {})
+    jid = JOBS.start("t", "Kadrowanie: prefix")
+    JOBS.bind(jid)
+    try:
+        with progress_prefix("Kadrowanie całego ujęcia F21→F24"):
+            runner.track([np.zeros((64, 64, 3), np.float32)] * 4, np.zeros((64, 64), np.float32))
+        j = next(x for x in JOBS.snapshot() if x["id"] == jid)
+        assert (j["step"], j["done"], j["total"]) == (
+            "Kadrowanie całego ujęcia F21→F24 – SAM 3.1: zapis klatek do Comfy", 4, 4)
+        runner.track([np.zeros((64, 64, 3), np.float32)] * 2, np.zeros((64, 64), np.float32))
+        j = next(x for x in JOBS.snapshot() if x["id"] == jid)
+        assert j["step"] == "SAM 3.1: zapis klatek do Comfy"      # prefix gone outside the block
+    finally:
+        JOBS.finish(jid)

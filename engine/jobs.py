@@ -42,7 +42,7 @@ class Jobs:
     # ------------------------------------------------------------------ lifecycle
     def try_start(self, kind: str, label: str, obj: Optional[str] = None, quiet: bool = False) -> int:
         """Start a heavy job only if nothing else runs (atomic); otherwise JobBusy.
-        quiet = short job (a few seconds, e.g. SAM3 on one frame): the UI shows it on the bar only, no modal."""
+        quiet = short job (a few seconds, e.g. SAM 3.1 on one frame): the UI shows it on the bar only, no modal."""
         with self._lock:
             run = [j for j in self._jobs.values() if j["state"] == "running"]
             if run:
@@ -68,7 +68,7 @@ class Jobs:
             jid = next(self._ids)
             self._jobs[jid] = {"id": jid, "kind": kind, "label": label, "state": "running", "step": "",
                                "done": 0, "total": 0, "started": time.time(), "updated": time.time(), "comfy": None,
-                               "comfy_info": None, "obj": obj, "quiet": bool(quiet)}
+                               "comfy_info": None, "obj": obj, "quiet": bool(quiet), "unit": "frames"}
             return jid
 
     def bind(self, jid: int) -> None:
@@ -104,7 +104,9 @@ class Jobs:
 
     def update(self, step: Optional[str] = None, done: Optional[int] = None, total: Optional[int] = None,
                jid: Optional[int] = None, comfy: Optional[str] = None,
-               comfy_info: Optional[Dict[str, Any]] = None) -> None:
+               comfy_info: Optional[Dict[str, Any]] = None, unit: Optional[str] = None) -> None:
+        """`unit`: what done / total count – "frames" (default) or "pct" (a job that only reports stage milestones in %:
+        the UI shows "postęp N %" and no ETA)."""
         jid = jid or getattr(self._local, "jid", None) or self._latest_running()
         with self._lock:
             j = self._jobs.get(jid) if jid else None
@@ -119,6 +121,8 @@ class Jobs:
                     j["comfy"] = comfy
                 if comfy_info is not None:
                     j["comfy_info"] = comfy_info
+                if unit is not None:
+                    j["unit"] = unit
                 j["updated"] = time.time()
 
     def cancel(self) -> bool:

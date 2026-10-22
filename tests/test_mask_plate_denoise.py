@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Project switch of the plate-to-mask denoise (SPEC 4b, user decision 2026-10-13).
 
-- project.json mask_plate_denoise: auto (key absent) / on / off; auto = on for EXR / > 8-bit, off for 8-bit sources
-  (same detection as engine/comfy_io.io_mode_for); defaults.json mplate.enabled = false = off everywhere.
+- project.json mask_plate_denoise: auto (key absent) / on / off; auto = OFF for every source (user decision 2026-10-22: the
+  denoised plate enters the pipeline only when chosen in the Plates step); defaults.json mplate.enabled = false = off everywhere.
 - off: no MaskPlate, no `mplate/` folder – crops straight from the display (core and final pass).
 - the effective flag is in the interval cache hash (ON hash unchanged = old caches valid) and in core.json;
   a core computed with the other value is stale; old core.json without the key = computed with ON.
@@ -35,13 +35,14 @@ def test_resolve_auto_on_off_and_kill_switch():
     assert r(None, {"bit_depth": 8, "source_type": "video"})["effective"] is False
     assert r("auto", {"bit_depth": 8, "source_type": "img_seq"})["effective"] is False
     assert r("auto", {"source_type": "video"})["effective"] is False            # MP4 without bit_depth
-    assert r("auto", {"bit_depth": 16, "source_type": "exr_seq"})["effective"] is True
-    assert r(None, {"bit_depth": 32})["effective"] is True
-    assert r(None, {})["effective"] is True                                       # unknown source = EXR (as io_mode_for)
+    assert r("auto", {"bit_depth": 16, "source_type": "exr_seq"})["effective"] is False       # 2026-10-22: auto = off
+    assert r(None, {"bit_depth": 32})["effective"] is False                       # no choice in Plates = off, any source
+    assert r(None, {})["effective"] is False
     d = r("on", {"bit_depth": 8})
     assert d["effective"] is True and d["auto_resolves_to"] == "off" and d["source_8bit"]
     d = r("off", {"bit_depth": 16})
-    assert d["effective"] is False and d["auto_resolves_to"] == "on"
+    assert d["effective"] is False and d["auto_resolves_to"] == "off"
+    assert r("on", {"bit_depth": 16})["effective"] is True                                    # chosen in Plates
     assert r("bogus", {"bit_depth": 16})["setting"] == "auto"
     for s in ("auto", "on", "off"):                                               # global kill-switch
         d = r(s, {"bit_depth": 16}, False)
@@ -136,12 +137,14 @@ def test_api_project_json_auto_8bit_kill_switch_and_stale(tmp_path, monkeypatch)
     pj = tmp_path / "work" / "matte_desk" / "project.json"
     assert "mask_plate_denoise" not in json.loads(pj.read_text(encoding="utf-8"))   # old project: no key -> auto
     d = api.get("/api/project/mask_plate_denoise").json()
-    assert d["setting"] == "auto" and d["effective"] is True                         # synthetic shot = EXR
-    assert api.get("/api/project/stages").json()["mask_plate_denoise"]["effective"] is True
+    assert d["setting"] == "auto" and d["effective"] is False                        # 2026-10-22: auto = off, also for EXR
+    assert api.get("/api/project/stages").json()["mask_plate_denoise"]["effective"] is False
     # an object with a core computed with the denoise ON (old core.json, no key)
     od = tmp_path / "work" / "matte_desk" / "objects" / "puppet" / "core"
     od.mkdir(parents=True, exist_ok=True)
     (od / "core.json").write_text(json.dumps({"keys_sig": []}))
+    d = api.put("/api/project/mask_plate_denoise", json={"setting": "on"}).json()   # chosen in Plates
+    assert d["effective"] is True and d["changed"] and d["stale_objects"] == []      # the old core was computed with ON
     d = api.put("/api/project/mask_plate_denoise", json={"setting": "off"}).json()
     assert d["setting"] == "off" and d["effective"] is False and d["changed"] and d["stale_objects"] == ["puppet"]
     assert json.loads(pj.read_text(encoding="utf-8"))["mask_plate_denoise"] == "off"

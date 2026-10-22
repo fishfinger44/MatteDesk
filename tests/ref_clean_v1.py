@@ -585,8 +585,12 @@ class DeflickerEngine:
                 mx = (Minv[0, 0] * px + Minv[0, 1] * py + Minv[0, 2]) / den
                 my = (Minv[1, 0] * px + Minv[1, 1] * py + Minv[1, 2]) / den
 
-                mapx = cv2.resize(mx * sx, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-                mapy = cv2.resize(my * sx, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                # small-grid coordinates -> full-size pixel coordinates with the pixel-centre convention
+                # ((x + 0.5) * s - 0.5); plain x * s sampled 1.5 px off at 4096 / 1024 and shifted the result
+                # ~0.25 px right / 0.2 px down (SH010 export 2026-10-22, also in the v10 script deflicker_detail_mc.py)
+                sy = h / fh
+                mapx = cv2.resize((mx + 0.5) * sx - 0.5, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                mapy = cv2.resize((my + 0.5) * sy - 0.5, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
                 Ln = cv2.remap(_logimg(nb), mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
                 mid_n = cv2.GaussianBlur(Ln, (0, 0), s_fine) - cv2.resize(
@@ -882,13 +886,19 @@ class PlateCleaner:
         enable_stage3: bool = False,
         enable_stage4: bool = True,
         enable_denoise: bool = False,
-        progress_cb: Optional[Callable[[str, int, int], None]] = None
+        progress_cb: Optional[Callable[[str, int, int], None]] = None,
+        stage1_window: int = 15,
+        stage1_iterations: int = 2,
+        stage3_radius: int = 3,
+        stage1_sigma: float = 6.0,
+        stage1_content_check: float = 0.0
     ) -> Tuple[List[np.ndarray], List[np.ndarray], CleanReport, Optional[List[np.ndarray]]]:
         """Runs the deflicker and optional denoise pipeline on a list of image frames.
         
         Returns:
             (cleaned_frames, combined_gain_maps, report, noise_residuals)
         """
+        assert stage1_sigma == 6.0 and stage1_content_check == 0.0, "the frozen reference has no sigma / content-check knobs"
         n = len(frames)
         h, w = frames[0].shape[:2]
 
@@ -909,8 +919,8 @@ class PlateCleaner:
             cur_frames, g1 = DeflickerEngine.run_stage1_local_mc(
                 cur_frames,
                 homography_chain=homographies,
-                win_radius=min(15, max(3, n // 2)),
-                iterations=2
+                win_radius=min(int(stage1_window), max(3, n // 2)),
+                iterations=int(stage1_iterations)
             )
             stages_applied.append("stage1_local_mc")
             for i in range(n):
@@ -965,7 +975,7 @@ class PlateCleaner:
             cur_frames = DeflickerEngine.run_stage3_detail_mc(
                 cur_frames,
                 homography_chain=homographies,
-                radius=min(3, max(1, n // 4))
+                radius=min(int(stage3_radius), max(1, n // 4))
             )
             stages_applied.append("stage3_detail_mc")
 

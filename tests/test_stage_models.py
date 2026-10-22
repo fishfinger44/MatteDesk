@@ -106,3 +106,68 @@ def test_api_stages_and_require(proj, env, monkeypatch):
     assert set(d["models_missing"]) >= {"matanyone", "videomama", "ltx"}
     r = api.post("/api/object/obj/finalize", json={"stage": "matanyone"})
     assert r.status_code == 409 and "MatAnyone2" in r.json()["detail"]
+
+
+def test_vitmatte_stage_open_with_birefnet_only(env):
+    """Stage 5 needs one edge model: BiRefNet_HR-matting / Lucida alone (no ViTMatte, commercial work) unlock it too."""
+    tmp, cfg = env
+    assert "vitmatte" in G.model_gate(cfg)
+    _touch(tmp / "hf" / "hub" / "models--egeorcun--lucida" / "snapshots" / "abc" / "model.safetensors")
+    assert "vitmatte" not in G.model_gate(cfg)
+
+
+def test_edge_engine_menu_and_switch(proj, env, monkeypatch):
+    """Stage 5 engine (user decision 2026-10-21): ViTMatte by default; BiRefNet when only it is installed; switching
+    (menu shown only with both installed) moves the object's ViTMatte zones to the BiRefNet default model and back."""
+    import shutil
+    from engine.zones import Zone, load_zones, save_zone
+    app_module, api, shot, pipe, frames, start = proj
+    tmp, cfg = env
+    real = app_module.load_config
+    monkeypatch.setattr(app_module, "load_config", lambda *a, **k: {**real(*a, **k), **cfg})
+    d = app_module._objects().dir("obj")
+    save_zone(d, Zone("z_01", "add", "matte", start, matting="vitmatte", params={"region": "outline", "model_px": 504}))
+    save_zone(d, Zone("z_02", "add", "matte", start, matting="vitmatte", params={"region": "outline", "vitmatte_model": "small"}))
+    vm_cache = tmp / "hf" / "hub" / "models--hustvl--vitmatte-base-composition-1k"
+    _touch(vm_cache / "snapshots" / "abc" / "config.json")
+    s = api.get("/api/object/obj/stages").json()
+    assert s["edge_engines"] == {"vitmatte": True, "birefnet": False} and s["edge_engine"] == "vitmatte"
+    assert api.put("/api/object/obj/edge_engine", json={"engine": "birefnet"}).status_code == 409   # not installed
+    _touch(tmp / "hf" / "hub" / "models--ZhengPeng7--BiRefNet_HR-matting" / "snapshots" / "abc" / "model.safetensors")
+    s = api.get("/api/object/obj/stages").json()
+    assert s["edge_engines"] == {"vitmatte": True, "birefnet": True} and s["edge_engine"] == "vitmatte"   # both: ViTMatte
+    r = api.put("/api/object/obj/edge_engine", json={"engine": "birefnet"}).json()
+    assert r["edge_engine"] == "birefnet" and sorted(r["zones_changed"]) == ["z_01", "z_02"]
+    zs = {z.zone_id: z.params for z in load_zones(d)}
+    assert zs["z_01"]["vitmatte_model"] == "birefnet_hr_matting" and "model_px" not in zs["z_01"]
+    assert api.get("/api/object/obj/stages").json()["edge_engine"] == "birefnet"
+    assert app_module._edge_engine_default_model("obj") == "birefnet_hr_matting"   # new zones follow the stage engine
+    r = api.put("/api/object/obj/edge_engine", json={"engine": "vitmatte"}).json()
+    assert all("vitmatte_model" not in z.params for z in load_zones(d))
+    shutil.rmtree(vm_cache)                                   # only BiRefNet left: the stage is BiRefNet, no menu
+    s = api.get("/api/object/obj/stages").json()
+    assert s["edge_engines"] == {"vitmatte": False, "birefnet": True} and s["edge_engine"] == "birefnet"
+
+
+def test_birefnet_stage_no_matanyone_zones(proj, env, monkeypatch):
+    """BiRefNet stage (user report 2026-10-21): the zone engine list offers no ViTMatte / MatAnyone2 – a MatAnyone2 zone
+    moves to BiRefNet on the switch, a zone switched to the per-frame engine gets the BiRefNet model, MatAnyone2 = 409."""
+    from engine.zones import Zone, load_zones, save_zone
+    app_module, api, shot, pipe, frames, start = proj
+    tmp, cfg = env
+    real = app_module.load_config
+    monkeypatch.setattr(app_module, "load_config", lambda *a, **k: {**real(*a, **k), **cfg})
+    d = app_module._objects().dir("obj")
+    save_zone(d, Zone("z_01", "add", "matte", start, matting="matanyone", params={"region": "outline"}))
+    save_zone(d, Zone("z_02", "add", "matte", start, matting="chroma", params={"region": "outline"}))
+    _touch(tmp / "hf" / "hub" / "models--hustvl--vitmatte-base-composition-1k" / "snapshots" / "abc" / "config.json")
+    _touch(tmp / "hf" / "hub" / "models--egeorcun--lucida" / "snapshots" / "abc" / "model.safetensors")
+    r = api.put("/api/object/obj/edge_engine", json={"engine": "birefnet"}).json()
+    assert r["zones_changed"] == ["z_01"]
+    z1 = {z.zone_id: z for z in load_zones(d)}["z_01"]
+    assert z1.matting == "vitmatte" and z1.params["vitmatte_model"] == "birefnet_hr_matting"
+    assert api.patch("/api/object/obj/zones/z_02", json={"matting": "matanyone"}).status_code == 409
+    assert api.patch("/api/object/obj/zones/z_02", json={"matting": "vitmatte"}).status_code == 200
+    assert {z.zone_id: z for z in load_zones(d)}["z_02"].params["vitmatte_model"] == "birefnet_hr_matting"
+    api.put("/api/object/obj/edge_engine", json={"engine": "vitmatte"})
+    assert api.patch("/api/object/obj/zones/z_02", json={"matting": "matanyone"}).status_code == 200   # ViTMatte stage: allowed

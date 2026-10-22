@@ -29,7 +29,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from comfy_client import ComfyClient
 import engine.config as engine_config
@@ -37,13 +37,17 @@ from engine.config import load_config
 from engine.jobs import JOBS, JobBusy, JobCancelled
 from doctor import EnvironmentDoctor
 from engine.coords import CoordTransformer, FrameMapper
-from engine.clean import CleanReport, DeflickerMetrics, LazyFrames, NukeDeflickerGroupGenerator, PlateCleaner
+from engine.clean import (CleanReport, DeflickerMetrics, NukeDeflickerGroupGenerator, PinnedFrameCache, PlateCleaner,
+                          clean_cache_budget)
 from engine.camera import Camera2DData, Camera2DTracker, NukeCamera2DGroupGenerator
-from engine.ingest import VIDEO_EXT, MediaInspector, ProjectCreator, ProxyGenerator, is_video_file, video_to_sequence
+from engine.ingest import (VIDEO_EXT, MediaInspector, ProjectCreator, ProxyGenerator, is_video_file, renumber_sequence,
+                           video_to_sequence)
 from engine.project import ShotProject
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("matte_desk.app")
+from engine.report import install_log_buffer  # noqa: E402
+install_log_buffer()   # last log lines for "Zgłoś problem" (the start_v*.bat console is not a file)
 
 
 
@@ -348,6 +352,8 @@ class OpenOrCreateProjectRequest(BaseModel):
     plates: Dict[str, str] = {}
     fps: Optional[float] = 24.0
     colorspace: Optional[str] = "ACES2065-1"
+    # new shot only: None = keep the frame numbers of the files (e.g. 1001-1100); N = renumber so the shot starts at N
+    first_frame: Optional[int] = None
 
 
 def _activate_project(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -394,6 +400,81 @@ def get_doctor_report():
         "comfy_flavor": doc.config.get("comfy_flavor", "desktop")
     }
     return data
+
+
+# ----------------------------------------------------------------------------- "Zgłoś problem" (engine/report.py)
+class ReportRequest(BaseModel):
+    what: str = ""
+    steps: str = ""
+    email: str = ""
+    screenshot: Optional[str] = None            # data:image/png;base64,… of the window (optional)
+    context: Dict[str, Any] = Field(default_factory=dict)   # source / error_title / error_text of the error window
+
+
+class ReportSendRequest(BaseModel):
+    id: str
+    consent: bool = False
+
+
+def _report_package(req: ReportRequest):
+    from engine import report
+    cfg = load_config()
+    objs: List[str] = []
+    obj_data: List[Dict[str, Any]] = []
+    key_prompts: Dict[str, List[str]] = {}
+    if STATE.get("work_dir"):
+        try:
+            store = _objects()
+            obj_data = store.list()
+            objs = [o["name"] for o in obj_data]
+            for n in objs:   # SAM 3.1 prompts typed on keys (the detect prompts are in object.json)
+                key_prompts[n] = [k["prompt"] for k in store.keys(n).values() if k.get("prompt")]
+        except Exception:
+            objs, obj_data, key_prompts = [], [], {}
+    anon = report.secrets_of(cfg, STATE, objs, engine_config.REPO_DIR)
+    project = report.project_summary(obj_data, key_prompts, (STATE.get("manifest") or {}).get("plates") or {}, anon)
+    client = STATE.get("comfy_client") or ComfyClient.from_config()
+    from engine.sysinfo import gpu_info
+
+    def doctor():
+        return EnvironmentDoctor().run_all_checks().to_dict()
+    pkg = report.build_package(req.model_dump(), version=APP_VERSION, anon=anon, gpu=gpu_info(),
+                               comfy=report.comfy_summary(client), doctor=report._doctor_items(doctor),
+                               jobs=JOBS.snapshot(), log=report.log_tail(engine_config.REPO_DIR), context=req.context,
+                               project=project)
+    return pkg, report._screenshot(req.screenshot), report.endpoint(cfg)
+
+
+@app.post("/api/report/preview")
+async def report_preview(req: ReportRequest):
+    """The whole package, anonymised, as it will be sent – kept under `id` for /api/report/send."""
+    from engine import report
+    try:
+        pkg, shot, url = await asyncio.get_running_loop().run_in_executor(None, lambda: _report_package(req))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    rid = report.STORE.put(pkg, shot)
+    return {"id": rid, "package": pkg, "text": report.preview_text(pkg, shot), "screenshot_kb": len(shot) // 1024 if shot else 0,
+            "configured": bool(url)}
+
+
+@app.post("/api/report/send")
+async def report_send(req: ReportSendRequest):
+    """Sends exactly the previewed package (only with the user's consent) to the report proxy."""
+    from engine import report
+    if not req.consent:
+        raise HTTPException(status_code=400, detail="Zaznacz zgodę na wysłanie zgłoszenia")
+    item = report.STORE.pop(req.id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Podgląd zgłoszenia wygasł – kliknij „Pokaż, co zostanie wysłane” jeszcze raz")
+    pkg, shot = item
+    url = report.endpoint(load_config())
+    try:
+        res = await asyncio.get_running_loop().run_in_executor(None, lambda: report.send(pkg, shot, url))
+    except RuntimeError as e:
+        report.STORE.restore(req.id, pkg, shot)   # the user can retry the same package
+        raise HTTPException(status_code=502, detail=str(e))
+    return res
 
 
 class ComfyFlavorRequest(BaseModel):
@@ -543,6 +624,8 @@ def install_component(what: str):
             res = installer.install_cotracker(cfg)
         elif what == "vitmatte":
             res = installer.install_vitmatte(cfg)
+        elif what == "birefnet":
+            res = installer.install_birefnet(cfg)
         elif what == "ltx":
             res = installer.install_ltx(cfg)
         elif what == "videomama":
@@ -553,7 +636,7 @@ def install_component(what: str):
             res = installer.install_git_node(cfg, what)
         else:
             installer.progress_end(False, "unknown")
-            raise HTTPException(status_code=404, detail="ffmpeg | git | nodes | cotracker | vitmatte | ltx | videomama | sam3 | matanyone2_weights | lama | matanyone2_node | inpaint_nodes | vhs_nodes | restart_comfy")
+            raise HTTPException(status_code=404, detail="ffmpeg | git | nodes | cotracker | vitmatte | birefnet | ltx | videomama | sam3 | matanyone2_weights | lama | matanyone2_node | inpaint_nodes | vhs_nodes | restart_comfy")
     except HTTPException:
         raise
     except Exception as e:  # report, the doctor re-checks afterwards
@@ -724,7 +807,8 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
         if Path(beauty_raw).suffix.lower() in VIDEO_EXT and Path(beauty_raw).is_file():
             # video -> sequence in the shot work folder (ffmpeg), bit depth from the header (SPEC 1.0)
             from engine.project import work_subdir_name
-            beauty_info = video_to_sequence(beauty_raw, work_p / work_subdir_name())
+            beauty_info = video_to_sequence(beauty_raw, work_p / work_subdir_name(),
+                                            req.first_frame if req.first_frame is not None else 1)
             if not req.fps or req.fps == 24.0:
                 req.fps = beauty_info["fps"]
             if not req.colorspace or req.colorspace == "ACES2065-1":
@@ -735,6 +819,15 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
 
         first_f = beauty_info.get("first_frame", 1)
         last_f = beauty_info.get("last_frame", 100)
+        src_first = first_f   # frame numbers of the files on disk
+        if req.first_frame is not None and int(req.first_frame) != first_f and beauty_info.get("frame_count", 0) > 1:
+            if int(req.first_frame) < 0:
+                raise HTTPException(status_code=400, detail="Pierwsza klatka nie może być ujemna")
+            from engine.project import work_subdir_name
+            beauty_pat = renumber_sequence(beauty_pat, first_f, last_f, int(req.first_frame),
+                                           work_p / work_subdir_name() / "source" /
+                                           f"beauty_from{int(req.first_frame)}")["pattern"]
+            first_f, last_f = int(req.first_frame), int(req.first_frame) + last_f - first_f
         plate_w = beauty_info.get("width")
         plate_h = beauty_info.get("height")
         if not plate_w or not plate_h:
@@ -749,15 +842,25 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
             from engine.project import work_subdir_name
             return video_to_sequence(pat, work_p / work_subdir_name(), int(first_f))["pattern"]
 
+        def _aux_seq(name: str, pat: str) -> str:
+            """Aux plate -> sequence pattern; numbered like the beauty files -> renumbered with the same shift."""
+            if is_video_file(pat):
+                return _aux_video_seq(pat)
+            info = MediaInspector.resolve_sequence_pattern(pat)
+            pat = info.get("pattern", pat)
+            if first_f != src_first and info.get("frame_count", 0) > 1 and info.get("first_frame") == src_first:
+                from engine.project import work_subdir_name
+                pat = renumber_sequence(pat, src_first, int(info["last_frame"]), first_f,
+                                        work_p / work_subdir_name() / "source" / f"{name}_from{first_f}")["pattern"]
+            return pat
+
         cleanplate_pat = req.plates.get("cleanplate", "").strip()
         if cleanplate_pat:
-            cleanplate_pat = _aux_video_seq(cleanplate_pat)
-            cleanplate_pat = MediaInspector.resolve_sequence_pattern(cleanplate_pat).get("pattern", cleanplate_pat)
+            cleanplate_pat = _aux_seq("cleanplate", cleanplate_pat)
 
         backlit_pat = req.plates.get("backlit", "").strip()
         if backlit_pat:
-            backlit_pat = _aux_video_seq(backlit_pat)
-            backlit_pat = MediaInspector.resolve_sequence_pattern(backlit_pat).get("pattern", backlit_pat)
+            backlit_pat = _aux_seq("backlit", backlit_pat)
 
         creator.create_manifest(
             shot_name=shot_name,
@@ -772,15 +875,15 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
             source_type=source_type,
             bit_depth=bit_depth,
             backlit_pattern=backlit_pat,
-            cleanplate_pattern=cleanplate_pat
+            cleanplate_pattern=cleanplate_pat,
+            source_first_frame=src_first
         )
 
         manifest_file = work_p / f"shot_manifest_{shot_name}.json"
         data = creator.init_project_from_manifest(manifest_file)
         depth_pat = req.plates.get("depth", "").strip()
         if depth_pat:
-            depth_pat = _aux_video_seq(depth_pat)
-            depth_pat = MediaInspector.resolve_sequence_pattern(depth_pat).get("pattern", depth_pat)
+            depth_pat = _aux_seq("depth", depth_pat)
             data["shot_project"].set_plate("depth", depth_pat)
             data["manifest"] = data["shot_project"].effective_manifest()
 
@@ -1604,15 +1707,52 @@ class CleanRunRequest(BaseModel):
     enable_denoise: bool = False
     export_mode: str = "nuke_group"  # "nuke_group" | "exr_deflicker" | "exr_deflicker_dn"
     confirmed: bool = False
+    # palette knobs (docs/PLAN_DEFLICKER_AUTO.md § 4); None = engine defaults
+    stage1_window: Optional[int] = None
+    stage1_iterations: Optional[int] = None
+    stage3_radius: Optional[int] = None
+    stage1_sigma: Optional[float] = None
+    stage4_luma: Optional[bool] = None
+    exr_dir: Optional[str] = None   # EXR export folder; None / "" = default <plate folder>_deflicker[_dn] next to the plate
 
 
 class CleanExportNkRequest(BaseModel):
     plate: str = "beauty"
 
 
-def _clean_oom_message(w: int, h: int, n: int, req: "CleanRunRequest") -> str:
-    if req.enable_denoise or req.enable_stage3:
-        return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Odszumianie i etap 3 trzymają całą sekwencję w pamięci – wyłącz je lub skróć zakres."
+def _clean_default_exr_dir(pat: str, denoise: bool) -> Path:
+    """<plate folder>_deflicker / _deflicker_dn next to the original (SPEC 4c.3)."""
+    source_p = Path(pat)
+    return source_p.parent.parent / f"{source_p.parent.name}_{'deflicker_dn' if denoise else 'deflicker'}"
+
+
+def _clean_exr_dir(pat: str, denoise: bool, chosen: Optional[str]) -> Path:
+    """Folder for the deflickered EXRs: the user's choice or the default; never the plate's own folder (same file names ->
+    the original frames would be overwritten)."""
+    dest = Path(chosen).expanduser() if chosen and chosen.strip() else _clean_default_exr_dir(pat, denoise)
+    if not dest.is_absolute():
+        raise HTTPException(status_code=400, detail=f"Katalog EXR musi być pełną ścieżką: {chosen}")
+    try:
+        same = dest.resolve() == Path(pat).parent.resolve()
+    except OSError:
+        same = False
+    if same:
+        raise HTTPException(status_code=400, detail="Katalog EXR = katalog oryginalnego plate'u – zapis nadpisałby oryginalne klatki. Wybierz inny katalog.")
+    return dest
+
+
+@app.get("/api/plate/clean/exr_dir")
+def get_clean_exr_dir(plate: str = "beauty", denoise: bool = False):
+    """Default EXR export folder of a plate (the palette shows it before the run)."""
+    if not STATE.get("manifest"):
+        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
+    pat = STATE["manifest"].get("plates", {}).get(plate)
+    if not pat:
+        raise HTTPException(status_code=400, detail=f"Brak zdefiniowanego plate'u '{plate}' w manifeście")
+    return {"path": str(_clean_default_exr_dir(pat, denoise)).replace("\\", "/")}
+
+
+def _clean_oom_message(w: int, h: int, n: int) -> str:
     return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Skróć zakres klatek."
 
 
@@ -1705,10 +1845,47 @@ async def run_plate_clean(req: CleanRunRequest):
             raise HTTPException(status_code=400, detail=f"Nie udało się wczytać klatki {f_path}")
         return img.astype(np.float32)
 
-    frames = LazyFrames(len(file_paths), load_frame)
-    load_frame(0)   # unreadable first frame -> clear error before the long run
+    # frames read once are pinned in RAM up to a budget (the cleaner sweeps the sequence ~10x; the rest is re-read)
+    frames = PinnedFrameCache(len(file_paths), load_frame, clean_cache_budget())
+    frames[0]   # unreadable first frame -> clear error before the long run
+
+    # Stage 3 and denoise rebuild pixels: only an EXR export carries them (the Nuke Group applies gain maps only) –
+    # without one they are skipped, so the report measures what the result really contains
+    write_exr = req.export_mode in ("exr_deflicker", "exr_deflicker_dn")
+    notes: List[str] = []
+    enable_stage3, enable_denoise = req.enable_stage3, req.enable_denoise
+    if not write_exr and (enable_stage3 or enable_denoise):
+        enable_stage3 = enable_denoise = False
+        notes.append("Etap 3 / odszumianie pominięte – działają tylko przy zapisie EXR (Group w Nuke'u nakłada tylko mapy jasności).")
+
+    # EXR export: each cleaned frame is written as soon as it is ready (stage 3 / denoise never hold the sequence)
+    sink = None
+    dest_exr_dir = None
+    written = [0]
+    if write_exr:
+        from engine.exr_io import write_rgb_like
+        # chosen folder or <plate folder>_deflicker / _deflicker_dn next to the original (SPEC 4c.3)
+        source_p = Path(pat)
+        dest_exr_dir = _clean_exr_dir(pat, req.export_mode == "exr_deflicker_dn", req.exr_dir)
+        dest_exr_dir.mkdir(parents=True, exist_ok=True)
+        tag = "+".join(n for n, on in (("stage1", req.enable_stage1), ("stage2", req.enable_stage2),
+                                       ("stage4", req.enable_stage4), ("stage3", enable_stage3),
+                                       ("denoise", enable_denoise)) if on)
+
+        def sink(idx: int, cl_frame: np.ndarray) -> None:
+            # Same encoding as the source (channels, half/float, compression, metadata) – SPEC 4c.3
+            src_file = file_paths[idx]
+            dest_file = dest_exr_dir / src_file.name
+            if src_file.suffix.lower() == ".exr":
+                write_rgb_like(dest_file, cl_frame, src_file, extra_attrs={"matteDesk": f"deflicker {tag}".encode()})
+            else:
+                cv2.imwrite(str(dest_file), cl_frame)
+            written[0] += 1
 
     loop = asyncio.get_running_loop()
+    JOBS.update(unit="pct")   # the cleaner reports stage milestones in % (0 / 10 / 40 / ... / 100), not frames
+    knobs = {k: getattr(req, k) for k in ("stage1_window", "stage1_iterations", "stage3_radius", "stage1_sigma", "stage4_luma")
+             if getattr(req, k) is not None}
 
     def on_progress(step_name: str, done: int, total: int):
         JOBS.progress(step_name, done, total)
@@ -1732,15 +1909,18 @@ async def run_plate_clean(req: CleanRunRequest):
                 target_reduction=req.target_reduction,
                 enable_stage1=req.enable_stage1,
                 enable_stage2=req.enable_stage2,
-                enable_stage3=req.enable_stage3,
+                enable_stage3=enable_stage3,
                 enable_stage4=req.enable_stage4,
-                enable_denoise=req.enable_denoise,
-                progress_cb=on_progress
+                enable_denoise=enable_denoise,
+                progress_cb=on_progress,
+                frame_sink=sink,
+                **knobs
             )
         )
     except MemoryError:
-        raise HTTPException(status_code=507, detail=_clean_oom_message(plate_w, plate_h, len(file_paths), req))
+        raise HTTPException(status_code=507, detail=_clean_oom_message(plate_w, plate_h, len(file_paths)))
 
+    logger.info(f"Deflicker {req.plate}: frame cache {frames.stats()}")
     clean_dir = work_dir / "deflicker"
     clean_dir.mkdir(parents=True, exist_ok=True)
     gain_dir = clean_dir / f"gain_{req.plate}"
@@ -1761,26 +1941,9 @@ async def run_plate_clean(req: CleanRunRequest):
     )
     report.nk_group_path = str(nk_file).replace("\\", "/")
 
-    # Export EXRs if selected
+    # EXRs were written by the sink while cleaning
     export_dir_str = ""
-    if req.export_mode in ("exr_deflicker", "exr_deflicker_dn"):
-        # <plate folder>_deflicker / _deflicker_dn next to the original (SPEC 4c.3)
-        suffix = "deflicker_dn" if req.export_mode == "exr_deflicker_dn" else "deflicker"
-        source_p = Path(pat)
-        dest_exr_dir = source_p.parent.parent / f"{source_p.parent.name}_{suffix}"
-        dest_exr_dir.mkdir(parents=True, exist_ok=True)
-
-        # Same encoding as the source (channels, half/float, compression, metadata) – SPEC 4c.3
-        from engine.exr_io import write_rgb_like
-        for idx, cl_frame in enumerate(cleaned):
-            src_file = file_paths[idx]
-            dest_file = dest_exr_dir / src_file.name
-            if src_file.suffix.lower() == ".exr":
-                write_rgb_like(dest_file, cl_frame, src_file,
-                               extra_attrs={"matteDesk": f"deflicker {'+'.join(report.stages_applied)}".encode()})
-            else:
-                cv2.imwrite(str(dest_file), cl_frame)
-
+    if write_exr:
         export_dir_str = str(dest_exr_dir).replace("\\", "/")
         report.export_dir = export_dir_str
 
@@ -1798,7 +1961,9 @@ async def run_plate_clean(req: CleanRunRequest):
         "success": True,
         "report": report.to_dict(),
         "nk_script_path": report.nk_group_path,
-        "export_dir": export_dir_str
+        "export_dir": export_dir_str,
+        "exr_written": written[0],
+        "notes": notes
     }
 
 
@@ -2161,7 +2326,7 @@ def _comfy_io_mode() -> str:
 
 
 def _plate_display(lin: np.ndarray) -> np.ndarray:
-    """Scene-linear -> display for SAM3 / MatAnyone inputs (PlateToDisplay formula; 4b replaces it in E5b)."""
+    """Scene-linear -> display for SAM 3.1 / MatAnyone2 inputs (PlateToDisplay formula; 4b replaces it in E5b)."""
     from engine.pipeline import default_display
     return default_display(lin)
 
@@ -2282,7 +2447,7 @@ class PointsRequest(BaseModel):
 
 @app.post("/api/object/{name}/points/{frame}")
 @object_edit
-@long_job("Punkty SAM3: {name}", quiet=True)
+@long_job("Punkty SAM 3.1: {name}", quiet=True)
 def set_points(name: str, frame: int, req: PointsRequest):
     """Stage 1 (Wykryj): the points of a frame ARE its key. Any change -> SAM3_Detect from the points -> key
     `kind: points` saved at that frame (author user; undo/redo in history.json). No points left -> key deleted
@@ -2318,9 +2483,9 @@ def set_points(name: str, frame: int, req: PointsRequest):
             KeyHistory(store, name).delete_key(frame)
             store.update(name, tool={"final_valid": False, "stale_from": frame})
         return {"success": True, "frame": frame, "empty": True, "deleted": bool(existing and existing.get("kind") == "points"),
-                "seconds": r["seconds"], "crop": r["crop"], "detail": ("SAM3 nie znalazł obiektu z promptu „" + prompt_now + "” – zmień prompt albo dodaj punkt +"
+                "seconds": r["seconds"], "crop": r["crop"], "detail": ("SAM 3.1 nie znalazł obiektu z promptu „" + prompt_now + "” – zmień prompt albo dodaj punkt +"
                                               if r["mode"] == "prompt" else
-                                              "SAM3 nie znalazł obiektu przy tych punktach – dodaj punkt + wyraźnie na obiekcie")}
+                                              "SAM 3.1 nie znalazł obiektu przy tych punktach – dodaj punkt + wyraźnie na obiekcie")}
     if existing and existing.get("kind") not in (None, "points", "mask") and existing.get("author") == "user":
         # a brush / polygon correction exists in this frame: keep it, store the points only
         store.update(name, tool={"final_valid": False, "stale_from": frame})
@@ -2395,14 +2560,14 @@ EDGE_MODES = ("auto", "backlit", "matanyone", "core", "ltx")
 
 @app.get("/api/object/{name}/edge_modes")
 def edge_modes(name: str):
-    """'Krawędź' list (SPEC 5.5): Backlit only when a backlit plate exists. LTX is no longer an edge mode (user decision
-    2026-10-16: its own stage „LTX Alpha-Gen” before the export, POST /api/object/{name}/ltx)."""
+    """'Krawędź' list (SPEC 5.5): Backlit only when a backlit plate exists. LTX-2.5 is no longer an edge mode (user decision
+    2026-10-16: its own stage „LTX-2.5 Alpha-Gen” before the export, POST /api/object/{name}/ltx)."""
     obj = _objects().get(name)
     has_bl = bool(_backlit_pattern())
     items = [{"mode": "auto", "label": f"Auto (→ {obj.get('edge_mode_auto') or '?'})", "enabled": True}]
     if has_bl:
         items.append({"mode": "backlit", "label": "Backlit", "enabled": True})
-    items += [{"mode": "matanyone", "label": "MatAnyone", "enabled": True},
+    items += [{"mode": "matanyone", "label": "MatAnyone2", "enabled": True},
               {"mode": "core", "label": "Ostra (rdzeń)", "enabled": True}]
     return {"current": obj.get("edge_mode", "auto"), "auto": obj.get("edge_mode_auto"),
             "reason": obj["tool"].get("edge_auto_reason", ""), "use_backlit": obj.get("use_backlit", True), "modes": items}
@@ -2419,7 +2584,7 @@ def set_edge_mode(name: str, req: EdgeModeRequest):
     if req.mode not in EDGE_MODES:
         raise HTTPException(status_code=400, detail=f"nieznany tryb {req.mode}")
     if req.mode == "ltx":
-        raise HTTPException(status_code=400, detail="LTX to teraz osobny etap „LTX Alpha-Gen” przed eksportem, nie tryb krawędzi")
+        raise HTTPException(status_code=400, detail="LTX-2.5 to teraz osobny etap „LTX-2.5 Alpha-Gen” przed eksportem, nie tryb krawędzi")
     if req.mode == "backlit" and not _backlit_pattern():
         raise HTTPException(status_code=400, detail="Brak plate'u backlit w projekcie")
     fields = {"edge_mode": req.mode}
@@ -2625,9 +2790,14 @@ def get_object_stages(name: str):
     info = object_stages(_objects(), name, Path(STATE["work_dir"]), (fr[0], fr[-1]) if fr else None,
                          mplate=_mask_plate_denoise(), work_range=_work_area())
     # user rule 2026-10-16: a stage whose model is not downloaded / installed is unavailable (locked, with the reason)
-    from engine.stage_models import apply_gate, model_gate
+    from engine.stage_models import apply_gate, edge_engines, effective_edge_engine, model_gate
     from engine.stages import STEPS
-    apply_gate(info, model_gate(load_config()), {sid: members for _n, sid, _l, members in STEPS})
+    cfg = load_config()
+    apply_gate(info, model_gate(cfg), {sid: members for _n, sid, _l, members in STEPS})
+    # stage 5 engine (user decision 2026-10-21): menu in the stage bar only when both engines are installed
+    inst = edge_engines(cfg)
+    info["edge_engines"] = inst
+    info["edge_engine"] = effective_edge_engine(_objects().get(name).get("edge_engine"), inst)
     block = _plate_gate()["block"]
     if block:   # Z26: plate QA undecided -> nothing of the object can run (results on disk stay visible)
         for x in info["stages"] + info["steps"]:
@@ -2685,6 +2855,7 @@ async def compute_all(name: str):
         res = await loop.run_in_executor(None, lambda: pipe.run_core(name, frames, cb))
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
+    await _auto_mask12(pipe, name)
     return {"success": True, "frames": [frames[0], frames[-1]], "work_area": _work_area(),
             "whole_shot": frames == _shot_frames(), "crops_recomputed": bool(reason), "crops_reason": reason,
             "crop_segments": len(crops["segments"]) if crops else None, "crop_flags": (crops or {}).get("flags") or {},
@@ -2693,10 +2864,28 @@ async def compute_all(name: str):
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals}
 
 
+async def _auto_mask12(pipe, name: str) -> None:
+    """Stage 1 done: the mask 1+2 (stabilised core) on every frame the core covers -> core_fix/ (objects without brush
+    corrections; 2026-10-22: stage 3 band lines read it instead of recomputing ~0.5 s per frame). Never fails the core."""
+    from engine.workarea import core_coverage
+    try:
+        if not hasattr(pipe, "write_mask12"):
+            return
+        cov = core_coverage(_objects().dir(name)) or []
+        frames = [f for f in _shot_frames() if any(a <= f <= b for a, b in cov)]
+        if not frames:
+            return
+        JOBS.progress("Maska 1+2 (wygładzony rdzeń) na dysk")
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: pipe.write_mask12(name, frames, _ws_progress("object_progress", name)))
+    except Exception as e:   # the core is there; stage 3 computes the mask itself as before
+        logging.getLogger(__name__).warning("maska 1+2 po rdzeniu %s: %s", name, e)
+
+
 @app.post("/api/object/{name}/run")
 @long_job("Licz ujęcie: {name}")
 async def run_object_core(name: str):
-    """Core SAM3 on the whole shot from the keys (7.2); intervals with unchanged inputs come from cache."""
+    """Core SAM 3.1 on the whole shot from the keys (7.2); intervals with unchanged inputs come from cache."""
     _require_stage(name, "core")
     pipe = _pipeline()
     cb = _ws_progress("object_progress", name)
@@ -2705,6 +2894,7 @@ async def run_object_core(name: str):
         res = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.run_core(name, frames, cb))
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
+    await _auto_mask12(pipe, name)
     return {"success": True, "frames": [frames[0], frames[-1]], "life_hints": getattr(res, "life_hints", []),
             "uncertain": res.uncertain, "suggested_keys": res.suggested_keys,
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals}
@@ -2718,7 +2908,7 @@ class FinalizeRequest(BaseModel):
 @app.post("/api/object/{name}/core_fix")
 @long_job("Zastosuj poprawki: {name}")
 async def core_fix_object(name: str):
-    """Stage 2 „▶▶ Zastosuj poprawki” (2026-10-15): the mask 1+2 (SAM3 core + brush corrections propagated by
+    """Stage 2 „▶▶ Zastosuj poprawki” (2026-10-15): the mask 1+2 (SAM 3.1 core + brush corrections propagated by
     CoTracker3) on every frame the core covers -> core_fix/ (view=core_fix, export source "core")."""
     from engine.workarea import core_coverage
     _require_stage(name, "cotracker")
@@ -2774,13 +2964,14 @@ class LtxSettingsRequest(BaseModel):
     seed: Optional[int] = None
     region_px: Optional[float] = None
     region_soft_px: Optional[float] = None
-    combine: Optional[str] = None        # region | max_core | raw
+    combine: Optional[str] = None        # region | max_core | raw | band (one band system, 2026-10-22)
     core_erode_px: Optional[int] = None
+    feather_px: Optional[float] = None   # band mode: inset feather into the core
     mask_source: Optional[str] = None    # core | matanyone | vitmatte (2026-10-16)
 
 
 def _ltx_status() -> Dict[str, Any]:
-    """Models of stage LTX (present / missing with size and repo) + the Comfy nodes it needs."""
+    """Models of stage LTX-2.5 (present / missing with size and repo) + the Comfy nodes it needs."""
     from engine.ltx_alpha import missing_nodes, models_status
     cfg = load_config()
     models = models_status(cfg.get("models_dir"))
@@ -2796,7 +2987,7 @@ def _ltx_status() -> Dict[str, Any]:
 
 @app.get("/api/object/{name}/ltx")
 def ltx_info(name: str):
-    """Stage „LTX Alpha-Gen”: the object's settings (defaults.json "ltx" <- object `ltx`), the stage result, models."""
+    """Stage „LTX-2.5 Alpha-Gen”: the object's settings (defaults.json "ltx" <- object `ltx`), the stage result, models."""
     from engine.ltx_alpha import COMBINES, GUIDES, object_settings
     from engine.stages import stage_run
     store = _objects()
@@ -2819,7 +3010,7 @@ def ltx_set(name: str, req: LtxSettingsRequest):
 
 
 def _ltx_preview_settings(name: str, overrides: Dict[str, Any]) -> Dict[str, Any]:
-    """The object's LTX settings with the palette values not saved yet (query parameters)."""
+    """The object's LTX-2.5 settings with the palette values not saved yet (query parameters)."""
     from engine.ltx_alpha import ltx_settings
     cur = dict(_objects().get(name).get("ltx") or {})
     cur.update({k: v for k, v in overrides.items() if v is not None})
@@ -2831,18 +3022,19 @@ def _ltx_preview_settings(name: str, overrides: Dict[str, Any]) -> Dict[str, Any
 @app.get("/api/object/{name}/ltx_preview/{frame}")
 def ltx_preview(name: str, frame: int, what: str = "band", region_px: Optional[float] = None,
                 region_soft_px: Optional[float] = None, core_erode_px: Optional[int] = None,
-                combine: Optional[str] = None, mask_source: Optional[str] = None):
-    """LTX palette (2026-10-16), live: what=band – 128 = where the LTX matte is kept, 255 = forced 1 (proxy PNG);
-    what=alpha – the current LTX version's raw matte re-limited with these values (404 without an LTX version)."""
+                combine: Optional[str] = None, mask_source: Optional[str] = None, feather_px: Optional[float] = None):
+    """LTX-2.5 palette (2026-10-16), live: what=band – 128 = where the LTX-2.5 matte is kept, 255 = forced 1 (proxy PNG);
+    what=alpha – the current LTX-2.5 version's raw matte re-limited with these values (404 without an LTX-2.5 version)."""
     name = _objects().get(name).get("part_of") or name
     s = _ltx_preview_settings(name, {"region_px": region_px, "region_soft_px": region_soft_px,
-                                     "core_erode_px": core_erode_px, "combine": combine, "mask_source": mask_source})
+                                     "core_erode_px": core_erode_px, "combine": combine, "mask_source": mask_source,
+                                     "feather_px": feather_px})
     try:
         band, alpha = _pipeline().ltx_frame_preview(name, frame, s)
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=404, detail=str(e))
     if what == "alpha" and alpha is None:
-        raise HTTPException(status_code=404, detail="Brak wyniku LTX – podgląd wyniku po „▶ Policz LTX”")
+        raise HTTPException(status_code=404, detail="Brak wyniku LTX-2.5 – podgląd wyniku po „▶ Policz LTX-2.5”")
     m = band if what != "alpha" else (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
     sc = _proxy_scale()
     w, h = _plate_size()
@@ -2852,9 +3044,9 @@ def ltx_preview(name: str, frame: int, what: str = "band", region_px: Optional[f
 
 
 @app.post("/api/object/{name}/ltx/refinish")
-@long_job("LTX – suwaki na wynik: {name}", quiet=True)
+@long_job("LTX-2.5 – suwaki na wynik: {name}", quiet=True)
 async def ltx_refinish(name: str, auto: bool = False):
-    """„Zastosuj suwaki na wynik” (2026-10-16): the current LTX version's raw mattes limited again with the saved
+    """„Zastosuj suwaki na wynik” (2026-10-16): the current LTX-2.5 version's raw mattes limited again with the saved
     region / mask settings -> a new version (no model run)."""
     name = _objects().get(name).get("part_of") or name
     pipe = _pipeline()
@@ -2867,9 +3059,9 @@ async def ltx_refinish(name: str, auto: bool = False):
 
 
 @app.post("/api/object/{name}/ltx")
-@long_job("LTX Alpha-Gen: {name}")
+@long_job("LTX-2.5 Alpha-Gen: {name}")
 async def ltx_compute(name: str):
-    """Stage „LTX Alpha-Gen” (user decision 2026-10-16): LTX-2.5 IC-LoRA Alpha-Gen on the work area, guided by the
+    """Stage „LTX-2.5 Alpha-Gen” (user decision 2026-10-16): LTX-2.5 IC-LoRA Alpha-Gen on the work area, guided by the
     mask 1+2 (other objects painted out of the guide), limited to the object -> runs/v### (tool.stage_runs.ltx).
     A part of a group: computed as the group on its parent (as stages 3 / 4)."""
     asked = name
@@ -2877,9 +3069,9 @@ async def ltx_compute(name: str):
     st = _ltx_status()
     if st["missing_models"]:
         raise HTTPException(status_code=409, detail="Brak modeli LTX-2.5 (" + ", ".join(st["missing_models"]) +
-                            f"; {st['missing_gb']} GB) – Doktor → „Zainstaluj LTX”")
+                            f"; {st['missing_gb']} GB) – Doktor → „Zainstaluj LTX-2.5”")
     if st["missing_nodes"]:
-        raise HTTPException(status_code=409, detail="Comfy bez węzłów LTX: " + ", ".join(st["missing_nodes"]) +
+        raise HTTPException(status_code=409, detail="Comfy bez węzłów LTX-2.5: " + ", ".join(st["missing_nodes"]) +
                             " – zaktualizuj ComfyUI (≥ 0.39) / zainstaluj ComfyUI-PlateMatte")
     frames = _work_frames()
     _require_core_on(name, frames)
@@ -2902,6 +3094,10 @@ class VmmSettingsRequest(BaseModel):
     protect_auto: Optional[bool] = None  # True = protect band by base (0 core / 3 matanyone)
     inset_px: Optional[float] = None     # unified sliders (2026-10-17): VideoMaMa replaces the base this far inside
     feather_px: Optional[float] = None   # ... blended into the deeper base over this many px
+    outer_feather_px: Optional[float] = None   # band system (2026-10-22): feather from the outer band edge
+    band_points: Optional[List[Dict[str, Any]]] = None   # Ctrl+Z of the band points (static/bandpoints.js): the points
+    band_ref_out: Optional[float] = None                 # as they were, with the sliders' reference (None = none)
+    band_ref_in: Optional[float] = None
     max_side: Optional[int] = None
     batch: Optional[int] = None
     overlap: Optional[int] = None
@@ -2945,7 +3141,9 @@ def vmm_set(name: str, req: VmmSettingsRequest):
     store = _objects()
     cur = dict(store.get(name).get("videomama") or {})
     body = req.model_dump()
-    cur.update({k: v for k, v in body.items() if v is not None and k != "protect_auto"})
+    cur.update({k: v for k, v in body.items() if v is not None and k not in ("protect_auto", "band_ref_out", "band_ref_in")})
+    if body.get("band_points") is not None:   # restoring the band points: their reference goes with them (also None)
+        cur["band_ref_out"], cur["band_ref_in"] = body.get("band_ref_out"), body.get("band_ref_in")
     if body.get("protect_auto"):
         cur.pop("protect_px", None)
     clean = vmm_settings({"videomama": cur})
@@ -2956,14 +3154,14 @@ def vmm_set(name: str, req: VmmSettingsRequest):
 @app.get("/api/object/{name}/videomama_preview/{frame}")
 def vmm_preview(name: str, frame: int, what: str = "band", base: Optional[str] = None, reach_px: Optional[float] = None,
                 protect_px: Optional[float] = None, protect_auto: Optional[int] = None,
-                inset_px: Optional[float] = None, feather_px: Optional[float] = None):
+                inset_px: Optional[float] = None, feather_px: Optional[float] = None, outer_feather_px: Optional[float] = None):
     """VideoMaMa palette, live: what=band – 128 = where VideoMaMa adds, 255 = protect band (proxy PNG); what=alpha –
     the current VideoMaMa version's raw matte put over the base with these values (404 without a VideoMaMa version)."""
     from engine.videomama import object_settings, vmm_settings
     name = _objects().get(name).get("part_of") or name
     cur = {k: v for k, v in object_settings(_objects().get(name)).items() if k != "protect"}
     cur.update({k: v for k, v in {"base": base, "reach_px": reach_px, "protect_px": protect_px, "inset_px": inset_px,
-                                  "feather_px": feather_px}.items() if v is not None})
+                                  "feather_px": feather_px, "outer_feather_px": outer_feather_px}.items() if v is not None})
     if protect_auto:
         cur["protect_px"] = None
     s = vmm_settings({"videomama": cur})
@@ -3178,8 +3376,8 @@ async def apply_motion_blur(name: str, req: MotionBlurRequest = MotionBlurReques
 @app.get("/api/object/{name}/edge_preview/{frame}")
 def edge_preview_frame(name: str, frame: int, band_scale: Optional[float] = None, shift_px: Optional[float] = None,
                        band_out_px: Optional[float] = None, band_in_px: Optional[float] = None):
-    """Stage 3 palette: preview of the MatAnyone edge before computing – proxy PNG, 255 = mask kept (mask 1+2 + shrink /
-    grow), 128 = adaptive band where MatAnyone decides, 0 = background; slider values not yet saved can be passed.
+    """Stage 3 palette: preview of the MatAnyone2 edge before computing – proxy PNG, 255 = mask kept (mask 1+2 + shrink /
+    grow), 128 = adaptive band where MatAnyone2 decides, 0 = background; slider values not yet saved can be passed.
     Headers X-MD-Source (mask12 | mask12+group), X-MD-Band-Px and X-MD-Outside-Crop-Px."""
     _objects().get(name)
     try:
@@ -3203,13 +3401,28 @@ def _preview_owner(name: str, stage: str) -> str:
     return (_objects().get(name).get("part_of") or name) if stage in ("matanyone", "videomama") else name
 
 
+def _spv_engine(name: str, stage: str, engine: Optional[str] = None) -> Optional[str]:
+    """Engine of a stage-5 preview: the one asked for, else the object's effective stage engine; None for other stages."""
+    if stage != "vitmatte":
+        return None
+    from engine.stage_models import EDGE_ENGINES, edge_engines, effective_edge_engine
+    if engine:
+        if engine not in EDGE_ENGINES:
+            raise HTTPException(status_code=400, detail="engine: " + " | ".join(EDGE_ENGINES))
+        return engine
+    return effective_edge_engine(_objects().get(name).get("edge_engine"), edge_engines(load_config()))
+
+
 @app.post("/api/object/{name}/stage_preview/{frame}")
 @long_job("Podgląd klatek: {name}", quiet=True)
 async def stage_preview_compute(name: str, frame: int, stage: str):
+    """Stage 5: the preview is computed with the object's current engine and kept per engine (slot
+    "vitmatte" / "vitmatte@birefnet", 2026-10-22) – the other engine's preview stays for the comparison."""
     from engine import stage_preview as sp
     if stage not in sp.STAGES:
         raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
     name = _preview_owner(name, stage)
+    engine = _spv_engine(name, stage)
     if stage == "videomama":
         st = _vmm_status()
         if st["missing_models"] or st["missing_nodes"]:
@@ -3224,7 +3437,7 @@ async def stage_preview_compute(name: str, frame: int, stage: str):
     from engine.zones import MissingFront
     try:
         meta = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: sp.run(pipe, name, stage, frame, win, Path(models_dir) if models_dir else None))
+            None, lambda: sp.run(pipe, name, stage, frame, win, Path(models_dir) if models_dir else None, engine=engine))
     except MissingFront as e:
         raise _missing_front_409(e)
     except (RuntimeError, FileNotFoundError, ValueError) as e:
@@ -3233,31 +3446,35 @@ async def stage_preview_compute(name: str, frame: int, stage: str):
 
 
 @app.get("/api/object/{name}/stage_preview/{stage}")
-def stage_preview_info(name: str, stage: str):
-    """{exists, stage, center, frames, stale, seconds} of the last preview of this stage."""
-    from engine import stage_preview as sp
-    if stage not in sp.STAGES:
-        raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
-    m = sp.read_meta(_objects(), _preview_owner(name, stage), stage)
-    return {"exists": bool(m), **(m or {})}
-
-
-@app.get("/api/object/{name}/stage_preview/{stage}/{frame}")
-def stage_preview_frame(name: str, stage: str, frame: int):
-    """Proxy PNG of the preview alpha of `frame` (404 outside the preview window). Header X-MD-Stale: 1 = made with
-    other settings than the current ones."""
+def stage_preview_info(name: str, stage: str, engine: Optional[str] = None):
+    """{exists, stage, center, frames, stale, seconds} of the last preview of this stage (stage 5: of `engine`,
+    default the object's current engine)."""
     from engine import stage_preview as sp
     if stage not in sp.STAGES:
         raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
     owner = _preview_owner(name, stage)
-    p = sp.frame_path(_objects(), owner, stage, frame)
+    eng = _spv_engine(owner, stage, engine)
+    m = sp.read_meta(_objects(), owner, stage, eng)
+    return {"exists": bool(m), **({"engine": eng, "slot": sp.slot(stage, eng)} if eng else {}), **(m or {})}
+
+
+@app.get("/api/object/{name}/stage_preview/{stage}/{frame}")
+def stage_preview_frame(name: str, stage: str, frame: int, engine: Optional[str] = None):
+    """Proxy PNG of the preview alpha of `frame` (404 outside the preview window). Header X-MD-Stale: 1 = made with
+    other settings than the current ones. Stage 5: `engine` picks the engine's preview."""
+    from engine import stage_preview as sp
+    if stage not in sp.STAGES:
+        raise HTTPException(status_code=400, detail="stage: " + " | ".join(sp.STAGES))
+    owner = _preview_owner(name, stage)
+    eng = _spv_engine(owner, stage, engine)
+    p = sp.frame_path(_objects(), owner, stage, frame, eng)
     a = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
     if a is None:
         raise HTTPException(status_code=404, detail="brak podglądu tej klatki")
     s = _proxy_scale()
     w, h = _plate_size()
     r = _png_response(cv2.resize(a, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA))
-    m = sp.read_meta(_objects(), owner, stage) or {}
+    m = sp.read_meta(_objects(), owner, stage, eng) or {}
     r.headers["X-MD-Stale"] = "1" if m.get("stale") else "0"
     return r
 
@@ -3327,8 +3544,8 @@ def _member_mask(store, name: str, frame: int, w: int, h: int, src: str = "alpha
                  run: Optional[str] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """(alpha, core) of one object in `frame` for the whole-of-parts preview, from the layer of the view (bug 2026-10-15:
     the whole was always the active alpha, so the Rdzeń / maska 1+2 / Alpha views of a linked object looked the same):
-    src "alpha" = the version `run` (default the active one), else the mask 1+2 / SAM3 core; "core_fix" = the mask 1+2,
-    else the core; "core" = the SAM3 core. core = core/c_####.png (seam detection, like FrameAlphas.core_of)."""
+    src "alpha" = the version `run` (default the active one), else the mask 1+2 / SAM 3.1 core; "core_fix" = the mask 1+2,
+    else the core; "core" = the SAM 3.1 core. core = core/c_####.png (seam detection, like FrameAlphas.core_of)."""
     from engine.export import run_alpha_loader
     from engine.workarea import is_visible, object_life
     o = store.get(name)
@@ -3394,7 +3611,7 @@ def object_frame(name: str, frame: int, view: str = "overlay", v: Optional[str] 
     view=alpha is the faithful preview (plan step 7): the version's alpha assembled like the export (INTER_AREA to the
     proxy); export=1 = the matte as exported (front objects subtracted, parts split) when the object can be exported.
     Z9: view=flicker = the version's flicker map (runs/v###/flicker_map.png, INFERNO, QA bbox) as a BGRA PNG (alpha =
-    brightness, so it overlays only where the edge flickers). Z10: view=cand&cand=i = mask of SAM3 candidate i."""
+    brightness, so it overlays only where the edge flickers). Z10: view=cand&cand=i = mask of SAM 3.1 candidate i."""
     store = _objects()
     obj = store.get(name)
     w, h = _plate_size()
@@ -3422,6 +3639,20 @@ def object_frame(name: str, frame: int, view: str = "overlay", v: Optional[str] 
     if view == "full":   # the whole of an object made of parts (parent + parts), as `<parent>_full` is assembled
         _png = _whole_of_parts(store, obj, frame, pw, ph, src, v)   # src = the layer of the view (alpha | core | core_fix)
         return _png_response(_png)
+    if view == "zone_core":
+        # the core a group's stage-5 zone is built on (user report 2026-10-21: the browser band preview of a group went
+        # round the hand inside the hair – it used the object's own core): the members' masks 1+2 joined with the seam,
+        # the same core the zone preview and stages 3 / 4 use (pipeline.preview_core). Not a group -> the core.
+        pipe = _pipeline()
+        if pipe.group_members(name):
+            try:
+                m = pipe.preview_core(name, [frame])[frame].astype(np.uint8) * 255
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail=f"Brak rdzenia grupy w klatce {frame}")
+            if m.shape != (ph, pw):
+                m = (cv2.resize(m, (pw, ph), interpolation=cv2.INTER_AREA) > 127).astype(np.uint8) * 255
+            return _png_response(m)
+        view = "core"
     if view == "cand":   # Z10: SAM3 candidate mask (stored at proxy size by /detect)
         m = cv2.imread(str(store.dir(name) / "candidates" / f"c_{int(cand):02d}.png"), cv2.IMREAD_GRAYSCALE)
         if m is None:
@@ -3542,7 +3773,7 @@ class KeySaveRequest(BaseModel):
 @app.post("/api/object/{name}/keys/{frame}")
 @object_edit
 def save_key(name: str, frame: int, req: KeySaveRequest):
-    """User key (SPEC 7.1): base (current core / SAM3 preview) +/- brush strokes and polygons -> hard mask."""
+    """User key (SPEC 7.1): base (current core / SAM 3.1 preview) +/- brush strokes and polygons -> hard mask."""
     from engine.keys import KeyHistory, apply_strokes
     store = _objects()
     w, h = _plate_size()
@@ -3591,10 +3822,10 @@ class CorrectRequest(BaseModel):
 
 @app.post("/api/object/{name}/correct/{frame}")
 @object_edit
-@long_job("Korekta SAM3: {name}", quiet=True)
+@long_job("Korekta SAM 3.1: {name}", quiet=True)
 def correct_frame(name: str, frame: int, req: CorrectRequest):
     """Stage 3 local correction (user request 2026-10-12): change ONLY the clicked hole / leak of the current frame
-    mask (its key, else the SAM3 core). SAM3_Detect from seed points of the current mask + the click; the connected
+    mask (its key, else the SAM 3.1 core). SAM3_Detect from seed points of the current mask + the click; the connected
     region under the click is added / removed, every other pixel stays identical. Saved at once as a key
     `correction` (undo in history.json); the changed region -> preview/da_####.png | dr_####.png for the overlay."""
     from engine.correct import local_correction, seed_points
@@ -3628,7 +3859,7 @@ def correct_frame(name: str, frame: int, req: CorrectRequest):
     if n == 0:
         what = "nic nowego do dodania" if req.mode == "add" else "nic do usunięcia"
         return {"success": True, "frame": frame, "changed_px": 0, "seconds": r["seconds"],
-                "detail": f"SAM3: {what} przy tym punkcie – kliknij bliżej brzegu albo użyj pędzla "
+                "detail": f"SAM 3.1: {what} przy tym punkcie – kliknij bliżej brzegu albo użyj pędzla "
                           f"({'G' if req.mode == 'add' else 'R'})"}
     old = keys.get(frame) or {}
     corr = list(old.get("corrections") or []) + [{"mode": req.mode, "point": [x, y], "px": n}]
@@ -3775,7 +4006,21 @@ def _zone_status(name: str, zones) -> Dict[str, Dict[str, Any]]:
 def list_zones(name: str):
     from engine.zones import load_zones
     zones = load_zones(_objects().dir(name))
-    return {"zones": [z.to_dict() for z in zones], "status": _zone_status(name, zones)}
+    return {"zones": [_zone_dict(name, z) for z in zones], "status": _zone_status(name, zones)}
+
+
+def _zone_dict(name: str, z) -> Dict[str, Any]:
+    """A zone for the UI: a whole-outline zone on the shared object band (2026-10-22) shows that band in its params
+    (`band_mode` = shared | own) – zones.js draws / counts / undoes its points as before."""
+    from engine.objband import mode, zone_params
+    d = z.to_dict()
+    store = _objects()
+    obj = store.get(name)
+    d["band_mode"] = mode(obj, f"zone:{z.zone_id}")
+    if d["band_mode"] == "shared":
+        root = obj.get("part_of") or name
+        d["params"] = zone_params(d, obj, store.get(root) if root != name else obj)
+    return d
 
 
 @app.get("/api/zones/preset_defaults/{preset}")
@@ -3796,7 +4041,7 @@ class ZoneInterpretRequest(BaseModel):
 
 @app.post("/api/object/{name}/zones/interpret")
 def zone_interpret(name: str, req: ZoneInterpretRequest):
-    """Plan step 9: what the zone description means without a VLM – preset, SAM3 phrase (`fg_en`), distractors,
+    """Plan step 9: what the zone description means without a VLM – preset, SAM 3.1 phrase (`fg_en`), distractors,
     routing multipliers, warnings; with `frame`: proposed "-" strokes along straight lines in the background (Hough),
     to confirm in the UI (nothing is written here)."""
     from engine.localmatte_prompt import detect_bg_lines, interpret_prompt
@@ -3908,6 +4153,12 @@ def save_zone_ep(name: str, zone_id: str, req: ZoneRequest, preview_frame: Optio
             fields["params"] = {**def_params, **(fields.get("params") or {})}
         if fields["matting"] not in ENGINES:
             raise HTTPException(status_code=400, detail=f"Strefa „matte”: silnik {'|'.join(ENGINES)}, preset {'|'.join(PRESETS)}")
+        model = _edge_engine_default_model(name)
+        if model and fields["matting"] == "matanyone":
+            fields["matting"] = "vitmatte"     # BiRefNet stage: MatAnyone2 is not offered (non-commercial)
+        if fields["matting"] == "vitmatte" and model and "vitmatte_model" not in (fields.get("params") or {}):
+            # a new zone takes the stage 5 engine of the object (BiRefNet -> its default model; ViTMatte = no key, as before)
+            fields["params"] = {**(fields.get("params") or {}), "vitmatte_model": model}
         outline = str((fields.get("params") or {}).get("region", "draw")) == "outline"
         if len(req.polygon) < 3 and not req.strokes and not outline:   # outline mode: the drawing is an optional exclusion
             raise HTTPException(status_code=400, detail="Strefa „matte”: narysuj obszar (wielokąt albo pędzel +)")
@@ -3938,7 +4189,7 @@ def save_zone_ep(name: str, zone_id: str, req: ZoneRequest, preview_frame: Optio
             raise _missing_front_409(e)
     save_zone(d, z)
     store.update(name, tool={"final_valid": False})
-    out: Dict[str, Any] = {"success": True, "zone": z.to_dict(), **({"plan": plan.to_dict()} if plan else {})}
+    out: Dict[str, Any] = {"success": True, "zone": _zone_dict(name, z), **({"plan": plan.to_dict()} if plan else {})}
     if preview_frame is not None and z.criterion == "matte":
         pv = _matte_preview(name, d, z, preview_frame)
         if pv is not None:
@@ -4029,8 +4280,7 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
         note = "podgląd = podpowiedź klucza (clean / chroma); MatAnyone2 na kadrze strefy liczy się przy „Przelicz finalnie” / „Zastosuj”"
     if eng == "vitmatte":    # per-frame engine on the zone crop: the preview IS the engine (one frame, no cache; station 2026-10-13)
         from engine.localmatte import LocalMatteResult
-        from engine.vitmatte import get_runner
-        from engine.zones import vitmatte_tile_px, vitmatte_zone
+        from engine.zones import edge_model_px, edge_model_runner, vitmatte_tile_px, vitmatte_zone
         hold_m = hold_fn(frame) if z.holdout else None
         # forced to 1 = the core eroded by the inset, as the full run passes it (engine/zones.py): without force_core
         # ViTMatte pasted 1 into the WHOLE core – the hard SAM3 edge in the raw preview alpha (user report 2026-10-17)
@@ -4041,12 +4291,11 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
             force_pv = cv2.erode(cb.astype(np.uint8), kf).astype(bool)
         bgm = zone_bg_mask_at(kz, cb.shape)
         pipe.release_comfy_gpu("podgląd ViTMatte")      # Comfy's models off the GPU first (idle queue only)
-        from engine.vitmatte import model_id_for
         al, tris, st = vitmatte_zone(kz, [frame], {frame: cb}, {frame: region}, lambda f: pipe.loader.frame(f),
-                                     get_runner(model_id_for((kz.params or {}).get("vitmatte_model"))),
+                                     edge_model_runner((kz.params or {}).get("vitmatte_model")),
                                      holdout=(lambda f: hold_m), bg=(lambda f: bgm),
                                      fg_erode_px=int((kz.params or {}).get("fg_erode_px", 2)),
-                                     model_px=int((kz.params or {}).get("model_px", 1008)),
+                                     model_px=edge_model_px(kz.params),
                                      unknown_value=float((kz.params or {}).get("unknown_value", 0.5)),
                                      tile_px=vitmatte_tile_px(kz.params),
                                      fg_sure={frame: fgm} if fg_fn is not None else None,
@@ -4125,6 +4374,11 @@ def patch_zone(name: str, zone_id: str, req: ZonePatchRequest):
     changes = {k: v for k, v in req.model_dump().items() if v is not None}
     if not changes:
         raise HTTPException(status_code=400, detail="Nic do zmiany")
+    from engine.objband import KEYS, mode
+    if "params" in changes and mode(_objects().get(name), f"zone:{zone_id}") == "shared":
+        # the card sends the params as shown (with the shared object band): the band is never written through a zone
+        # (a stale copy would overwrite another stage's edit) – its edits / Ctrl+Z go to /band
+        changes["params"] = {k: v for k, v in changes["params"].items() if k not in KEYS}
     if "matting" in changes and changes["matting"] not in ENGINES:
         raise HTTPException(status_code=400, detail=f"Silnik: {'|'.join(ENGINES)}")
     if "preset" in changes and changes["preset"] not in PRESETS:
@@ -4138,12 +4392,25 @@ def patch_zone(name: str, zone_id: str, req: ZonePatchRequest):
         plan = interpret_prompt(changes["prompt"])
         if plan.preset and "preset" not in changes and plan.preset != z.preset and z.criterion == "matte":
             changes["preset"] = plan.preset     # step 9: the description names the kind of detail
+    if changes.get("matting") in ("matanyone", "vitmatte") and z.criterion == "matte":
+        model = _edge_engine_default_model(name)       # BiRefNet stage (user decision 2026-10-21)
+        if model and changes["matting"] == "matanyone":
+            raise HTTPException(status_code=409, detail="Silnik etapu to BiRefNet – MatAnyone2 (niekomercyjny) niedostępny w strefie; "
+                                                        "zmień silnik etapu strzałką ▾ przy etapie")
+        from engine.birefnet import MODELS as BIREFNET
+        if model and str((z.params or {}).get("vitmatte_model") or "") not in BIREFNET:
+            z.params = {**(z.params or {}), "vitmatte_model": model}
+    if "params" in changes and (z.params or {}).get("band_points") and "band_ref_out" not in changes["params"]:
+        # band points set before the slider reference existed (2026-10-21): the sliders as they were = scale 1, so this
+        # change already sizes the band the points shape
+        from engine.zones import band_refs
+        changes["params"] = {**changes["params"], **{k: (z.params or {}).get(k, v) for k, v in band_refs(z.params).items()}}
     for k, v in changes.items():
         setattr(z, k, v)
     d = _objects().dir(name)
     save_zone(d, z)
     _objects().update(name, tool={"final_valid": False})
-    return {"success": True, "zone": z.to_dict(), "changed": sorted(changes), "status": _zone_status(name, [z])[zone_id],
+    return {"success": True, "zone": _zone_dict(name, z), "changed": sorted(changes), "status": _zone_status(name, [z])[zone_id],
             **({"plan": plan.to_dict()} if plan else {})}
 
 
@@ -4181,7 +4448,7 @@ def put_zone_key(name: str, zone_id: str, frame: int, req: ZoneKeyRequest):
     set_zone_key(z, frame, req.polygon, req.strokes, req.bg_strokes, req.prompt)
     save_zone(_objects().dir(name), z)
     _objects().update(name, tool={"final_valid": False})
-    return {"success": True, "zone": z.to_dict(), "keys": list(zone_keys(z)),
+    return {"success": True, "zone": _zone_dict(name, z), "keys": list(zone_keys(z)),
             "key": {**zone_keys(z)[int(frame)], "prompt": zone_key_prompt(z, int(frame))}}
 
 
@@ -4196,7 +4463,7 @@ def delete_zone_key(name: str, zone_id: str, frame: int):
         raise HTTPException(status_code=409, detail=str(e))
     save_zone(_objects().dir(name), z)
     _objects().update(name, tool={"final_valid": False})
-    return {"success": True, "zone": z.to_dict(), "keys": list(zone_keys(z))}
+    return {"success": True, "zone": _zone_dict(name, z), "keys": list(zone_keys(z))}
 
 
 @app.get("/api/object/{name}/zones/{zone_id}/keys")
@@ -4220,12 +4487,659 @@ def get_zone_region(name: str, zone_id: str, frame: int):
         raise HTTPException(status_code=409, detail=str(e))
 
 
+# ---- band control points of an outline zone (2026-10-21, engine/bandmap.py): position + two whiskers per key frame
+def _band_frames(name: str, frame: int) -> List[int]:
+    """Frames the points are tracked over – the same span as the zone preview (active version, cores on disk)."""
+    d = _objects().dir(name)
+    return [x for x in _active_run_frames(name) if (d / "core" / f"c_{x:04d}.png").exists()] or [frame]
+
+
+class _BandOwner:
+    """A band with control points (one band system, user decision 2026-10-22): a whole-outline zone of stage 5 or a
+    stage with a band (VideoMaMa). Its params hold `band_points` + the sliders' reference `band_ref_out / _in`;
+    `out` / `inn` = the sliders now (the constant band), `owner_id` = the tracking cache key."""
+
+    def __init__(self, name: str, kind: str, params: Dict[str, Any], owner_id: str, out: float, inn: float, save):
+        self.name, self.kind, self.params, self.owner_id = name, kind, dict(params or {}), owner_id
+        self.out, self.inn, self._save = float(out), float(inn), save
+        self.key, self.obj_name = "", name      # band owner key (engine/objband.py) and the object it belongs to
+
+    def defaults(self) -> Dict[str, Any]:
+        return {"out": int(round(self.out)), "in": int(round(self.inn))}
+
+    def scales(self) -> Tuple[float, float]:
+        ro, ri = self.params.get("band_ref_out"), self.params.get("band_ref_in")
+        return (self.out / float(ro) if ro else 1.0), (self.inn / float(ri) if ri else 1.0)
+
+    def refs(self) -> Dict[str, float]:
+        return {"band_ref_out": self.out, "band_ref_in": self.inn}
+
+    def store(self, pts) -> None:
+        params = {**self.params, "band_points": pts}
+        if not pts:   # no points = the constant band again (bit-identical)
+            params["band_points"] = []
+            params["band_ref_out"] = None
+            params["band_ref_in"] = None
+        self.params = params
+        self._save(params)
+        _objects().update(self.name, tool={"final_valid": False})
+
+
+def _shared_save(root: str):
+    """Save of the shared object band (engine/objband.py): the main object of the group, field `band`."""
+    from engine.objband import KEYS
+
+    def save(params):
+        _objects().update(root, band={k: params.get(k) for k in KEYS})
+    return save
+
+
+def _zone_own_save(name: str, z):
+    from engine.objband import KEYS
+    from engine.zones import save_zone
+
+    def save(params):
+        z.params = {k: v for k, v in {**(z.params or {}), **params}.items() if not (k in KEYS and not v)}
+        save_zone(_objects().dir(name), z)
+    return save
+
+
+def _zone_owner(name: str, z) -> _BandOwner:
+    """The band of a whole-outline zone: the shared object band (default, 2026-10-22) or its own points (detached)."""
+    from engine.objband import KEYS, SHARED_OWNER, mode, shared
+    from engine.zones import OUTLINE_OUT_PX, outline_in_px
+    p = z.params or {}
+    out, inn = float(p.get("outline_out_px", OUTLINE_OUT_PX)), float(outline_in_px(p))
+    store = _objects()
+    obj = store.get(name)
+    key = f"zone:{z.zone_id}"
+    if mode(obj, key) == "shared":
+        root = obj.get("part_of") or name
+        ow = _BandOwner(root, "zone", {**{k: v for k, v in p.items() if k not in KEYS}, **shared(store.get(root))},
+                        SHARED_OWNER, out, inn, _shared_save(root))
+    else:
+        ow = _BandOwner(name, "zone", p, z.zone_id, out, inn, _zone_own_save(name, z))
+    ow.key, ow.obj_name = key, name
+    return ow
+
+
+BAND_STAGES = ("videomama", "matanyone", "ltx")
+
+
+def _stage_own(name: str, stage: str) -> Tuple[Dict[str, Any], Any, float, float]:
+    """(own params, own save, slider out, slider in) of a stage band (VideoMaMa: „Pas na zewnątrz” = reach, „Wcięcie
+    w rdzeń” = inset; MatAnyone2: the px mode of the edge band, object field `edge_band`; LTX-2.5: the band mode)."""
+    from engine.objband import KEYS
+    from engine.videomama import object_settings
+    store = _objects()
+    if stage == "ltx":
+        from engine.ltx_alpha import object_settings as ltx_object_settings
+        ls = ltx_object_settings(store.get(name))
+        if ls["combine"] != "band":
+            raise HTTPException(status_code=409, detail="Punkty pasa LTX-2.5 działają w trybie wyniku „pas” – wybierz go w palecie LTX-2.5")
+        lraw = dict(store.get(name).get("ltx") or {})
+
+        def save_ltx(params):
+            cur = dict(store.get(name).get("ltx") or {})
+            cur.update({k: params.get(k) for k in KEYS})
+            store.update(name, ltx=cur)
+        return {k: lraw.get(k) for k in KEYS}, save_ltx, ls["region_px"], float(ls["core_erode_px"])
+    if stage == "matanyone":
+        from engine.edge import band_px_limits
+        o = store.get(name)
+        lim = band_px_limits(o)
+        if not lim:
+            raise HTTPException(status_code=409, detail="Punkty pasa MatAnyone2 działają w trybie px – ustaw „Pas na zewnątrz” / "
+                                                        "„Wcięcie” w palecie Krawędź")
+        eb = dict(o.get("edge_band") or {})
+
+        def save_ma(params):
+            pts = params.get("band_points") or []
+            store.update(name, edge_band={k: params.get(k) for k in KEYS} if pts else None)
+        return {k: eb.get(k) for k in KEYS}, save_ma, lim[0], lim[1]
+    s = object_settings(store.get(name))
+    raw = dict(store.get(name).get("videomama") or {})
+
+    def save(params):
+        cur = dict(store.get(name).get("videomama") or {})
+        cur.update({k: params.get(k) for k in KEYS})
+        store.update(name, videomama=cur)
+    return {k: raw.get(k) for k in KEYS}, save, s["reach_px"], float(s.get("inset_px") or 0.0)
+
+
+def _stage_owner(name: str, stage: str) -> _BandOwner:
+    """The band of a stage: the shared object band (default, 2026-10-22) or the stage's own points (detached); a part =
+    its group. `stage` = a stage name or "zone:<zone_id>" (a whole-outline zone of stage 5)."""
+    from engine.objband import SHARED_OWNER, mode, shared
+    if stage.startswith("zone:"):
+        return _zone_owner(name, _load_zone_or_404(name, stage[5:]))
+    if stage not in BAND_STAGES:
+        raise HTTPException(status_code=400, detail=f"Pas z punktami: etap {'|'.join(BAND_STAGES)}")
+    store = _objects()
+    name = store.get(name).get("part_of") or name
+    own, save, out, inn = _stage_own(name, stage)
+    obj = store.get(name)
+    if mode(obj, stage) == "shared":
+        ow = _BandOwner(name, "stage", shared(obj), SHARED_OWNER, out, inn, _shared_save(name))
+    else:
+        ow = _BandOwner(name, "stage", own, f"stage_{stage}", out, inn, save)
+    ow.key, ow.obj_name = stage, name
+    return ow
+
+
+def _band_state(name: str, z, frame: int) -> Dict[str, Any]:
+    return _band_state_o(name, _zone_owner(name, z), frame)
+
+
+def _band_state_o(name: str, ow: "_BandOwner", frame: int) -> Dict[str, Any]:
+    from engine.bandmap import band_points, snap_normal, widths_at
+    from engine.bandtrack import track_positions
+    from engine.zonecache import ZoneCache
+    name = ow.name
+    pts = band_points(ow.params)
+    defaults = ow.defaults()
+    if not pts:
+        return {"frame": frame, "points": [], "defaults": defaults}
+    pipe = _pipeline()
+    frames = _band_frames(name, frame)
+    # the same frame span as the zone preview (one tracking per point set, shared); never waited for here – the
+    # nearest keys' positions until the background tracking is done ("tracking": true, the UI polls)
+    tracker = pipe._zone_tracker()
+    front_fn, _ = pipe.front_holdout(name, frames, need=False)
+    tinfo: Dict[str, Any] = {}
+    pos = track_positions(pts, frames, tracker, pipe._band_tracker_frames(name) if tracker else None,
+                          ZoneCache(_objects().dir(name), ow.owner_id).dir, core_at=pipe.band_core_at(name),
+                          occluder_at=front_fn, resolve=[frame], wait=False, info=tinfo).get(frame)
+    if pos is None:                     # a frame outside the tracked span: the nearest key's position
+        from engine.bandmap import static_positions
+        pos = static_positions(pts, [frame])[frame]
+    try:   # the outline the band is built on (a group: its members with the seam) – snap + normal for the whiskers
+        core = pipe.preview_core(name, [frame])[frame]
+    except FileNotFoundError:
+        core = None
+    so, si = ow.scales()        # the sliders size the band, the points shape it (2026-10-21)
+    out = []
+    for q in pts:
+        x, y, vis = pos.get(q["id"], (None, None, False))
+        o, i = widths_at(q, frame)
+        o, i = o * so, i * si
+        sn = snap_normal(core, x, y) if core is not None and x is not None else None
+        out.append({"id": q["id"], "x": x, "y": y, "visible": vis, "out": round(o, 2), "in": round(i, 2),
+                    "key": str(frame) in q["keys"], "keys": sorted(int(k) for k in q["keys"]),
+                    **({"sx": round(sn[0], 2), "sy": round(sn[1], 2), "nx": round(sn[2], 4), "ny": round(sn[3], 4)} if sn else {})})
+    return {"frame": frame, "points": out, "defaults": defaults, "tracking": bool(tinfo.get("pending")),
+            "scale": {"out": round(so, 4), "in": round(si, 4)}}
+
+
+@app.get("/api/object/{name}/zones/{zone_id}/band/{frame}")
+def get_zone_band(name: str, zone_id: str, frame: int):
+    """Band control points of the zone in `frame`: tracked position (CoTracker3, cached), visibility, the two widths
+    (animated between keys) and whether `frame` is a key of the point. Not a job: it never waits (tracking runs in the
+    background) – as a job it marked the app busy and the band area of the same frame was skipped (user report
+    2026-10-21: „dalej nie widać zakresu”)."""
+    z = _load_zone_or_404(name, zone_id)
+    try:
+        return _band_state(name, z, frame)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+class BandPointRequest(BaseModel):
+    id: Optional[str] = None             # absent = a new point
+    x: Optional[float] = None            # position in this frame (full-frame px); absent = where the point is now
+    y: Optional[float] = None
+    out: Optional[float] = None          # whisker into the background (px); absent = the current (animated) value
+    in_: Optional[float] = Field(None, alias="in")   # whisker into the object (px)
+
+
+@app.put("/api/object/{name}/zones/{zone_id}/band/{frame}")
+@object_edit
+def put_zone_band(name: str, zone_id: str, frame: int, req: BandPointRequest):
+    """Add a band point in `frame` or set a key of an existing one there (position and / or widths). Width 0 on both
+    sides = a gap in the band. Any change invalidates the zone's result (new version on „Zastosuj”)."""
+    from engine.zones import region_mode
+    z = _load_zone_or_404(name, zone_id)
+    if z.criterion != "matte" or region_mode(z) != "outline":
+        raise HTTPException(status_code=400, detail="Punkty pasa tylko dla strefy „cały obrys”")
+    return _band_put(_zone_owner(name, z), frame, req)
+
+
+def _band_put(ow: "_BandOwner", frame: int, req: "BandPointRequest") -> Dict[str, Any]:
+    from engine.bandmap import MAX_WIDTH_PX, band_points
+    name = ow.name
+    pts = [dict(p) for p in band_points(ow.params)]
+    if not ow.params.get("band_ref_out"):   # the sliders as they are now = scale 1 for these points
+        ow.params = {**ow.params, **ow.refs()}
+    state = _band_state_o(name, ow, frame)
+    cur = {q["id"]: q for q in state["points"]}
+    so, si = ow.scales()
+    clamp = lambda v: float(min(MAX_WIDTH_PX, max(0.0, v)))
+    raw_o = lambda v: clamp(v) / so if so > 1e-6 else clamp(v)     # shown (scaled) px -> stored px
+    raw_i = lambda v: clamp(v) / si if si > 1e-6 else clamp(v)
+    if req.id is None:
+        if req.x is None or req.y is None:
+            raise HTTPException(status_code=400, detail="Nowy punkt pasa: podaj x i y")
+        d0 = state["defaults"]
+        n = 1 + max([int(p["id"][1:]) for p in pts if str(p["id"]).startswith("p") and str(p["id"])[1:].isdigit()] or [0])
+        pts.append({"id": f"p{n}", "keys": {str(frame): {"x": float(req.x), "y": float(req.y),
+                                                         "out": raw_o(req.out if req.out is not None else d0["out"]),
+                                                         "in": raw_i(req.in_ if req.in_ is not None else d0["in"])}}})
+        pid = f"p{n}"
+    else:
+        p = next((q for q in pts if q["id"] == req.id), None)
+        if p is None:
+            raise HTTPException(status_code=404, detail=f"Brak punktu pasa {req.id}")
+        c = cur.get(req.id, {})
+        x = req.x if req.x is not None else c.get("sx", c.get("x"))     # snapped to the outline (station 2026-10-21:
+        y = req.y if req.y is not None else c.get("sy", c.get("y"))     # a raw track had drifted 500 px into the sky)
+        if x is None or y is None:
+            raise HTTPException(status_code=409, detail="Punkt jest w tej klatce niewidoczny – podaj jego położenie (x, y)")
+        p["keys"] = {**p["keys"], str(frame): {"x": float(x), "y": float(y),
+                                               "out": raw_o(req.out if req.out is not None else c.get("out", 0)),
+                                               "in": raw_i(req.in_ if req.in_ is not None else c.get("in", 0))}}
+        pid = req.id
+    ow.store(pts)
+    return {"success": True, "point": pid, "band": _band_state_o(name, ow, frame)}
+
+
+@app.delete("/api/object/{name}/zones/{zone_id}/band/{point_id}")
+@object_edit
+def delete_zone_band(name: str, zone_id: str, point_id: str, frame: Optional[int] = None):
+    """Remove a band point, or only its key in `frame` (?frame=N; the last key removes the point)."""
+    return _band_delete_point(_zone_owner(name, _load_zone_or_404(name, zone_id)), point_id, frame)
+
+
+def _band_delete_point(ow: "_BandOwner", point_id: str, frame: Optional[int]) -> Dict[str, Any]:
+    from engine.bandmap import band_points
+    pts = [dict(p) for p in band_points(ow.params)]
+    p = next((q for q in pts if q["id"] == point_id), None)
+    if p is None:
+        raise HTTPException(status_code=404, detail=f"Brak punktu pasa {point_id}")
+    if frame is not None:
+        if str(frame) not in p["keys"]:
+            raise HTTPException(status_code=404, detail=f"Punkt {point_id} nie ma klucza w klatce {frame}")
+        p["keys"] = {k: v for k, v in p["keys"].items() if k != str(frame)}
+    if frame is None or not p["keys"]:
+        pts = [q for q in pts if q["id"] != point_id]
+    ow.store(pts)
+    return {"success": True}
+
+
+@app.delete("/api/object/{name}/zones/{zone_id}/band")
+@object_edit
+def delete_zone_band_keys(name: str, zone_id: str, frame: Optional[int] = None):
+    """Band keys of ALL points in `frame` (?frame=N – playback bar 🔑✕ / Delete / RMB on the triangle, 2026-10-21; a point
+    left without keys goes too), or every band point (no frame = the constant band again)."""
+    return _band_delete_keys(_zone_owner(name, _load_zone_or_404(name, zone_id)), frame)
+
+
+def _band_delete_keys(ow: "_BandOwner", frame: Optional[int]) -> Dict[str, Any]:
+    from engine.bandmap import band_points
+    pts = [dict(p) for p in band_points(ow.params)]
+    if frame is None:
+        removed = [p["id"] for p in pts]
+        pts = []
+    else:
+        removed = [p["id"] for p in pts if str(frame) in p["keys"]]
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Brak kluczy pasa w klatce {frame}")
+        for p in pts:
+            p["keys"] = {k: v for k, v in p["keys"].items() if k != str(frame)}
+        pts = [p for p in pts if p["keys"]]
+    ow.store(pts)
+    return {"success": True, "removed": removed, "points": [p["id"] for p in pts]}
+
+
+# ----------------------------------------------------------------------------- band of a stage (one band system)
+class BandParamsRequest(BaseModel):
+    band_points: List[Dict[str, Any]] = []
+    band_ref_out: Optional[float] = None
+    band_ref_in: Optional[float] = None
+
+
+@app.get("/api/object/{name}/stage_band/{stage}/params")
+def get_stage_band_params(name: str, stage: str):
+    """The band points of a stage as stored (+ the sliders' reference) – what Ctrl+Z restores."""
+    ow = _stage_owner(name, stage)
+    return {k: ow.params.get(k) for k in ("band_points", "band_ref_out", "band_ref_in")}
+
+
+@app.put("/api/object/{name}/stage_band/{stage}/params")
+@object_edit
+def put_stage_band_params(name: str, stage: str, req: BandParamsRequest):
+    """Ctrl+Z of a band edit (static/bandpoints.js): the points and their reference exactly as given."""
+    ow = _stage_owner(name, stage)
+    ow.params = {**ow.params, "band_ref_out": req.band_ref_out, "band_ref_in": req.band_ref_in}
+    ow.store([dict(p) for p in req.band_points])
+    return {"success": True}
+
+
+class BandModeRequest(BaseModel):
+    mode: str                            # "shared" | "own"
+
+
+@app.put("/api/object/{name}/stage_band/{stage}/mode")
+@object_edit
+def put_stage_band_mode(name: str, stage: str, req: BandModeRequest):
+    """„Odłącz → własny pas” (own: the stage gets a copy of the shared band – nothing changes in its result) or „wróć do
+    wspólnego” (shared: the stage's own points are dropped, it reads the object band again). `stage` = a stage or
+    "zone:<zone_id>"."""
+    from engine.objband import KEYS, mode
+    if req.mode not in ("shared", "own"):
+        raise HTTPException(status_code=400, detail="mode: shared | own")
+    store = _objects()
+    ow = _stage_owner(name, stage)
+    obj_name, key = ow.obj_name, ow.key
+    if mode(store.get(obj_name), key) == req.mode:
+        return {"success": True, "mode": req.mode, "changed": False}
+    if req.mode == "own":
+        copy = {k: ow.params.get(k) for k in KEYS}
+        _set_band_mode(obj_name, key, "own")
+        own = _stage_owner(name, stage)
+        own.params = {**own.params, **copy}
+        if copy.get("band_points"):
+            own.store([dict(p) for p in copy["band_points"]])
+    else:
+        ow.params = {**ow.params, "band_ref_out": None, "band_ref_in": None}
+        ow.store([])
+        _set_band_mode(obj_name, key, "shared")
+    store.update(obj_name, tool={"final_valid": False})
+    return {"success": True, "mode": req.mode, "changed": True}
+
+
+def _set_band_mode(obj_name: str, key: str, md: str) -> None:
+    store = _objects()
+    modes = dict(store.get(obj_name).get("band_modes") or {})
+    if md == "own":
+        modes[key] = "own"
+    else:
+        modes.pop(key, None)
+    store.update(obj_name, band_modes=modes)
+
+
+@app.get("/api/object/{name}/stage_band/{stage}/{frame}")
+def get_stage_band(name: str, stage: str, frame: int):
+    """Band control points of a stage with a band (VideoMaMa) in `frame` – as the zone's band (2026-10-22)."""
+    try:
+        return _band_state_o(name, _stage_owner(name, stage), frame)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.put("/api/object/{name}/stage_band/{stage}/{frame}")
+@object_edit
+def put_stage_band(name: str, stage: str, frame: int, req: BandPointRequest):
+    """Add a band point of the stage in `frame` or set its key there (position / widths); invalidates the stage."""
+    return _band_put(_stage_owner(name, stage), frame, req)
+
+
+@app.delete("/api/object/{name}/stage_band/{stage}/{point_id}")
+@object_edit
+def delete_stage_band(name: str, stage: str, point_id: str, frame: Optional[int] = None):
+    """Remove a band point of the stage, or only its key in `frame` (?frame=N; the last key removes the point)."""
+    return _band_delete_point(_stage_owner(name, stage), point_id, frame)
+
+
+@app.delete("/api/object/{name}/stage_band/{stage}")
+@object_edit
+def delete_stage_band_keys(name: str, stage: str, frame: Optional[int] = None):
+    """Band keys of ALL points of the stage in `frame` (?frame=N), or every band point (no frame = constant band)."""
+    return _band_delete_keys(_stage_owner(name, stage), frame)
+
+
+class BandCopyRequest(BaseModel):
+    source: str                          # "zone:<zone_id>" | "<stage>" | "band" (the shared object band)
+
+
+@app.post("/api/object/{name}/stage_band/{stage}/copy")
+@object_edit
+def copy_band_points(name: str, stage: str, req: BandCopyRequest):
+    """„Kopiuj klucze pasa z …” (user decision 2026-10-22): the band points of another owner (a stage-5 whole-outline zone
+    or another stage) replace this band's; widths as the source SHOWS them (its slider scale), this band's sliders
+    become the reference. `stage` = a stage name or "zone:<zone_id>" (copy into a zone)."""
+    from engine.bandmap import band_points
+    def owner(key: str) -> _BandOwner:
+        if key == "band":   # the shared object band as stored (scale 1)
+            from engine.objband import SHARED_OWNER, shared
+            root = _objects().get(name).get("part_of") or name
+            b = shared(_objects().get(root))
+            return _BandOwner(root, "object", b, SHARED_OWNER, b["band_ref_out"] or 0.0, b["band_ref_in"] or 0.0, _shared_save(root))
+        if key.startswith("zone:"):
+            return _zone_owner(name, _load_zone_or_404(name, key[5:]))
+        return _stage_owner(name, key)
+    src, dst = owner(req.source), owner(stage)
+    if dst.owner_id == "band":
+        raise HTTPException(status_code=409, detail="Etap czyta wspólny pas obiektu – „odłącz” go, żeby skopiować do niego "
+                                                    "punkty z innego etapu, albo „ustaw jako wspólny” w źródle")
+    so, si = src.scales()
+    pts = []
+    for p in band_points(src.params):
+        keys = {k: {**v, "out": float(v.get("out", 0)) * so, "in": float(v.get("in", 0)) * si} for k, v in p["keys"].items()}
+        pts.append({"id": p["id"], "keys": keys})
+    if not pts:
+        raise HTTPException(status_code=404, detail="Źródło nie ma punktów pasa")
+    dst.params = {**dst.params, **dst.refs()}
+    dst.store(pts)
+    return {"success": True, "points": len(pts), "keys": sorted({int(k) for p in pts for k in p["keys"]})}
+
+
+# ----------------------------------------------------------------------------- the shared object band (2026-10-22)
+def _band_owner_keys(name: str) -> List[Tuple[str, str]]:
+    """(object, key) of every band owner of the group of `name`: the stages + the whole-outline zones of its members."""
+    from engine.stages import group_parts
+    from engine.zones import load_zones, region_mode
+    store = _objects()
+    root = store.get(name).get("part_of") or name
+    out = [(root, k) for k in BAND_STAGES]
+    for m in [root] + group_parts(store, root):
+        for z in load_zones(store.dir(m)):
+            try:
+                if z.criterion == "matte" and region_mode(z) == "outline":
+                    out.append((m, f"zone:{z.zone_id}"))
+            except ValueError:
+                continue
+    return out
+
+
+def _band_active(obj: Dict[str, Any], key: str) -> bool:
+    """Whether the stage reads band points in its current mode (MatAnyone2: the px mode; LTX-2.5: the result „pas”)."""
+    if key == "matanyone":
+        from engine.edge import band_px_limits
+        return bool(band_px_limits(obj))
+    if key == "ltx":
+        from engine.ltx_alpha import object_settings as ltx_object_settings
+        return ltx_object_settings(obj)["combine"] == "band"
+    return True
+
+
+@app.get("/api/object/{name}/band")
+def get_object_band(name: str):
+    """The shared band of the object (its group): points, keys, reference and the mode of every band owner
+    (stages 3 / 4 / 7, the whole-outline zones of stage 5) – shared or own (detached, with its own point count)."""
+    from engine.bandmap import band_points
+    from engine.objband import mode, own_params, shared
+    store = _objects()
+    root = store.get(name).get("part_of") or name
+    b = shared(store.get(root))
+    pts = band_points(b)
+    owners = []
+    for m, key in _band_owner_keys(name):
+        obj = store.get(m)
+        md = mode(obj, key)
+        if md == "own":
+            if key.startswith("zone:"):
+                own = _load_zone_or_404(m, key[5:]).params or {}
+            else:
+                own = own_params(obj, key)
+            n = len(band_points(own))
+        else:
+            n = len(pts)
+        owners.append({"object": m, "key": key, "mode": md, "points": n, "active": _band_active(obj, key)})
+    return {"object": root, "points": len(pts), "keys": sorted({int(k) for p in pts for k in p["keys"]}),
+            "band_ref_out": b["band_ref_out"], "band_ref_in": b["band_ref_in"], "owners": owners}
+
+
+@app.get("/api/object/{name}/band/params")
+def get_object_band_params(name: str):
+    """The shared band as stored (what Ctrl+Z restores)."""
+    from engine.objband import shared
+    store = _objects()
+    return shared(store.get(store.get(name).get("part_of") or name))
+
+
+@app.put("/api/object/{name}/band/params")
+@object_edit
+def put_object_band_params(name: str, req: BandParamsRequest):
+    """The shared band exactly as given (Ctrl+Z of „odłącz” / „ustaw jako wspólny” / a band edit)."""
+    store = _objects()
+    root = store.get(name).get("part_of") or name
+    pts = [dict(p) for p in req.band_points]
+    store.update(root, band={"band_points": pts, "band_ref_out": req.band_ref_out if pts else None,
+                             "band_ref_in": req.band_ref_in if pts else None})
+    store.update(root, tool={"final_valid": False})
+    return {"success": True}
+
+
+@app.delete("/api/object/{name}/band")
+@object_edit
+def delete_object_band(name: str, frame: Optional[int] = None):
+    """Keys of the shared band in `frame` (?frame=N), or the whole shared band (every stage on it = constant band)."""
+    from engine.objband import SHARED_OWNER, shared
+    store = _objects()
+    root = store.get(name).get("part_of") or name
+    ow = _BandOwner(root, "object", shared(store.get(root)), SHARED_OWNER, 0.0, 0.0, _shared_save(root))
+    return _band_delete_keys(ow, frame)
+
+
+class BandFromRequest(BaseModel):
+    source: str                          # a stage or "zone:<zone_id>" (detached) whose points become the shared band
+
+
+@app.post("/api/object/{name}/band/from")
+@object_edit
+def set_object_band_from(name: str, req: BandFromRequest):
+    """„Ustaw jako wspólny”: the points of a detached stage / zone become the shared band of the object (as stored, with
+    their reference – the source's result does not change) and the source reads it again (shared). Every other stage on
+    the shared band changes with it (↻ where computed)."""
+    from engine.bandmap import band_points
+    from engine.objband import KEYS
+    src = _stage_owner(name, req.source)
+    if src.owner_id == "band":
+        raise HTTPException(status_code=409, detail="To już jest wspólny pas obiektu")
+    pts = band_points(src.params)
+    if not pts:
+        raise HTTPException(status_code=404, detail="Źródło nie ma punktów pasa")
+    store = _objects()
+    root = store.get(src.obj_name).get("part_of") or src.obj_name
+    store.update(root, band={k: src.params.get(k) for k in KEYS})
+    src.params = {**src.params, "band_ref_out": None, "band_ref_in": None}
+    src.store([])
+    _set_band_mode(src.obj_name, src.key, "shared")
+    store.update(root, tool={"final_valid": False})
+    return {"success": True, "points": len(pts), "keys": sorted({int(k) for p in pts for k in p["keys"]})}
+
+
+from collections import OrderedDict
+_LINES_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()   # stage-3 band lines (stage_band_lines)
+
+
+def _STATE_PLATE_KEY() -> Any:
+    m = STATE.get("manifest") or {}
+    return [(m.get("plates") or {}).get("beauty_clean") or (m.get("plates") or {}).get("beauty"), _mask_plate_denoise()]
+
+
+@app.get("/api/object/{name}/stage_band/{stage}/{frame}/lines")
+def stage_band_lines(name: str, stage: str, frame: int, outer_feather_px: Optional[float] = None,
+                     reach_px: Optional[float] = None, inset_px: Optional[float] = None, feather_px: Optional[float] = None,
+                     band_scale: Optional[float] = None, shift_px: Optional[float] = None):
+    """Preview lines of a stage band in `frame` (plate px): band edges (dashed), where the inset / outer feather end
+    (thin dashes) – the same drawing as the stage-5 zone (2026-10-22). Slider values may be given for a live preview."""
+    from engine.bandsys import band_widths, feather_lines
+    from engine.ltx_alpha import sdf_px
+    from engine.videomama import object_settings, vmm_settings
+    ow = _stage_owner(name, stage)
+    def lines(m, mode):
+        if m is None or not m.any():
+            return []
+        cnts, _ = cv2.findContours(m.astype(np.uint8), mode, cv2.CHAIN_APPROX_SIMPLE)
+        return [cv2.approxPolyDP(c, 1.5, True).reshape(-1, 2).tolist() for c in cnts if len(c) >= 3]
+    if stage == "ltx":   # the band mode of the LTX-2.5 result: region (out) / core erode (in), feathers into the core
+        from engine.ltx_alpha import ltx_settings
+        from engine.ltx_alpha import object_settings as ltx_object_settings
+        cur = dict(ltx_object_settings(_objects().get(ow.name)))
+        cur.update({k: v for k, v in {"region_px": reach_px, "core_erode_px": inset_px, "feather_px": feather_px,
+                                      "region_soft_px": outer_feather_px}.items() if v is not None})
+        s = ltx_settings({"ltx": cur})
+        pipe = _pipeline()
+        try:
+            mask = pipe.ltx_mask(ow.name, [frame], s, pipe.preview_core(ow.name, [frame]))[frame]
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        pf = pipe.ltx_band_points(ow.name, s, [frame], only=[frame])
+        m = (np.asarray(mask) > 0.5).astype(np.float32)
+        o, i = band_widths(m, s["region_px"], float(s["core_erode_px"]), pf(frame) if pf else None)
+        band, inner, outer = feather_lines(sdf_px(m), o, i, s.get("feather_px", 0.0), s["region_soft_px"])
+        return {"frame": frame, "band_contours": lines(band, cv2.RETR_CCOMP),
+                "inset_feather_contours": lines(inner, cv2.RETR_EXTERNAL), "feather_contours": lines(outer, cv2.RETR_EXTERNAL)}
+    if stage == "matanyone":   # the edge band of the palette (adaptive / px + points), feathers into the core
+        from engine.stages import mask_sig, settings_sig
+        from engine.zones import feather_maps
+        o = _objects().get(ow.name)
+        # the stage-3 band takes ~0.5 s (core stabilisation, adaptive widths): kept per frame + settings, so going back
+        # to a frame (and the neighbours the UI prefetches) is instant (user report 2026-10-22: slow on a frame change)
+        root = _objects().root
+        cores = sorted((p.parent.parent.name, p.stat().st_mtime_ns) for p in root.glob("*/core/core.json"))
+        ck = json.dumps([str(root), ow.name, frame, band_scale, shift_px, reach_px, inset_px, feather_px, outer_feather_px,
+                         settings_sig(o), mask_sig(_objects(), ow.name), cores, _STATE_PLATE_KEY()], default=str)
+        from engine.objband import edge_band
+        if edge_band(o):   # band points: their positions settle when the CoTracker3 tracking ends – never kept
+            ck = None
+        hit = _LINES_CACHE.get(ck) if ck else None
+        if hit is not None:
+            _LINES_CACHE.move_to_end(ck)
+            return hit
+        try:
+            # adaptive mode (0 / 0): band_scale / shift_px of the palette (2026-10-22: the lines in both modes)
+            m, info = _pipeline().edge_preview(ow.name, frame, band_scale, shift_px, band_out_px=reach_px, band_in_px=inset_px)
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        band, core = m == 128, np.asarray(info["core"]).astype(bool)
+        fi = float(feather_px if feather_px is not None else (o.get("band_in_feather_px") or 0.0))
+        fo = float(outer_feather_px if outer_feather_px is not None else (o.get("band_out_feather_px") or 0.0))
+        d_in, d_out, li, lo = feather_maps(band, core, fi, fo)
+        solid = core & ~band
+        res = {"frame": frame, "band_contours": lines(band, cv2.RETR_CCOMP),
+               "inset_feather_contours": lines(solid | (band & (d_in < li)), cv2.RETR_EXTERNAL) if fi > 0 else [],
+               "feather_contours": lines(solid | (band & (d_out >= lo)), cv2.RETR_EXTERNAL) if fo > 0 else []}
+        if ck:
+            _LINES_CACHE[ck] = res
+        while len(_LINES_CACHE) > 64:
+            _LINES_CACHE.popitem(last=False)
+        return res
+    cur = {k: v for k, v in object_settings(_objects().get(ow.name)).items() if k != "protect"}
+    cur.update({k: v for k, v in {"reach_px": reach_px, "inset_px": inset_px, "feather_px": feather_px,
+                                  "outer_feather_px": outer_feather_px}.items() if v is not None})
+    s = vmm_settings({"videomama": cur})
+    pipe = _pipeline()
+    try:
+        core = pipe.preview_core(ow.name, [frame])
+        base = pipe.vmm_base(ow.name, [frame], s, core)[0][frame]
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    pf = pipe.vmm_band_points(ow.name, s, [frame], only=[frame])
+    b = np.clip(base.astype(np.float32), 0, 1)
+    o, i = band_widths(b, s["reach_px"], float(s.get("inset_px") or 0.0), pf(frame) if pf else None)
+    band, inner, outer = feather_lines(sdf_px(b), o, i, s.get("feather_px", 0.0), s.get("outer_feather_px", 0.0))
+    return {"frame": frame, "band_contours": lines(band, cv2.RETR_CCOMP),
+            "inset_feather_contours": lines(inner, cv2.RETR_EXTERNAL), "feather_contours": lines(outer, cv2.RETR_EXTERNAL)}
+
+
 @app.post("/api/object/{name}/zones/{zone_id}/apply")
 @long_job("Zastosuj strefę {zone_id}: {name}")
 async def apply_zone_ep(name: str, zone_id: str, stage: Optional[str] = None):
     """„Zastosuj” (plan step 4): only the zones are recomputed (cache) on the base alpha of the active version -> a new
     version runs/v### (QA + edge report); 409 with `missing_front` when objects in front lack masks.
-    `?stage=vitmatte` (stage 4, 2026-10-15): on the stage-3 MatAnyone version, brush + matte zones only."""
+    `?stage=vitmatte` (stage 4, 2026-10-15): on the stage-3 MatAnyone2 version, brush + matte zones only."""
     from engine.zones import MissingFront
     _load_zone_or_404(name, zone_id)
     if stage not in (None, "vitmatte"):
@@ -4240,7 +5154,7 @@ async def apply_zone_ep(name: str, zone_id: str, stage: Optional[str] = None):
     cb = _ws_progress("object_progress", name)
     try:
         _, run_dir, info = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: pipe.apply_zone(name, _shot_frames(), zone_id, cb, stage=stage))
+            None, lambda: pipe.apply_zone(name, _work_frames(), zone_id, cb, stage=stage))   # the work area, like stages 3 / 4 (2026-10-22)
     except MissingFront as e:
         raise _missing_front_409(e)
     except (RuntimeError, FileNotFoundError, ValueError) as e:
@@ -4304,6 +5218,13 @@ def object_runs(name: str):
                 qa = {}
         flags = qa.get("flags") or {}
         zones = {}
+        from engine.birefnet import MODELS as _BIREFNET_IDS
+        # stage 5 engine of the version (2026-10-22: the HUD offers the other engine's mask): BiRefNet when a zone used it
+        edge_engine = None
+        if rj.get("stage") == "vitmatte":
+            ids = set(_BIREFNET_IDS.values()) | set(_BIREFNET_IDS)
+            used = [str((st or {}).get("model") or "") for st in (rj.get("zones") or {}).values() if isinstance(st, dict)]
+            edge_engine = "birefnet" if any(m in ids for m in used) else "vitmatte"
         for zid, st in (rj.get("zones") or {}).items():   # "Szczegóły" of the version: engines and time per frame
             if not isinstance(st, dict):
                 continue
@@ -4317,6 +5238,7 @@ def object_runs(name: str):
                     "edge_corrected": (qa.get("edge") or {}).get("corrected"), "active": d.name == active,
                     "zones": zones, "applied_from": rj.get("applied_from"), "applied_zone": rj.get("applied_zone"),
                     "stage": rj.get("stage"),         # matanyone / vitmatte / core (stage 3 / 4 result, base 1+2) or None
+                    "edge_engine": edge_engine,       # stage 5 versions: vitmatte | birefnet
                     "base": rj.get("base"),           # vitmatte: core | matanyone
                     "motion_blur": rj.get("motion_blur"),   # „Motion blur alfy” (2026-10-16): strength, base_run, longest_px
                     "base_run": rj.get("base_run"), "base_stage": rj.get("base_stage"),   # Experiments: made from this version
@@ -4388,6 +5310,58 @@ class ObjectSettingsRequest(BaseModel):
     band_out_px: Optional[float] = None  # px mode of the edge band (2026-10-16): at least this far out of the mask 1+2 edge
     band_in_px: Optional[float] = None   # ... and into it; the adaptive width wins where larger; no shift of the mask
     band_in_feather_px: Optional[float] = None   # feather of the inset into the core (0 = hard switch, 2026-10-17)
+    band_out_feather_px: Optional[float] = None  # feather from the outer band edge into the core (band system 2026-10-22)
+
+
+def _edge_engine_default_model(name: str) -> Optional[str]:
+    """`vitmatte_model` a new stage-5 zone gets from the object's engine: BiRefNet -> birefnet_hr_matting,
+    ViTMatte -> None (the zone keeps the ViTMatte default)."""
+    from engine.stage_models import edge_engines, effective_edge_engine
+    eng = effective_edge_engine(_objects().get(name).get("edge_engine"), edge_engines(load_config()))
+    return "birefnet_hr_matting" if eng == "birefnet" else None
+
+
+class EdgeEngineRequest(BaseModel):
+    engine: str                          # vitmatte | birefnet
+
+
+@app.put("/api/object/{name}/edge_engine")
+@object_edit
+def put_edge_engine(name: str, req: EdgeEngineRequest):
+    """Stage 5 engine of the object (user decision 2026-10-21: arrow menu in the stage bar when both are installed,
+    default ViTMatte). Matte zones on a model of the other engine move to this engine's default model (their results
+    become stale); a zone already on this engine (e.g. Lucida, ViTMatte small) keeps its model."""
+    from engine.birefnet import MODELS as BIREFNET
+    from engine.stage_models import EDGE_ENGINE_LABEL, EDGE_ENGINES, edge_engines
+    from engine.zones import load_zones, save_zone
+    if req.engine not in EDGE_ENGINES:
+        raise HTTPException(status_code=400, detail=f"silnik etapu: {' | '.join(EDGE_ENGINES)}")
+    if not edge_engines(load_config()).get(req.engine):
+        raise HTTPException(status_code=409, detail=f"{EDGE_ENGINE_LABEL[req.engine]} nie jest zainstalowany – Doktor")
+    store = _objects()
+    d = store.dir(name)
+    changed = []
+    for z in load_zones(d):
+        if z.criterion != "matte" or z.matting not in ("vitmatte", "matanyone"):
+            continue
+        cur = str((z.params or {}).get("vitmatte_model") or "base")
+        if z.matting == "matanyone":
+            if req.engine != "birefnet":
+                continue
+            z.matting = "vitmatte"     # BiRefNet stage: no MatAnyone2 zones (non-commercial; user decision 2026-10-21)
+        elif (cur in BIREFNET) == (req.engine == "birefnet"):
+            continue
+        params = dict(z.params or {})
+        if req.engine == "birefnet":
+            params["vitmatte_model"] = "birefnet_hr_matting"
+        else:
+            params.pop("vitmatte_model", None)
+        params.pop("model_px", None)          # each engine has its own default crop side (engine/zones.py edge_model_px)
+        z.params = params
+        save_zone(d, z)
+        changed.append(z.zone_id)
+    obj = store.update(name, edge_engine=req.engine, **({"tool": {"final_valid": False}} if changed else {}))
+    return {"success": True, "edge_engine": req.engine, "zones_changed": changed, "object": obj}
 
 
 @app.put("/api/object/{name}/settings")
@@ -4414,6 +5388,8 @@ def object_settings(name: str, req: ObjectSettingsRequest):
         upd["band_in_px"] = clamp_band_px(req.band_in_px)
     if req.band_in_feather_px is not None:
         upd["band_in_feather_px"] = float(min(64.0, max(0.0, req.band_in_feather_px)))
+    if req.band_out_feather_px is not None:
+        upd["band_out_feather_px"] = float(min(200.0, max(0.0, req.band_out_feather_px)))
     if req.temporal_smoothing is not None:
         if req.temporal_smoothing not in ("weak", "normal", "strong"):
             raise HTTPException(status_code=400, detail="wygładzanie: weak | normal | strong")
@@ -4429,7 +5405,7 @@ def object_settings(name: str, req: ObjectSettingsRequest):
         m = str(req.ma_scale_mode).strip()
         m = {"1": "1.0", "0.50": "0.5"}.get(m, m)
         if m not in MA_SCALE_MODES:
-            raise HTTPException(status_code=400, detail="skala MatAnyone: auto | 1.0 | 0.75 | 0.5")
+            raise HTTPException(status_code=400, detail="skala MatAnyone2: auto | 1.0 | 0.75 | 0.5")
         upd["ma_scale_mode"] = m
     if req.core_stabilize is not None:
         upd["core_stabilize"] = bool(req.core_stabilize)
@@ -4657,17 +5633,23 @@ class ExportRequest(BaseModel):
     run: Optional[str] = None
 
 
-EXPORT_SOURCES = ("active", "core", "matanyone", "videomama", "vitmatte", "ltx", "version")
-EXPORT_SOURCE_LABEL = {"active": "aktywna wersja", "core": "rdzeń (1+2)", "matanyone": "MatAnyone (etap 3)",
-                       "videomama": "VideoMaMa (etap 4)", "vitmatte": "ViTMatte (etap 5)", "ltx": "LTX Alpha-Gen (etap 7)",
-                       "version": "wybrana wersja"}
+from engine.final_touch import FT_PREFIX, base_run as ft_base_run, set_context_provider as _ft_set_ctx   # noqa: E402
+
+_ft_set_ctx(lambda: _ft_context())   # the Final Touch motion blur reads the open shot's plate through the app
+
+EXPORT_SOURCES = ("active", "core", "matanyone", "videomama", "vitmatte", "ltx", "version", "final_touch")
+EXPORT_SOURCE_LABEL = {"active": "aktywna wersja", "core": "rdzeń (1+2)", "matanyone": "MatAnyone2 (etap 3)",
+                       "videomama": "VideoMaMa (etap 4)", "vitmatte": "ViTMatte (etap 5)", "ltx": "LTX-2.5 Alpha-Gen (etap 7)",
+                       "version": "wybrana wersja", "final_touch": "Final Touch (baza + korekty)"}
 # when an object of a full export / of the context has no result of the chosen source (e.g. a hand without ViTMatte
 # zones): the next source down, reported in the warning – a written object chosen by name never falls back
 EXPORT_FALLBACK = {"vitmatte": ["vitmatte", "videomama", "matanyone", "active", "core"],
                    "matanyone": ["matanyone", "active", "core"],
                    "videomama": ["videomama", "matanyone", "active", "core"],
                    "ltx": ["ltx", "vitmatte", "videomama", "matanyone", "active", "core"],
-                   "core": ["core"], "version": ["version", "active"], "active": ["active"]}
+                   "core": ["core"], "version": ["version", "active"], "active": ["active"],
+                   # an object without its own corrections: base = the result of the last computed stage
+                   "final_touch": ["final_touch"]}
 
 
 def _export_source_run(name: str, source: str, run: Optional[str] = None, build_core: bool = False):
@@ -4684,16 +5666,19 @@ def _export_source_run(name: str, source: str, run: Optional[str] = None, build_
         r, ok, why = stage_run(store, name, source)
         if r and ok:
             return r, ""
-        return None, why or {"matanyone": "brak wyniku etapu 3 MatAnyone", "videomama": "brak wyniku etapu 4 VideoMaMa",
-                             "vitmatte": "brak wyniku etapu 5 ViTMatte", "ltx": "brak wyniku etapu 7 LTX Alpha-Gen"}[source]
+        return None, why or {"matanyone": "brak wyniku etapu 3 MatAnyone2", "videomama": "brak wyniku etapu 4 VideoMaMa",
+                             "vitmatte": "brak wyniku etapu 5 ViTMatte", "ltx": "brak wyniku etapu 7 LTX-2.5 Alpha-Gen"}[source]
     if source == "version":
         r = run or tool.get("active_run")
         if not r or not (store.dir(name) / "runs" / r / "run.json").exists():
             return None, f"brak wersji {r or ''}".strip()
         return r, ""
+    if source == "final_touch":   # base + hand corrections (stage Final Touch): "ft:<base version>"
+        b = _ft_base(name, build_core=build_core)
+        return (FT_PREFIX + b["run"], "") if b["run"] else (None, b["why"])
     st = {s["id"]: s["state"] for s in object_stages(store, name, Path(STATE["work_dir"]), mplate=_mask_plate_denoise())["stages"]}
     if st["core"] != "done":
-        return None, "rdzeń SAM3 nieaktualny albo nie policzony – „▶▶ Przelicz całość” (etap 1)"
+        return None, "rdzeń SAM 3.1 nieaktualny albo nie policzony – „▶▶ Przelicz całość” (etap 1)"
     if not build_core and not core_fix_state(store, name)[1]:
         return None, "maska 1+2 nieaktualna – „▶▶ Zastosuj poprawki” (etap 2)"
     return "core", ""
@@ -4731,7 +5716,7 @@ async def _export_by_source(req: "ExportRequest"):
         chain = [req.source] if strict else EXPORT_FALLBACK[req.source]
         why0 = ""
         for src in chain:
-            r, why = _export_source_run(n, src, req.run if n == one else None, build_core=(src == "core" and n in needed))
+            r, why = _export_source_run(n, src, req.run if n == one else None, build_core=(src in ("core", "final_touch") and n in needed))
             if r:
                 runs[n] = r
                 if src != req.source:
@@ -4750,7 +5735,7 @@ async def _export_by_source(req: "ExportRequest"):
     from engine.stages import core_fix_state
     pipe = None
     for n in sorted(needed):
-        if runs.get(n) == "core" and not core_fix_state(store, n)[1]:
+        if runs.get(n) and ft_base_run(runs[n]) == "core" and not core_fix_state(store, n)[1]:
             pipe = pipe or _pipeline()
             JOBS.progress(f"Maska 1+2: {n}")
             from engine.workarea import core_coverage
@@ -4760,6 +5745,7 @@ async def _export_by_source(req: "ExportRequest"):
     frames = _work_frames() if req.scope == "work_area" else _shot_frames()
     def owner(n: str) -> str:   # a part resolved to its parent's group version: the version lives in the parent's runs/
         r, par = runs.get(n), store.get(n).get("part_of")
+        r = ft_base_run(r) if r else r
         if r and r != "core" and par and not (store.dir(n) / "runs" / r / "run.json").exists() \
                 and (store.dir(par) / "runs" / r / "run.json").exists():
             return par
@@ -4771,12 +5757,12 @@ async def _export_by_source(req: "ExportRequest"):
             objs.append({**o, "tool": {**o["tool"], "active_run": runs[o["name"]]}, **({"_run_owner": ow} if ow != o["name"] else {})})
 
     def coverage(n: str):
-        if runs[n] == "core":
+        if ft_base_run(runs[n]) == "core":
             try:
                 return json.loads((store.dir(n) / "core_fix" / "core_fix.json").read_text(encoding="utf-8")).get("coverage") or []
             except (OSError, ValueError):
                 return []
-        return run_coverage(store.dir(owner(n)), runs[n]) or []
+        return run_coverage(store.dir(owner(n)), ft_base_run(runs[n])) or []
     relevant = set(needed)
     if want is not None:
         back = max((o.get("depth_order", 0) for o in every if o["name"] in needed), default=0)
@@ -4916,6 +5902,205 @@ async def export_one(name: str, req: Optional[ObjectExportRequest] = None):
     return await export_mattes(ExportRequest(objects=[name], format=req.format if req else None,
                                              scope=req.scope if req else "all", source=req.source if req else "active",
                                              run=req.run if req else None))
+
+
+# ------------------------------------------------------------------------------------------------ stage Final Touch
+# PLAN_FINAL_TOUCH.md step 1 (2026-10-22): hand corrections of the alpha frame by frame (bitmap brush) over a chosen base
+# version; stored as stroke paths in objects/<obj>/final_touch/final_touch.json (engine/final_touch.py)
+
+def _ft_base(name: str, build_core: bool = True) -> Dict[str, Any]:
+    """Base of the object's Final Touch: {source, run, chosen, why} – the chosen export source (final_touch.json base),
+    else the result of the last computed stage (DEFAULT_BASE_ORDER). run = a version, "core" (mask 1+2) or None."""
+    from engine.final_touch import DEFAULT_BASE_ORDER, load as ft_load
+    b = ft_load(_objects().dir(name)).get("base") or {}
+    if b.get("source"):
+        r, why = _export_source_run(name, b["source"], b.get("run"), build_core=build_core)
+        return {"source": b["source"], "run": r, "chosen": True,
+                "why": "" if r else f"baza „{EXPORT_SOURCE_LABEL.get(b['source'], b['source'])}”: {why}"}
+    for src in DEFAULT_BASE_ORDER:
+        r, _why = _export_source_run(name, src, None, build_core=build_core)
+        if r:
+            return {"source": src, "run": r, "chosen": False, "why": ""}
+    return {"source": None, "run": None, "chosen": False, "why": "brak policzonej wersji – najpierw rdzeń SAM 3.1 (etap 1)"}
+
+
+def _ft_info(name: str) -> Dict[str, Any]:
+    from engine.final_touch import corrections_sig, frames_of, load as ft_load
+    d = ft_load(_objects().dir(name))
+    fin = d.get("finish") or {}
+    return {"base": _ft_base(name), "base_choice": d.get("base"), "frames": {str(f): d["frames"][str(f)] for f in frames_of(d)},
+            "finish": fin, "shutter_manifest": _pipeline()._mb_shutter(None), "sig": corrections_sig(d)}
+
+
+@app.get("/api/object/{name}/final_touch")
+def get_final_touch(name: str):
+    """Final Touch of the object: the base (chosen / default, resolved to a version), the strokes per frame, their hash."""
+    if not STATE.get("work_dir"):
+        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
+    return _ft_info(name)
+
+
+class FinalTouchBaseRequest(BaseModel):
+    source: Optional[str] = None     # an export source (engine/final_touch.BASE_SOURCES); None = default (last stage)
+    run: Optional[str] = None        # the version for source "version"
+
+
+@app.put("/api/object/{name}/final_touch")
+def put_final_touch_base(name: str, req: FinalTouchBaseRequest):
+    """Choose the base (DECYZJA: any computed version, changeable at any time – the corrections stay, on the new base)."""
+    from engine.final_touch import set_base
+    _require_stage(name, "final_touch")
+    if req.source == "version" and not (req.run and (_objects().dir(name) / "runs" / req.run / "run.json").exists()):
+        raise HTTPException(status_code=400, detail=f"brak wersji {req.run or ''}".strip())
+    try:
+        set_base(_objects().dir(name), req.source, req.run)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _ft_info(name)
+
+
+class FinalTouchFinishRequest(BaseModel):
+    black: Optional[float] = None    # engine/final_touch.FINISH_DEFAULT / FINISH_RANGE; absent = keep
+    white: Optional[float] = None
+    gamma: Optional[float] = None
+    erode_px: Optional[float] = None   # > 0 erode, < 0 dilate
+    blur_px: Optional[float] = None
+    mb_strength: Optional[float] = None       # motion blur of the alpha (0 = off), x the shutter's physical blur
+    mb_shutter_deg: Optional[float] = None    # absent = keep; set `mb_shutter_manifest` to go back to the manifest
+    mb_shutter_manifest: Optional[bool] = None
+    mb_measured: Optional[bool] = None        # strength per edge segment measured on the plate (hybrid), else global
+
+
+def _ft_gpu():
+    """GPU worker for the Final Touch motion blur (user request 2026-10-22): `mb_device` auto | gpu | cpu as the
+    „Motion blur alfy” palette; one worker kept open for the session (a preview per frame cannot pay a process start
+    every time), the device decision cached for 30 s (it asks ComfyUI's queue). None = the CPU."""
+    import time as _t
+    from engine import align_gpu
+    from engine.motionblur import mb_device
+    now = _t.time()
+    dec = STATE.get("ft_mb_device")
+    if not dec or now - dec[1] > 30.0:
+        try:
+            dec = (mb_device()[0], now)
+        except align_gpu.GpuWorkerError:
+            dec = ("cpu", now)
+        STATE["ft_mb_device"] = dec
+    if dec[0] != "gpu":
+        return None
+    g = STATE.get("ft_gpu")
+    if g is None:
+        g = STATE["ft_gpu"] = align_gpu.open_aligner()
+    return g
+
+
+def _ft_gpu_error(e: Exception) -> None:
+    """The worker failed: drop it (the next call opens a fresh one after the 30 s decision window)."""
+    from engine import align_gpu
+    g = STATE.pop("ft_gpu", None)
+    align_gpu.close_aligner(g)
+    STATE["ft_mb_device"] = ("cpu", __import__("time").time())
+    logger.warning("Final Touch motion blur: GPU worker failed, CPU for the next 30 s: %s", e)
+
+
+def _ft_context() -> Optional[Dict[str, Any]]:
+    """Plate context of the Final Touch motion blur (engine/final_touch.set_context_provider): gray plate frames of
+    the open shot, its shutter, the GPU worker (lazily, `mb_device`); the per-object cache dir is added by
+    final_touch.apply."""
+    if not STATE.get("work_dir"):
+        return None
+    pipe = _pipeline()
+    return {"gray": pipe._mb_gray(_shot_frames()), "shutter_deg": pipe._mb_shutter(None), "gpu": _ft_gpu,
+            "on_gpu_error": _ft_gpu_error}
+
+
+@app.put("/api/object/{name}/final_touch/finish")
+def put_final_touch_finish(name: str, req: FinalTouchFinishRequest):
+    """Global finishing of the Final Touch (levels / gamma / erode / blur, user decision 2026-10-22: moved here from the
+    ViTMatte zone sliders): applied on the base before the strokes, live in the preview and in the export."""
+    from engine.final_touch import set_finish
+    _require_stage(name, "final_touch")
+    body = {k: v for k, v in req.dict().items() if v is not None and k != "mb_shutter_manifest"}
+    if req.mb_shutter_manifest:
+        body["mb_shutter_deg"] = None
+    try:
+        set_finish(_objects().dir(name), body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _ft_info(name)
+
+
+class FinalTouchFrameRequest(BaseModel):
+    strokes: List[Dict[str, Any]] = []   # [{mode add|remove|erase, radius_px, hardness, p: [[x, y(, r)], ...]}] plate px
+
+
+@app.put("/api/object/{name}/final_touch/frames/{frame}")
+def put_final_touch_frame(name: str, frame: int, req: FinalTouchFrameRequest):
+    """Replace the strokes of one frame (the UI appends a stroke, Ctrl+Z puts the previous list back); [] = none."""
+    from engine.final_touch import set_frame
+    _require_stage(name, "final_touch")
+    if frame not in set(_shot_frames()):
+        raise HTTPException(status_code=400, detail=f"klatka {frame} poza ujęciem")
+    try:
+        set_frame(_objects().dir(name), frame, req.strokes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _ft_info(name)
+
+
+@app.delete("/api/object/{name}/final_touch/frames/{frame}")
+def delete_final_touch_frame(name: str, frame: int):
+    """Remove the corrections of one frame (🔑✕ / Delete in the stage)."""
+    from engine.final_touch import set_frame
+    set_frame(_objects().dir(name), frame, [])
+    return _ft_info(name)
+
+
+@app.get("/api/object/{name}/final_touch/layer/{frame}")
+def final_touch_layer(name: str, frame: int, c: Optional[str] = None):
+    """Overlay of the frame's correction layer C (engine/final_touch.layer) as a BGRA proxy PNG: green where the
+    strokes add (C > 0), red where they remove (C < 0), alpha = |C| – what the strokes really do after the eraser and
+    the hardness, not their history (user report 2026-10-22). 404 without corrections in this frame."""
+    from engine.final_touch import layer, load as ft_load
+    d = ft_load(_objects().dir(name))
+    strokes = (d.get("frames") or {}).get(str(int(frame))) or []
+    if not strokes:
+        raise HTTPException(status_code=404, detail="brak korekt w tej klatce")
+    w, h = _plate_size()
+    cl = layer(strokes, w, h)
+    sc = _proxy_scale()
+    small = cv2.resize(cl, (max(1, round(w * sc)), max(1, round(h * sc))), interpolation=cv2.INTER_AREA)
+    bgra = np.zeros(small.shape + (4,), np.uint8)
+    pos, neg = np.clip(small, 0, 1), np.clip(-small, 0, 1)
+    bgra[..., 1] = (pos * 255).astype(np.uint8) + (neg * 60).astype(np.uint8)        # G
+    bgra[..., 2] = (neg * 255).astype(np.uint8) + (pos * 80).astype(np.uint8)        # R
+    bgra[..., 0] = (pos * 120).astype(np.uint8) + (neg * 90).astype(np.uint8)        # B
+    bgra[..., 3] = (np.maximum(pos, neg) * 255).astype(np.uint8)   # the palette's opacity slider scales it
+    return _png_response(bgra)
+
+
+@app.get("/api/object/{name}/final_touch/frame/{frame}")
+def final_touch_frame(name: str, frame: int, b: Optional[str] = None, c: Optional[str] = None):
+    """Proxy PNG of base + corrections in `frame` – the alpha the export writes for source „Final Touch” (same loader,
+    8-bit rounding like view=alpha). `b` = the resolved base version from GET final_touch (saves resolving it per frame);
+    `c` = the corrections hash (cache buster only)."""
+    from engine.export import run_alpha_loader
+    from engine.workarea import fmt_intervals, run_coverage, run_frames
+    store = _objects()
+    od = store.dir(name)
+    if b is None:
+        b = _ft_base(name)["run"]
+    if not b or (b != "core" and not (od / "runs" / b / "run.json").exists()):
+        raise HTTPException(status_code=404, detail="Brak bazy Final Touch – najpierw policzony etap (albo wybierz bazę)")
+    if b != "core":
+        rf = run_frames(od, b)
+        if rf is not None and frame not in set(rf):
+            raise HTTPException(status_code=404, detail=f"Baza {b} obejmuje {fmt_intervals(run_coverage(od, b))} – klatka {frame} poza nią")
+    w, h = _plate_size()
+    a = _export_quantize(run_alpha_loader(od, FT_PREFIX + b, w, h)(frame))
+    s = _proxy_scale()
+    small = cv2.resize(a, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+    return _png_response(_alpha_u8(small))
 
 
 @app.post("/api/object/{name}/recompute_dependents")
@@ -5157,7 +6342,7 @@ class IntervalEngineRequest(BaseModel):
 @app.put("/api/object/{name}/interval_engine")
 @object_edit
 def set_interval_engine(name: str, req: IntervalEngineRequest):
-    """Propagation engine of the key interval containing `frame` (7.2 pkt 7): SAM3 or CoTracker3 points."""
+    """Propagation engine of the key interval containing `frame` (7.2 pkt 7): SAM 3.1 or CoTracker3 points."""
     if req.engine not in ("sam3", "points"):
         raise HTTPException(status_code=400, detail="silnik: sam3 | points")
     store = _objects()
@@ -5381,7 +6566,7 @@ def detect_object(name: str, req: ObjectDetectRequest):
 
 @app.get("/api/object/{name}/candidate/{index}")
 def candidate_thumbnail(name: str, index: int, side: int = 160):
-    """Z10: thumbnail of SAM3 candidate `index` – the proxy crop of its bbox with the mask as alpha (BGRA PNG, longer
+    """Z10: thumbnail of SAM 3.1 candidate `index` – the proxy crop of its bbox with the mask as alpha (BGRA PNG, longer
     side <= `side` px) for the candidate list of stage 1."""
     store = _objects()
     obj = store.get(name)
@@ -5495,6 +6680,10 @@ def override_crop(name: str, seg_id: str, req: CropOverrideRequest):
 
 
 # Mount static assets
+# deflicker: measurement -> automatic settings -> 1024 px preview (docs/PLAN_DEFLICKER_AUTO.md); routes built with this namespace
+from api_deflicker import make_router as _make_deflicker_router   # noqa: E402
+app.include_router(_make_deflicker_router(globals()))
+
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 

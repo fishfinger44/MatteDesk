@@ -28,7 +28,7 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire); else wire();
   if (lang === 'pl') return;
 
-  const ATTRS = ['title', 'placeholder', 'aria-label', 'alt', 'data-fold-name', 'data-ask', 'data-tip'];
+  const ATTRS = ['title', 'placeholder', 'aria-label', 'alt', 'data-fold-name', 'data-ask', 'data-tip', 'label'];   // label: <optgroup>
   // looks Polish: diacritics, common words, typical letter groups / endings (same idea as tools/i18n_extract.py)
   const PL = /[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ„”]|\b(Zapisz|Anuluj|Zamknij|Projekt|Obiekt|Klatka|klatka|klatki|Etap|etap|Brak|brak|Wybierz|Dodaj|Policz|Przelicz|Kliknij|Trwa|nie|jest|albo|tylko|przez|dla|bez|potem|teraz|maska|strefa|klucz|Tak|Nie|w|z|na|lub|gdy|czy|jak|razem)\b|[a-z]*(sz|cz|rz)[a-z]*|\b\w+(anie|enie|ania|enia|acja|acji|cja|cji|ować|ują|uje|ych|ymi|owy|owa|owe|ego|iej|ami|ach)\b/
   let exact = new Map();

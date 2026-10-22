@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """engine/pipeline.py - Per-object orchestration: core propagation (7.2) and "Przelicz finalnie" (7.3a).
 
-Glues ObjectStore (keys, crops.json) + plate-to-mask crop loader + SAM3 / MatAnyone runners + runs/v###.
+Glues ObjectStore (keys, crops.json) + plate-to-mask crop loader + SAM 3.1 / MatAnyone2 runners + runs/v###.
 Used by the API; tests drive it with the mock Comfy client.
 """
 
@@ -254,6 +254,26 @@ class PlateCropLoader:
             s = max(16, int(round(seg.side * scale)))
             c = cv2.resize(c, (s, s), interpolation=cv2.INTER_AREA)
         return c
+
+
+class _ReleaseOnUse:
+    """A point tracker that asks ComfyUI to free the GPU the first time it is really used (a cached propagation never
+    touches it)."""
+
+    def __init__(self, tracker, release):
+        self._t, self._release, self._done = tracker, release, False
+
+    def __getattr__(self, k):
+        if not self._done:
+            self._done = True
+            self._release()
+        return getattr(self._t, k)
+
+    def __call__(self, *a, **kw):
+        if not self._done:
+            self._done = True
+            self._release()
+        return self._t(*a, **kw)
 
 
 class ObjectPipeline:
@@ -601,7 +621,7 @@ class ObjectPipeline:
             return False
 
     def load_core_soft(self, name: str, frames: Sequence[int], core: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
-        """SAM3 soft probabilities written by run_core (`core_soft/p_####.png`, uint8) of the frames that have them."""
+        """SAM 3.1 soft probabilities written by run_core (`core_soft/p_####.png`, uint8) of the frames that have them."""
         sdir = self.store.dir(name) / "core_soft"
         probs: Dict[int, np.ndarray] = {}
         if sdir.exists():
@@ -612,16 +632,26 @@ class ObjectPipeline:
         return probs
 
     def stabilized_core(self, name: str, frames: Sequence[int], core: Dict[int, np.ndarray], keys: Dict[int, np.ndarray],
-                        radius: int = 2, band_px: int = 8, probs_out: Optional[Dict[int, np.ndarray]] = None):
+                        radius: int = 2, band_px: int = 8, probs_out: Optional[Dict[int, np.ndarray]] = None,
+                        only: Optional[Sequence[int]] = None):
         """engine/corestab.stabilize_core on the display gray (user keys untouched); deterministic for the same inputs.
-        `probs_out`: filled with the stabilised probability maps (soft start of the band)."""
+        `probs_out`: filled with the stabilised probability maps (soft start of the band). `only`: previews – just
+        these frames stabilised (corestab `only`)."""
         from engine.corestab import stabilize_core
-        gray = lambda f: cv2.cvtColor((np.clip(self.loader.read(f), 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        gcache = self.__dict__.setdefault("_stab_gray", {})   # one plate read per frame for every group member (preview)
+
+        def gray(f):
+            if f not in gcache:
+                if len(gcache) > 16:
+                    gcache.clear()
+                gcache[f] = cv2.cvtColor((np.clip(self.loader.read(f), 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+            return gcache[f]
         user_keys = [f for f, k in keys.items()] if keys else []
         # SAM3 soft probabilities (run_core with the PlateMatte soft node) -> probability mode; missing frames = binary
         probs = self.load_core_soft(name, frames, core)
         stab, stats = stabilize_core(core, gray, radius=radius, band_px=band_px, keys=user_keys, probs=probs or None,
-                                     progress=lambda d, t: job_progress("Stabilizacja rdzenia", d, t), probs_out=probs_out)
+                                     progress=lambda d, t: job_progress("Stabilizacja rdzenia", d, t), probs_out=probs_out,
+                                     only=only)
         # the edge against an object in front is the run_core front subtraction, not SAM jitter: it must follow the
         # front object in every frame – the temporal vote dragged it after the moving front object and opened seams
         # in the export union (E6 synthetic: 5 -> 14 px). Within band_px of a front core the frame keeps its own value
@@ -646,27 +676,28 @@ class ObjectPipeline:
                         probs_out[f] = np.where(near, consistent_soft(probs[f], core[f]), probs_out[f]).astype(np.uint8)
         return stab, stats
 
-    def core_with_soft(self, name: str, frames: Sequence[int], keys: Dict[int, np.ndarray], stabilize: bool):
-        """(core, soft): the SAM3 core (stabilised when `stabilize`) and the probability maps of the frames that have one
+    def core_with_soft(self, name: str, frames: Sequence[int], keys: Dict[int, np.ndarray], stabilize: bool,
+                       only: Optional[Sequence[int]] = None):
+        """(core, soft): the SAM 3.1 core (stabilised when `stabilize`) and the probability maps of the frames that have one
         and are not keys (stabilised the same way, threshold-consistent with the core; keys stay hard). Soft start of
-        the edge band (user decision 2026-10-14): MatAnyone CoreCombine core_mode=soft, ViTMatte zone trimap."""
+        the edge band (user decision 2026-10-14): MatAnyone2 CoreCombine core_mode=soft, ViTMatte zone trimap."""
         from engine.corestab import consistent_soft
         core = self.load_core(name, frames)
         soft: Dict[int, np.ndarray] = {}
         if stabilize:
-            core, self._corestab_stats = self.stabilized_core(name, frames, core, keys, probs_out=soft)
+            core, self._corestab_stats = self.stabilized_core(name, frames, core, keys, probs_out=soft, only=only)
         else:
             soft = {f: consistent_soft(p, core[f]) for f, p in self.load_core_soft(name, frames, core).items()}
         kset = set(keys or {})
         return core, {f: p for f, p in soft.items() if f not in kset}
 
     def _final_core(self, name: str, frames: Sequence[int], obj: Dict[str, Any], keys: Dict[int, np.ndarray],
-                    kinds: Optional[Sequence[str]] = None):
+                    kinds: Optional[Sequence[str]] = None, only: Optional[Sequence[int]] = None):
         """Core fed to the edge mode: zones (2) + shrink / grow slider (3). Deterministic – recomputed by the edge fix.
-        `kinds`: zone kinds applied (stage 3 MatAnyone: only the brush corrections; None = all)."""
+        `kinds`: zone kinds applied (stage 3 MatAnyone2: only the brush corrections; None = all)."""
         # (1b) temporal stabilisation of the SAM3 core (engine/corestab.py; object option core_stabilize) + the SAM3
         # probabilities stabilised alongside (soft start of the band; consistent with the core, keys hard)
-        core, soft = self.core_with_soft(name, frames, keys, core_stabilize_on(obj))
+        core, soft = self.core_with_soft(name, frames, keys, core_stabilize_on(obj), only=only)
         self._final_soft = soft
         # (2) zones on the core, before the edge mode (7.7 pkt 5)
         zres = self.apply_zones(name, frames, core, keys, probs=soft, kinds=kinds)
@@ -675,7 +706,7 @@ class ObjectPipeline:
 
     def _keys_with_brush(self, name: str, keys: Dict[int, np.ndarray], core2: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
         """Key masks handed to the edge pass. With stage-2 brush corrections the key frames carry the mask 1+2 (the
-        corrected core there), else MatAnyone2 is anchored on the raw SAM3 key and erases thin added parts (antennae:
+        corrected core there), else MatAnyone2 is anchored on the raw SAM 3.1 key and erases thin added parts (antennae:
         alpha 0.05 on the added pixels, synthetic test 2026-10-15). Without brush zones: the keys as they are (bitwise)."""
         from engine.stages import zone_dicts
         if not zone_dicts(self.store.dir(name), ("brush",)):
@@ -700,8 +731,8 @@ class ObjectPipeline:
         parts = group_parts(self.store, name)
         return [name] + parts if parts else None
 
-    def _mask12(self, name: str, frames: Sequence[int]) -> Dict[int, np.ndarray]:
-        """Mask 1+2 of one object (stabilised SAM3 core + its brush corrections) on `frames`; frames outside its life
+    def _mask12(self, name: str, frames: Sequence[int], only: Optional[Sequence[int]] = None) -> Dict[int, np.ndarray]:
+        """Mask 1+2 of one object (stabilised SAM 3.1 core + its brush corrections) on `frames`; frames outside its life
         range = empty. ValueError when it has no core there."""
         obj = self.store.get(name)
         keys = self.keys(name)
@@ -710,19 +741,56 @@ class ObjectPipeline:
         if not fr:
             return {f: empty for f in frames}
         try:
-            core, soft = self.core_with_soft(name, fr, keys, core_stabilize_on(obj))
+            core, soft = self.core_with_soft(name, fr, keys, core_stabilize_on(obj), only=only)
         except FileNotFoundError as e:
             raise ValueError(f"„{name}” (część grupy): {e} – policz jej rdzeń (etap 1)")
         zres = self.apply_zones(name, fr, core, keys, probs=soft, kinds=("brush",))
         m = zres.core if zres else core
         return {f: m.get(f, empty) for f in frames}
 
-    def group_core(self, name: str, frames: Sequence[int]) -> Dict[int, np.ndarray]:
+    def _mask12_disk(self, name: str, f: int) -> Optional[np.ndarray]:
+        """The mask 1+2 of frame f from core_fix/ (written by stage 1 / „Zastosuj poprawki”) when it is current for
+        `name` and every member of its group (a group: joined with the seam as group_core); None = compute it.
+        A group whose parent has its own brush zones is recomputed (group_core applies them once more on the whole)."""
+        from engine.stages import core_fix_state, zone_dicts
+        members = self.group_members(name)
+        if members and zone_dicts(self.store.dir(name), ("brush",)):
+            return None
+        cs = []
+        for m in members or [name]:
+            try:
+                if not core_fix_state(self.store, m)[1]:
+                    return None
+            except (OSError, ValueError):
+                return None
+            im = cv2.imread(str(self.store.dir(m) / "core_fix" / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
+            if im is None or im.shape != (self.h, self.w):
+                return None
+            cs.append(im > 127)
+        if not members:
+            return cs[0]
+        from engine.export import seam_px, seamless_union
+        return seamless_union([c.astype(np.float32) for c in cs], cs, gap_px=seam_px(self.store.get(name))) > 0.5
+
+    def write_mask12(self, name: str, frames: Sequence[int], progress_cb=None) -> Optional[Dict[str, Any]]:
+        """After the SAM 3.1 core (stage 1, 2026-10-22): the mask 1+2 (stabilised core) written to core_fix/ when the
+        object has no brush corrections – with corrections that is „▶▶ Zastosuj poprawki” (stage 2) as before."""
+        from engine.stages import zone_dicts
+        if zone_dicts(self.store.dir(name), ("brush",)):
+            return None
+        return self.build_core_fix(name, frames, progress_cb)
+
+    def group_core(self, name: str, frames: Sequence[int], only: Optional[Sequence[int]] = None) -> Dict[int, np.ndarray]:
         """The whole of a group (user decision 2026-10-15): masks 1+2 of the parent and its parts joined with the contact
         seam filled (the parent's part_seam_px, engine/export.seamless_union – the same rule as `<parent>_full`)."""
         from engine.export import seam_px, seamless_union
         members = self.group_members(name) or [name]
-        masks = [self._mask12(m, frames) for m in members]
+        if only is not None and len(members) > 1:   # a preview: the members side by side (cv2 releases the GIL)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(members)) as ex:
+                masks = list(ex.map(lambda m: self._mask12(m, frames, only), members))
+        else:
+            masks = [self._mask12(m, frames, only) for m in members]
         gap = seam_px(self.store.get(name))
         out = {}
         for f in frames:
@@ -732,7 +800,7 @@ class ObjectPipeline:
 
     def _stage_core(self, name: str, frames: Sequence[int], obj: Dict[str, Any], keys: Dict[int, np.ndarray]):
         """(core, soft, members) the stages 3 / 4 start from: a group -> its whole (soft maps off: they belong to the
-        parent alone); else the (stabilised) SAM3 core of the object. The brush corrections are applied by the caller
+        parent alone); else the (stabilised) SAM 3.1 core of the object. The brush corrections are applied by the caller
         (apply_zones, idempotent on the whole)."""
         members = self.group_members(name)
         if members:
@@ -820,7 +888,7 @@ class ObjectPipeline:
 
     def ltx_guides(self, name: str, seg: CropSegment, frames: Sequence[int], core2: Dict[int, np.ndarray],
                    others: Dict[int, np.ndarray], guide: str) -> List[np.ndarray]:
-        """Guide crops of stage LTX (engine/ltx_alpha.py): the plate-to-mask crop as it is ("plain"), with the other
+        """Guide crops of stage LTX-2.5 (engine/ltx_alpha.py): the plate-to-mask crop as it is ("plain"), with the other
         objects painted out ("isolate") or also the surroundings defocused ("steer")."""
         from engine.ltx_alpha import isolate_guide
         out = []
@@ -834,7 +902,7 @@ class ObjectPipeline:
         return out
 
     def ltx_mask(self, name: str, frames: Sequence[int], s: Dict[str, Any], core12: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
-        """The mask that limits / guides LTX (user request 2026-10-16, setting mask_source): the mask 1+2 (`core12`,
+        """The mask that limits / guides LTX-2.5 (user request 2026-10-16, setting mask_source): the mask 1+2 (`core12`,
         a group = its whole) or the result of stage 3 / 4 (alpha > 0.5; must exist)."""
         src = s.get("mask_source", "core")
         if src == "core":
@@ -845,20 +913,20 @@ class ObjectPipeline:
         if re.fullmatch(r"v\d{3,}", src):   # a version of stage Eksperymenty (later stages may use it; LTX never feeds stage 5 back)
             rjp = self.store.dir(name) / "runs" / src / "run.json"
             if not rjp.exists():
-                raise ValueError(f"Maska LTX = wersja {src} – nie ma jej (usunięta?); wybierz inną maskę")
+                raise ValueError(f"Maska LTX-2.5 = wersja {src} – nie ma jej (usunięta?); wybierz inną maskę")
             if json.loads(rjp.read_text(encoding="utf-8")).get("stage") != "experiment":
-                raise ValueError(f"Maska LTX = wersja {src}: tylko wersje z Eksperymentów (wyniki etapów 3 / 4 wybierz po nazwie etapu)")
+                raise ValueError(f"Maska LTX-2.5 = wersja {src}: tylko wersje z Eksperymentów (wyniki etapów 3 / 4 wybierz po nazwie etapu)")
             run = src
         else:
             run, _, _ = stage_run(self.store, name, src)
         if not run:
-            raise ValueError(f"Maska LTX = wynik etapu {'MatAnyone' if src == 'matanyone' else 'ViTMatte'} – brak tego wyniku; "
+            raise ValueError(f"Maska LTX-2.5 = wynik etapu {'MatAnyone2' if src == 'matanyone' else 'ViTMatte'} – brak tego wyniku; "
                              "policz etap albo wybierz maskę 1+2")
         ld = run_alpha_loader(self.store.dir(name), run, self.w, self.h)
         return {f: ld(f) > 0.5 for f in frames}
 
     def ltx_others(self, name: str, frames: Sequence[int], members: Sequence[str]) -> Dict[int, np.ndarray]:
-        """Union of the masks 1+2 of every other object of the project (painted out of the LTX guide); objects without
+        """Union of the masks 1+2 of every other object of the project (painted out of the LTX-2.5 guide); objects without
         a core are skipped."""
         acc: Dict[int, np.ndarray] = {}
         for o in self.store.list():
@@ -874,7 +942,7 @@ class ObjectPipeline:
 
     def ltx_run(self, name: str, frames: Sequence[int], settings: Optional[Dict[str, Any]] = None,
                 progress_cb=None, models: Optional[Dict[str, str]] = None) -> str:
-        """Stage „LTX Alpha-Gen” (user decision 2026-10-16, a stage of its own before the export): LTX-2.5 IC-LoRA
+        """Stage „LTX-2.5 Alpha-Gen” (user decision 2026-10-16, a stage of its own before the export): LTX-2.5 IC-LoRA
         Alpha-Gen on every crop segment of the object, guided by the plate-to-mask crop (other objects painted out),
         limited to the object by its mask 1+2 -> a version runs/v### (stage "ltx", alpha = alpha_base) ->
         tool.stage_runs.ltx. A group (parent + parts) is computed as a whole, as in stages 3 / 4."""
@@ -899,18 +967,20 @@ class ObjectPipeline:
         segs = self._work_segments(name, frames) if members else self._segments_in(name, frames)
         gen = AlphaGen(self.client, self.work / "comfy_io", s, models=models,
                        progress=lambda t, d, n: job_progress(t, d, n))
+        pts_at = self.ltx_band_points(name, s, frames)
+        crop_pts = lambda f, seg: [(x - seg.crop[0], y - seg.crop[1], o, i) for x, y, o, i in pts_at(f)] if pts_at else None
         run_dir = next_run_dir(self.store.dir(name))
         for seg in segs:
             sf = [f for f in frames if seg.first <= f <= seg.last]
             for chunk in contiguous_chunks(sf):
                 if not chunk:
                     continue
-                job_progress(f"LTX: przewodnik {seg.seg_id}", 0, len(chunk))
+                job_progress(f"LTX-2.5: przewodnik {seg.seg_id}", 0, len(chunk))
                 guides = self.ltx_guides(name, seg, chunk, core2, others, s["guide"])
                 mattes = gen.run(f"{name}_{seg.seg_id}_{chunk[0]}", guides, (seg.side, seg.side))
                 for f, m in zip(chunk, mattes):
                     cc = extract_crop(core2[f].astype(np.float32), seg)
-                    a = finish(m, cc, s)
+                    a = finish(m, cc, s, crop_pts(f, seg))
                     write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
                     write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
                     write_alpha_exr(run_dir / "ltx_raw" / seg.seg_id / f"a_{f:04d}.exr", m)
@@ -932,12 +1002,12 @@ class ObjectPipeline:
         self.store.update(name, tool={"stage_runs": {**(self.store.get(name)["tool"].get("stage_runs") or {}),
                                                      "ltx": run_dir.name}})
         if progress_cb:
-            progress_cb("LTX Alpha-Gen", len(frames), len(frames))
+            progress_cb("LTX-2.5 Alpha-Gen", len(frames), len(frames))
         return run_dir.name
 
     def run_referenced(self, name: str, run: str) -> bool:
         """Something builds on this version: the active run, another version (applied_from / base_run / refinished_from /
-        LTX mask), a stage result other than the one being redone, or the object's last export (outputs.json)."""
+        LTX-2.5 mask), a stage result other than the one being redone, or the object's last export (outputs.json)."""
         obj = self.store.get(name)
         tool = obj.get("tool") or {}
         if tool.get("active_run") == run:
@@ -973,7 +1043,7 @@ class ObjectPipeline:
 
     def ltx_refinish(self, name: str, frames: Sequence[int], settings: Optional[Dict[str, Any]] = None,
                      progress_cb=None, auto: bool = False) -> str:
-        """„Zastosuj suwaki na wynik” of stage LTX (2026-10-16): the RAW LTX mattes of the current LTX version
+        """„Zastosuj suwaki na wynik” of stage LTX-2.5 (2026-10-16): the RAW LTX-2.5 mattes of the current LTX-2.5 version
         (runs/<v>/ltx_raw) limited again with the current region / mask settings -> a new version, no model run."""
         import time
         from engine.export import run_alpha_loader
@@ -987,7 +1057,7 @@ class ObjectPipeline:
         src = (obj.get("tool") or {}).get("stage_runs", {}).get("ltx")
         od = self.store.dir(name)
         if not src or not (od / "runs" / src / "ltx_raw").exists():
-            raise ValueError("brak wyniku LTX z surową alfą – najpierw „▶ Policz LTX”")
+            raise ValueError("brak wyniku LTX-2.5 z surową alfą – najpierw „▶ Policz LTX-2.5”")
         srj = json.loads((od / "runs" / src / "run.json").read_text(encoding="utf-8"))
         segs = [CropSegment.from_dict(d) for d in srj["segments_def"]]
         lo, hi = srj["frames"]
@@ -999,15 +1069,16 @@ class ObjectPipeline:
         zres = self.apply_zones(name, frames, core, keys, probs=soft, kinds=("brush",))
         mask = self.ltx_mask(name, frames, s, zres.core if zres else core)
         raw = run_alpha_loader(od, src, self.w, self.h, sub="ltx_raw")
+        pts_at = self.ltx_band_points(name, s, frames)
         run_dir, from_run = self._refinish_dir(name, src, srj, auto)
         n = 0
         for seg in segs:
             for f in [x for x in frames if seg.first <= x <= seg.last]:
                 n += 1
-                job_progress("LTX: suwaki na wynik", n, len(frames))
+                job_progress("LTX-2.5: suwaki na wynik", n, len(frames))
                 m = extract_crop(raw(f).astype(np.float32), seg)
                 cc = extract_crop(mask[f].astype(np.float32), seg)
-                a = finish(m, cc, s)
+                a = finish(m, cc, s, [(x - seg.crop[0], y - seg.crop[1], o, i) for x, y, o, i in pts_at(f)] if pts_at else None)
                 write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
                 write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
                 write_alpha_exr(run_dir / "ltx_raw" / seg.seg_id / f"a_{f:04d}.exr", m)
@@ -1030,26 +1101,28 @@ class ObjectPipeline:
         self.store.update(name, tool={"stage_runs": {**(self.store.get(name)["tool"].get("stage_runs") or {}),
                                                      "ltx": run_dir.name}})
         if progress_cb:
-            progress_cb("LTX: suwaki na wynik", len(frames), len(frames))
+            progress_cb("LTX-2.5: suwaki na wynik", len(frames), len(frames))
         return run_dir.name
 
     def ltx_frame_preview(self, name: str, f: int, s: Dict[str, Any]) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """LTX palette, live (2026-10-16): (band u8 – 128 kept region / 255 forced 1, the LTX alpha of the current LTX
+        """LTX-2.5 palette, live (2026-10-16): (band u8 – 128 kept region / 255 forced 1, the LTX-2.5 alpha of the current LTX-2.5
         version re-limited with `s` or None without one). Mask 1+2 = the members' masks + seam (fast, as the zone
         previews), or the stage 3 / 4 result (mask_source)."""
         from engine.export import run_alpha_loader
         from engine.ltx_alpha import band_u8, finish
         mask = self.ltx_mask(name, [f], s, self.preview_core(name, [f]))[f]
+        pf = self.ltx_band_points(name, s, [f], only=[f])
+        pts = pf(f) if pf else None
         alpha = None
         src = (self.store.get(name).get("tool") or {}).get("stage_runs", {}).get("ltx")
         od = self.store.dir(name)
         if src and (od / "runs" / src / "ltx_raw").exists():
             try:
                 raw = run_alpha_loader(od, src, self.w, self.h, sub="ltx_raw")(f)
-                alpha = finish(raw, mask.astype(np.float32), s)
+                alpha = finish(raw, mask.astype(np.float32), s, pts)
             except (OSError, KeyError, ValueError):
                 alpha = None
-        return band_u8(mask, s), alpha
+        return band_u8(mask, s, pts), alpha
 
     # ------------------------------------------------------------------ stage „VideoMaMa” (engine/videomama.py)
     def vmm_base(self, name: str, frames: Sequence[int], s: Dict[str, Any],
@@ -1062,16 +1135,19 @@ class ObjectPipeline:
         from engine.stages import stage_run
         run, ok, why = stage_run(self.store, name, "matanyone")
         if not run or not ok:
-            raise ValueError("Baza VideoMaMa = wynik MatAnyone (etap 3) – " + (why or "brak tego wyniku") +
-                             "; przelicz MatAnyone albo wybierz bazę „maska 1+2”")
+            raise ValueError("Baza VideoMaMa = wynik MatAnyone2 (etap 3) – " + (why or "brak tego wyniku") +
+                             "; przelicz MatAnyone2 albo wybierz bazę „maska 1+2”")
         ld = run_alpha_loader(self.store.dir(name), run, self.w, self.h)
         return {f: ld(f).astype(np.float32) for f in frames}, run
 
     def _vmm_write(self, run_dir: Path, seg: CropSegment, f: int, raw: np.ndarray, base_c: np.ndarray,
-                   guide_c: np.ndarray, s: Dict[str, Any]) -> None:
+                   guide_c: np.ndarray, s: Dict[str, Any], pts_at=None) -> None:
         from engine.refine import write_alpha_exr
         from engine.videomama import compose
-        a = compose(base_c, raw, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0))
+        x0, y0 = seg.crop[0], seg.crop[1]
+        pts = [(x - x0, y - y0, o, i) for x, y, o, i in pts_at(f)] if pts_at else None   # plate px -> crop px
+        a = compose(base_c, raw, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0),
+                    s.get("outer_feather_px", 0.0), pts)
         write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
         write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
         write_alpha_exr(run_dir / "vmm_raw" / seg.seg_id / f"a_{f:04d}.exr", raw)
@@ -1106,7 +1182,7 @@ class ObjectPipeline:
 
     def vmm_run(self, name: str, frames: Sequence[int], models_dir: Optional[Path], settings: Optional[Dict[str, Any]] = None,
                 progress_cb=None) -> str:
-        """Stage „VideoMaMa” (user decision 2026-10-16, between MatAnyone and ViTMatte): VideoMaMa on every crop segment,
+        """Stage „VideoMaMa” (user decision 2026-10-16, between MatAnyone2 and ViTMatte): VideoMaMa on every crop segment,
         guided by the mask 1+2, put over the base (mask 1+2 or the stage-3 result) -> runs/v### (stage "videomama",
         raw matte in vmm_raw/) -> tool.stage_runs.videomama. A group (parent + parts) is computed as a whole."""
         import time
@@ -1128,6 +1204,7 @@ class ObjectPipeline:
         except Exception:
             pass
         gen = VideoMaMa(self.client, self.work / "comfy_io", s, models_dir, progress=lambda t, d, n: job_progress(t, d, n))
+        pts_at = self.vmm_band_points(name, s, frames)
         run_dir = next_run_dir(self.store.dir(name))
         for seg in segs:
             sf = [f for f in frames if seg.first <= f <= seg.last]
@@ -1139,7 +1216,7 @@ class ObjectPipeline:
                 guides = [extract_crop(core2[f].astype(np.float32), seg) for f in chunk]
                 mattes = gen.run(f"{name}_{seg.seg_id}_{chunk[0]}", imgs, guides)
                 for f, m, gc in zip(chunk, mattes, guides):
-                    self._vmm_write(run_dir, seg, f, m, extract_crop(base[f], seg), gc, s)
+                    self._vmm_write(run_dir, seg, f, m, extract_crop(base[f], seg), gc, s, pts_at)
         self._vmm_run_json(run_dir, name, obj, frames, segs, s, base_run, gen.log, t0, members, core2)
         if progress_cb:
             progress_cb("VideoMaMa", len(frames), len(frames))
@@ -1173,6 +1250,7 @@ class ObjectPipeline:
         core2 = zres.core if zres else core
         base, base_run = self.vmm_base(name, frames, s, core2)
         raw = run_alpha_loader(od, src, self.w, self.h, sub="vmm_raw")
+        pts_at = self.vmm_band_points(name, s, frames)
         run_dir, from_run = self._refinish_dir(name, src, srj, auto)
         n = 0
         for seg in segs:
@@ -1180,7 +1258,7 @@ class ObjectPipeline:
                 n += 1
                 job_progress("VideoMaMa: suwaki na wynik", n, len(frames))
                 self._vmm_write(run_dir, seg, f, extract_crop(raw(f).astype(np.float32), seg), extract_crop(base[f], seg),
-                                extract_crop(core2[f].astype(np.float32), seg), s)
+                                extract_crop(core2[f].astype(np.float32), seg), s, pts_at)
         extra = {k: srj[k] for k in ("coverage",) if k in srj}
         extra["refinished_from"] = from_run
         extra["auto_refinish"] = bool(auto)
@@ -1197,21 +1275,24 @@ class ObjectPipeline:
         from engine.videomama import band_u8, compose
         core = self.preview_core(name, [f])
         base = self.vmm_base(name, [f], s, core)[0][f]
+        pf = self.vmm_band_points(name, s, [f], only=[f])
+        pts = pf(f) if pf else None
         alpha = None
         src = (self.store.get(name).get("tool") or {}).get("stage_runs", {}).get("videomama")
         od = self.store.dir(name)
         if src and (od / "runs" / src / "vmm_raw").exists():
             try:
                 raw = run_alpha_loader(od, src, self.w, self.h, sub="vmm_raw")(f)
-                alpha = compose(base, raw, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0))
+                alpha = compose(base, raw, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0),
+                                s.get("outer_feather_px", 0.0), pts)
             except (OSError, KeyError, ValueError):
                 alpha = None
-        return band_u8(base, s), alpha
+        return band_u8(base, s, pts), alpha
 
     def build_core_fix(self, name: str, frames: Sequence[int], progress_cb=None) -> Dict[str, Any]:
-        """Stage 2 „▶▶ Zastosuj poprawki” (user decision 2026-10-15): the mask 1+2 = SAM3 core (stabilised as for the
+        """Stage 2 „▶▶ Zastosuj poprawki” (user decision 2026-10-15): the mask 1+2 = SAM 3.1 core (stabilised as for the
         edge pass) + the brush corrections (zones params.source = brush, propagated by CoTracker3) on the shot ->
-        <obj>/core_fix/c_####.png (full frames, 0 / 255) + core_fix.json {sig}. Exactly the core stage 3 (MatAnyone)
+        <obj>/core_fix/c_####.png (full frames, 0 / 255) + core_fix.json {sig}. Exactly the core stage 3 (MatAnyone2)
         starts from (before the shrink / grow slider); the export source "rdzeń (1+2)"."""
         from engine.stages import core_fix_sig, zone_dicts
         from engine.workarea import intervals_from_frames
@@ -1244,7 +1325,7 @@ class ObjectPipeline:
         """'Przelicz finalnie': one pass + the edge position report (qa.json -> edge). The edge correction is NOT
         applied automatically (Z27 pkt 1, user decision) – stage 4 shows the pieces and `apply_edge_fix` makes it
         a new version on demand.
-        `stage="matanyone"` (stage 3 of the 2026-10-15 layout): edge mode MatAnyone2 on the mask 1+2 (SAM3 core + brush
+        `stage="matanyone"` (stage 3 of the 2026-10-15 layout): edge mode MatAnyone2 on the mask 1+2 (SAM 3.1 core + brush
         corrections), WITHOUT the matte (ViTMatte) and threshold zones -> the base version stage 4 applies its zones on
         (alpha_base for every frame, tool.stage_runs.matanyone).
         `preview_dir` (stage preview, engine/stage_preview.py): the same edge pass written into that scratch folder –
@@ -1384,7 +1465,7 @@ class ObjectPipeline:
         obj = self.store.get(name)
         run = run or obj["tool"].get("active_run")
         if not run or not (self.store.dir(name) / "runs" / run / "run.json").exists():
-            raise ValueError("brak wersji – najpierw „▶ Przelicz MatAnyone” (etap 3) albo „Przelicz finalnie”")
+            raise ValueError("brak wersji – najpierw „▶ Przelicz MatAnyone2” (etap 3) albo „Przelicz finalnie”")
         return run
 
     def _mb_gray(self, shot: Sequence[int]):
@@ -1423,11 +1504,11 @@ class ObjectPipeline:
                           progress_cb=None, shutter_deg: Optional[float] = None,
                           device: Optional[str] = None) -> Tuple[Path, Dict[str, Any]]:
         """„Zastosuj motion blur” -> a new runs/v### from the base version: every frame's alpha with the object's motion
-        blur (engine/motionblur.py); core of the base kept (hard links). A version without zones (stage 3 MatAnyone, mask
+        blur (engine/motionblur.py); core of the base kept (hard links). A version without zones (stage 3 MatAnyone2, mask
         1+2) gets the blurred alpha as its alpha_base too, a version with zones keeps the base's alpha_base.
         A stage's result (tool.stage_runs: matanyone, vitmatte@…) stays that stage's result: the new version inherits the
-        stage keys and replaces the base in stage_runs (user decision 2026-10-16: ViTMatte on the MatAnyone base then
-        reads the blurred MatAnyone – fine for tests); any other version becomes a plain version (applied_from = base)."""
+        stage keys and replaces the base in stage_runs (user decision 2026-10-16: ViTMatte on the MatAnyone2 base then
+        reads the blurred MatAnyone2 – fine for tests); any other version becomes a plain version (applied_from = base)."""
         import shutil
         from engine.export import run_alpha_loader
         from engine import align_gpu
@@ -1518,8 +1599,8 @@ class ObjectPipeline:
 
     def _brush_anchors(self, name: str, frames: Sequence[int], core: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
         """Key frames of the enabled stage-2 brush corrections that carry a drawing (an empty key only ends a correction)
-        -> the core passed to the edge mode there (the mask 1+2): extra MatAnyone anchors, so its memory keeps what the
-        brush added / removed between the SAM3 keys."""
+        -> the core passed to the edge mode there (the mask 1+2): extra MatAnyone2 anchors, so its memory keeps what the
+        brush added / removed between the SAM 3.1 keys."""
         from engine.stages import zone_kind
         from engine.zones import load_zones, zone_keys
         fs = set(frames)
@@ -1551,8 +1632,9 @@ class ObjectPipeline:
         from engine.refine import ZONE_FEATHER_PX
         full, rep = fin.finalize(obj, segs, frames, core, keys, start, run_dir, mode, progress_cb,
                                  exclude=zres.removed if zres else None, soft_override=zres.soft if zres else None,
-                                 band_fn=self._band_fn(obj), keep_holes=keep, core_soft=core_soft,
-                                 soft_feather=(zres.feather_px if zres and zres.feather_px else ZONE_FEATHER_PX))
+                                 band_fn=self._band_fn(obj, frames), keep_holes=keep, core_soft=core_soft,
+                                 soft_feather=(zres.feather_px if zres and zres.feather_px else ZONE_FEATHER_PX),
+                                 soft_weights=zres.weights if zres else None)
         if not with_qa:   # stage preview: the alpha only
             return full, rep, run_dir, None
         qa = self.run_qa(name, frames, full, segs, run_dir, removed=zres.removed if zres else None, attempts=attempts,
@@ -1584,11 +1666,11 @@ class ObjectPipeline:
     def edge_preview(self, name: str, f: int, band_scale: Optional[float] = None,
                      shift_px: Optional[float] = None, band_out_px: Optional[float] = None,
                      band_in_px: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Preview of the MatAnyone edge before computing (stage 3 palette, user request 2026-10-15): full-frame uint8,
-        255 = the mask the edge pass keeps (mask 1+2 + „Przesuń środek konturu”), 128 = the adaptive band where MatAnyone decides
-        (same `_band_fn` as „Przelicz MatAnyone”, with the slider values not yet saved), 0 = background.
+        """Preview of the MatAnyone2 edge before computing (stage 3 palette, user request 2026-10-15): full-frame uint8,
+        255 = the mask the edge pass keeps (mask 1+2 + „Przesuń środek konturu”), 128 = the adaptive band where MatAnyone2 decides
+        (same `_band_fn` as „Przelicz MatAnyone2”, with the slider values not yet saved), 0 = background.
         The mask is built the way `finalize(stage="matanyone")` builds it (2026-10-16; was: raw core_fix / core PNGs):
-        stabilised SAM3 core + brush corrections, a group = the whole of its members (group_core) in the group crops
+        stabilised SAM 3.1 core + brush corrections, a group = the whole of its members (group_core) in the group crops
         (_work_segments), then the shrink / grow shift. The stabilisation votes over +-2 frames, so a window of
         f-2..f+2 (inside the object's life range) is computed."""
         from engine.crop import paste_crop
@@ -1615,15 +1697,20 @@ class ObjectPipeline:
             raise ValueError(f"obiekt niewidoczny w klatce {f} (zakres życia)")
         keys = self.keys(name)
         members = self.group_members(name)
+        disk = self._mask12_disk(name, f)
         try:
-            if members:   # a group: the whole (members' masks 1+2 joined with the seam), as stage 3 computes it
-                gcore = self.group_core(name, win)
+            if disk is not None:   # the mask 1+2 on disk is current: read, not recomputed (2026-10-22, ~0.1 s)
+                self._band_ref = (name, {f: disk})
+                core = self._shifted_core({f: disk}, obj, keys, None)[f]
+                src = "mask12 (core_fix)" + ("+group" if members else "")
+            elif members:   # a group: the whole (members' masks 1+2 joined with the seam), as stage 3 computes it
+                gcore = self.group_core(name, win, only=[f])   # one frame shown: only it is stabilised
                 zres = self.apply_zones(name, win, gcore, keys, kinds=("brush",))
                 self._band_ref = (name, zres.core if zres else gcore)
                 core = self._shifted_core(zres.core if zres else gcore, obj, keys, zres)[f]
                 src = "mask12+group"
             else:
-                core = self._final_core(name, win, obj, keys, kinds=("brush",))[0][f]
+                core = self._final_core(name, win, obj, keys, kinds=("brush",), only=[f])[0][f]
                 src = "mask12"
         except FileNotFoundError:
             raise ValueError(f"Brak rdzenia w klatce {f} – „▶▶ Przelicz całość” (etap 1)")
@@ -1638,13 +1725,26 @@ class ObjectPipeline:
                      "band_px": int((out == 128).sum()), "crop": list(seg.crop),
                      "outside_crop_px": self._crop_outside([seg], [f], {f: core}), "core": core, "seg": seg}
 
-    def _band_fn(self, obj):
+    def _band_fn(self, obj, frames: Optional[Sequence[int]] = None):
         """Adaptive band (7.8 pkt 2) on the plate-to-mask crop: focus blur + motion blur along the normal.
         The widths are measured on the edge BEFORE the shrink / grow shift (`self._band_ref`, set by _final_core /
         the group branch: the real edge on the plate) and laid around the shifted core: measured on the shifted
-        contour they grew inside the curls and cancelled the shift (user report CLIP2_A F62, 2026-10-16)."""
+        contour they grew inside the curls and cancelled the shift (user report CLIP2_A F62, 2026-10-16).
+        px mode with band points (one band system, 2026-10-22: object field `edge_band`): the points shape the px widths
+        (the sliders size them); `frames` = the run's frames (tracking awaited), None = a preview of one frame."""
         from engine.edge import adaptive_band, adaptive_band_width, band_px, band_px_limits
         lim = band_px_limits(obj)
+        from engine.objband import SHARED_OWNER, edge_band, mode
+        eb = edge_band(obj) or {}       # the shared object band unless stage 3 is detached (2026-10-22)
+        owner = SHARED_OWNER if mode(obj, "matanyone") == "shared" else "stage_matanyone"
+        pts_of = None
+        if lim and eb.get("band_points"):
+            ro, ri = eb.get("band_ref_out"), eb.get("band_ref_in")
+            sc = ((lim[0] / float(ro)) if ro else 1.0, (lim[1] / float(ri)) if ri else 1.0)
+            pf_all = self.band_points_fn(obj["name"], eb, owner, list(frames), None, sc) if frames else None
+            def pts_of(f):
+                pf = pf_all or self.band_points_fn(obj["name"], eb, owner, [f], [f], sc)
+                return pf(f) if pf else []
         scale = 1.0 if lim else float(obj.get("band_scale", 1.0))
         ref_name, ref = getattr(self, "_band_ref", None) or (None, None)
         if ref_name != obj.get("name"):
@@ -1675,7 +1775,13 @@ class ObjectPipeline:
                 mc = extract_crop(ref[f].astype(np.float32), seg) > 0.5
             wmap = adaptive_band_width(mc, g, flow, self.shutter, scale)
             if lim:
-                return band_px(core_crop, wmap, lim[0], lim[1])
+                o, i = lim
+                if pts_of:
+                    from engine.bandsys import band_widths
+                    x0, y0 = seg.crop[0], seg.crop[1]
+                    pts = [(x - x0, y - y0, po, pi) for x, y, po, pi in pts_of(f)]   # plate px -> crop px
+                    o, i = band_widths(core_crop, lim[0], lim[1], pts)
+                return band_px(core_crop, wmap, o, i)
             return adaptive_band(core_crop, wmap)
         return fn
 
@@ -1739,7 +1845,7 @@ class ObjectPipeline:
 
     def analyze_run(self, name: str, run: str, thr_px: float = 0.5, min_frames: int = 5, progress_cb=None) -> Dict[str, Any]:
         """Stage Eksperymenty (user request 2026-10-16): QA and edge-correction proposals of the CHOSEN base version
-        (MatAnyone / ViTMatte / LTX / mask 1+2 / any version): measured once into the version's own folder (qa.json,
+        (MatAnyone2 / ViTMatte / LTX-2.5 / mask 1+2 / any version): measured once into the version's own folder (qa.json,
         flicker_map.png, edge/e_####.npz) when missing, then the proposals counted with the thresholds -> qa.json
         `edge` + edge/edge.json (what „Zastosuj poprawkę krawędzi” reads)."""
         from engine.export import run_alpha_loader
@@ -1790,7 +1896,7 @@ class ObjectPipeline:
     def experiment_from_base(self, name: str, base_run: str, mode: str = "matanyone", fix: Optional[Sequence[str]] = None,
                              progress_cb=None) -> str:
         """Stage Eksperymenty, „Przelicz z tej bazy” (user decision 2026-10-16, replaces „Przelicz finalnie”): the mask of
-        the chosen BASE version (alpha > 0.5 – MatAnyone / ViTMatte / LTX / mask 1+2 / any version; a group version =
+        the chosen BASE version (alpha > 0.5 – MatAnyone2 / ViTMatte / LTX-2.5 / mask 1+2 / any version; a group version =
         the whole) -> the threshold zones of the object -> optionally the edge correction of the pieces `fix` (measured
         on the base by analyze_run: the BASE's edge is shifted) -> edge mode `mode` -> a new version with QA + edge
         report; run.json records where it came from (`base_run`, `base_stage`). Versions are never rewritten, so the
@@ -1973,6 +2079,60 @@ class ObjectPipeline:
         s = min(1.0, 1024.0 / max(self.w, self.h))
         return lambda sub: ([cv2.resize(self.loader.frame(f), None, fx=s, fy=s, interpolation=cv2.INTER_AREA) for f in sub], s)
 
+    BAND_TRACK_SIDE = 640         # longer side of the object-stabilised crop the band points are tracked on (px)
+
+    def _band_tracker_frames(self, name: Optional[str] = None):
+        """Tracker frames for the band points (engine/bandtrack.py). With `name`: a crop that FOLLOWS the object – the
+        core's centroid, smoothed over ±2 frames, a fixed window = the largest bbox + margin, longer side
+        BAND_TRACK_SIDE – so the object nearly stands still in it (user idea 2026-10-21: stabilise on the core; the
+        beach pan moved ~190 px a frame) and CoTracker3 gets ~3x fewer pixels; returns (imgs, scale, crop origins).
+        Images from the beauty proxies (JPEG ~7 ms a frame vs ~70 ms a 4K PNG) when they exist. Without `name` or
+        cores: the whole frame at 1024 px, as _tracker_frames_for."""
+        proxy = self.store.root.parent / "proxy" / "beauty"
+        W, H = self.w, self.h
+
+        def read(f):
+            im = cv2.imread(str(proxy / f"p_{f:04d}.jpg"), cv2.IMREAD_COLOR) if proxy.is_dir() else None
+            return (im, im.shape[1] / float(W)) if im is not None else (self.loader.frame(f), 1.0)
+
+        def whole(sub):
+            s = min(1.0, 1024.0 / max(W, H))
+            return [cv2.resize(read(f)[0], (round(W * s), round(H * s)), interpolation=cv2.INTER_AREA) for f in sub], s
+
+        def follow(sub):
+            core_at = self.band_core_at(name)
+            boxes = {}
+            for f in sub:
+                c = core_at(f)
+                if c is not None and c.any():
+                    ys, xs = np.nonzero(c)
+                    boxes[f] = (xs.min(), ys.min(), xs.max(), ys.max(), xs.mean(), ys.mean())
+            if not boxes:
+                return whole(sub)
+            bw = max(b[2] - b[0] for b in boxes.values()) + 1
+            bh = max(b[3] - b[1] for b in boxes.values()) + 1
+            m = 0.08 * max(bw, bh)
+            cw, ch = int(min(W, bw + 2 * m)), int(min(H, bh + 2 * m))
+            known = sorted(boxes)
+            cen = np.array([boxes[min(known, key=lambda k: abs(k - f))][4:6] for f in sub], np.float64)
+            r = 2                                    # smooth the centre: legs / hair move the centroid frame to frame
+            sm = np.array([cen[max(0, i - r):i + r + 1].mean(0) for i in range(len(sub))])
+            ox = np.clip(sm[:, 0] - cw / 2.0, 0, W - cw)
+            oy = np.clip(sm[:, 1] - ch / 2.0, 0, H - ch)
+            s = min(1.0, self.BAND_TRACK_SIDE / float(max(cw, ch)))
+            tw, th = max(16, round(cw * s)), max(16, round(ch * s))
+            imgs = []
+            for i, f in enumerate(sub):
+                im, p = read(f)
+                x0, y0 = int(round(ox[i] * p)), int(round(oy[i] * p))
+                crop = im[y0:y0 + int(round(ch * p)), x0:x0 + int(round(cw * p))]
+                imgs.append(cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA))
+            return imgs, s, np.stack([ox, oy], axis=1)
+
+        load = follow if name else whole
+        load.variant = f"objcrop{self.BAND_TRACK_SIDE}" if name else ""
+        return load
+
     def plate_sig(self, f: int) -> Any:
         """Signature of a plate frame for the zone cache: path + size + mtime (the display transform is fixed)."""
         try:
@@ -1981,6 +2141,12 @@ class ObjectPipeline:
             return [str(p), st.st_size, int(st.st_mtime)]
         except OSError:
             return [str(self.loader.pattern), f]
+
+    def _lazy_core(self, name: str, core: Dict[int, np.ndarray]) -> "_LazyCore":
+        """`core` + the core of any other shot frame loaded on first use (zone drawing frames outside the asked frames:
+        a preview window, a work area – only the zone's bbox / tracking points are read from them)."""
+        members = self.group_members(name)
+        return _LazyCore(core, lambda f: (self.group_core(name, [f]) if members else self.load_core(name, [f]))[f])
 
     def zone_regions(self, name: str, z, frames: Sequence[int], core: Dict[int, np.ndarray],
                      only: Optional[Sequence[int]] = None):
@@ -2020,6 +2186,8 @@ class ObjectPipeline:
             return self._zone_regions_finish(name, z, frames, core, only, regions, bgs,
                                              {"keys": sorted(zone_keys(z)), "tracked": False}, fg_fn, fg_names, matte)
         tracker = self._zone_tracker()
+        if tracker is not None:
+            tracker = _ReleaseOnUse(tracker, lambda: self.release_comfy_gpu("obszar strefy: śledzenie CoTracker3"))
         if local:
             for k, d in (cache.get_tracks(tr_sig) or {}).items():
                 tcache[str(k)] = {f: LocalWarp(pts=d["pts"], dst=d["dst"][i], vis=d["vis"][i], fallback=d["fallback"][i])
@@ -2033,7 +2201,7 @@ class ObjectPipeline:
         def point_exclude(k: int):
             ms = [m for m in ((fg_fn(k) if fg_fn else None), front_fn(k)) if m is not None]
             return np.logical_or.reduce(ms) if ms else None
-        regions, bgs, tr, info = propagate_regions(z, frames, core, shape, self._tracker_frames_for() if tracker else None,
+        regions, bgs, tr, info = propagate_regions(z, frames, self._lazy_core(name, core), shape, self._tracker_frames_for() if tracker else None,
                                                    tracker, transforms_cache=tcache or None,
                                                    point_exclude=point_exclude if excl_names else None)
         if info.get("tracked"):
@@ -2066,7 +2234,8 @@ class ObjectPipeline:
                 lds = [ld for ld in (self._member_core_loader(m, frames) for m in todo) if ld is not None]
                 if lds:
                     band_core = {f: np.logical_or.reduce([ld(f) for ld in lds]) for f in out_frames}
-            regions = {**drawn, **outline_regions(z, band_core, drawn, self.zone_exclude(name, z, out_frames))}
+            regions = {**drawn, **outline_regions(z, band_core, drawn, self.zone_exclude(name, z, out_frames),
+                                                  band_at=self.zone_band_points(name, z, frames, only=only))}
             if members and fg_fn is not None:
                 from engine.export import seam_px
                 from engine.zones import _disk_k, outline_in_px
@@ -2086,6 +2255,66 @@ class ObjectPipeline:
                     regions[f] = regions[f] & ~m
             info = {**info, "fg_objects": fg_names}
         return regions, bgs, info
+
+    def band_points_fn(self, name: str, params: Optional[Dict[str, Any]], owner: str, frames: Sequence[int],
+                       only: Optional[Sequence[int]] = None, scales: Tuple[float, float] = (1.0, 1.0)):
+        """f -> visible band control points (x, y, out, in, plate px) of a band owner – a whole-outline zone or a stage
+        with a band (engine/bandsys.py, 2026-10-22) – None without points. Positions tracked by CoTracker3 from the points'
+        keys (engine/bandtrack.py, cached per owner). `only` (previews): the frames shown – positions resolved just there
+        and the tracker never waited for (background, nearest keys meanwhile); without it the tracking is awaited."""
+        from engine.bandmap import band_points, points_at
+        from engine.bandtrack import track_positions
+        from engine.zonecache import ZoneCache
+        pts = band_points(params)
+        if not pts:
+            return None
+        tracker = self._zone_tracker()
+        front_fn, _ = self.front_holdout(name, frames, need=False)
+        pos = track_positions(pts, list(frames), tracker, self._band_tracker_frames(name) if tracker else None,
+                              ZoneCache(self.store.dir(name), owner).dir, core_at=self.band_core_at(name),
+                              occluder_at=front_fn, resolve=only, wait=only is None)
+        so, si = scales
+        return lambda f: points_at(pts, f, pos.get(f, {}), so, si)
+
+    def zone_band_points(self, name: str, z, frames: Sequence[int], only: Optional[Sequence[int]] = None):
+        """band_points_fn of an outline zone (its sliders scale the points' widths)."""
+        from engine.objband import SHARED_OWNER, mode, zone_params
+        from engine.zones import band_scales
+        obj = self.store.get(name)
+        root = obj.get("part_of") or name
+        if mode(obj, f"zone:{z.zone_id}") != "shared":
+            return self.band_points_fn(name, z.params, z.zone_id, frames, only, band_scales(z.params))
+        # the shared object band (2026-10-22): tracked once per group on its main object, the zone's sliders scale it
+        p = zone_params({"zone_id": z.zone_id, "params": z.params}, obj, self.store.get(root))
+        return self.band_points_fn(root, p, SHARED_OWNER, frames, only, band_scales(p))
+
+    def ltx_band_points(self, name: str, s: Dict[str, Any], frames: Sequence[int], only: Optional[Sequence[int]] = None):
+        """band_points_fn of stage LTX-2.5 in the band mode: „Pas na zewnątrz” (region) / „Wcięcie w rdzeń” (core erode)."""
+        if s.get("combine") != "band" or not s.get("band_points"):
+            return None
+        ro, ri = s.get("band_ref_out"), s.get("band_ref_in")
+        so = float(s["region_px"]) / float(ro) if ro else 1.0
+        si = float(s["core_erode_px"]) / float(ri) if ri else 1.0
+        return self.band_points_fn(name, {"band_points": s["band_points"]}, s.get("band_owner") or "stage_ltx", frames, only, (so, si))
+
+    def vmm_band_points(self, name: str, s: Dict[str, Any], frames: Sequence[int], only: Optional[Sequence[int]] = None):
+        """band_points_fn of stage VideoMaMa: its band = „Pas na zewnątrz” (reach) / „Wcięcie w rdzeń” (inset)."""
+        if not s.get("band_points"):
+            return None
+        ro, ri = s.get("band_ref_out"), s.get("band_ref_in")
+        so = float(s["reach_px"]) / float(ro) if ro else 1.0
+        si = float(s.get("inset_px") or 0.0) / float(ri) if ri else 1.0
+        return self.band_points_fn(name, {"band_points": s["band_points"]}, s.get("band_owner") or "stage_videomama", frames, only,
+                                   (so, si))
+
+    def band_core_at(self, name: str):
+        """k -> the outline mask band points are tracked from (a group: its members with the seam), None if missing."""
+        def at(k: int):
+            try:
+                return self.preview_core(name, [k])[k]
+            except FileNotFoundError:
+                return None
+        return at
 
     def zone_fg(self, name: str, z, frames: Sequence[int]):
         """Objects that are one matte with `name` and count as SURE foreground of the zone (out of the ViTMatte region,
@@ -2152,7 +2381,7 @@ class ObjectPipeline:
         return front or None
 
     def _member_core_loader(self, name: str, frames: Sequence[int]):
-        """f -> the own mask 1+2 of a group member (core_fix/ when present in that frame, else the SAM3 core; a frame
+        """f -> the own mask 1+2 of a group member (core_fix/ when present in that frame, else the SAM 3.1 core; a frame
         without either – outside the member's life range – = empty); None when the member has no mask in `frames`."""
         od = self.store.dir(name)
         dirs = [od / "core_fix", od / "core"]
@@ -2168,7 +2397,7 @@ class ObjectPipeline:
         return ld
 
     def preview_core(self, name: str, frames: Sequence[int]) -> Dict[int, np.ndarray]:
-        """Core of the zone previews: the SAM3 core of `name`; a group = the members' masks 1+2 joined with the seam
+        """Core of the zone previews: the SAM 3.1 core of `name`; a group = the members' masks 1+2 joined with the seam
         (fast stand-in of group_core – no stabilisation; stage 4 „Zastosuj” computes on group_core)."""
         members = self.group_members(name)
         if not members:
@@ -2214,9 +2443,10 @@ class ObjectPipeline:
         if outline_without_drawing(z):   # nothing to propagate: only this frame's core (fast, no CoTracker)
             frames = [f]
         core = self.preview_core(name, frames)   # a group: its whole (members + seam), as the zone computes
-        if len(frames) > 1:
-            self.release_comfy_gpu("obszar strefy: śledzenie CoTracker3")
-        regions, bgs, info = self.zone_regions(name, z, frames, core)
+        # Comfy's models are freed only when CoTracker3 really tracks (zone_regions) – before, every frame step of
+        # stage 5 unloaded them (~0.15 s + a 10-30 s reload on the next Comfy run, 2026-10-22)
+        # only this frame: the band points resolved here, their tracking never awaited (background; 2026-10-21)
+        regions, bgs, info = self.zone_regions(name, z, frames, core, only=[f])
         reg = regions.get(f)
         out: Dict[str, Any] = {"zone_id": zone_id, "frame": f, "keys": info["keys"], "is_key": f in zone_keys(z), "contours": [],
                                "bbox": None, "area_px": int(reg.sum()) if reg is not None else 0}
@@ -2230,6 +2460,25 @@ class ObjectPipeline:
             # outline mode: the region is the band; the drawing (propagated) is the exclusion – the UI draws both and a
             # new key starts from the exclusion, never from the band
             out["region_mode"] = "outline"
+            if reg is not None and reg.any():
+                # the whole band ring – outer AND inner edges (user report 2026-10-21: with band points the band
+                # vanished from the preview, only the outer edge came back); the UI fills it even-odd
+                cnts, _ = cv2.findContours(reg.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                out["band_contours"] = [cv2.approxPolyDP(c, 1.5, True).reshape(-1, 2).tolist() for c in cnts if len(c) >= 3]
+                from engine.zones import feather_maps, zone_feather_px, zone_outer_feather_px
+                fo = zone_outer_feather_px(z)
+                if f in core:
+                    # where the feathers end, both inside the band and never crossing (apply_zones weights, 2026-10-22):
+                    # inner = the inset feather from the inner band edge, outer = from the outer band edge (0 = as inset)
+                    fi = zone_feather_px(z)
+                    d_in, d_out, li, lo = feather_maps(reg, core[f], fi, fo if fo > 0 else fi)
+                    c0 = core[f].astype(bool) & ~reg    # the solid side = the core without the band (the band reaches into it)
+                    lines = lambda m: [cv2.approxPolyDP(c, 1.5, True).reshape(-1, 2).tolist()
+                                       for c in cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0] if len(c) >= 3]
+                    out["inset_feather_contours"] = lines(c0 | (reg & (d_in < li)))
+                    # also at 0 = „jak wcięcie”: the result feathers the outer edge over the inset length then, so the
+                    # line shows it (it looked like a hard cut, review 2026-10-22)
+                    out["feather_contours"] = lines(c0 | (reg & (d_out >= lo)))
             dr = (info.get("drawn") or {}).get(f)
             out["exclude_contours"] = []
             if dr is not None and dr.any():
@@ -2275,8 +2524,18 @@ class ObjectPipeline:
         s = min(1.0, 1024.0 / max(self.w, self.h))
         frames_small = lambda: ([cv2.resize(self.loader.frame(f), None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
                                  for f in frames], s)
-        tr = {z.zone_id: follow_transforms(z, frames, core, frames_small if tracker else None, tracker) for z in zones
-              if zone_kind(z) != "brush"}        # brush regions come from zone_regions above
+        def zone_tr(z):
+            fr = list(frames)
+            if z.static or z.frame in core:
+                return follow_transforms(z, fr, core, frames_small if tracker else None, tracker)
+            # the zone's drawing frame lies outside these frames (preview window around another frame): follow the zone
+            # over the span from its drawing frame to these frames, keep only the asked frames
+            ext = list(range(min(fr[0], z.frame), max(fr[-1], z.frame) + 1))
+            small = lambda: ([cv2.resize(self.loader.frame(f), None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+                              for f in ext], s)
+            t = follow_transforms(z, ext, self._lazy_core(name, core), small if tracker else None, tracker)
+            return {f: t[f] for f in fr}
+        tr = {z.zone_id: zone_tr(z) for z in zones if zone_kind(z) != "brush"}   # brush regions: zone_regions above
         user = [f for f, k in self.store.keys(name).items() if k.get("author") == "user"]
         ma_run = None
         # MatAnyone engine, or the ViTMatte hybrid with a MatAnyone base (experiment 2026-10-15)
@@ -2302,7 +2561,7 @@ class ObjectPipeline:
         base alpha of the active version (runs/v###/alpha_base, written by "Przelicz finalnie" when zones exist) -> a new
         version runs/v### with QA + edge report. The core must be unchanged since that version (else 'Przelicz finalnie').
         `stage="vitmatte"` (stage 4 of the 2026-10-15 layout): the base is the object's `vitmatte_base` – the stage-3
-        MatAnyone version (tool.stage_runs.matanyone, must be current) or the mask 1+2 written as a version
+        MatAnyone2 version (tool.stage_runs.matanyone, must be current) or the mask 1+2 written as a version
         (core_base_run) – only the brush + matte zones -> tool.stage_runs["vitmatte@<base>"] (+ "vitmatte")."""
         import shutil
         from engine.refine import ZONE_FEATHER_PX, apply_soft_override, next_run_dir, read_alpha, write_alpha_exr
@@ -2324,7 +2583,7 @@ class ObjectPipeline:
             else:
                 run, ok, why = stage_run(self.store, name, "matanyone")
                 if not run or not ok:
-                    raise ValueError("najpierw etap 3 MatAnyone („▶ Przelicz MatAnyone”)" + (f" – {why}" if why else "")
+                    raise ValueError("najpierw etap 3 MatAnyone2 („▶ Przelicz MatAnyone2”)" + (f" – {why}" if why else "")
                                      + " albo baza ViTMatte = maska 1+2")
             kinds = ("brush", "matte")
         if not run:
@@ -2359,7 +2618,7 @@ class ObjectPipeline:
                 c0 = cv2.imread(str(rdir / "core" / seg.seg_id / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
                 if c0 is None or not np.array_equal(c0 > 127, extract_crop(cmp[f].astype(np.float32), seg) > 0.5):
                     raise ValueError("rdzeń (albo poprawki pędzlem) zmienił się od tej wersji – „Przelicz finalnie” "
-                                     "(etap 3: „▶ Przelicz MatAnyone”) zamiast „Zastosuj”")
+                                     "(etap 3: „▶ Przelicz MatAnyone2”) zamiast „Zastosuj”")
         new_dir = next_run_dir(self.store.dir(name))
         per_seg: Dict[str, Dict[int, np.ndarray]] = {}
         for n, seg in enumerate(segs):
@@ -2373,7 +2632,8 @@ class ObjectPipeline:
                     sa, sarea = zres.soft[f]
                     area = extract_crop(sarea.astype(np.float32), seg) > 0.5
                     a = apply_soft_override(base, extract_crop(sa.astype(np.float32), seg), area,
-                                            zres.feather_px or ZONE_FEATHER_PX)
+                                            zres.feather_px or ZONE_FEATHER_PX,
+                                            extract_crop(zres.weights[f], seg) if f in zres.weights else None)
                 res[f] = a
                 write_alpha_exr(new_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
                 (new_dir / "alpha_base" / seg.seg_id).mkdir(parents=True, exist_ok=True)
@@ -2462,6 +2722,41 @@ class ObjectPipeline:
 
 
 # ----------------------------------------------------------------------------- edge pieces (Z27 pkt 1)
+class _LazyCore(dict):
+    """Core masks: the given frames + any other frame with a core on disk, loaded on first access (`in` / [] / get)."""
+
+    def __init__(self, base: Dict[int, np.ndarray], load: Callable[[int], np.ndarray]):
+        super().__init__(base)
+        self._load = load
+        self._absent: set = set()
+
+    def __contains__(self, f) -> bool:
+        if dict.__contains__(self, f):
+            return True
+        try:
+            self[f]
+            return True
+        except KeyError:
+            return False
+
+    def __missing__(self, f):
+        if f in self._absent:
+            raise KeyError(f)
+        try:
+            m = self._load(int(f))
+        except (FileNotFoundError, KeyError, ValueError, TypeError):
+            self._absent.add(f)
+            raise KeyError(f)
+        self[f] = m
+        return m
+
+    def get(self, f, default=None):
+        try:
+            return self[f]
+        except KeyError:
+            return default
+
+
 def core_stabilize_on(obj: Dict[str, Any]) -> bool:
     """Object option core_stabilize (user decision 2026-10-14: ON by default, also for objects created before the
     option existed; switched off per object in the settings)."""

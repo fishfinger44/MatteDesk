@@ -50,6 +50,7 @@ class DoctorReport:
     comfy_flavor: str
     comfy_url: Optional[str]
     items: List[CheckItem] = field(default_factory=list)
+    licences: List[Dict[str, Any]] = field(default_factory=list)   # licence_summary(): commercial vs research use
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -93,28 +94,50 @@ REQUIRED_MINIMAX_REMOVER_NODES = ["MinimaxModelLoader", "MinimaxVideoRemover"]
 REQUIRED_VHS_NODES = ["VHS_LoadImagesPath"]
 VHS_LABEL = "VideoHelperSuite (ujęcia 8-bit)"
 VHS_DIRS = ("ComfyUI-VideoHelperSuite", "comfyui-videohelpersuite")   # git clone | ComfyUI Manager (registry id)
-VHS_FIX = ("Wymagane teraz: TAK – ujęcia 8-bitowe (PNG/JPG, np. CLIP2_A, SH020): SAM3, MatAnyone2 i strefy wysyłają do ComfyUI "
+VHS_FIX = ("Wymagane teraz: TAK – ujęcia 8-bitowe (PNG/JPG, np. CLIP2_A, SH020): SAM 3.1, MatAnyone2 i strefy wysyłają do ComfyUI "
            "foldery PNG czytane węzłem VHS_LoadImagesPath; bez niego liczenie takich ujęć pada („Node 'VHS_LoadImagesPath' not found”). "
            "Ujęcia EXR go nie potrzebują. Pobranie: węzeł ok. 1 MB + zależności pip (imageio-ffmpeg ok. 30 MB; opencv zwykle już jest). "
            "Kliknij „Zainstaluj” albo ComfyUI Manager: „ComfyUI-VideoHelperSuite”.")
 
+BIREFNET_LABEL = "Model: BiRefNet_HR-matting / Lucida"
+
 # Licences of third-party components (not part of MatteDesk; the user downloads them and accepts them).
 # key = LINKS key -> (text, non-commercial). Keep in sync with THIRD_PARTY_LICENSES.md.
+# Short on purpose (user 2026-10-21: no clutter) – the UI adds "commercial: yes" / "non-commercial only"; details in
+# THIRD_PARTY_LICENSES.md.
+# Checked at the source 2026-10-21 (LICENSE files on GitHub, Hugging Face model cards).
 LICENSES = {
     "comfyui": ("GPL-3.0", False),
-    "sam3": ("Meta SAM License – sprawdź warunki na stronie modelu", False),
-    "matanyone2_node": ("węzeł spiritform: brak pliku licencji w repo; pakiet MatAnyone2: S-Lab License 1.0 – tylko niekomercyjnie", True),
-    "matanyone2_weights": ("S-Lab License 1.0 – tylko niekomercyjnie (komercyjnie po zgodzie autorów)", True),
-    "cotracker3": ("CC BY-NC 4.0 – tylko niekomercyjnie", True),
-    "vitmatte": ("MIT (kod); wagi wg karty modelu na Hugging Face", False),
-    "depthcrafter": ("Tencent – tylko cele akademickie, badawcze i edukacyjne, bez produkcji", True),
-    "local_nodes": ("GPL-3.0-or-later (część MatteDesk)", False),
-    "inpaint_lama": ("węzły GPL-3.0; model LaMa Apache-2.0", False),
+    "sam3": ("SAM License (bez zastosowań wojskowych / ITAR)", False),
+    "matanyone2_node": ("S-Lab 1.0 (MatAnyone2)", True),
+    "matanyone2_weights": ("S-Lab 1.0", True),
+    "cotracker3": ("CC BY-NC 4.0", True),
+    "vitmatte": ("wagi trenowane na zbiorze Adobe", True),
+    "birefnet": ("MIT", False),
+    "depthcrafter": ("Tencent, tylko badawczo", True),
+    "local_nodes": ("GPL-3.0 (MatteDesk)", False),
+    "inpaint_lama": ("Apache-2.0 / GPL-3.0", False),
     "vhs": ("GPL-3.0", False),
-    "ltx": ("LTX-2 Community License – akceptujesz ją na Hugging Face („Agree and Access”)", False),
-    "minimax_remover": ("węzły GPL-3.0; wagi wg karty modelu na Hugging Face", False),
-    "videomama": ("kod VideoMaMa CC BY-NC 4.0 – tylko niekomercyjnie; wagi SVD: Stability AI Community License", True),
+    "ltx": ("LTX-2.x Community, darmowo do 10 mln USD przychodu/rok", False),
+    "minimax_remover": ("wagi CC BY-NC 4.0", True),
+    "videomama": ("kod CC BY-NC 4.0", True),
 }
+
+# Doctor's licence summary (user decision 2026-10-21: "what is commercial and what is research use") – one row per
+# third-party component, installed or not: (shown name, LICENSES key, use). use: "commercial" (check the terms) |
+# "research" (non-commercial / research only = LICENSES nc) | "check" (licence not established).
+LICENCE_SUMMARY = [
+    ("ComfyUI", "comfyui", "commercial"), ("SAM 3.1", "sam3", "commercial"),
+    ("BiRefNet_HR-matting / Lucida", "birefnet", "commercial"), ("LaMa", "inpaint_lama", "commercial"),
+    ("LTX-2.5 Alpha-Gen", "ltx", "commercial"), ("VideoHelperSuite", "vhs", "commercial"),
+    ("MatAnyone2", "matanyone2_weights", "research"), ("CoTracker3", "cotracker3", "research"),
+    ("ViTMatte", "vitmatte", "research"), ("VideoMaMa", "videomama", "research"),
+    ("DepthCrafter", "depthcrafter", "research"), ("MiniMax-Remover", "minimax_remover", "research"),
+]
+
+
+def licence_summary() -> List[Dict[str, Any]]:
+    return [{"name": n, "use": use, "license": LICENSES[k][0]} for n, k, use in LICENCE_SUMMARY]
 
 # Where to get missing components (official sources). Shown in the UI and in INSTALL_<date>.md.
 LINKS = {
@@ -135,6 +158,8 @@ LINKS = {
                    "https://huggingface.co/facebook/cotracker3 (plik scaled_offline.pth)"],
     "vitmatte": ["https://huggingface.co/hustvl/vitmatte-base-composition-1k (pobiera Doktor / 1. użycie strefy)",
                  "https://github.com/hustvl/ViTMatte"],
+    "birefnet": ["https://huggingface.co/ZhengPeng7/BiRefNet_HR-matting (444 MB)",
+                 "https://huggingface.co/egeorcun/lucida (885 MB)"],
     "depthcrafter": ["https://github.com/akatz-ai/ComfyUI-DepthCrafter-Nodes (model pobiera się sam przy 1. użyciu)",
                      "https://github.com/Tencent/DepthCrafter"],
     "local_nodes": ["handoff/comfy/custom_nodes/ w repo MatteDesk (nie ma ich w internecie)"],
@@ -221,9 +246,11 @@ class EnvironmentDoctor:
 
         # Our node packages on disk (copied by the "Zainstaluj" button)
         items.append(self.check_node_files())
+        items.append(self.check_report_endpoint())
         model_actions = {"Model: MiniMax-Remover": "install_minimax_weights", "Model: LTX-2.5 Alpha-Gen": "install_ltx",
                          "Model: VideoMaMa": "install_videomama",
-                         "Model: CoTracker3": "install_cotracker", "Model: ViTMatte": "install_vitmatte", "Model: SAM3": "install_sam3",
+                         "Model: CoTracker3": "install_cotracker", "Model: ViTMatte": "install_vitmatte", "Model: SAM 3.1": "install_sam3",
+                         BIREFNET_LABEL: "install_birefnet",
                        "Model: MatAnyone2": "install_matanyone2_weights", "Model: LaMa (big-lama.pt)": "install_lama"}
         node_actions = {"ComfyUI-MatAnyone2": "install_matanyone2_node",
                         "Inpaint LaMa (comfyui-inpaint-nodes)": "install_inpaint_nodes",
@@ -259,9 +286,10 @@ class EnvironmentDoctor:
 
         # Where to get what is missing
         link_keys = {"Python Version": "python", "ffmpeg": "ffmpeg", "Git": "git", "ComfyUI Service": "comfyui", "ComfyUI Flavor": "comfyui",
-                     "SAM3 Core Nodes": "comfyui", "SAM3 Node Signatures": "comfyui", "Model: SAM3": "sam3",
+                     "SAM 3.1 Core Nodes": "comfyui", "SAM 3.1 Node Signatures": "comfyui", "Model: SAM 3.1": "sam3",
                      "ComfyUI-MatAnyone2": "matanyone2_node", "Model: MatAnyone2": "matanyone2_weights",
                      "Model: CoTracker3": "cotracker3", "Model: ViTMatte": "vitmatte", "ComfyUI-DepthCrafter-Nodes": "depthcrafter",
+                     BIREFNET_LABEL: "birefnet",
                      "ComfyUI-PlateMatte": "local_nodes", "ComfyUI-MatAnyone2-Keyframes": "local_nodes",
                      "Custom Nodes (Filesystem)": "local_nodes",
                      "Inpaint LaMa (comfyui-inpaint-nodes)": "inpaint_lama", "Model: LaMa (big-lama.pt)": "inpaint_lama",
@@ -287,7 +315,8 @@ class EnvironmentDoctor:
             summary=counts,
             comfy_flavor=detected_flavor,
             comfy_url=active_url,
-            items=items
+            items=items,
+            licences=licence_summary(),
         )
 
         return report
@@ -341,7 +370,7 @@ class EnvironmentDoctor:
             )
 
     def check_gpu(self) -> CheckItem:
-        """GPU as ComfyUI sees it (/system_stats): all GPU work (SAM3, MatAnyone2, DepthCrafter, CoTracker3) runs in
+        """GPU as ComfyUI sees it (/system_stats): all GPU work (SAM 3.1, MatAnyone2, DepthCrafter, CoTracker3) runs in
         ComfyUI's Python – MatteDesk's own .venv has no PyTorch."""
         if self.simulation.get("simulate_no_gpu"):
             return CheckItem(name="GPU & CUDA", category="Hardware", status="warning",
@@ -365,8 +394,23 @@ class EnvironmentDoctor:
         vram = d.get("vram_total", 0) / 1024 ** 3
         self.comfy_vram_gb = vram
         return CheckItem(name="GPU & CUDA", category="Hardware", status="ok",
-                         message=f"{name} ({vram:.1f} GB VRAM, PyTorch {torch_v} w ComfyUI) – na nim liczą się SAM3, MatAnyone2 i CoTracker3",
+                         message=f"{name} ({vram:.1f} GB VRAM, PyTorch {torch_v} w ComfyUI) – na nim liczą się SAM 3.1, MatAnyone2 i CoTracker3",
                          details={"device_name": name, "vram_gb": round(vram, 2), "pytorch": torch_v})
+
+    def check_report_endpoint(self) -> CheckItem:
+        """„Zgłoś problem” (engine/report.py): the report proxy from config.json `report_endpoint` (Cloudflare Worker,
+        infra/report_proxy/). Optional – without it the rest of the app works; reports cannot be sent."""
+        from engine.report import endpoint, health
+        url = endpoint(self.config)
+        need = "Wymagane teraz: NIE – tylko do przycisku „Zgłoś problem” (wysyła opis i diagnostykę jako zgłoszenie)."
+        if not url:
+            return CheckItem(name="Zgłaszanie problemów", category="Config", status="info",
+                             message=f"Serwer zgłoszeń nie jest ustawiony (report_endpoint w config.json). {need}")
+        ok, why = (True, "pominięte (symulacja)") if self.simulation.get("skip_network") else health(url)
+        return CheckItem(name="Zgłaszanie problemów", category="Config", status="ok" if ok else "warning",
+                         message=f"Serwer zgłoszeń {url}: {why}. {need}", details={"report_endpoint": url},
+                         fix_suggestion=None if ok else "Sprawdź połączenie z internetem albo zaporę; zgłoszenie możesz też "
+                                                        "opisać na GitHubie (link w oknie „O programie”).")
 
     def check_ffmpeg(self) -> CheckItem:
         if self.simulation.get("simulate_no_ffmpeg"):
@@ -714,25 +758,25 @@ class EnvironmentDoctor:
 
             if sam3_missing:
                 items.append(CheckItem(
-                    name="SAM3 Core Nodes",
+                    name="SAM 3.1 Core Nodes",
                     category="ComfyUI Nodes",
                     status="error",
-                    message=f"Brak węzłów SAM3 w ComfyUI: {sam3_missing}",
+                    message=f"Brak węzłów SAM 3.1 w ComfyUI: {sam3_missing}",
                     details={"missing": sam3_missing},
-                    fix_suggestion="Zaktualizuj ComfyUI do wersji z obsługą SAM3 (nodes_sam3 w comfy_extras)."
+                    fix_suggestion="Zaktualizuj ComfyUI do wersji z obsługą SAM 3.1 (nodes_sam3 w comfy_extras)."
                 ))
             elif sam3_schema_mismatch:
                 items.append(CheckItem(
-                    name="SAM3 Node Signatures",
+                    name="SAM 3.1 Node Signatures",
                     category="ComfyUI Nodes",
                     status="error",
-                    message=f"Niezgodność wejść węzłów SAM3: {'; '.join(sam3_schema_mismatch)}",
+                    message=f"Niezgodność wejść węzłów SAM 3.1: {'; '.join(sam3_schema_mismatch)}",
                     details={"mismatches": sam3_schema_mismatch},
-                    fix_suggestion="Zaktualizuj ComfyUI: węzły SAM3 w rdzeniu ComfyUI mają inne wejścia, niż oczekuje MatteDesk (initial_mask, conditioning)."
+                    fix_suggestion="Zaktualizuj ComfyUI: węzły SAM 3.1 w rdzeniu ComfyUI mają inne wejścia, niż oczekuje MatteDesk (initial_mask, conditioning)."
                 ))
             else:
                 items.append(CheckItem(
-                    name="SAM3 Core Nodes",
+                    name="SAM 3.1 Core Nodes",
                     category="ComfyUI Nodes",
                     status="ok",
                     message="Węzły SAM3_Detect, SAM3_VideoTrack, SAM3_TrackToMask są zgodne ze specyfikacją",
@@ -892,18 +936,18 @@ class EnvironmentDoctor:
         sam3_file = models_dir / "checkpoints" / sam3_name
         if sam3_file.exists():
             items.append(CheckItem(
-                name="Model: SAM3",
+                name="Model: SAM 3.1",
                 category="Models",
                 status="ok",
-                message=f"SAM3 wagi obecne ({sam3_name}, {sam3_file.stat().st_size / (1024**2):.0f} MB)",
+                message=f"SAM 3.1 wagi obecne ({sam3_name}, {sam3_file.stat().st_size / (1024**2):.0f} MB)",
                 details={"path": str(sam3_file)}
             ))
         else:
             items.append(CheckItem(
-                name="Model: SAM3",
+                name="Model: SAM 3.1",
                 category="Models",
                 status="error",
-                message=f"Brak wag SAM3: {sam3_file}",
+                message=f"Brak wag SAM 3.1: {sam3_file}",
                 fix_suggestion=f"Pobierz {sam3_name} do {models_path}\\checkpoints\\ (nazwa pliku = `sam3_checkpoint` w config.json)"
             ))
 
@@ -952,10 +996,10 @@ class EnvironmentDoctor:
         items.append(CheckItem(
             name="Model: LTX-2.5 Alpha-Gen", category="Models", status="ok" if not ltx_miss else "warning",
             message=("Modele LTX-2.5 obecne (transformer int8, Gemma int8, VAE, LoRA Alpha-Gen)" if not ltx_miss else
-                     f"Brak {len(ltx_miss)} z 5 plików LTX-2.5 ({sum(m['gb'] for m in ltx_miss):.1f} GB) – etap 6 „LTX” wyłączony"),
+                     f"Brak {len(ltx_miss)} z 5 plików LTX-2.5 ({sum(m['gb'] for m in ltx_miss):.1f} GB) – etap 7 „LTX-2.5” wyłączony"),
             details={"missing": [f"{m['folder']}/{m['file']}" for m in ltx_miss]},
             fix_suggestion=None if not ltx_miss else (
-                "Wymagane teraz: NIE – tylko etap 6 „LTX Alpha-Gen” (opcjonalny). Do czego: generatywna alfa włosów, dymu, "
+                "Wymagane teraz: NIE – tylko etap 7 „LTX-2.5 Alpha-Gen” (opcjonalny). Do czego: generatywna alfa włosów, dymu, "
                 "rozmycia ruchu. Pobranie: ok. 40 GB (transformer 21,5 + Gemma 15,4 + VAE 1,8 + LoRA 1,3) z Hugging Face; "
                 "repozytoria Lightricks są „gated”: najpierw „hf auth login” i „Agree and Access” na stronach modeli. "
                 "VRAM: działa na 24 GB z przelewaniem do RAM-u (zalecane ≥ 64 GB RAM).")))
@@ -1033,10 +1077,43 @@ class EnvironmentDoctor:
                                            "„vitmatte” nie policzą się",
                                    details={"reason": vm_dev}, fix_suggestion=vm_need))
 
+        # 4b. BiRefNet_HR-matting / Lucida – optional edge models of the ViTMatte zone engine (MIT weights, 2026-10-21)
+        items.append(self.check_birefnet())
+
         # 5. Plate alignment on the GPU (engine/align_gpu_worker.py in ComfyUI's Python; numpy + torch only)
         items.append(self.check_align_gpu())
 
         return items
+
+    def check_birefnet(self) -> CheckItem:
+        """BiRefNet_HR-matting / Lucida in ComfyUI's Python (engine/birefnet_worker.py): packages + weights in the HF cache.
+        Optional: chosen per zone in „Model” of the ViTMatte section – the commercial alternative to ViTMatte."""
+        from engine import birefnet
+        need = ("Wymagane teraz: NIE – opcjonalny model krawędzi w strefie ViTMatte (paleta „Strefa” → „Model”). Do czego: "
+                "alternatywa ViTMatte do pracy komercyjnej (wagi MIT; wagi ViTMatte są tylko niekomercyjne). Pobiera: "
+                "BiRefNet_HR-matting 444 MB + Lucida 885 MB do cache Hugging Face; timm (~3 MB, czasem też kornia / einops) "
+                "do Pythona ComfyUI, tylko jeśli ich brak – PyTorch ComfyUI zostaje bez zmian. Kliknij „Zainstaluj”.")
+        try:
+            from engine.installer import comfy_python
+            from engine.vitmatte import check_worker_python
+            ok, dev, cached = check_worker_python(comfy_python(self.config), list(birefnet.MODELS.values()),
+                                                  worker=birefnet.WORKER)
+        except Exception as e:
+            ok, dev, cached = False, str(e), []
+        names = {v: birefnet.LABELS[k] for k, v in birefnet.MODELS.items()}
+        have = [names[m] for m in cached if m in names]
+        if ok and len(have) == len(names):
+            return CheckItem(name=BIREFNET_LABEL, category="Models", status="ok",
+                             message=f"BiRefNet_HR-matting i Lucida gotowe (liczą w Pythonie ComfyUI na {dev})",
+                             details={"device": dev, "cached": cached})
+        if ok:
+            miss = [n for n in names.values() if n not in have]
+            return CheckItem(name=BIREFNET_LABEL, category="Models", status="info",
+                             message=f"Opcjonalne: brak wag {', '.join(miss)}" + (f" (są: {', '.join(have)})" if have else ""),
+                             details={"device": dev, "cached": cached}, fix_suggestion=need)
+        return CheckItem(name=BIREFNET_LABEL, category="Models", status="info",
+                         message=f"Opcjonalne: BiRefNet_HR-matting / Lucida niedostępne w Pythonie ComfyUI ({dev})",
+                         details={"reason": dev}, fix_suggestion=need)
 
     def check_align_gpu(self) -> CheckItem:
         """Alignment worker in ComfyUI's Python: optional speed-up, the CPU code works without it."""
@@ -1149,7 +1226,7 @@ def main():
     parser.add_argument("--simulate-desktop", action="store_true", help="Simulate ComfyUI Desktop flavor")
     parser.add_argument("--simulate-offline", action="store_true", help="Simulate ComfyUI service offline")
     parser.add_argument("--simulate-missing-model", action="store_true", help="Simulate missing model weights")
-    parser.add_argument("--simulate-altered-sam3", action="store_true", help="Simulate altered SAM3 node schemas")
+    parser.add_argument("--simulate-altered-sam3", action="store_true", help="Simulate altered SAM 3.1 node schemas")
     parser.add_argument("--write-local", action="store_true",
                         help="Zapisz wykryty port Comfy i folder ComfyUI do config.local.json (tylko ta maszyna)")
     args = parser.parse_args()

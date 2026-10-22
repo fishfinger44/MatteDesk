@@ -213,8 +213,8 @@ def test_stage_ltx_api_export_and_edge_modes(proj, tmp_path, monkeypatch):
     pipe.client.handlers["SaveImageAdvanced"] = _alphagen_handler(tmp_path / "ltx_out", rec)
     pipe.client.output_root = tmp_path / "ltx_out"
     d = api.get("/api/object/obj/stages").json()
-    assert [s["n"] for s in d["steps"]] == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert [s["id"] for s in d["steps"]][-2:] == ["ltx", "export"]
+    assert [s["n"] for s in d["steps"]] == [1, 2, 3, 4, 5, 6, 7, 8, 9]    # 8 = Final Touch (2026-10-22)
+    assert [s["id"] for s in d["steps"]][-3:] == ["ltx", "final_touch", "export"]
     st = {s["id"]: s["state"] for s in d["stages"]}
     assert st["ltx"] == "todo" and "opcjonalny" in next(s for s in d["stages"] if s["id"] == "ltx")["why"]
     # LTX is no longer an edge mode of the experiments

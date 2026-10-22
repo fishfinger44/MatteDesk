@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/crop.py - Crop engine for SAM3 (SPEC 5.2) – "the heart".
+"""engine/crop.py - Crop engine for SAM 3.1 (SPEC 5.2) – "the heart".
 
 0. instance choice: SAM3_Detect on the full proxy letterboxed (black padding) to a square, individual masks.
 1. coarse localization: SAM3_VideoTrack on the same square proxies, initial mask = chosen instance, no text,
@@ -10,7 +10,7 @@
 3. constant-crop segments: greedy, union bbox (+margin) must fit a square where the object fills >= min_fill
    (0.35) of the side in every frame; keys do NOT split segments; 8-frame overlap.
 4. square crop per segment: side = max(w, h) of the union x 1.10, at least bbox + 64, multiple of 16 (32 for
-   LTX); centred on the union; shifted inside the plate, mirror padding when the plate is too small.
+   LTX-2.5); centred on the union; shifted inside the plate, mirror padding when the plate is too small.
 5. tiles for objects larger than 2 x 1008 with thin parts (1008-px squares, 25 % overlap).
 7. crops.json: [{seg_id, first, last, overlap_in, overlap_out, crop:[x, y, side, side], pad:[l, t, r, b],
    scale_to_1008, tiles:[...], manual}] – crop x/y = top-left of the virtual square (may be < 0 with padding).
@@ -135,9 +135,10 @@ class CoarseTrack:
 
 
 def coarse_localize(runner: Any, proxies: Sequence[np.ndarray], start_idx: int, init_mask_proxy: np.ndarray,
-                    proxy_scale: float, key_masks: Optional[Dict[int, np.ndarray]] = None) -> CoarseTrack:
+                    proxy_scale: float, key_masks: Optional[Dict[int, np.ndarray]] = None,
+                    frame_numbers: Optional[Sequence[int]] = None) -> CoarseTrack:
     """SAM3_VideoTrack on letterboxed proxies, forward and backward from `start_idx` (no text)."""
-    from engine.comfy_io import LazySeq
+    from engine.comfy_io import LazySeq, progress_prefix
     # letterboxed on access (a 1000-frame shot as a list of 1920 x 1920 float frames would need ~47 GB RAM)
     sq = LazySeq(lambda i: letterbox_square(proxies[i])[0], range(len(proxies)))
     p0 = proxies[0]
@@ -156,11 +157,15 @@ def coarse_localize(runner: Any, proxies: Sequence[np.ndarray], start_idx: int, 
 
     # only the bbox of each mask is kept (not the masks themselves)
     bboxes: List[Optional[Tuple[float, float, float, float]]] = [None] * n
-    fwd = runner.track(sq[start_idx:], init_sq)
+    fn = list(frame_numbers) if frame_numbers is not None else list(range(n))
+    # the crop pass always covers the whole shot (stable crops keep the interval cache): say so in the progress
+    with progress_prefix(f"Kadrowanie całego ujęcia F{fn[start_idx]}→F{fn[-1]}"):
+        fwd = runner.track(sq[start_idx:], init_sq)
     for k, m in enumerate(fwd):
         bboxes[start_idx + k] = bbox_of(start_idx + k, m)
     if start_idx > 0:
-        bwd = runner.track(sq[start_idx::-1], init_sq)
+        with progress_prefix(f"Kadrowanie całego ujęcia F{fn[start_idx]}→F{fn[0]}"):
+            bwd = runner.track(sq[start_idx::-1], init_sq)
         for k, m in enumerate(bwd):
             if k:
                 bboxes[start_idx - k] = bbox_of(start_idx - k, m)
@@ -384,7 +389,8 @@ def run_crop_engine(runner: Any, load_proxy, frames: Sequence[int], start_frame:
     from engine.comfy_io import LazySeq
     proxies = LazySeq(lambda i: load_proxy(frames[i]), range(len(frames)))   # read on access (long shots)
     idx_keys = {frames.index(f): m for f, m in (key_masks_proxy or {}).items() if f in frames}
-    tr = coarse_localize(runner, proxies, frames.index(start_frame), init_mask_proxy, proxy_scale, idx_keys)
+    tr = coarse_localize(runner, proxies, frames.index(start_frame), init_mask_proxy, proxy_scale, idx_keys,
+                         frame_numbers=frames)
     # rounding safety: proxy px -> plate px, grow by one proxy pixel
     g = 1.0 / proxy_scale
     raw = [None if b is None else (max(0.0, b[0] - g), max(0.0, b[1] - g), min(plate_w, b[2] + g), min(plate_h, b[3] + g))

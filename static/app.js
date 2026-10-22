@@ -156,6 +156,9 @@ class MatteDeskViewer {
     this.inputCleanPlate = document.getElementById('inputCleanPlate');
     this.inputBacklitPlate = document.getElementById('inputBacklitPlate');
     this.inputDepthPlate = document.getElementById('inputDepthPlate');
+    this.beautyRangeHint = document.getElementById('beautyRangeHint');
+    this.frameNumberingGroup = document.getElementById('frameNumberingGroup');
+    this.inputFirstFrame = document.getElementById('inputFirstFrame');
     this.doctorReportContent = document.getElementById('doctorReportContent');
     this.comfyStatusText = document.getElementById('comfyStatusText');
     this.comfyStatusDot = document.querySelector('.status-dot');
@@ -281,9 +284,15 @@ class MatteDeskViewer {
     const alignCompareBar = () => {
       if (!cmpBar || !cmpInner || !pill) return;
       const folded = pill.classList.contains('in-more-menu') || !pill.offsetParent;
-      const x = folded ? 16 : Math.round(pill.getBoundingClientRect().left - cmpBar.getBoundingClientRect().left);
-      const max = Math.max(16, cmpBar.clientWidth - cmpInner.offsetWidth);   // never pushed out of the window
-      cmpInner.style.marginLeft = `${Math.max(0, Math.min(x, max))}px`;
+      const barL = cmpBar.getBoundingClientRect().left;
+      const x = folded ? 16 : Math.round(pill.getBoundingClientRect().left - barL);
+      // the shot info sits first in this row (2026-10-22): the margin counts from its right edge
+      const sp = document.getElementById('shotInfoPill');
+      const base = sp && sp.offsetParent ? Math.round(sp.getBoundingClientRect().right - barL) : 0;
+      const right = document.getElementById('compareRight');
+      const rw = right ? right.offsetWidth + 24 : 0;   // the ComfyUI status + language on the right (2026-10-22)
+      const max = Math.max(16, cmpBar.clientWidth - base - rw - cmpInner.offsetWidth);   // never pushed out of the window
+      cmpInner.style.marginLeft = `${Math.max(12, Math.min(x - base, max))}px`;
     };
     this.alignCompareBar = alignCompareBar;
     window.addEventListener('resize', alignCompareBar);
@@ -405,6 +414,19 @@ class MatteDeskViewer {
 
     // Keyboard Shortcuts
     window.addEventListener('keydown', (e) => {
+      // ← / → = one frame (user request 2026-10-22) also when a palette slider / checkbox / list still has the focus
+      // after a click – only typing into a text / number field keeps the arrows for its caret
+      const t = e.target;
+      const typing = t.isContentEditable || t.tagName === 'TEXTAREA'
+        || (t.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'button', 'color', 'file'].includes(t.type));
+      if ((e.code === 'ArrowLeft' || e.code === 'ArrowRight') && !typing && !e.ctrlKey && !e.metaKey && !e.altKey
+          && ['INPUT', 'SELECT'].includes(t.tagName)) {
+        e.preventDefault();
+        t.blur();
+        if (e.shiftKey) window.dispatchEvent(new CustomEvent('md-key-step', { detail: e.code === 'ArrowLeft' ? -1 : 1 }));
+        else this.stepFrame(e.code === 'ArrowLeft' ? -1 : 1);
+        return;
+      }
       if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
       if (e.code === 'KeyC' && !e.ctrlKey && !e.metaKey && this.activePlate !== this.compare.ref) {
         if (!this.compare.holdC) { this.compare.holdC = true; this.render(); }
@@ -480,6 +502,13 @@ class MatteDeskViewer {
         this.browsePlateFolder(targetId, btn.hasAttribute('data-file'));
       });
     });
+    // frame numbering of a new shot: keep the file range (default) or start at N (like mocha)
+    document.querySelectorAll('input[name="frameNumbering"]').forEach((r) => {
+      r.addEventListener('change', () => { this.inputFirstFrame.disabled = r.value !== 'start' || !r.checked; });
+    });
+    if (this.inputBeautyPlate) {
+      this.inputBeautyPlate.addEventListener('change', () => this.inspectBeautyRange());
+    }
 
     // Doctor Modal
     document.getElementById('openDoctorBtn').addEventListener('click', () => {
@@ -531,6 +560,18 @@ class MatteDeskViewer {
     }
     if (this.btnRunClean) {
       this.btnRunClean.addEventListener('click', () => this.runPlateClean());
+    }
+    if (this.cleanExportModeSelect) {
+      this.cleanExportModeSelect.addEventListener('change', () => this.syncCleanExrOnly());
+      // EXR folder: default next to the plate (follows plate / denoise until the user picks one), picker, "domyślny"
+      this.cleanExrDirInput = document.getElementById('cleanExrDirInput');
+      this.cleanExrDirUser = false;
+      document.getElementById('cleanExrDirPick')?.addEventListener('click', () => this.pickCleanExrDir());
+      document.getElementById('cleanExrDirDefault')?.addEventListener('click', () => { this.cleanExrDirUser = false; this.loadCleanExrDir(); });
+      this.cleanExrDirInput?.addEventListener('input', () => { this.cleanExrDirUser = true; });
+      this.cleanDenoiseCheckbox?.addEventListener('change', () => this.loadCleanExrDir());
+      this.cleanPlateSelect?.addEventListener('change', () => { this.cleanExrDirUser = false; this.loadCleanExrDir(); });
+      this.syncCleanExrOnly();
     }
     if (this.btnExportCleanNk) {
       this.btnExportCleanNk.addEventListener('click', () => this.exportCleanNk());
@@ -716,11 +757,38 @@ class MatteDeskViewer {
         const input = document.getElementById(targetInputId);
         if (input) {
           input.value = picked;
+          if (input === this.inputBeautyPlate) this.inspectBeautyRange();
         }
       }
     } catch (e) {
       console.warn('Native picker failed:', e);
     }
+  }
+
+  // wizard: frame range of the beauty files under the field (video = frames from the "first frame" setting)
+  async inspectBeautyRange() {
+    const raw = this.inputBeautyPlate.value.trim();
+    if (!this.beautyRangeHint) return;
+    this.beautyRangeHint.textContent = '';
+    this.beautyRangeHint.className = 'field-hint';
+    if (!raw) return;
+    try {
+      const res = await fetch('/api/project/plate/inspect', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: raw })
+      });
+      const info = (await res.json()).info || {};
+      if (info.exists && info.frame_count > 0 && info.first_frame != null && info.source_type !== 'video') {
+        this.beautyRangeHint.textContent = `✓ Klatki ${info.first_frame}–${info.last_frame} (${info.frame_count} kl.)`;
+        this.beautyRangeHint.className = 'field-hint success';
+        if (info.pattern && info.pattern !== raw) this.inputBeautyPlate.value = info.pattern;
+      } else if (info.exists && info.source_type === 'video') {
+        this.beautyRangeHint.textContent = `✓ Wideo: ${info.frame_count || '?'} kl. – numeracja od pierwszej klatki (domyślnie 1)`;
+        this.beautyRangeHint.className = 'field-hint success';
+      } else if (!info.exists) {
+        this.beautyRangeHint.textContent = '⚠️ Ścieżka nie istnieje';
+        this.beautyRangeHint.className = 'field-hint warning';
+      }
+    } catch (e) { /* hint only */ }
   }
 
   async inspectWorkingDir(dirPath) {
@@ -757,7 +825,10 @@ class MatteDeskViewer {
           }
           if (plates.backlit && this.inputBacklitPlate) this.inputBacklitPlate.value = plates.backlit;
           if (plates.depth && this.inputDepthPlate) this.inputDepthPlate.value = plates.depth;
+          if (this.frameNumberingGroup) this.frameNumberingGroup.style.display = 'none';   // numbering = the manifest's
+          if (this.beautyRangeHint) this.beautyRangeHint.textContent = `Klatki ${info.first}–${info.last} (manifest)`;
         } else {
+          if (this.frameNumberingGroup) this.frameNumberingGroup.style.display = '';
           this.workDirStatusHint.textContent = 'Katalog gotowy. Wprowadź ścieżki płyt, aby zainicjalizować ujęcie.';
           this.workDirStatusHint.className = 'field-hint';
 
@@ -766,6 +837,7 @@ class MatteDeskViewer {
           if (det.cleanplate && this.inputCleanPlate && !this.inputCleanPlate.value) this.inputCleanPlate.value = det.cleanplate;
           if (det.backlit && this.inputBacklitPlate && !this.inputBacklitPlate.value) this.inputBacklitPlate.value = det.backlit;
           if (det.depth && this.inputDepthPlate && !this.inputDepthPlate.value) this.inputDepthPlate.value = det.depth;
+          if (this.inputBeautyPlate && this.inputBeautyPlate.value) this.inspectBeautyRange();
         }
       }
     } catch (e) {
@@ -797,6 +869,16 @@ class MatteDeskViewer {
       plates.depth = this.inputDepthPlate.value.trim();
     }
 
+    const startAt = document.querySelector('input[name="frameNumbering"][value="start"]');
+    let firstFrame = null;
+    if (startAt && startAt.checked) {
+      firstFrame = parseInt(this.inputFirstFrame.value, 10);
+      if (!Number.isFinite(firstFrame) || firstFrame < 0) {
+        alert('Pierwsza klatka musi być liczbą ≥ 0.');
+        return;
+      }
+    }
+
     this.showLoading(true, 'Wczytywanie / konfigurowanie projektu...');
     try {
       const res = await fetch('/api/project/open_or_create', {
@@ -804,7 +886,8 @@ class MatteDeskViewer {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           work_dir: workDir,
-          plates: plates
+          plates: plates,
+          first_frame: firstFrame
         })
       });
       const api = await readApiResponse(res);
@@ -1501,7 +1584,7 @@ class MatteDeskViewer {
     if (m === 'loading') { this._cmpNote = 'Wczytywanie maski…'; return null; }
     if (!m) this._cmpNote = obj && obj.name ? (obj.matteNote || `„${obj.name}”: brak alpha i rdzenia w F${f} – samo tło`) : 'Wybierz obiekt (lista Obiekt) – bez maski widać samo tło';
     else {   // which mask the cut-out uses (it follows the selected stage, objects.js matteFor)
-      const src = { core: 'rdzeń SAM3', key: 'klucz SAM3', core_fix: 'maska 1+2' }[m.kind] || (m.run ? `wersja ${m.run}` : 'alpha');
+      const src = { core: 'rdzeń SAM 3.1', key: 'klucz SAM 3.1', core_fix: 'maska 1+2' }[m.kind] || (m.run ? `wersja ${m.run}` : 'alpha');
       this._cmpNote = `„${m.group || obj.name}”${m.group ? ' (grupa ze szwem)' : ''} F${f}: wycięcie – ${src}`;
     }
     // cached per frame / matte / background; the image objects are compared too (a recomputed mask = a new Image)
@@ -1709,6 +1792,7 @@ class MatteDeskViewer {
           <div style="padding:14px 18px 6px;font-size:16px;font-weight:700;">${this.esc(title)}</div>
           <div style="padding:6px 18px 12px;font-size:13px;line-height:1.5;overflow:auto;">${html}</div>
           <div style="padding:12px 18px;border-top:1px solid #2a2a2e;display:flex;gap:8px;justify-content:flex-end;">
+            ${tone === 'error' && window.mdReport ? '<button type="button" class="btn btn-secondary" data-report="1" style="margin-right:auto;" title="Wyślij autorowi opis tego błędu z diagnostyką (przed wysłaniem zobaczysz całość)">🐞 Zgłoś problem</button>' : ''}
             ${cancel ? `<button type="button" class="btn btn-secondary" data-r="0">${this.esc(cancel)}</button>` : ''}
             <button type="button" class="btn btn-primary" data-r="1" style="background:${col};border-color:${col};">${this.esc(ok)}</button>
           </div></div>`;
@@ -1718,6 +1802,12 @@ class MatteDeskViewer {
       };
       const done = (v) => { document.removeEventListener('keydown', onKey, true); bg.remove(); resolve(v); };
       bg.querySelectorAll('button[data-r]').forEach((b) => b.addEventListener('click', () => done(b.dataset.r === '1')));
+      const rep = bg.querySelector('button[data-report]');
+      if (rep) rep.addEventListener('click', () => {   // the error's title + text go with the report (engine/report.py context)
+        const text = (bg.querySelector('[role="dialog"] > div:nth-child(2)') || {}).innerText || '';
+        done(false);
+        window.mdReport.open({ source: 'error_dialog', error_title: String(title || ''), error_text: text });
+      });
       bg.addEventListener('click', (e) => { if (e.target === bg && cancel) done(false); });
       document.addEventListener('keydown', onKey, true);
       document.body.appendChild(bg);
@@ -1736,7 +1826,7 @@ class MatteDeskViewer {
   showInstallResults(results) {
     const names = { nodes: 'Węzły MatteDesk (PlateMatte, MatAnyone2-Keyframes)', matanyone2_node: 'Węzeł ComfyUI-MatAnyone2',
       inpaint_nodes: 'Węzły inpaint (LaMa)', depthcrafter_nodes: 'Węzły DepthCrafter', minimax_nodes: 'Węzły MiniMax-Remover', vhs_nodes: 'Węzły VideoHelperSuite', minimax_weights: 'Wagi MiniMax-Remover', sam3: 'Wagi SAM3.1', matanyone2_weights: 'Wagi MatAnyone2', lama: 'Wagi LaMa',
-      cotracker: 'CoTracker3', vitmatte: 'ViTMatte', ltx: 'Modele LTX-2.5 Alpha-Gen', videomama: 'VideoMaMa (węzeł + wagi)', restart_comfy: 'Restart ComfyUI' };
+      cotracker: 'CoTracker3', vitmatte: 'ViTMatte', birefnet: 'BiRefNet_HR-matting / Lucida', ltx: 'Modele LTX-2.5 Alpha-Gen', videomama: 'VideoMaMa (węzeł + wagi)', restart_comfy: 'Restart ComfyUI' };
     const allOk = results.every((r) => r.ok);
     const needsRestart = results.some((r) => r.ok && ['nodes', 'matanyone2_node', 'inpaint_nodes', 'depthcrafter_nodes', 'minimax_nodes', 'vhs_nodes', 'videomama'].includes(r.what));
     const rows = results.map((r) => {
@@ -1805,6 +1895,17 @@ class MatteDeskViewer {
       const res = await fetch('/api/doctor');
       const data = await res.json();
       let html = `<div style="margin-bottom:12px; font-weight:600;">Wariant ComfyUI: ${data.comfy_flavor} | Status ogólny: ${data.all_ok ? '<span style="color:#10b981">OK</span>' : '<span style="color:#f0703a">Wymaga uwagi</span>'}</div>`;
+      // licence summary (user decision 2026-10-21): what may be used in commercial work and what is research / non-commercial only
+      const lics = data.licences || [];
+      const licList = (use) => lics.filter((l) => l.use === use)
+        .map((l) => `<span title="${(l.license || '').replace(/"/g, '&quot;')}">${l.name}</span>`).join(', ') || '—';
+      if (lics.length) {
+        html += `<div style="margin-bottom:12px;padding:8px 10px;border:1px solid #303035;border-radius:6px;font-size:12px;line-height:1.5;">
+          <span style="color:#10b981;">✔ Komercyjnie:</span> ${licList('commercial')}<br>
+          <span style="color:#f87171;">⚠ Tylko badawczo:</span> ${licList('research')}${lics.some((l) => l.use === 'check') ? `<br>
+          <span style="color:#e8a33d;">? Do sprawdzenia:</span> ${licList('check')}` : ''}
+        </div>`;
+      }
       html += '<table style="width:100%; border-collapse:collapse; font-size:12px;">';
       const ACTIONS = {
         install_ffmpeg: ['ffmpeg', 'Wymagane teraz: TAK – wczytywanie ujęć wideo (MP4 / MOV) i podglądy. Instaluje ffmpeg przez winget (Gyan.FFmpeg, ok. 100 MB, akceptuje jego licencję w Twoim imieniu); gdy winget nie działa – pobiera paczkę portable z gyan.dev do bin/ffmpeg MatteDesk. Ścieżka trafia do config.local.json.'],
@@ -1812,7 +1913,8 @@ class MatteDeskViewer {
         install_nodes: ['nodes', 'Kopiuje węzły PlateMatte i MatAnyone2-Keyframes do custom_nodes ComfyUI (stara wersja → backups/).'],
         install_cotracker: ['cotracker', 'Instaluje pakiet CoTracker3 w Pythonie ComfyUI (< 1 MB, PyTorch ComfyUI zostaje bez zmian) i pobiera wagi scaled_offline.pth (97 MB). CoTracker3 liczy się potem na GPU przez ComfyUI.'],
         install_vitmatte: ['vitmatte', 'Wymagane teraz: TAK – strefy z presetem „włosy” i silnik „vitmatte”. Pobiera wagi ViTMatte (hustvl/vitmatte-base-composition-1k, ~390 MB) do cache Hugging Face; transformers doinstaluje w Pythonie ComfyUI tylko, jeśli ich brak. ViTMatte liczy się potem na GPU w Pythonie ComfyUI.'],
-        install_sam3: ['sam3', 'Pobiera wagi SAM3 (sam3.1_multiplex_fp16.safetensors, ~1,7 GB) z huggingface.co/Comfy-Org/sam3.1 do models/checkpoints.'],
+        install_birefnet: ['birefnet', 'Wymagane teraz: NIE – opcjonalny model krawędzi w strefie ViTMatte (wagi MIT, do pracy komercyjnej). Pobiera BiRefNet_HR-matting (444 MB) i Lucida (885 MB) do cache Hugging Face; timm (~3 MB, czasem kornia / einops) doinstaluje w Pythonie ComfyUI tylko, jeśli ich brak – PyTorch ComfyUI bez zmian.'],
+        install_sam3: ['sam3','Pobiera wagi SAM 3.1 (sam3.1_multiplex_fp16.safetensors, ~1,7 GB) z huggingface.co/Comfy-Org/sam3.1 do models/checkpoints.'],
         install_matanyone2_weights: ['matanyone2_weights', 'Pobiera wagi MatAnyone2 (matanyone2.pth, ~135 MB) z github.com/pq-yang/MatAnyone2 do models/matanyone2.'],
         install_matanyone2_node: ['matanyone2_node', 'Klonuje węzeł ComfyUI-MatAnyone2 (github.com/spiritform/comfy-matanyone2) do custom_nodes ComfyUI (jeśli go nie ma), instaluje jego wymagania i uruchamia jego install.py w Pythonie ComfyUI (pakiet matanyone2 z GitHub pq-yang/MatAnyone2, hydra-core, thinplate; kilka MB, PyTorch bez zmian).'],
         install_lama: ['lama', 'Pobiera big-lama.pt (~196 MB) do models/inpaint (opcjonalne).'],
@@ -1820,10 +1922,10 @@ class MatteDeskViewer {
         install_depthcrafter_nodes: ['depthcrafter_nodes', 'Klonuje węzły DepthCrafter (github.com/akatz-ai/ComfyUI-DepthCrafter-Nodes) do custom_nodes ComfyUI i instaluje ich wymagania. Wymagane teraz: nie (tylko funkcja „Głębia”). Do czego: mapa głębi ujęcia (etap 0). Model ok. 4–6 GB pobierze się sam przy 1. użyciu.'],
         install_minimax_nodes: ['minimax_nodes', 'Klonuje węzły MiniMax-Remover (github.com/1038lab/ComfyUI-MiniMax-Remover) do custom_nodes ComfyUI i instaluje ich wymagania. Wymagane teraz: nie – moduł Inpainting jest dopiero w planach. Do czego: usuwanie obiektów z wideo. Wagi 2,6 GB – osobny przycisk.'],
         install_minimax_weights: ['minimax_weights', 'Wymagane teraz: nie – moduł Inpainting jest dopiero w planach. Pobiera wagi MiniMax-Remover (2,6 GB: transformer 2,15 GB + vae 0,48 GB) z huggingface.co/zibojia/minimax-remover do models/MiniMax-Remover.'],
-        install_vhs_nodes: ['vhs_nodes', 'Wymagane teraz: TAK – ujęcia 8-bitowe (PNG/JPG) w SAM3, MatAnyone2 i strefach (węzeł VHS_LoadImagesPath). Klonuje ComfyUI-VideoHelperSuite (github.com/Kosinkadink/ComfyUI-VideoHelperSuite, ok. 1 MB) do custom_nodes ComfyUI i instaluje jego wymagania w Pythonie ComfyUI (imageio-ffmpeg ok. 30 MB; opencv zwykle już jest).'],
+        install_vhs_nodes: ['vhs_nodes', 'Wymagane teraz: TAK – ujęcia 8-bitowe (PNG/JPG) w SAM 3.1, MatAnyone2 i strefach (węzeł VHS_LoadImagesPath). Klonuje ComfyUI-VideoHelperSuite (github.com/Kosinkadink/ComfyUI-VideoHelperSuite, ok. 1 MB) do custom_nodes ComfyUI i instaluje jego wymagania w Pythonie ComfyUI (imageio-ffmpeg ok. 30 MB; opencv zwykle już jest).'],
         install_inpaint_nodes: ['inpaint_nodes', 'Klonuje comfyui-inpaint-nodes (github.com/Acly) do custom_nodes ComfyUI (opcjonalne).'],
         install_videomama: ['videomama', 'Wymagane teraz: nie – tylko etap 4 „VideoMaMa” (opcjonalny). Do czego: kosmyki włosów i detal krawędzi z maski 1+2. Klonuje węzeł ComfyUI-VideoMaMa (github.com/okdalto/ComfyUI-VideoMaMa) do custom_nodes ComfyUI i pobiera 7,1 GB wag (UNet VideoMaMa 6,1 GB z huggingface.co/SammyLim/VideoMaMa + image encoder i VAE SVD-xt 1,5 GB) do models/videomama. Po instalacji węzła – restart ComfyUI.'],
-        install_ltx: ['ltx', 'Wymagane teraz: nie – tylko etap 7 „LTX Alpha-Gen” (opcjonalny). Do czego: generatywna alfa włosów, dymu, rozmycia ruchu. Pobiera ok. 40 GB (transformer int8 21,5 GB, Gemma int8 15,4 GB, VAE 1,8 GB, LoRA Alpha-Gen 1,3 GB) z huggingface.co/Lightricks do models/ (przerwane pobieranie wznawia się). Wymaga logowania do Hugging Face („hf auth login”) i „Agree and Access” na stronach Lightricks/LTX-2.5 i Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen.'],
+        install_ltx: ['ltx', 'Wymagane teraz: nie – tylko etap 7 „LTX-2.5 Alpha-Gen” (opcjonalny). Do czego: generatywna alfa włosów, dymu, rozmycia ruchu. Pobiera ok. 40 GB (transformer int8 21,5 GB, Gemma int8 15,4 GB, VAE 1,8 GB, LoRA Alpha-Gen 1,3 GB) z huggingface.co/Lightricks do models/ (przerwane pobieranie wznawia się). Wymaga logowania do Hugging Face („hf auth login”) i „Agree and Access” na stronach Lightricks/LTX-2.5 i Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen.'],
       };
       const required = [];   // items with an install action -> "Zainstaluj wszystkie brakujące"
       let nRequired = 0;
@@ -1836,15 +1938,15 @@ class MatteDeskViewer {
         // not items only waiting for a ComfyUI restart
         // MiniMax-Remover: future Inpainting module, not used by the program yet -> only its own buttons
         // LTX-2.5: optional stage 6, ~40 GB behind a Hugging Face login -> only its own button
-        const notInBatch = ['minimax_nodes', 'minimax_weights', 'ltx', 'videomama'];
+        const notInBatch = ['minimax_nodes', 'minimax_weights', 'ltx', 'videomama', 'birefnet'];
         if (act && !isRestart && !notInBatch.includes(act[0]) && (it.status === 'error' || it.status === 'warning')
             && !required.some((r) => r[0] === act[0])) { required.push(act); if (it.status === 'error') nRequired++; }
         // third-party licence: the user downloads the component and accepts its licence (non-commercial ones highlighted)
         const licEsc = (it.license || '').replace(/"/g, '&quot;');
         const licAsk = it.license ? ` Licencja: ${licEsc}${it.license_nc ? ' (NIE do pracy komercyjnej)' : ''} – pobierając, akceptujesz ją.` : '';
         const licLine = !it.license ? '' : it.license_nc
-          ? `<br><small style="color:#f87171;">⚠ Licencja: ${it.license} – nie do pracy komercyjnej. Pobierasz i akceptujesz ją sam (THIRD_PARTY_LICENSES.md).</small>`
-          : `<br><small style="color:#9a9aa0;">Licencja: ${it.license}</small>`;
+          ? `<br><small style="color:#f87171;">⚠ ${it.license} – tylko niekomercyjnie</small>`
+          : `<br><small style="color:#9a9aa0;">${it.license} – <span style="color:#10b981;">komercyjnie OK</span></small>`;
         const btn = it.action === 'start_comfy'
           ? `<br><button class="btn doctor-start-comfy" style="margin-top:4px;padding:2px 10px;font-size:12px;background:#10b981;color:#06281d;font-weight:700;border:0;">▶ Uruchom ComfyUI</button>`
           : !act ? '' : isRestart
@@ -2041,10 +2143,12 @@ class MatteDeskViewer {
       this.cleanBadgeStatus.textContent = `Wyczyszczony (-${rep.reduction_pct}%)`;
     } else {
       this.cleanBadgeStatus.className = 'badge badge-warning';
-      this.cleanBadgeStatus.textContent = 'Wymagane czyszczenie';
+      this.cleanBadgeStatus.textContent = `Częściowo (-${rep.reduction_pct}%)`;
     }
 
-    const stagesStr = rep.stages_applied ? rep.stages_applied.join(' + ') : 'Deflicker v10';
+    const STAGE_NAMES = { stage1_local_mc: 'jasność obszarów', stage2_tiles_mc: 'kratka 9×6', stage4_global_mc: 'cała klatka',
+                          stage3_detail_mc: 'migotanie faktury i cieni', denoise_mc: 'odszumianie w czasie' };
+    const stagesStr = rep.stages_applied ? rep.stages_applied.map((s) => STAGE_NAMES[s] || s).join(' + ') : 'Deflicker';
     this.cleanSummaryText.textContent = `Raport dla ${rep.plate_name}: Zastosowano ${stagesStr}. Redukcja migotania: ${rep.reduction_pct}%. Zakres wzmocnienia: ${rep.gain_min} - ${rep.gain_max}.`;
     this.cleanMetricsGrid.style.display = 'grid';
 
@@ -2102,13 +2206,57 @@ class MatteDeskViewer {
     }
   }
 
+  // Texture flicker (stage 3) and denoise rebuild pixels: only an EXR export carries them, so they are disabled
+  // (and unchecked) for the Nuke Group
+  syncCleanExrOnly() {
+    const exr = this.cleanExportModeSelect.value !== 'nuke_group';
+    for (const cb of [this.cleanStage3Checkbox, this.cleanDenoiseCheckbox]) {
+      cb.disabled = !exr;
+      if (!exr) cb.checked = false;
+      cb.closest('label').style.opacity = exr ? '' : '0.5';
+    }
+    const note = document.getElementById('cleanExrOnlyNote');
+    if (note) note.style.display = exr ? 'none' : '';
+    const row = document.getElementById('cleanExrDirRow');
+    if (row) row.style.display = exr ? '' : 'none';
+    if (exr) this.loadCleanExrDir();
+  }
+
+  // default EXR folder of the selected plate (<plate folder>_deflicker / _deflicker_dn); a folder the user typed or picked stays
+  async loadCleanExrDir() {
+    if (!this.cleanExrDirInput || this.cleanExrDirUser) return;
+    try {
+      const plate = this.cleanPlateSelect.value;
+      const res = await fetch(`/api/plate/clean/exr_dir?plate=${encodeURIComponent(plate)}&denoise=${this.cleanDenoiseCheckbox.checked}`);
+      const api = await readApiResponse(res);
+      if (api.ok && api.data.path) this.cleanExrDirInput.value = api.data.path;
+    } catch (e) { /* no project yet */ }
+  }
+
+  async pickCleanExrDir() {
+    try {
+      const res = await fetch('/api/dialog/pick_folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: window.mdT ? window.mdT('Katalog zapisu EXR po deflickerze') : 'Katalog zapisu EXR po deflickerze', initial_dir: this.cleanExrDirInput.value })
+      });
+      const data = await res.json();
+      if (data.folder) { this.cleanExrDirInput.value = data.folder; this.cleanExrDirUser = true; }
+    } catch (e) {
+      console.warn('Native picker failed:', e);
+    }
+  }
+
   async runPlateClean() {
     const plate = this.cleanPlateSelect.value;
-    const mode = this.cleanExportModeSelect.value;
+    // EXR with denoise goes to <plate>_deflicker_dn/, without to <plate>_deflicker/
+    const mode = this.cleanExportModeSelect.value === 'nuke_group' ? 'nuke_group'
+      : (this.cleanDenoiseCheckbox.checked ? 'exr_deflicker_dn' : 'exr_deflicker');
     let confirmed = false;
 
+    const exrDir = mode !== 'nuke_group' && this.cleanExrDirInput ? this.cleanExrDirInput.value.trim() : '';
     if (mode !== 'nuke_group') {
-      confirmed = await this.uiConfirm(`Wybrano tryb zapisu pełnych plików EXR (${mode}). Zapisać wygenerowane klatki w folderze projektu?`, { title: 'Zapisać pełne klatki EXR?', ok: 'Zapisz', tone: 'info' });
+      confirmed = await this.uiConfirm(`Zapisać pełne klatki EXR po deflickerze do:\n${exrDir || '(katalog domyślny obok plate\'u)'}\n\nIstniejące pliki o tych samych nazwach zostaną nadpisane.`, { title: 'Zapisać pełne klatki EXR?', ok: 'Zapisz', tone: 'info' });
       if (!confirmed) return;
     }
 
@@ -2129,7 +2277,9 @@ class MatteDeskViewer {
           enable_stage3: this.cleanStage3Checkbox.checked,
           enable_stage4: this.cleanStage4Checkbox.checked,
           enable_denoise: this.cleanDenoiseCheckbox.checked,
+          ...(window.deflickerPalette ? window.deflickerPalette.knobs() : {}),   // palette: window / iterations / sigma / luma, no early stop
           export_mode: mode,
+          exr_dir: exrDir || null,
           confirmed: confirmed
         })
       });
@@ -2137,10 +2287,12 @@ class MatteDeskViewer {
       const data = api.data;
       if (api.ok && data.success && data.report) {
         this.displayCleanReport(data.report);
-        this.showToast(`Czyszczenie plate'u ${plate} zakończone sukcesem (-${data.report.reduction_pct}%)!`);
-        if (data.nk_script_path) {
-          alert(`Wygenerowano węzeł Nuke:\n${data.nk_script_path}\n\nGroup Deflicker_${plate} jest gotowy do podpięcia pod Read w Nuke.`);
-        }
+        this.showToast(`Deflicker plate'u ${plate} zakończony (-${data.report.reduction_pct}%)`);
+        if (data.notes && data.notes.length) alert(data.notes.join('\n'));
+        const msg = [];
+        if (data.export_dir) msg.push(`Zapisano ${data.exr_written} klatek EXR do:\n${data.export_dir}`);
+        if (data.nk_script_path) msg.push(`Wygenerowano węzeł Nuke:\n${data.nk_script_path}\n\nGroup Deflicker_${plate} jest gotowy do podpięcia pod Read w Nuke${data.export_dir ? ' (przy EXR niepotrzebny – czytaj zapisane klatki)' : ''}.`);
+        if (msg.length) alert(msg.join('\n\n'));
       } else {
         alert(`Błąd: ${api.error || 'Nie udało się zakończyć czyszczenia'}`);
       }
@@ -2630,8 +2782,15 @@ class MatteDeskViewer {
     console.log('[MatteDesk]', msg);
     let t = document.getElementById('mdToast');
     if (!t) { t = document.createElement('div'); t.id = 'mdToast'; t.className = 'md-toast'; document.body.appendChild(t); }
+    // low on the screen, just above the timeline / job bar where the eye is (user 2026-10-22: the top one was missed)
+    const foot = document.querySelector('.app-footer');
+    const jobBar = document.getElementById('jobBar');
+    const barUp = jobBar && getComputedStyle(jobBar).display !== 'none';
+    t.style.bottom = `${Math.round((foot ? foot.getBoundingClientRect().height : 0) + (barUp ? 56 : 16))}px`;
+    const err = /^\s*(Błąd|Error|⚠|✗|❌)/.test(String(msg));
+    t.classList.toggle('md-toast-err', err);
     t.textContent = msg; t.style.display = 'block';
-    clearTimeout(this._toastT); this._toastT = setTimeout(() => { t.style.display = 'none'; }, ms);
+    clearTimeout(this._toastT); this._toastT = setTimeout(() => { t.style.display = 'none'; }, err ? Math.max(ms, 7000) : ms);
   }
 }
 

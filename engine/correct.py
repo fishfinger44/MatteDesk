@@ -3,11 +3,11 @@
 """engine/correct.py - local correction of a frame mask (stage 3, user request 2026-10-12).
 
 The user clicks only where the mask is wrong:
-  + in a hole / a missed part  -> SAM3 is asked again (seed points from the current mask + the click) and ONLY the
+  + in a hole / a missed part  -> SAM 3.1 is asked again (seed points from the current mask + the click) and ONLY the
                                   new region connected to the click is added,
-  - on a leak                   -> SAM3 with a negative point; ONLY the part of the current mask that SAM3 drops and
+  - on a leak                   -> SAM 3.1 with a negative point; ONLY the part of the current mask that SAM 3.1 drops and
                                   that touches the click is removed.
-Everything else stays bit-identical to the current mask (key of the frame, else the SAM3 core).
+Everything else stays bit-identical to the current mask (key of the frame, else the SAM 3.1 core).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import numpy as np
 
 def seed_points(mask: np.ndarray, n: int = 8, exclude: Optional[Sequence[float]] = None,
                 exclude_r: float = 0.0) -> List[List[float]]:
-    """Up to `n` points deep inside `mask` (distance-transform maxima, spread apart) - they tell SAM3 which object
+    """Up to `n` points deep inside `mask` (distance-transform maxima, spread apart) - they tell SAM 3.1 which object
     it is. Points closer than `exclude_r` to `exclude` are skipped (e.g. around a negative click)."""
     b = (mask > 0.5).astype(np.uint8)
     if not b.any():
@@ -77,7 +77,7 @@ def component_at(region: np.ndarray, point: Sequence[float], snap_px: float = 12
 
 def local_correction(base: np.ndarray, sam: np.ndarray, point: Sequence[float], mode: str,
                      snap_px: float = 12.0) -> Tuple[np.ndarray, np.ndarray]:
-    """base = current mask, sam = SAM3 mask for (seeds + click). Returns (new mask, changed region).
+    """base = current mask, sam = SAM 3.1 mask for (seeds + click). Returns (new mask, changed region).
     add: only the part of (sam - base) connected to the click is added; remove: only the part of (base - sam)
     under the click is removed. Pixels outside the changed region are exactly `base`."""
     b, m = base > 0.5, sam > 0.5

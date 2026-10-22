@@ -22,6 +22,7 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 os.environ.setdefault("MD_ALIGN_DEVICE", "cpu")
 os.environ.setdefault("MD_MODEL_GATE", "0")      # model gate of the stages (engine/stage_models.py): off – synthetic tests have no models
 os.environ.setdefault("MD_MB_DEVICE", "cpu")      # motion blur of the alpha: the same (tests/test_motion_blur.py asks for gpu)
+os.environ.setdefault("MD_SHARED_PROBE", "0")   # spilled-GPU-memory counter in the MatAnyone2 probe (engine/refine.py): off, no PowerShell in tests
 
 REAL_DATA_ROOT = Path(os.environ.get("MATTE_DESK_REAL_ROOT", "C:\\shots\\SH010\\frame_####.exr"))
 

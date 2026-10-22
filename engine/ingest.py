@@ -47,7 +47,7 @@ def tonemap_plate_to_display(img_linear: np.ndarray, white: float = 1.0) -> np.n
 
 
 def plate_to_display_float(img_linear: np.ndarray, white: float = 1.0) -> np.ndarray:
-    """Same PlateToDisplay curve as float32 0..1 – the input of SAM3 / MatAnyone / LTX and of measurements."""
+    """Same PlateToDisplay curve as float32 0..1 – the input of SAM 3.1 / MatAnyone2 / LTX-2.5 and of measurements."""
     x = np.maximum(img_linear, 0.0) / float(white)
     x = (x / (x + 0.6)) * 1.6
     return (np.clip(x, 0.0, 1.0) ** (1.0 / 1.6)).astype(np.float32)
@@ -190,6 +190,8 @@ class MediaInspector:
         raw = path_or_pattern.strip().replace("\\", "/")
         if not raw:
             return {"pattern": "", "exists": False, "frame_count": 0}
+        # Nuke / ffmpeg printf pattern (plate.%04d.exr) -> hash pattern
+        raw = re.sub(r"%0?(\d*)d", lambda m: "#" * max(1, int(m.group(1) or 1)), raw)
 
         # If it's already a pattern with '#'
         if "#" in raw:
@@ -313,6 +315,34 @@ def video_to_sequence(path: Union[str, Path], work_dir: Union[str, Path], first_
     return decode_video(path, out, first_frame=first_frame)
 
 
+def renumber_sequence(pattern: str, src_first: int, src_last: int, new_first: int,
+                      out_dir: Union[str, Path]) -> Dict[str, Any]:
+    """Sequence `pattern` src_first..src_last -> the same frames numbered from `new_first` in `out_dir` (like mocha's
+    start frame). Hard links (no copy, same pixels); a copy only when the target is on another drive. Missing source
+    frames stay missing. An existing renumbered set is reused. Returns {pattern, first_frame, last_frame, linked}."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    name = Path(pattern).name
+    ext = Path(name).suffix
+    stem = re.split(r"[_.-]?(?:#+|%0?\d*d)", name)[0] or "frame"
+    pad = max(4, len(str(new_first + src_last - src_first)))
+    linked = True
+    for f in range(src_first, src_last + 1):
+        src = ProxyGenerator.resolve_frame_path(pattern, f)
+        dst = out / f"{stem}.{new_first + f - src_first:0{pad}d}{ext}"
+        if not src.is_file() or (dst.is_file() and dst.stat().st_size == src.stat().st_size):
+            continue
+        if dst.exists():
+            dst.unlink()
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+            linked = False
+    return {"pattern": str(out / f"{stem}.{'#' * pad}{ext}").replace("\\", "/"), "first_frame": new_first,
+            "last_frame": new_first + src_last - src_first, "linked": linked}
+
+
 class ProjectCreator:
     """Initializes a MatteDesk project inside <work>/matte_desk/ (manifest is read-only)."""
 
@@ -433,7 +463,8 @@ class ProjectCreator:
         source_type: str = "exr_seq",
         bit_depth: int = 16,
         backlit_pattern: str = "",
-        cleanplate_pattern: str = ""
+        cleanplate_pattern: str = "",
+        source_first_frame: Optional[int] = None
     ) -> Dict[str, Any]:
         """Generate shot_manifest_<shot>.json from template (new-shot wizard only, never overwrites)."""
         manifest = {
@@ -458,6 +489,9 @@ class ProjectCreator:
             "work": work_dir,
             "objects": []
         }
+        if source_first_frame is not None and int(source_first_frame) != int(first_frame):
+            # shot renumbered at import (plates linked into <work>/source/*_from<first>): original file numbering
+            manifest["source_first"] = int(source_first_frame)
 
         target_file = Path(work_dir) / f"shot_manifest_{shot_name}.json"
         if target_file.exists():
@@ -476,9 +510,7 @@ class ProxyGenerator:
     @staticmethod
     def resolve_frame_path(pattern: str, frame_num: int) -> Path:
         """Replace #### or %04d in pattern with zero-padded frame number."""
-        if "####" in pattern:
-            return Path(pattern.replace("####", f"{frame_num:04d}"))
-        elif "#" in pattern:
+        if "#" in pattern:
             hashes = len(re.findall(r"#+", pattern)[0])
             fmt = f"{{:0{hashes}d}}"
             return Path(re.sub(r"#+", fmt.format(frame_num), pattern))

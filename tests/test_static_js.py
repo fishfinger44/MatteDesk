@@ -258,7 +258,8 @@ def test_stage_layout_2026_10_15():
     keys = re.findall(r"\{ key: '(\w+)', id: '(\w+)'", src)
     assert keys == [("PLATES", "plates"), ("SAM3", "sam3"), ("BRUSH", "cotracker"), ("MATANYONE", "matanyone"),
                     ("VIDEOMAMA", "videomama"), ("VITMATTE", "vitmatte"), ("EXPERIMENTS", "final"), ("LTX", "ltx"),
-                    ("EXPORT", "export")]     # 2026-10-16: 4 VideoMaMa between MatAnyone and ViTMatte
+                    ("FINAL_TOUCH", "final_touch"), ("EXPORT", "export")]
+    # 2026-10-16: 4 VideoMaMa between MatAnyone and ViTMatte; 2026-10-22: 8 Final Touch (hand corrections) before Eksport
     assert "const ST = Object.fromEntries(STAGES.map((s) => [s.key, s.n]))" in src
     code = _strip_strings(src)
     assert not re.search(r"S\.stage\s*[=!<>]==?\s*\d", code), "numer etapu wpisany na sztywno (użyj ST.<klucz>)"
@@ -267,10 +268,17 @@ def test_stage_layout_2026_10_15():
         zc = _strip_strings((STATIC / z).read_text(encoding="utf-8"))
         assert not re.search(r"stage\s*[=!]==\s*\d", zc), z
     # every stage pane has its description at the top, every object stage has one in STAGES
-    assert src.count("${descHtml('") == 8
+    assert src.count("${descHtml('") == 9
     assert all(f"key: '{k}'" in src and "desc: '<b>Co robi:</b>" in src
-               for k in ("SAM3", "BRUSH", "MATANYONE", "VIDEOMAMA", "VITMATTE", "EXPERIMENTS", "LTX", "EXPORT"))
-    assert src.count("desc: '<b>Co robi:</b>") == 8 and src.count("<b>Najlepsze do:</b>") >= 7
+               for k in ("SAM3", "BRUSH", "MATANYONE", "VIDEOMAMA", "VITMATTE", "EXPERIMENTS", "LTX", "FINAL_TOUCH", "EXPORT"))
+    assert src.count("desc: '<b>Co robi:</b>") == 9 and src.count("<b>Najlepsze do:</b>") >= 8
+    # stage Final Touch: static/finaltouch.js, its pane, export source with base + corrections, Alpha = base + corrections
+    assert '<script src="/static/finaltouch.js"></script>' in HTML and HTML.index("brush.js") < HTML.index("finaltouch.js") < HTML.index("tips.js")
+    ft = (STATIC / "finaltouch.js").read_text(encoding="utf-8")
+    assert "/final_touch/frames/${f}`" in ft and "/final_touch/frame/${f}?b=" in ft and "MD_FT.ready = true" in ft
+    assert 'id="ftPanel"' in src and '<option value="final_touch"' in src and "window.MD_FT.matteRef(f)" in src
+    assert "window.MD_FT.onDraw(d.f)" in src and "window.MD_FT.undo(f)" in src and "window.MD_FT.deleteKeysAt(f)" in src
+    assert not re.search(r"stage\s*[=!]==\s*\d", _strip_strings(ft))
     # stage VideoMaMa: its own pane + palette, export source, ViTMatte base
     assert "/videomama`" in src and 'id="vmRun"' in src and 'id="vmStagePv"' in src and "videomama_preview" in src
     assert '<option value="videomama"' in src and src.count('<option value="videomama"') >= 2
@@ -343,3 +351,18 @@ def test_object_life_on_keys_lane():
     assert "uiConfirm" in js and "md-object-stages" in js
     obj = (STATIC / "objects.js").read_text(encoding="utf-8")
     assert "new CustomEvent('md-object-stages'" in obj and "window.MD_OBJ = " in obj and "life-hidden" in obj
+
+
+def test_one_mask_source_chooser_2026_10_21():
+    """User request 2026-10-21: the base mask is chosen the same way in every stage – one helper (fillMaskSelect, same
+    order / names / greyed-out state); each stage passes only the earlier stages it may use."""
+    js = (STATIC / "objects.js").read_text(encoding="utf-8")
+    assert "function fillMaskSelect(" in js and "function expBaseOptions" not in js
+    for call in ("fillMaskSelect($('vmBase'), ['core', 'matanyone']",
+                 "fillMaskSelect(bs, ['core', 'matanyone', 'videomama']",
+                 "fillMaskSelect(sel, ['core', 'matanyone', 'vitmatte'], { versions: 'experiment'",
+                 "fillMaskSelect(sel, ['core', 'matanyone', 'videomama', 'vitmatte', 'ltx'], { value: 'run', versions: 'all'",
+                 "fillMaskSelect(sel, ['core', 'matanyone', 'videomama', 'vitmatte', 'ltx'], { avail:"):
+        assert call in js, call
+    order = [js.index(f"{{ k: '{k}', label:") for k in ("core", "matanyone", "videomama", "vitmatte", "ltx")]
+    assert order == sorted(order)                    # one order everywhere: 1+2, 3, 4, 5, 7

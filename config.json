@@ -3,5 +3,6 @@
   "comfy_host": "127.0.0.1",
   "backend_host": "127.0.0.1",
   "backend_port": 8765,
-  "sam3_checkpoint": "sam3.1_multiplex_fp16.safetensors"
+  "sam3_checkpoint": "sam3.1_multiplex_fp16.safetensors",
+  "report_endpoint": "https://mattedesk-report.lechfish.workers.dev"
 }

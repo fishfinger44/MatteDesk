@@ -51,8 +51,18 @@ class ComfyClient:
         # failure detection in wait_for_prompt (Z19): Comfy down / prompt lost for this long -> error (not 30 min of silence)
         self.down_after_s = 10.0
         self.lost_after_s = 10.0
+        # Comfy that ACCEPTS the connection but does not answer (request timed out) is busy, not down: loading a
+        # 96-frame batch of 2688 px float EXR froze its HTTP server for > 10 s (SH010 2026-10-21) and the run was
+        # aborted as "ComfyUI nie odpowiada" although the process lived. Busy is tolerated this long.
+        self.busy_after_s = 900.0
         self._clock = time.monotonic       # injectable (tests: fake clock)
         self._sleep = time.sleep
+
+    @staticmethod
+    def is_timeout(err: Any) -> bool:
+        """The `_request` failure text of a request that timed out (connection accepted, no answer)."""
+        t = str(err).lower()
+        return "timed out" in t or "timeout" in t
 
     @classmethod
     def from_config(cls) -> "ComfyClient":
@@ -183,11 +193,13 @@ class ComfyClient:
         interrupted in Comfy and JobCancelled is raised. Failures are detected instead of waiting for the timeout (Z19):
         Comfy not answering for `down_after_s` -> kind "comfy_down"; our prompt neither queued nor in the history for
         `lost_after_s` (Comfy restarted) -> kind "lost"; execution_error -> readable message (GPU / RAM out of memory)
-        with the raw text in `raw_error`."""
+        with the raw text in `raw_error`. A request that TIMES OUT (the connection is accepted, no answer) means
+        Comfy is busy, not down: waited for up to `busy_after_s`, then kind "comfy_hung"."""
         from engine.jobs import JOBS, JobCancelled
         clock = self._clock
         start = clock()
         down_since: Optional[float] = None
+        busy_since: Optional[float] = None
         lost_since: Optional[float] = None
         while clock() - start < timeout_sec:
             if JOBS.cancelled():
@@ -195,7 +207,19 @@ class ComfyClient:
                 raise JobCancelled()
             elapsed = clock() - start
             st, data = self._request(f"/history/{prompt_id}")
-            if st == 0:   # connection refused / timeout: Comfy closed or crashed
+            if st == 0 and self.is_timeout(data):   # accepted, no answer in time: busy (e.g. loading inputs)
+                down_since = None
+                busy_since = busy_since if busy_since is not None else clock()
+                waited = clock() - busy_since
+                JOBS.update(comfy=f"ComfyUI zajęty – nie odpowiada od {waited:.0f}s (wczytuje dane?)",
+                            comfy_info={"state": "busy", "prompt": prompt_id})
+                if waited >= self.busy_after_s:
+                    msg = (f"ComfyUI nie odpowiada od {waited / 60:.0f} min, choć działa (zawieszony?) – "
+                           "zrestartuj go i policz ponownie")
+                    JOBS.update(comfy=msg, comfy_info={"state": "hung", "prompt": prompt_id, "error": msg})
+                    return {"success": False, "error": msg, "kind": "comfy_hung"}
+            elif st == 0:   # connection refused: Comfy closed or crashed
+                busy_since = None
                 down_since = down_since if down_since is not None else clock()
                 JOBS.update(comfy=f"ComfyUI nie odpowiada · {clock() - down_since:.0f}s",
                             comfy_info={"state": "down", "prompt": prompt_id})
@@ -204,7 +228,7 @@ class ComfyClient:
                     JOBS.update(comfy=msg, comfy_info={"state": "down", "prompt": prompt_id, "error": msg})
                     return {"success": False, "error": msg, "kind": "comfy_down"}
             else:
-                down_since = None
+                down_since = busy_since = None
                 hist = data.get(prompt_id, data) if st == 200 and isinstance(data, dict) else None
                 if hist:
                     status_info = hist.get("status", {}) if isinstance(hist, dict) else {}

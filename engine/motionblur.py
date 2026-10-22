@@ -182,6 +182,52 @@ def motion_blur_alpha(alpha: np.ndarray, g: np.ndarray, g_prev: Optional[np.ndar
     return vector_blur(alpha, vx, vy, k, min_px, max_px)
 
 
+def motion_blur_measured(alpha: np.ndarray, g: np.ndarray, g_prev: Optional[np.ndarray], g_next: Optional[np.ndarray],
+                         shutter_deg: float, strength: float, measured: bool = True,
+                         min_px: float = MB_DEFAULTS["min_px"], max_px: float = MB_DEFAULTS["max_px"],
+                         gpu: Any = None, cache: Any = None, frame: Optional[int] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """The hybrid (engine/mb_map.py, user decision 2026-10-22): direction from the object's velocity, strength per edge
+    segment measured on the plate (ratio map m) x `strength`; `measured=False` = one strength everywhere.
+    The velocity is computed once and shared by the measurement and the blur; `cache` (engine/mb_map.MbCache, with
+    `frame`) keeps the velocity and the ratio map at flow scale per frame – a slider move costs only the blur. The
+    ratio map always goes through flow scale (down + up), so a cached frame equals a fresh one. GPU: the ratio is
+    folded into the velocity field at flow scale, so the worker needs no change."""
+    k = float(shutter_deg) / 360.0 * float(strength)
+    if k <= 0:
+        return alpha.astype(np.float32), {"moving_px": 0, "max_px": 0.0, "samples": 0}
+    from engine.mb_map import MbCache, strength_map
+    reach = max_px * 0.5 + 2.0
+    mask = alpha > 0.5
+    h, w = mask.shape
+    s = min(1.0, FLOW_SIDE / float(max(w, h)))
+    sw, sh = max(8, int(round(w * s))), max(8, int(round(h * s)))
+    msmall = cv2.resize(mask.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST) if s < 1.0 else mask.astype(np.uint8)
+    key = MbCache.key(frame, msmall, shutter_deg if measured else 0.0) if (cache is not None and frame is not None) else None
+    hit = cache.get(key) if key else None
+    mst: Dict[str, Any] = {}
+    if hit is not None and (not measured or hit.get("m") is not None):
+        vs, s, ms = hit["vs"], hit["s"], hit.get("m")
+        mst = {"cached": 1}
+    else:
+        vs, s = velocity_small(mask, g, g_prev, g_next, reach)
+        if vs is None:
+            return alpha.astype(np.float32), {"moving_px": 0, "max_px": 0.0, "samples": 0, "measured": 0}
+        ms = None
+        if measured:
+            vf = vs if s >= 1.0 else cv2.resize(vs, (w, h), interpolation=cv2.INTER_LINEAR) / s
+            m_full, mst = strength_map(alpha, g, np.ascontiguousarray(vf[..., 0]), np.ascontiguousarray(vf[..., 1]), shutter_deg)
+            ms = m_full if s >= 1.0 else cv2.resize(m_full, (vs.shape[1], vs.shape[0]), interpolation=cv2.INTER_AREA)
+        if key:
+            cache.put(key, vs, s, ms)
+    vsm = vs if ms is None else (vs * ms[..., None]).astype(np.float32)   # the ratio folded into the velocity
+    if gpu is not None:
+        out, st = vector_blur_gpu(gpu, alpha, vsm, s, k, min_px, max_px)
+    else:
+        vf = vsm if s >= 1.0 else cv2.resize(vsm, (w, h), interpolation=cv2.INTER_LINEAR) / s
+        out, st = vector_blur(alpha, np.ascontiguousarray(vf[..., 0]), np.ascontiguousarray(vf[..., 1]), k, min_px, max_px)
+    return out, {**st, **{f"map_{kk}": v for kk, v in mst.items()}}
+
+
 def mb_device(requested: Optional[str] = None) -> Tuple[str, str]:
     """('gpu' | 'cpu', note) for „Zastosuj motion blur”: `requested` > env MD_MB_DEVICE (tests: cpu) > config
     `mb_device` (auto). auto = GPU when ComfyUI's Python has CUDA and ComfyUI's queue is idle."""

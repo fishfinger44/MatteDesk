@@ -58,17 +58,21 @@ function run(avail, widths) {
   const shown = new Set(Object.keys(widths));
   const total = () => [...shown].reduce((s, k) => s + widths[k], 0) + (shown.size < Object.keys(widths).length ? 40 : 0);
   const folded = fitItems(FOLD_ORDER.filter(k => k in widths), () => total() > avail,
-                          k => shown.delete(k), () => Object.keys(widths).forEach(k => shown.add(k)));
+                          k => shown.delete(k), () => Object.keys(widths).forEach(k => shown.add(k)), k => shown.add(k));
   return { folded, fits: total() <= avail };
 }
-const w = { overlayStyle: 280, shotInfoPill: 300, plateSelectorPill: 330, comfyStatusIndicator: 60, rest: 600 };
-console.log(JSON.stringify([run(5000, w), run(1300, w), run(1000, w), run(680, w), run(300, w)]));
+// 2026-10-22 (evening): the shot info, the ComfyUI status and the language left the top bar for the compare row
+const w = { reportBtn: 130, overlayStyle: 280, plateSelectorPill: 330, rest: 600 };
+const w2 = { reportBtn: 130, overlayStyle: 180, plateSelectorPill: 330, rest: 600 };
+console.log(JSON.stringify([run(5000, w), run(1300, w), run(1000, w), run(680, w), run(300, w), run(1400, w2)]));
 """
     r = subprocess.run([node, "-e", script, str(STATIC / "header_fit.js")], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
-    wide, mid, narrow, tiny, impossible = json.loads(r.stdout)
+    wide, mid, narrow, tiny, impossible, overlay = json.loads(r.stdout)
+    assert overlay == {"folded": [], "fits": True}                            # everything fits
     assert wide == {"folded": [], "fits": True}
-    assert mid["folded"] == ["overlayStyle", "shotInfoPill"] and mid["fits"]  # least important first, stops once it fits
-    assert narrow["folded"] == ["overlayStyle", "shotInfoPill", "plateSelectorPill"] and narrow["fits"]
+    # least important first, stops once it fits
+    assert mid["folded"] == ["reportBtn"] and mid["fits"]
+    assert narrow["folded"] == ["reportBtn", "overlayStyle"] and narrow["fits"]
     assert tiny["folded"] == _fold_order() and tiny["fits"]
     assert impossible["folded"] == _fold_order() and not impossible["fits"]  # never loops, never folds the rest

@@ -1,8 +1,8 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-r"""engine/corestab.py - temporal stabilisation of the binary SAM3 core before the edge mode / zone trimaps
+r"""engine/corestab.py - temporal stabilisation of the binary SAM 3.1 core before the edge mode / zone trimaps
 (user decision 2026-10-13 after the CLIP2_A flicker split: the core edge jumps ~8 % of the 4 px rim per frame even after
-motion compensation, the base MatAnyone edge inherits it, the zone trimap too).
+motion compensation, the base MatAnyone2 edge inherits it, the zone trimap too).
 
 `stabilize_core(cores, gray, radius=2, band_px=8, keys=())`: for frame i the cores of frames i±1..i±radius are warped
 INTO frame i by DIS optical flow measured on the display gray (crop around the union of the cores + margin, so a 1080p
@@ -49,7 +49,8 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
                    progress: Optional[Callable[[int, int], None]] = None,
                    probs: Optional[Dict[int, np.ndarray]] = None, flip_margin: float = 0.0,
                    protect_thin: bool = True,
-                   probs_out: Optional[Dict[int, np.ndarray]] = None) -> Tuple[Dict[int, np.ndarray], Dict[str, float]]:
+                   probs_out: Optional[Dict[int, np.ndarray]] = None,
+                   only: Optional[Iterable[int]] = None) -> Tuple[Dict[int, np.ndarray], Dict[str, float]]:
     """Returns (stabilised cores, stats {changed_px_per_frame, frames, mode}).
 
     Two guards against eroding what is not jitter (synthetic puppet 2026-10-14: a 2-4 px antenna vanished entirely,
@@ -60,15 +61,18 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
     puppet antenna, CLIP2_A): thin protection alone keeps the full gain (CLIP2_A rim 0.133 -> 0.096, antenna 0 % lost);
     a margin of 0.1-0.2 halves the jitter repair and most of the gain -> default margin 0.
 
-    `probs` (frame -> SAM3 soft probabilities, uint8 0..255 or float 0..1, full frame): PROBABILITY mode – the aligned
+    `probs` (frame -> SAM 3.1 soft probabilities, uint8 0..255 or float 0..1, full frame): PROBABILITY mode – the aligned
     window averages the probabilities with per-pixel confidence weights |2p - 1| (+0.05 so the centre always counts;
     an uncertain 0.5 barely votes, as the entropy weighting of inference-time temporal probability smoothing) and the
     core becomes `average > 0.5` inside the band. Frames without a map fall back to their binary core (p = 0 / 1).
 
     `probs_out` (dict, filled in place; probability mode only): the STABILISED probability map of every frame that has a
     soft map and is not a key – the aligned average inside the band, the frame's own p elsewhere – as uint8, made
-    consistent with the returned binary core (consistent_soft). The soft start of the edge band (MatAnyone CoreCombine
-    core_mode=soft, ViTMatte zone trimap; user decision 2026-10-14)."""
+    consistent with the returned binary core (consistent_soft). The soft start of the edge band (MatAnyone2 CoreCombine
+    core_mode=soft, ViTMatte zone trimap; user decision 2026-10-14).
+
+    `only` (previews of one frame, 2026-10-22): stabilise just these frames – the others come back as they are (the
+    neighbours still vote; the result of an `only` frame is the same as without `only`); flows only for its window."""
     frames = sorted(cores)
     n = len(frames)
     if n < 3 or radius < 1:
@@ -91,6 +95,7 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
         p = p[y0:y1, x0:x1]
         return (p.astype(np.float32) / 255.0) if p.dtype == np.uint8 else np.clip(p, 0, 1).astype(np.float32)
     keys = set(int(k) for k in keys)
+    only_set = None if only is None else set(int(f) for f in only)
     x0, y0, x1, y1 = _crop_box(cores, margin)
     h, w = y1 - y0, x1 - x0
     dis = cv2.DISOpticalFlow_create(preset)
@@ -110,6 +115,18 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
             flows[k] = dis.calc(gray8(frames[i]), gray8(frames[j]), None)
         return flows[k]
 
+    if only_set is not None:   # a preview: the few flows of its window at once on several cores (cv2 releases the GIL)
+        pairs = sorted({pq for i, f in enumerate(frames) if f in only_set and f not in keys
+                        for d in range(-radius, radius + 1) if d and 0 <= i + d < n for pq in ((i, i + d), (i + d, i))})
+        if len(pairs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            for i in sorted({q for pq in pairs for q in pq}):
+                gray8(frames[i])
+
+            def calc(pq):
+                return pq, cv2.DISOpticalFlow_create(preset).calc(g8[frames[pq[0]]], g8[frames[pq[1]]], None)
+            with ThreadPoolExecutor(max_workers=min(8, len(pairs))) as ex:
+                flows.update(dict(ex.map(calc, pairs)))
     gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     out: Dict[int, np.ndarray] = {}
     changed = 0
@@ -117,7 +134,7 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
         if progress is not None:
             progress(i + 1, n)
         c = cores[f]
-        if f in keys:
+        if f in keys or (only_set is not None and f not in only_set):
             out[f] = c.copy()
             continue
         cc = c[y0:y1, x0:x1].astype(np.float32)

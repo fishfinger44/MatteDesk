@@ -78,7 +78,8 @@
     const ram = d.comfy && d.comfy.ram;
     if (ram && ram.total) out.push(barRow('RAM', 1 - ram.free / ram.total, `${gb(ram.total - ram.free)} / ${gb(ram.total)} GB`));
     let cs;
-    if (!d.comfy || !d.comfy.alive) cs = '<span class="err">Comfy: nie odpowiada</span>';
+    if (ci.state === 'busy') cs = `<span class="warn">${esc(d.job.comfy || 'Comfy: zajęty – wczytuje dane')}</span>`;   // alive, HTTP blocked
+    else if (!d.comfy || !d.comfy.alive) cs = '<span class="err">Comfy: nie odpowiada</span>';
     else if (ci.state === 'ours') cs = 'Comfy: liczy NASZE zadanie';
     else if (ci.state === 'foreign') cs = `<span class="warn">Comfy: liczy CUDZE zadanie, nasze czeka (${ci.ahead} przed nami)</span>`;
     else if (ci.state === 'queued') cs = `Comfy: nasze w kolejce (${ci.ahead} przed nami)`;
@@ -88,7 +89,7 @@
     out.push(`<div class="r">${cs}${q ? ` · kolejka: ${q.running.length} liczy, ${q.pending.length} czeka` : ''}</div>`);
     if (d.job) {
       const j = d.job;
-      out.push(`<div class="r">${esc(j.step || j.label)}${j.total ? ` · ${j.done}/${j.total}` : ''}${j.eta_s != null ? ` · ETA ${mmss(j.eta_s)}` : ''}</div>`);
+      out.push(`<div class="r">${esc(j.step || j.label)}${j.total ? ` · ${j.unit === 'pct' ? `${Math.round((100 * j.done) / j.total)} %` : `${j.done}/${j.total}`}` : ''}${j.eta_s != null ? ` · ETA ${mmss(j.eta_s)}` : ''}</div>`);
       if (ci.error) out.push(`<div class="r err">${esc(ci.error)}</div>${ci.raw_error ? `<details><summary>surowy komunikat</summary><pre>${esc(JSON.stringify(ci.raw_error, null, 1))}</pre></details>` : ''}`);
     }
     return out.join('');
@@ -150,7 +151,9 @@
     '#btnMeasureClean', '#btnRunClean', '#btnRunCameraTrack', '#btnDepthRun', '#st1Detect', '#st2Crops',
     '#st3Run', '#st3Rerun', '#st4Final', '#z4ApplyShot', '#z4CpAuto', '#st5Export', '#st5ExportOne', '#st5ExportWhole', '#st5QRun', '.doctor-install', '#btnSavePlate',
     // newer stage buttons and the floating palettes (2026-10-16: "Run MatAnyone" on the palette did nothing visible during VideoMaMa)
-    '#st1All', '#ppAll', '#st3Ma', '#epCompute', '#vmRun', '#lx6Run', '#exAnalyze', '#exCompute', '#zpApply', '#b2Apply'].join(',');
+    '#st1All', '#ppAll', '#st3Ma', '#epCompute', '#vmRun', '#lx6Run', '#exAnalyze', '#exCompute', '#zpApply', '#b2Apply',
+    // frame previews, SAM3 of one frame, motion blur, the Nuke script (user request 2026-10-22: everything that computes waits)
+    '#zpStagePv', '#epStagePv', '#vmStagePv', '#ppCompute', '#z4PvFrame', '#mbApply', '#e5NkOnly'].join(',');
   document.addEventListener('click', (e) => {
     const b = busy && e.target.closest && e.target.closest(HEAVY);
     if (!b) return;
@@ -176,8 +179,13 @@
     el.classList.toggle('ind', !j.total);
     el.style.width = j.total ? `${Math.min(100, (100 * j.done) / j.total)}%` : '';
   }
+  // done / total: frames, or % for jobs that only report stage milestones (unit "pct", e.g. Deflicker)
+  function count(j) {
+    if (!j.total) return '';
+    return j.unit === 'pct' ? `postęp ${Math.round((100 * j.done) / j.total)} %` : `klatki ${j.done}/${j.total}`;
+  }
   function meta(j) {
-    return [j.total ? `klatki ${j.done}/${j.total}` : '', j.comfy || '', mmss(j.elapsed_s)].filter(Boolean).join(' · ');
+    return [count(j), j.comfy || '', mmss(j.elapsed_s)].filter(Boolean).join(' · ');
   }
   function render(run) {
     const j = run.length ? run[run.length - 1] : null;
@@ -220,8 +228,10 @@
     const wasBusy = !!busy;
     busy = run.length ? run[run.length - 1] : null;
     if (!!busy !== wasBusy) detPoll();
-    if (busy && busy.quiet) { render(run); document.body.classList.remove('job-busy'); setTimeout(poll, 700); return; }
+    // a quiet job (SAM3 on one frame, a frame preview): the small bar only, no blocking window – but the compute buttons
+    // are locked just the same, a click says what is running (user request 2026-10-22)
     markLocked();
+    if (busy && busy.quiet) { render(run); setTimeout(poll, 700); return; }
     if (run.length) {
       render(run);
     } else {

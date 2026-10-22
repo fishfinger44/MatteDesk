@@ -6,36 +6,35 @@ MatteDesk (this code) is licensed under **GPL-3.0-or-later** – see [LICENSE](L
 from their original sources only when the user asks, to the user's computer. By downloading them you accept their licences,
 and you are responsible for complying with them – especially for commercial work. The Doctor shows the licence next to each item.
 
-As of 2026-10-16. Licences can change – check the current licence at the source before commercial use.
-"Checked" = the licence file was read from a local installation; "to confirm" = taken from the project's documentation, not verified.
+As of 2026-10-21: every licence below was read at the source (the LICENSE file on GitHub or the Hugging Face model card).
+Licences can change – check the current licence at the source before commercial use. The Doctor shows a short version.
 
 ## ⚠️ Non-commercial / research use only
 
-| Component | Used in MatteDesk for | Licence | Status | Source |
-|---|---|---|---|---|
-| **MatAnyone2** (code + weights) | final edge pass, "matanyone" zone engine | S-Lab License 1.0 – **non-commercial only**; commercial use needs the authors' permission | checked | https://github.com/pq-yang/MatAnyone2 |
-| **CoTracker3** (code + weights) | point tracking, roto propagation | CC BY-NC 4.0 – **non-commercial only** | checked | https://github.com/facebookresearch/co-tracker |
-| **VideoMaMa** (code + UNet; SVD weights) | VideoMaMa stage (edge between MatAnyone and ViTMatte) | code CC BY-NC 4.0 – **non-commercial only**; Stable Video Diffusion weights: Stability AI Community License | from the test notes, to confirm | https://huggingface.co/SammyLim/VideoMaMa |
-| **DepthCrafter** (model) | depth maps | Tencent – **academic, research and education only, no production use** | checked | https://github.com/Tencent/DepthCrafter |
-| **LTX-2.5 + IC-LoRA Alpha-Gen** (optional) | stage "LTX" | LTX-2 Community License ("gated" repo, accepted on Hugging Face) | to confirm | https://huggingface.co/Lightricks |
+| Component | Used in MatteDesk for | Licence (source) |
+|---|---|---|
+| **MatAnyone2** (code + weights) | stage 3, "matanyone" zone engine | S-Lab License 1.0 – non-commercial only; commercial use needs the authors' permission (`pq-yang/MatAnyone2` LICENSE.txt) |
+| comfy-matanyone2 (node) | runs MatAnyone2 in ComfyUI | no licence file; README: MatAnyone2 under S-Lab License 1.0 (`spiritform/comfy-matanyone2`) |
+| **CoTracker3** (code + weights) | stage 2, point tracking | CC BY-NC 4.0 (`facebookresearch/co-tracker` LICENSE.md, HF `facebook/cotracker3`) |
+| **ViTMatte** (weights `hustvl/vitmatte-*`) | stage 5 zones, model "ViTMatte" | code MIT, model card Apache-2.0, but the composition-1k weights are trained on the **Adobe Deep Image Matting** dataset, whose licence agreement allows models trained on it to be used and distributed for non-commercial purposes only (FBA Matting README says the same of its Adobe-trained models); distinctions-646 weights: academic dataset, licence not published |
+| **VideoMaMa** (code; UNet weights) | stage 4 | code CC BY-NC 4.0 (`cvlab-kaist/VideoMaMa` README / License.md); UNet + `dino_projection_mlp` checkpoints: Stability AI Community License (HF `SammyLim/VideoMaMa`); the base `stable-video-diffusion-img2vid-xt`: Stability AI Community License (free commercial use only under USD 1M annual revenue, with registration). The code is NC, so the stage is NC |
+| ComfyUI-VideoMaMa (node) | runs VideoMaMa in ComfyUI | no licence file; README: "follows the original VideoMaMa license" (`okdalto/ComfyUI-VideoMaMa`) |
+| **DepthCrafter** (model + nodes) | depth maps (optional) | Tencent: "only for academic, research and education purposes … no commercial or production purposes" (`Tencent/DepthCrafter`, `akatz-ai/ComfyUI-DepthCrafter-Nodes` LICENSE) |
+| **MiniMax-Remover** (weights) | inpainting (planned, optional) | CC BY-NC 4.0 (HF `zibojia/minimax-remover`; the GitHub repo has no licence file) |
 
 MatteDesk keeps working without these components. The features that need them are unavailable, and the Doctor says so.
 
-## ComfyUI models and nodes
+## ✔ Commercial use allowed (check the conditions)
 
-| Component | Licence | Status | Source |
-|---|---|---|---|
-| ComfyUI | GPL-3.0 | checked | https://github.com/comfyanonymous/ComfyUI |
-| SAM 3.1 (weights `sam3.1_multiplex_fp16`) | Meta SAM License | to confirm | https://huggingface.co/Comfy-Org/sam3.1 |
-| ViTMatte (`hustvl/vitmatte-*`) | MIT (code); weights per the model card | to confirm | https://github.com/hustvl/ViTMatte |
-| LaMa (`big-lama.pt`) | Apache-2.0 | to confirm | https://github.com/advimman/lama |
-| MiniMax-Remover (weights) | per the model card | to confirm | https://github.com/zibojia/MiniMax-Remover |
-| comfyui-inpaint-nodes | GPL-3.0 | checked | https://github.com/Acly/comfyui-inpaint-nodes |
-| ComfyUI-MiniMax-Remover | GPL-3.0 | checked | https://github.com/1038lab/ComfyUI-MiniMax-Remover |
-| ComfyUI-VideoHelperSuite | GPL-3.0 | checked | https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite |
-| ComfyUI-DepthCrafter-Nodes | Tencent (as DepthCrafter) | checked | https://github.com/akatz-ai/ComfyUI-DepthCrafter-Nodes |
-| ComfyUI-VideoMaMa | CC BY-NC 4.0 (as VideoMaMa) | to confirm | https://github.com/okdalto/ComfyUI-VideoMaMa |
-| comfy-matanyone2 | **no licence file** in the repo | checked | https://github.com/spiritform/comfy-matanyone2 |
+| Component | Used in MatteDesk for | Licence (source) |
+|---|---|---|
+| ComfyUI | runs the models | GPL-3.0 |
+| **SAM 3.1** (weights `sam3.1_multiplex_fp16`) | stage 1 | SAM License (Meta, 2025-11-19): royalty-free use incl. commercial; no military / ITAR / Trade-Controls uses (HF `Comfy-Org/sam3.1`, `facebookresearch/sam3`) |
+| **BiRefNet_HR-matting** (`ZhengPeng7/BiRefNet_HR-matting`) | stage 5 zones, model "BiRefNet_HR-matting" | MIT (code + weights); the training sets of this checkpoint are not listed (BiRefNet's matting sets – P3M-10k, AM-2k, AIM-500, Distinctions-646, HIM2K… – are academic) |
+| **Lucida** (`egeorcun/lucida`) | stage 5 zones, model "Lucida" | MIT (code + weights); the model card says part of the training data (DIS5K, P3M-10k, COD10K) is research-only |
+| **LTX-2.5 + IC-LoRA Alpha-Gen** (optional) | stage 7 | LTX-2.x Community License (2026-08-11, gated on HF): free incl. commercial for entities under USD 10M annual revenue; above that a paid commercial licence (`Lightricks/LTX-2` LICENSE-2_x) |
+| LaMa (`big-lama.pt`) | inpainting (optional) | Apache-2.0 (`advimman/lama`) |
+| comfyui-inpaint-nodes, ComfyUI-MiniMax-Remover, ComfyUI-VideoHelperSuite | nodes | GPL-3.0 |
 
 ## Python libraries and fonts
 
@@ -45,6 +44,7 @@ MatteDesk keeps working without these components. The features that need them ar
 | Uvicorn, httpx, websockets, NumPy, SciPy, OpenEXR, PyTorch | BSD |
 | OpenCV, Transformers, huggingface_hub | Apache-2.0 |
 | Fonts Inter, JetBrains Mono (Google Fonts) | SIL Open Font License 1.1 |
+| html2canvas 1.4.1 (loaded from cdnjs only when a report includes a window screenshot) | MIT |
 
 ## ComfyUI nodes from this repository
 

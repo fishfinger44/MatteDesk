@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 # fine-grained stage -> (Doctor's install action label, checker(cfg) -> missing descriptions)
-DOCTOR = {"core": "„Zainstaluj” przy „Model: SAM3”", "cotracker": "„Zainstaluj” przy „Model: CoTracker3”",
+DOCTOR = {"core": "„Zainstaluj” przy „Model: SAM 3.1”", "cotracker": "„Zainstaluj” przy „Model: CoTracker3”",
           "matanyone": "„Zainstaluj” przy „Model: MatAnyone2”", "videomama": "„Zainstaluj VideoMaMa”",
-          "vitmatte": "„Zainstaluj” przy „Model: ViTMatte”", "ltx": "„Zainstaluj LTX”"}
-LABEL = {"core": "SAM3", "cotracker": "CoTracker3", "matanyone": "MatAnyone2", "videomama": "VideoMaMa",
+          "vitmatte": "„Zainstaluj” przy „Model: ViTMatte” albo „Model: BiRefNet_HR-matting / Lucida”", "ltx": "„Zainstaluj LTX-2.5”"}
+LABEL = {"core": "SAM 3.1", "cotracker": "CoTracker3", "matanyone": "MatAnyone2", "videomama": "VideoMaMa",
          "vitmatte": "ViTMatte", "ltx": "LTX-2.5 Alpha-Gen"}
 # the SAM3 model gates the whole stage 1 (detect / crops / core)
 ALSO = {"core": ("detect", "crops")}
@@ -55,8 +55,35 @@ def hf_cached(model_id: str) -> bool:
 
 
 def _vitmatte(cfg: Dict[str, Any]) -> List[str]:
+    """Stage 5 needs one edge model of the zone engine: ViTMatte or (since 2026-10-21) BiRefNet_HR-matting / Lucida."""
+    from engine.birefnet import MODELS as BIREFNET
     from engine.vitmatte import DEFAULT_MODEL
-    return [] if hf_cached(DEFAULT_MODEL) else [f"{DEFAULT_MODEL} (cache Hugging Face)"]
+    ids = [DEFAULT_MODEL, *BIREFNET.values()]
+    return [] if any(hf_cached(m) for m in ids) else [f"{' / '.join(ids)} (cache Hugging Face)"]
+
+
+EDGE_ENGINES = ("vitmatte", "birefnet")   # stage 5 engine (object field `edge_engine`, user decision 2026-10-21)
+EDGE_ENGINE_LABEL = {"vitmatte": "ViTMatte", "birefnet": "BiRefNet"}
+
+
+def edge_engines(cfg: Dict[str, Any]) -> Dict[str, bool]:
+    """Which stage-5 edge engines have weights on disk: ViTMatte (any hustvl model) / BiRefNet (BiRefNet_HR-matting or
+    Lucida). The UI shows the stage menu only when both are there. Gate off (tests): both."""
+    if not enabled():
+        return {e: True for e in EDGE_ENGINES}
+    from engine.birefnet import MODELS as BIREFNET
+    from engine.vitmatte import MODELS as VITMATTE
+    return {"vitmatte": any(hf_cached(m) for m in VITMATTE.values()),
+            "birefnet": any(hf_cached(m) for m in BIREFNET.values())}
+
+
+def effective_edge_engine(choice: Optional[str], installed: Dict[str, bool]) -> str:
+    """The object's choice when installed; else the one that is installed; default ViTMatte (both or none)."""
+    c = choice if choice in EDGE_ENGINES else "vitmatte"
+    if installed.get(c):
+        return c
+    other = next((e for e in EDGE_ENGINES if e != c and installed.get(e)), None)
+    return other or c
 
 
 def _videomama(cfg: Dict[str, Any]) -> List[str]:

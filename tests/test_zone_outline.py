@@ -85,6 +85,36 @@ def test_apply_zones_outline_without_drawing_and_with_an_exclusion(monkeypatch):
     assert not area1[:, :x_mid].any() and np.array_equal(area1[:, x_mid + 1:], band[:, x_mid + 1:])
 
 
+def test_outline_feathers_blend_into_core_and_black(monkeypatch):
+    """User rule 2026-10-22: in a whole-outline zone the inset feather blends the CORE (1) into the matte from the inner
+    band edge, the outer feather the matte into the core (black where there is none) – not into the stage base."""
+    import engine.vitmatte as vm
+    from engine.zones import feather_maps, outline_in_px
+    from test_zone_vitmatte import MockRunner, _frames_scene
+    img, core, hair, region, frames = _frames_scene(3)
+    monkeypatch.setattr(vm, "get_runner", lambda model_id=None: MockRunner())
+    tr = {"z_01": {f: np.eye(2, 3, dtype=np.float32) for f in frames}}
+    params = {"region": "outline", "outline_out_px": 40, "outer_feather_px": 10, "inset_feather_px": 6, "temporal": "none"}
+    z = Zone("z_01", "add", "matte", frames[0], matting="vitmatte", params=params)
+    r = apply_zones(frames, {f: core for f in frames}, lambda f: img, [z], tr)
+    f = frames[0]
+    a, area = r.soft[f]
+    assert (r.weights[f][area] == 255).all()                       # the area wins outright (partners are in the alpha)
+    d_in, d_out, li, lo = feather_maps(area, core, 6, 10)
+    assert a[area & (d_in < 1.5)].min() > 0.8                      # at the inner band edge: the core (1)
+    assert a[area & (d_out < 1.5)].max() < 0.2                     # at the outer band edge: black (0)
+    # an outer band edge ON the core (band 0 px outside): the outer feather blends into the core there, not into black
+    z0 = Zone("z_01", "add", "matte", frames[0], matting="vitmatte", params={**params, "outline_out_px": 0})
+    a0, area0 = apply_zones(frames, {f: core for f in frames}, lambda f: img, [z0], tr).soft[f]
+    _, d_out0, _, _ = feather_maps(area0, core, 6, 10)
+    assert a0[area0 & core & (d_out0 < 1.5)].min() > 0.8
+    # a soft stage base (MatAnyone2 / VideoMaMa, user decision 2026-10-22): the outer feather blends into max(core, base)
+    # – the outer band edge is continuous with the base, no step; the inner edge still goes to the core (1)
+    soft = np.full(core.shape, 0.4, np.float32); soft[core] = 1.0
+    ab, areab = apply_zones(frames, {f: core for f in frames}, lambda f: img, [z], tr, base_alpha=lambda f: soft).soft[f]
+    assert abs(ab[areab & (d_out < 1.5)].mean() - 0.4) < 0.08 and ab[areab & (d_in < 1.5)].min() > 0.8
+
+
 def test_api_outline_zone_needs_no_drawing_and_excludes_objects(tmp_path, monkeypatch):
     import engine.vitmatte as vm
     from test_zone_matte import _api_project
@@ -169,3 +199,28 @@ def test_zone_feather_px():
     assert zone_feather_px(Zone("z", "add", "matte", 1)) == ZONE_FEATHER_PX              # default = the former fixed value
     assert zone_feather_px(Zone("z", "add", "matte", 1, params={"inset_feather_px": 3})) == 3.0
     assert zone_feather_px(Zone("z", "add", "matte", 1, params={"inset_feather_px": 0})) == 0.5   # never a hard 0
+
+
+def test_zone_core_view_is_the_group_core(tmp_path, monkeypatch):
+    """User report 2026-10-21: the stage-5 band preview of a group (head + hand) went round the hand inside the hair –
+    it used the object's own core. view=zone_core = the core the zone is computed on: a group's members joined with the
+    seam (pipeline.preview_core, as stages 3 / 4); not a group -> the object's core."""
+    from test_zone_matte import _api_project
+    app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
+    own = api.get(f"/api/object/obj/frame/{start}?view=core")
+    alone = api.get(f"/api/object/obj/frame/{start}?view=zone_core")
+    assert alone.status_code == 200 and alone.content == own.content
+    store = pipe.store
+    store.create("hand", ["hand"], depth_order=1)
+    store.update("hand", part_of="obj")
+    cd = store.dir("hand") / "core"; cd.mkdir(parents=True)
+    ys, xs = np.where(pipe.load_core("obj", [start])[start])
+    m = np.zeros((shot.h, shot.w), np.uint8)
+    m[int(ys.min()):int(ys.max()) + 1, int(xs.max()) + 1:min(shot.w, int(xs.max()) + 20)] = 255   # touching on the right
+    for f in frames:
+        cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
+    grp = api.get(f"/api/object/obj/frame/{start}?view=zone_core")
+    assert grp.status_code == 200
+    g = cv2.imdecode(np.frombuffer(grp.content, np.uint8), cv2.IMREAD_GRAYSCALE) > 127
+    o = cv2.imdecode(np.frombuffer(own.content, np.uint8), cv2.IMREAD_GRAYSCALE) > 127
+    assert g.sum() > o.sum() and (g & o).sum() >= 0.98 * o.sum()      # the object + the hand, one piece

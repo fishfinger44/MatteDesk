@@ -6,7 +6,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MatteDesk – Interaktywne Narzędzie do Wycinania Alpha</title>
-  <meta name="description" content="MatteDesk - narzędzie do mattów alpha: SAM3 → korekty klatek → MatAnyone2, etapami">
+  <meta name="description" content="MatteDesk - narzędzie do mattów alpha: SAM 3.1 → korekty klatek → MatAnyone2, etapami">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -25,14 +25,6 @@
           <span class="version-tag" id="appVersion" title="Wersja MatteDesk – kliknij: O programie (autor, licencja)">v…</span>
         </div>
         <button class="btn btn-primary" id="openProjectModalBtn" title="Otwórz / skonfiguruj projekt ujęcia">📁 Projekt</button>
-        <div class="shot-info-pill" id="shotInfoPill" data-fold-name="ujęcie">
-          <span class="pill-label">Ujęcie:</span>
-          <span class="pill-value" id="shotNameDisplay">Brak projektu</span>
-          <span class="pill-divider">•</span>
-          <span class="pill-value" id="shotRangeDisplay">F0 - F0</span>
-          <span class="pill-divider">•</span>
-          <span class="pill-value" id="shotResDisplay">----x----</span>
-        </div>
       </div>
 
       <div class="header-center">
@@ -49,9 +41,9 @@
         </div>
         <div class="view-mode-tabs" id="viewModeTabs">
           <button class="tab-btn active" data-view="none" title="Sam obraz plate'u">Plate</button>
-          <button class="tab-btn" data-view="core" title="Rdzeń SAM3 wybranego obiektu (niebieska nakładka) – po „▶▶ Przelicz całość”; w etapie 2 maska 1+2 (rdzeń + poprawki pędzlem)">Rdzeń</button>
-          <button class="tab-btn" data-view="alpha" title="Maska z miękką krawędzią wybranego obiektu (zielona nakładka; aktywna wersja) – od etapu 3 MatAnyone">Alpha</button>
-          <button class="tab-btn" data-view="comp" title="Podgląd compu: obiekt na tle czarnym / białym / 18 % / szachownicy / kolorze [V = zmiana tła] – od etapu 3 MatAnyone">Comp</button>
+          <button class="tab-btn" data-view="core" title="Rdzeń SAM 3.1 wybranego obiektu (niebieska nakładka) – po „▶▶ Przelicz całość”; w etapie 2 maska 1+2 (rdzeń + poprawki pędzlem)">Rdzeń</button>
+          <button class="tab-btn" data-view="alpha" title="Kanał alpha wybranego obiektu: czarno-biały (biały = obiekt, szarość = półprzezroczystość; aktywna wersja) – od etapu 3 MatAnyone2">Alpha</button>
+          <button class="tab-btn" data-view="comp" title="Podgląd compu: obiekt na tle BG (tło docelowe, gdy jest w projekcie), inaczej na zielonym [V = zmiana tła: BG / zielone / czarne / białe / 18 % / szachownica / kolor] – od etapu 3 MatAnyone2">Comp</button>
         </div>
         <div class="overlay-style" id="overlayStyle" data-fold-name="wygląd nakładki" title="Wygląd nakładki oglądanej warstwy (rdzeń / alpha / klucz) – zapamiętany w przeglądarce">
           <span class="ovs-layer" id="ovsLayer">—</span>
@@ -67,17 +59,22 @@
           <button type="button" class="btn btn-secondary header-more-btn" id="headerMoreBtn" aria-haspopup="true" aria-expanded="false">⋯</button>
           <div class="header-more-menu" id="headerMoreMenu" hidden></div>
         </div>
-        <div class="status-indicator" id="comfyStatusIndicator" data-fold-name="stan ComfyUI" title="Stan ComfyUI">
-          <span class="status-dot"></span>
-          <span class="status-text" id="comfyStatusText">ComfyUI: Sprawdzanie...</span>
-        </div>
-        <button class="btn btn-secondary" id="langToggle" data-fold-name="język" title="Język interfejsu: kliknij, żeby przełączyć EN / PL">🌐 EN</button>
+        <button class="btn btn-secondary" id="reportBtn" data-fold-name="zgłoś problem" title="Zgłoś problem autorowi MatteDesk – opis + diagnostyka (przed wysłaniem zobaczysz całość)">🐞 Zgłoś problem</button>
         <button class="btn btn-secondary" id="openDoctorBtn" title="Diagnostyka środowiska">🩺 Doktor</button>
       </div>
     </header>
 
     <!-- Comparison of the plate pair: second row under the header, aligned with the "Plate:" pill (app.js alignCompareBar) -->
     <div class="compare-bar" id="compareBar">
+      <!-- shot info moved here from the top bar (user decision 2026-10-22: the top bar folded „Zgłoś problem” into ⋯) -->
+      <div class="shot-info-pill" id="shotInfoPill" title="Otwarte ujęcie: nazwa, zakres klatek, rozdzielczość (przestrzeń barw)">
+        <span class="pill-label">Ujęcie:</span>
+        <span class="pill-value" id="shotNameDisplay">Brak projektu</span>
+        <span class="pill-divider">•</span>
+        <span class="pill-value" id="shotRangeDisplay">F0 - F0</span>
+        <span class="pill-divider">•</span>
+        <span class="pill-value" id="shotResDisplay">----x----</span>
+      </div>
       <div class="compare-inner" id="compareInner">
         <span class="cmp-title muted">Porównanie:</span>
         <span class="cmp-bg" id="cmpBgCtl" hidden>
@@ -94,6 +91,14 @@
         </div>
         <label class="cmp-extra" id="p0WipeRow" hidden title="Linia wipe"><input id="p0Wipe" type="range" min="0" max="1" step="0.005" value="0.5"></label>
         <label class="cmp-extra" id="p0GainRow" hidden title="Wzmocnienie różnicy"><select id="p0Gain" class="plate-select-dropdown"><option value="2">×2</option><option value="4" selected>×4</option><option value="8">×8</option></select></label>
+      </div>
+      <!-- ComfyUI status + language, under „Doktor” (user decision 2026-10-22: the top bar folded them into ⋯) -->
+      <div class="compare-right" id="compareRight">
+        <div class="status-indicator" id="comfyStatusIndicator" title="Stan ComfyUI">
+          <span class="status-dot"></span>
+          <span class="status-text" id="comfyStatusText">ComfyUI: Sprawdzanie...</span>
+        </div>
+        <button class="btn btn-secondary" id="langToggle" title="Język interfejsu: kliknij, żeby przełączyć EN / PL">🌐 EN</button>
       </div>
     </div>
 
@@ -136,6 +141,7 @@
             <span class="hud-item" id="hudPlateRes">4K Plate</span>
             <span class="hud-item hud-mode" id="hudMode" style="display:none"></span>
             <span class="hud-item hud-mask" id="hudMask" style="display:none" title="Która maska jest teraz pokazana / wycięta na podglądzie (wynik którego etapu, wersja, zakres klatek)"></span>
+            <button type="button" class="hud-item hud-mask-alt" id="hudMaskAlt" style="display:none" title="Etap z dwoma silnikami: pokaż maskę drugiego silnika (domyślnie – maska silnika wybranego w etapie)"></button>
           </div>
           <div class="canvas-note" id="canvasNote" style="display:none"></div>
           <div class="edge-legend" id="edgeLegend" style="display:none">
@@ -194,7 +200,7 @@
 
       <!-- Keys lane + scrubbable timeline track -->
       <div class="timeline-track-container" id="timelineTrackContainer">
-        <div class="timeline-segs" id="timelineSegs" title="Odcinki kadru (etap 1 SAM3); pomarańczowe = przedziały do przeliczenia. Klik = skok"></div>
+        <div class="timeline-segs" id="timelineSegs" title="Odcinki kadru (etap 1 SAM 3.1); pomarańczowe = przedziały do przeliczenia. Klik = skok"></div>
         <div class="timeline-zones" id="timelineZones" title="Klucze aktywnej strefy (romby w kolorze strefy): klik = skok, PPM = usuń klucz; pasek = zakres między kluczami"></div>
         <canvas class="timeline-load" id="timelineLoad" height="3" title="Wczytanie klatek: zielone = plate i nakładka widoku gotowe, czerwone = jeszcze nie, szare = brak wyniku w klatce"></canvas>
         <div class="timeline-keys" id="timelineKeys" title="Klucze: niebieski = użytkownik, jasny = automatyczny, kropka = klucz z punktów. Klik = skok do klatki, dwuklik = usuń klucz"></div>
@@ -239,6 +245,16 @@
                 <button type="button" class="btn btn-ghost btn-sm btn-browse-plate" data-target="inputBeautyPlate" title="Wybierz folder">📁</button>
                 <button type="button" class="btn btn-ghost btn-sm btn-browse-plate" data-target="inputBeautyPlate" data-file="1" title="Wybierz plik (klatka albo wideo)">🎞️</button>
               </div>
+              <span class="field-hint" id="beautyRangeHint"></span>
+            </div>
+            <div class="form-group" id="frameNumberingGroup">
+              <label>Numeracja klatek <span class="optional-label">(tylko nowe ujęcie)</span>:</label>
+              <div class="frame-numbering-row">
+                <label class="radio-inline"><input type="radio" name="frameNumbering" value="keep" checked> Zachowaj zakres z plików</label>
+                <label class="radio-inline"><input type="radio" name="frameNumbering" value="start"> Pierwsza klatka:</label>
+                <input type="number" id="inputFirstFrame" class="form-input form-input-narrow" value="1" min="0" step="1" disabled>
+              </div>
+              <span class="field-hint">Inna pierwsza klatka = plate'y podlinkowane z nową numeracją w folderze roboczym (bez kopiowania); eksport też w tej numeracji.</span>
             </div>
             <div class="form-group">
               <label for="inputCleanPlate">Clear plate (samo tło) <span class="optional-label">(opcjonalny – tylko miarka krawędzi, nigdy maska)</span>:</label>
@@ -324,24 +340,48 @@
           </div>
 
           <div class="clean-options-section" style="margin-top: 14px;">
-            <div class="section-title">Etapy przetwarzania (łańcuch v10)</div>
-            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
-              <label class="checkbox-label"><input type="checkbox" id="cleanStage1Checkbox" checked><span><strong>Etap 1:</strong> poziom lokalny z kompensacją ruchu (guided filter)</span></label>
-              <label class="checkbox-label"><input type="checkbox" id="cleanStage2Checkbox" checked><span><strong>Etap 2:</strong> niezależne kafle 9×6 z kompensacją ruchu</span></label>
-              <label class="checkbox-label"><input type="checkbox" id="cleanStage4Checkbox" checked><span><strong>Etap 4:</strong> globalna korekta per kanał z wygładzeniem w czasie</span></label>
-              <label class="checkbox-label"><input type="checkbox" id="cleanStage3Checkbox"><span><strong>Etap 3 (opcjonalny):</strong> cieniowanie, pasmo 2–40 px z przepływem DIS</span></label>
-              <label class="checkbox-label"><input type="checkbox" id="cleanDenoiseCheckbox"><span><strong>Odszumianie w czasie:</strong> filtr bilateralny z kompensacją ruchu (residuum szumu zapisane osobno)</span></label>
-            </div>
+            <div class="section-title">Deflicker</div>
+            <p class="align-summary-text" style="margin: 6px 0 0;">
+              Wyrównuje pulsowanie jasności i koloru: żarówki, LED, świece, chmury, nierówna ekspozycja w stop-motion,
+              część kadru migająca mocniej niż reszta. Zmienia tylko jasność (mapy jasności), pikseli nie przerysowuje.
+            </p>
           </div>
 
-          <div class="form-group" style="margin-top: 14px;">
+          <div class="form-group" style="margin-top: 12px;">
             <label for="cleanExportModeSelect">Zapis wyniku:</label>
             <select id="cleanExportModeSelect" class="form-input">
               <option value="nuke_group" selected>Group do Nuke'a (domyślnie, bez zapisu EXR)</option>
-              <option value="exr_deflicker">Pełne klatki EXR bez migotania (&lt;plate&gt;_deflicker/)</option>
-              <option value="exr_deflicker_dn">Pełne klatki EXR bez migotania + odszumione (&lt;plate&gt;_deflicker_dn/)</option>
+              <option value="exr_deflicker">Pełne klatki EXR obok plate'u (&lt;plate&gt;_deflicker/, z odszumianiem _deflicker_dn/)</option>
             </select>
+            <div id="cleanExrDirRow" style="display: none; margin-top: 8px;">
+              <label for="cleanExrDirInput">Katalog EXR:</label>
+              <div style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center;">
+                <input type="text" id="cleanExrDirInput" class="form-input" style="flex: 1 1 220px; min-width: 0;" title="Gdzie zapisać klatki EXR po deflickerze (nazwy plików jak w oryginale; nigdy w katalogu oryginalnego plate'u)">
+                <button type="button" class="btn btn-secondary btn-sm" id="cleanExrDirPick" title="Wybierz katalog zapisu EXR">📁 Wybierz…</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="cleanExrDirDefault" title="Przywróć domyślny katalog obok plate'u">domyślny</button>
+              </div>
+            </div>
           </div>
+
+          <div class="clean-options-section" style="margin-top: 12px;">
+            <div class="section-title">Dodatkowo – tylko przy zapisie EXR</div>
+            <p class="align-summary-text" id="cleanExrOnlyNote" style="margin: 4px 0 0;">
+              Te dwie opcje przerysowują piksele, więc Group w Nuke'u ich nie przeniesie – wybierz zapis EXR.
+            </p>
+            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage3Checkbox"><span><strong>Migotanie faktury i cieni</strong> – gdy po deflickerze nadal „oddychają” cienie, faktura albo drobne wzory (filc, tkanina, cienie liści). Nie przy szybkim ruchu, motion blurze i włosach – może zostawić smugi.</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanDenoiseCheckbox"><span><strong>Odszumianie w czasie</strong> – gdy mocne ziarno albo szum z wysokiego ISO przeszkadza w kluczowaniu. Nie, gdy ziarno ma zostać w finalnym obrazie (wtedy odszum w Nuke'u tylko do klucza).</span></label>
+            </div>
+          </div>
+
+          <details class="clean-options-section" style="margin-top: 12px;">
+            <summary class="section-title" style="cursor: pointer;">Ustawienia zaawansowane – części deflickera</summary>
+            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage1Checkbox" checked><span><strong>Obszary</strong> – jasność dużych płaskich obszarów porównana z ±15 sąsiednimi klatkami (lewa strona pulsuje, prawa nie). Gdy to wystarczy, dwie kolejne części są pomijane same.</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage2Checkbox" checked><span><strong>Kratka 9×6</strong> – każdy z 54 prostokątów kadru wygładzany w czasie osobno (dopieszcza np. jeden róg).</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="cleanStage4Checkbox" checked><span><strong>Cała klatka</strong> – jedna korekta R / G / B na klatkę, wygładzona w czasie z zachowaniem trendu (ogólne pompowanie jasności lub koloru).</span></label>
+            </div>
+          </details>
 
           <div class="progress-bar-container" id="cleanProgressBar" style="display: none; margin-top: 12px;">
             <div class="progress-bar-fill" id="cleanProgressFill" style="width: 0%;"></div>
@@ -352,7 +392,7 @@
           <button class="btn btn-secondary" id="closeCleanBtn">Zamknij</button>
           <button class="btn btn-secondary" id="btnExportCleanNk" disabled>💾 Pokaż ścieżkę .nk</button>
           <button class="btn btn-primary" id="btnMeasureClean">Zmierz migotanie</button>
-          <button class="btn btn-warning" id="btnRunClean" disabled>⚡ Wykonaj czyszczenie</button>
+          <button class="btn btn-warning" id="btnRunClean" disabled>⚡ Deflicker</button>
         </div>
       </div>
     </div>
@@ -475,7 +515,7 @@
             <tr><td><kbd>Spacja</kbd></td><td>Odtwórz / zatrzymaj</td></tr>
             <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Klatka wstecz / w przód</td></tr>
             <tr><td><kbd>Shift+←</kbd> / <kbd>Shift+→</kbd></td><td>Poprzedni / następny klucz</td></tr>
-            <tr><td><kbd>Del</kbd> / <kbd>Backspace</kbd></td><td>Etap 1 SAM3: usuń ostatni punkt klatki (bez punktów – usuń klucz; też 🔑✕ na pasku i dwuklik na znaczniku klucza); etap 2 CoTracker: usuń klucze poprawek tej klatki; etap 4 ViTMatte: usuń klucz SAM3 bieżącej klatki</td></tr>
+            <tr><td><kbd>Del</kbd> / <kbd>Backspace</kbd></td><td>Etap 1 SAM 3.1: usuń ostatni punkt klatki (bez punktów – usuń klucz; też 🔑✕ na pasku i dwuklik na znaczniku klucza); etap 2 CoTracker3: usuń klucze poprawek tej klatki; etap 4 ViTMatte: usuń klucz SAM 3.1 bieżącej klatki</td></tr>
             <tr><td><kbd>Esc</kbd></td><td>Przerwij wielokąt; drugi raz – wyłącz narzędzie (samo przesuwanie)</td></tr>
             <tr><td><kbd>Home</kbd> / <kbd>End</kbd></td><td>Pierwsza / ostatnia klatka</td></tr>
             <tr><td><kbd>Shift+B</kbd> / <kbd>Shift+N</kbd></td><td>Zakres pracy (work area): początek / koniec w bieżącej klatce (też przeciąganie znaczników [ ] na osi czasu)</td></tr>
@@ -483,13 +523,13 @@
             <tr><td><kbd>1</kbd> / <kbd>2</kbd></td><td>Piksel 1:1 / dopasuj do okna</td></tr>
             <tr><td><kbd>Kółko</kbd>, <kbd>LPM</kbd></td><td>Zoom w punkcie kursora, przesuwanie</td></tr>
             <tr><td><kbd>Alt</kbd> (przytrzymaj)</td><td>Łapka przy każdym narzędziu: przeciąganie przesuwa obraz, po puszczeniu Alt wraca wybrane narzędzie</td></tr>
-            <tr><td colspan="2"><b>Etap 1 – SAM3 (wykryj + rdzeń)</b></td></tr>
+            <tr><td colspan="2"><b>Etap 1 – SAM 3.1 (wykryj + rdzeń)</b></td></tr>
             <tr><td><kbd>G</kbd> / <kbd>R</kbd> (etap 1)</td><td>Narzędzie Punkt + / Punkt − (klik; PPM = odwrotny znak; klik na punkt = usuń; Esc = wyłącz – samo przesuwanie)</td></tr>
-            <tr><td><kbd>Enter</kbd> (etap 1)</td><td>„▶ Przelicz klatkę” (punkty / prompt → klucz SAM3); przy otwartym wielokącie – zamknij wielokąt</td></tr>
+            <tr><td><kbd>Enter</kbd> (etap 1)</td><td>„▶ Przelicz klatkę” (punkty / prompt → klucz SAM 3.1); przy otwartym wielokącie – zamknij wielokąt</td></tr>
             <tr><td>Klik w ramkę</td><td>Po „Wykryj kandydatów”: ramki z numerami na obrazie – najechanie pokazuje maskę, klik wybiera kandydata</td></tr>
-            <tr><td><kbd>K</kbd> / <kbd>L</kbd> (etap 1)</td><td>Korekta + / Korekta −: klik w dziurę = dodaj tylko ten fragment, klik na wyciek = usuń tylko ten fragment (reszta maski bez zmian; klucz SAM3)</td></tr>
-            <tr><td><kbd>P</kbd> (etap 1)</td><td>Wielokąt klucza SAM3 (Enter zamyka, PPM na 1. punkcie = usuwający)</td></tr>
-            <tr><td colspan="2"><b>Etap 2 – CoTracker (pędzel poprawek)</b></td></tr>
+            <tr><td><kbd>K</kbd> / <kbd>L</kbd> (etap 1)</td><td>Korekta + / Korekta −: klik w dziurę = dodaj tylko ten fragment, klik na wyciek = usuń tylko ten fragment (reszta maski bez zmian; klucz SAM 3.1)</td></tr>
+            <tr><td><kbd>P</kbd> (etap 1)</td><td>Wielokąt klucza SAM 3.1 (Enter zamyka, PPM na 1. punkcie = usuwający)</td></tr>
+            <tr><td colspan="2"><b>Etap 2 – CoTracker3 (pędzel poprawek)</b></td></tr>
             <tr><td><kbd>G</kbd> / <kbd>R</kbd> / <kbd>E</kbd> (etap 2)</td><td>Pędzel Dodaj / Usuń / Zmaż poprawkę – kreska = klucz poprawki, CoTracker3 przenosi ją na inne klatki</td></tr>
             <tr><td colspan="2"><b>Etapy 4–5 – strefy ViTMatte / Eksperymenty</b></td></tr>
             <tr><td><kbd>G</kbd> / <kbd>R</kbd> / <kbd>P</kbd></td><td>Pędzel dodaj / pędzel usuń / wielokąt (Enter zamyka, PPM na 1. punkcie = usuwający); <kbd>L</kbd> (etap 4) = lupa</td></tr>
@@ -499,7 +539,7 @@
             <tr><td><kbd>C</kbd> (przytrzymaj)</td><td>Sam plate bez nakładki (beauty)</td></tr>
             <tr><td><kbd>O</kbd></td><td>Onion skin ±1: kontur maski z klatki −1 (czerwony) i +1 (niebieski) na bieżącej – ocena migotania krawędzi</td></tr>
             <tr><td><kbd>M</kbd> (etapy 3–5)</td><td>Mapa migotania wersji (INFERNO) jako nakładka</td></tr>
-            <tr><td colspan="2"><b>Etapy 3–5 – wersje (MatAnyone / ViTMatte / Eksperymenty)</b></td></tr>
+            <tr><td colspan="2"><b>Etapy 3–5 – wersje (MatAnyone2 / ViTMatte / Eksperymenty)</b></td></tr>
             <tr><td><kbd>V</kbd></td><td>Comp: zmiana tła (czarne / białe / 18 % / szachownica / kolor)</td></tr>
             <tr><td><kbd>N</kbd></td><td>Następna flaga QA</td></tr>
             <tr><td><kbd>B</kbd> (etapy 3–5)</td><td>Wersja aktywna ↔ poprzednia (A/B bez przeliczania)</td></tr>
@@ -532,6 +572,7 @@
         </div>
         <div class="modal-footer">
           <span id="aboutUpdateStatus" style="margin-right:auto;font-size:12px;color:#9a9aa0;"></span>
+          <button class="btn btn-secondary" id="aboutReportBtn" title="Opis problemu + diagnostyka do autora (przed wysłaniem zobaczysz całość)">🐞 Zgłoś problem</button>
           <button class="btn btn-secondary" id="aboutUpdateBtn" title="Sprawdza najnowsze wydanie MatteDesk na GitHubie (Releases)">Sprawdź aktualizacje</button>
           <button class="btn btn-primary" id="confirmAboutBtn">Zamknij</button>
         </div>
@@ -545,11 +586,15 @@
   <script src="/static/workarea.js"></script>
   <script src="/static/life.js"></script>
   <script src="/static/zones.js"></script>
+  <script src="/static/bandpoints.js"></script>
   <script src="/static/brush.js"></script>
+  <script src="/static/finaltouch.js"></script>
   <script src="/static/stage0.js"></script>
   <script src="/static/depth.js"></script>
   <script src="/static/jobs.js"></script>
   <script src="/static/tips.js"></script>
   <script src="/static/about.js"></script>
+  <script src="/static/report.js"></script>
+  <script src="/static/deflicker.js"></script>
 </body>
 </html>

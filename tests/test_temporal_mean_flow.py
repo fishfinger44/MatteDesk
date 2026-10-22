@@ -81,3 +81,11 @@ def test_zone_flow_mean_shares_the_cache_and_clips_before(tmp_path, monkeypatch)
         a0, area = r0.soft[f]
         assert np.allclose(r1.soft[f][0], a0, atol=1e-4)
         assert not ((r1.soft[f][0] > 0) & (r1.soft[f][0] < 0.001) & area).any()   # nothing below the cut smeared back
+
+
+def test_flow_cache_keeps_only_the_window():
+    """RAM (user report 2026-10-22: 4K x2 flow_mean filled 60 GB): pairs below the window of the current frame are dropped."""
+    from engine.refine import _drop_flows
+    cache = {(i, j): i for i in range(10) for j in range(10) if i != j and abs(i - j) <= 2}
+    _drop_flows(cache, 5)
+    assert cache and all(min(k) >= 5 for k in cache)

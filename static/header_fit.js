@@ -7,18 +7,29 @@
 (function (root) {
   'use strict';
 
-  // first = folded first
-  const FOLD_ORDER = ['overlayStyle', 'shotInfoPill', 'plateSelectorPill', 'comfyStatusIndicator'];
+  // first = folded first; the overlay look (colour / opacity of the mask) is used while working, the shot name is not
+  // (user report 2026-10-22: the opacity slider was in "⋯" while the bar had room)
+  // (the shot info left the top bar for the compare row, 2026-10-22)
+  const FOLD_ORDER = ['reportBtn', 'overlayStyle', 'plateSelectorPill'];
 
   // Pure part (unit-tested in node): fold items in order while `overflows()` says the bar is too wide.
   // `fold(item)` moves one item into the menu, `unfoldAll()` puts everything back. Returns the folded items.
-  function fitItems(items, overflows, fold, unfoldAll) {
+  // With `unfold(item)`: a second pass puts back every folded item that fits after all (a wide item folded late can
+  // free room for a narrow, more useful one folded before it) – the most important first.
+  function fitItems(items, overflows, fold, unfoldAll, unfold) {
     unfoldAll();
     const folded = [];
     for (const it of items) {
       if (!overflows()) break;
       fold(it);
       folded.push(it);
+    }
+    if (unfold) {
+      for (const it of folded.slice().reverse()) {
+        unfold(it);
+        if (overflows()) fold(it);
+        else folded.splice(folded.indexOf(it), 1);
+      }
     }
     return folded;
   }
@@ -41,10 +52,9 @@
 
     const overflows = () => header.scrollWidth > header.clientWidth + 1;
     const fold = (it) => { wrap.hidden = false; menu.appendChild(it.el); it.el.classList.add('in-more-menu'); };
+    const unfold = (it) => { if (it.el.parentNode === menu) { it.ph.parentNode.insertBefore(it.el, it.ph.nextSibling); it.el.classList.remove('in-more-menu'); } };
     const unfoldAll = () => {
-      for (const it of items) {
-        if (it.el.parentNode === menu) { it.ph.parentNode.insertBefore(it.el, it.ph.nextSibling); it.el.classList.remove('in-more-menu'); }
-      }
+      for (const it of items) unfold(it);
       wrap.hidden = true;
     };
 
@@ -54,7 +64,8 @@
       fitting = true;
       try {
         const open = !menu.hidden;
-        const folded = fitItems(items, overflows, fold, unfoldAll);
+        const folded = fitItems(items, overflows, fold, unfoldAll, unfold);
+        wrap.hidden = !folded.length;
         btn.title = folded.length
           ? 'Schowane, bo okno jest za wąskie: ' + folded.map(it => it.el.dataset.foldName || it.id).join(', ')
           : '';

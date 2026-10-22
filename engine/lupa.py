@@ -3,7 +3,7 @@
 """engine/lupa.py - "Lupa" on thin parts (SPEC 5.2 pkt 5b).
 
 When thin_score > 0.15 (or the user adds a lupa frame), a small extra square (256-512 plate px) around the thin
-parts lets SAM3 see them 2-4x larger. Prompt = positive points on the core skeleton inside the lupa + negatives
+parts lets SAM 3.1 see them 2-4x larger. Prompt = positive points on the core skeleton inside the lupa + negatives
 from the background ring; tracking with SAM3_VideoTrack in constant-lupa segments. The result is merged into the
 core only inside the lupa area (dilate 16 px) with an SDF crossfade; it may only ADD thin parts connected to the
 core (no new islands). Outside the lupa the core is unchanged.

@@ -58,7 +58,7 @@
       <button class="btn btn-secondary btn-sm" id="p0CleanOpen">✨ Czyszczenie…</button>
     </div>
     <div class="pane-section">
-      <div class="sec-title">Plate do maskowania <span class="muted">(wejście SAM3 / MatAnyone – projekt)</span></div>
+      <div class="sec-title">Plate do maskowania <span class="muted">(wejście SAM 3.1 / MatAnyone2 – projekt)</span></div>
       <div class="row"><label>Odszumianie plate'u do maskowania<select id="p0Denoise" class="form-input"></select></label></div>
       <div id="p0DenoiseInfo" class="muted"></div>
     </div>
@@ -122,7 +122,7 @@
     if (!d || !sel) return;
     const onoff = (v) => (v ? 'wł.' : 'wył.');
     const autoOn = d.auto_resolves_to === 'on';
-    sel.innerHTML = `<option value="auto">auto (→ ${onoff(autoOn)}, ${window.MD.esc(d.source_8bit ? 'źródło 8-bit' : 'źródło EXR / > 8 bit')})</option><option value="on">wł.</option><option value="off">wył.</option>`;
+    sel.innerHTML = `<option value="auto">auto (→ ${onoff(autoOn)})</option><option value="on">wł.</option><option value="off">wył.</option>`;
     sel.value = d.setting;
     sel.disabled = !d.global_enabled;
     $('p0DenoiseInfo').textContent = d.global_enabled

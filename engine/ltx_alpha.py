@@ -1,10 +1,10 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/ltx_alpha.py - stage "LTX Alpha-Gen" (user decision 2026-10-16: its own stage before the export, taken out of
+"""engine/ltx_alpha.py - stage "LTX-2.5 Alpha-Gen" (user decision 2026-10-16: its own stage before the export, taken out of
 the experiments' edge modes).
 
 LTX-2.5 22B + IC-LoRA Alpha-Gen (Lightricks) turns a plain RGB video into a grey alpha matte. The model takes NO mask
-and no prompt – it picks the foreground itself. The masks of the tool (SAM3 core + brush = mask 1+2) steer it the way
+and no prompt – it picks the foreground itself. The masks of the tool (SAM 3.1 core + brush = mask 1+2) steer it the way
 dughogan/nuke-alphagen-ofx (MIT) does ("isolate then matte"):
   guide "plain"   – the crop of the plate-to-mask as it is;
   guide "isolate" – the OTHER objects of the project painted out of the crop (fill from the plate around them, solved
@@ -24,7 +24,7 @@ card), crossfaded over the overlap; the guide scaled down only (long side <= max
 Measured on SH050 (RTX 4090 24 GB, 128 GB RAM, Comfy 0.40, int8 transformer + int8 Gemma, 2026-10-16): 97 frames x
 1280 x 736 in one batch = 1.14 s / frame, 22.5 GB VRAM peak (dynamic loading), ~33 GB RAM; first batch +~45 s (load).
 Quality (local_results/ltx_alpha/RAPORT.md): best on real hair / motion blur / defocus with a clear foreground (CLIP2_A,
-CLIP3_A – finer strands than MatAnyone, less flicker); on SH010 (puppet in front of a textured set) plain picks the whole
+CLIP3_A – finer strands than MatAnyone2, less flicker); on SH010 (puppet in front of a textured set) plain picks the whole
 set – "steer" is needed and the edge stays soft; "isolate" fails for occluders lying ON the target.
 """
 
@@ -58,7 +58,7 @@ LTX_NODES = ("UNETLoader", "LoraLoaderModelOnly", "GetICLoRAParameters", "CLIPLo
              "SaveImageAdvanced", "PlateLoadEXR")
 SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 GUIDES = ("plain", "isolate", "steer")
-COMBINES = ("region", "max_core", "raw")
+COMBINES = ("region", "max_core", "raw", "band")   # band = the one band system (engine/bandsys.py, 2026-10-22)
 # which mask limits / guides LTX (user request 2026-10-16): the mask 1+2 (default), or the result of stage 3 / 4 (> 0.5)
 MASK_SOURCES = ("core", "matanyone", "vitmatte")
 LTX_DEFAULTS: Dict[str, Any] = {
@@ -72,8 +72,16 @@ LTX_DEFAULTS: Dict[str, Any] = {
     "combine": "region",      # region | max_core (+ eroded mask 1+2: holes filled) | raw (no limit – diagnostics)
     "core_erode_px": 4,
     "mask_source": "core",    # core = mask 1+2 | matanyone = stage 3 result | vitmatte = stage 4 result (alpha > 0.5)
+    # combine "band" (one band system, user decision 2026-10-22): the band region_px outside .. core_erode_px inside the
+    # mask edge; the matte blends into the core over feather_px from the inner edge and region_soft_px from the outer
+    # one; band points shape it (the sliders' reference band_ref_out / _in)
+    "feather_px": 0.0,
+    "band_points": [],
+    "band_ref_out": None,
+    "band_ref_in": None,
 }
 SETTING_KEYS = tuple(LTX_DEFAULTS)
+BAND_KEYS = ("feather_px", "band_points", "band_ref_out", "band_ref_in")   # in the signature only in the band mode
 
 
 def ltx_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -93,7 +101,11 @@ def ltx_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[s
         s[k] = int(s[k])
     for k in ("region_px", "region_soft_px"):
         s[k] = float(s[k])
-    return s
+    s["feather_px"] = float(min(200.0, max(0.0, float(s.get("feather_px") or 0.0))))
+    from engine.bandmap import band_points
+    s["band_points"] = band_points({"band_points": s.get("band_points")}) if s.get("band_points") else []
+    from engine.objband import apply   # the shared object band unless the stage is detached (2026-10-22)
+    return apply(obj, "ltx", s)
 
 
 def object_settings(obj: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -106,19 +118,25 @@ def object_settings(obj: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 
 def settings_sig(s: Dict[str, Any]) -> str:
-    d = {k: s.get(k) for k in SETTING_KEYS}
+    d = {k: s.get(k) for k in SETTING_KEYS if k not in BAND_KEYS or s.get("combine") == "band"}
     if d.get("mask_source", "core") == "core":   # the default: absent from the signature (older runs stay current)
         d.pop("mask_source", None)
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def band_u8(mask: np.ndarray, s: Dict[str, Any]) -> np.ndarray:
-    """Band preview of the LTX palette: 128 = where the LTX matte is kept (the mask grown by region_px), 255 = forced 1
+def band_u8(mask: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
+    """Band preview of the LTX-2.5 palette: 128 = where the LTX-2.5 matte is kept (the mask grown by region_px), 255 = forced 1
     (combine max_core: the mask eroded by core_erode_px); raw = the whole frame 128."""
     if s["combine"] == "raw":
         return np.full(mask.shape, 128, np.uint8)
     d = sdf_px(mask)
     out = np.zeros(mask.shape, np.uint8)
+    if s["combine"] == "band":
+        from engine.bandsys import band_widths
+        o, i = band_widths(mask, s["region_px"], s["core_erode_px"], pts)
+        out[(d >= -o) & (d <= i)] = 128
+        out[d > i] = 255
+        return out
     out[d >= -s["region_px"]] = 128
     if s["combine"] == "max_core":
         out[d >= s["core_erode_px"]] = 255
@@ -126,7 +144,7 @@ def band_u8(mask: np.ndarray, s: Dict[str, Any]) -> np.ndarray:
 
 
 def models_status(models_dir: Optional[Path]) -> List[Dict[str, Any]]:
-    """Every LTX model file: {key, folder, file, repo, gb, present}."""
+    """Every LTX-2.5 model file: {key, folder, file, repo, gb, present}."""
     out = []
     for key, (folder, fn, repo, gb) in LTX_MODELS.items():
         p = Path(models_dir) / folder / fn if models_dir else None
@@ -141,7 +159,7 @@ def missing_nodes(object_info: Optional[Dict[str, Any]]) -> List[str]:
 
 # ----------------------------------------------------------------------------- batching
 def batch_length(n: int) -> int:
-    """Frames LTX gets for a batch of n: the next 8k+1 (the last frame repeated)."""
+    """Frames LTX-2.5 gets for a batch of n: the next 8k+1 (the last frame repeated)."""
     return max(9, ((max(1, n) - 1 + 7) // 8) * 8 + 1)
 
 
@@ -243,13 +261,19 @@ def sdf_px(core: np.ndarray) -> np.ndarray:
     return (inside - outside).astype(np.float32)
 
 
-def finish(alpha: np.ndarray, core: np.ndarray, s: Dict[str, Any]) -> np.ndarray:
-    """LTX matte (crop) -> the object's alpha: limited to the grown mask 1+2 (`region`), optionally joined with the
-    eroded mask 1+2 (`max_core`); `raw` = untouched."""
+def finish(alpha: np.ndarray, core: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
+    """LTX-2.5 matte (crop) -> the object's alpha: limited to the grown mask 1+2 (`region`), optionally joined with the
+    eroded mask 1+2 (`max_core`); `raw` = untouched; `band` = the one band system (engine/bandsys.py; band points (x, y,
+    out, in) in the crop's pixels shape it)."""
     a = np.clip(alpha.astype(np.float32), 0, 1)
     if s["combine"] == "raw":
         return a
     d = sdf_px(core)
+    if s["combine"] == "band":
+        from engine.bandsys import band_widths, compose
+        c = (np.asarray(core) > 0.5).astype(np.float32)
+        o, i = band_widths(c, s["region_px"], s["core_erode_px"], pts)
+        return compose(c, a, d, o, i, s.get("feather_px", 0.0), s["region_soft_px"])
     reg = np.clip((d + s["region_px"]) / max(s["region_soft_px"], 1e-3) + 0.5, 0.0, 1.0)
     a = a * reg
     if s["combine"] == "max_core":
@@ -306,7 +330,7 @@ def decode_matte(png_bytes: bytes) -> np.ndarray:
     """16-bit (or 8-bit) grey / RGB PNG -> float32 0..1 (mean of the channels: the model's matte is grey)."""
     a = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
     if a is None:
-        raise ValueError("LTX: nieczytelny PNG wyniku")
+        raise ValueError("LTX-2.5: nieczytelny PNG wyniku")
     scale = 65535.0 if a.dtype == np.uint16 else 255.0
     a = a.astype(np.float32) / scale
     if a.ndim == 3:
@@ -332,10 +356,10 @@ class AlphaGen:
             raise RuntimeError(busy)
         sub = self.client.queue_prompt(g)
         if not sub.get("success"):
-            raise RuntimeError(f"Comfy odrzucił graf LTX Alpha-Gen: {sub.get('error')}")
+            raise RuntimeError(f"Comfy odrzucił graf LTX-2.5 Alpha-Gen: {sub.get('error')}")
         res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=4 * 3600)
         if not res.get("success"):
-            raise RuntimeError(f"LTX Alpha-Gen nie powiódł się: {res.get('error')}")
+            raise RuntimeError(f"LTX-2.5 Alpha-Gen nie powiódł się: {res.get('error')}")
         return res
 
     def run(self, tag: str, guides: Sequence[np.ndarray], out_size: Tuple[int, int]) -> List[np.ndarray]:
@@ -358,14 +382,14 @@ class AlphaGen:
                     img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
                 img = cv2.copyMakeBorder(img, 0, side_h - sh, 0, side_w - sw, cv2.BORDER_REFLECT_101)
                 cv2.imwrite(str(job / f"g_{i:04d}.exr"), np.ascontiguousarray(img, np.float32))
-            self.progress(f"LTX: paczka {bi + 1}/{len(bl)} ({nb} kl., {side_w}×{side_h})", bi, len(bl))
+            self.progress(f"LTX-2.5: paczka {bi + 1}/{len(bl)} ({nb} kl., {side_w}×{side_h})", bi, len(bl))
             t0 = time.time()
             prefix = f"matte_desk_ltx/{tag}_{bi:02d}_{int(t0)}"
             res = self._run(alphagen_graph(str(job / "g_####.exr").replace("\\", "/"), length, side_w, side_h,
                                            prefix, self.s["seed"], self.models))
             files = sorted(res.get("outputs", {}).get("50", {}).get("images", []), key=lambda i: i["filename"])
             if len(files) < nb:
-                raise RuntimeError(f"LTX: paczka {bi + 1} zwróciła {len(files)} klatek z {nb}")
+                raise RuntimeError(f"LTX-2.5: paczka {bi + 1} zwróciła {len(files)} klatek z {nb}")
             self.log.append({"batch": bi, "frames": [a, b], "length": length, "side": [side_w, side_h],
                              "seconds": round(time.time() - t0, 1)})
             for i in range(nb):

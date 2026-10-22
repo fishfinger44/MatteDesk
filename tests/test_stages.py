@@ -22,7 +22,7 @@ def test_stage_progression_and_staleness(tmp_path):
     store = ObjectStore(work)
     store.create("obj", ["puppet"])
     assert _st(store, work) == {"detect": "todo", "crops": "locked", "core": "locked", "cotracker": "locked",
-                                "matanyone": "locked", "videomama": "locked", "vitmatte": "locked", "final": "locked", "ltx": "locked",
+                                "matanyone": "locked", "videomama": "locked", "vitmatte": "locked", "final": "locked", "ltx": "locked", "final_touch": "locked",
                                 "export": "locked"}
     with pytest.raises(ValueError, match="Wykryj"):
         require(store, "obj", work, "core")
@@ -31,7 +31,7 @@ def test_stage_progression_and_staleness(tmp_path):
     assert _st(store, work)["crops"] == "todo" and object_stages(store, "obj", work)["next"] == "crops"
     (store.dir("obj") / "crops.json").write_text("{}")
     assert _st(store, work)["core"] == "todo"
-    with pytest.raises(ValueError, match="Rdzeń SAM3"):
+    with pytest.raises(ValueError, match="Rdzeń SAM 3.1"):
         require(store, "obj", work, "final")
     cd = store.dir("obj") / "core"; cd.mkdir()
     (cd / "core.json").write_text(json.dumps({"keys_sig": keys_signature(store, "obj")}))

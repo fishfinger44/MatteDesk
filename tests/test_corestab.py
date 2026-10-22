@@ -97,3 +97,19 @@ def test_api_core_stabilize_option_finalize_and_apply(tmp_path, monkeypatch):
     fz2 = api.post("/api/object/obj/finalize", json={"edge_mode": "matanyone"})
     rj2 = json.loads((pipe.store.dir("obj") / "runs" / fz2.json()["run"] / "run.json").read_text(encoding="utf-8"))
     assert "core_stabilize" not in rj2
+
+
+def test_stabilize_core_only_one_frame_is_bitwise_the_full_window():
+    """Previews (2026-10-22): `only` stabilises one frame of the window (its flows on several cores) – the same result
+    for it as the whole window, the other frames come back as they are; with soft probabilities too."""
+    cores, truth, grays = _pan()
+    win = {f: cores[f] for f in range(3, 8)}
+    probs = {f: (cv2.GaussianBlur(cores[f].astype(np.float32), (0, 0), 1.5) * 255).astype(np.uint8) for f in win}
+    for pr in (None, probs):
+        po_full, po_one = {}, {}
+        full, _ = stabilize_core(win, lambda f: grays[f], radius=2, band_px=8, probs=pr, probs_out=po_full)
+        one, _ = stabilize_core(win, lambda f: grays[f], radius=2, band_px=8, probs=pr, probs_out=po_one, only=[5])
+        assert np.array_equal(one[5], full[5]) and (one[5] != win[5]).any()
+        assert all(np.array_equal(one[f], win[f]) for f in win if f != 5)
+        if pr is not None:
+            assert np.array_equal(po_one[5], po_full[5])

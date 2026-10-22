@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/sam3.py - SAM3 through ComfyUI (SPEC 5.1, 5.3, 7.2). Graphs use only core SAM3 nodes, core I/O and
+"""engine/sam3.py - SAM 3.1 through ComfyUI (SPEC 5.1, 5.3, 7.2). Graphs use only core SAM 3.1 nodes, core I/O and
 the PlateMatte loaders; frames go to Comfy as files written by the tool (display values, already cropped /
 squared), never as full 4K plates.
 
@@ -126,8 +126,8 @@ def combine_prompt_points(prompt_mask: Optional[np.ndarray], plus_mask: Optional
                           minus_mask: Optional[np.ndarray], thr: float = 0.5) -> Tuple[np.ndarray, Dict[str, int]]:
     """„▶ Przelicz klatkę” with a prompt (user decision 2026-10-15, second version): the prompt is the base, positive
     points ADD what they point at, negative points SUBTRACT what they point at: (prompt ∪ plus) − minus.
-    prompt_mask = SAM3 from the prompt, plus_mask = SAM3 from the positive points (negatives as negatives), minus_mask =
-    SAM3 from the negative points used as positives (what was clicked; positives as negatives). None = not computed.
+    prompt_mask = SAM 3.1 from the prompt, plus_mask = SAM 3.1 from the positive points (negatives as negatives), minus_mask =
+    SAM 3.1 from the negative points used as positives (what was clicked; positives as negatives). None = not computed.
     (SAM3_Detect given a prompt and points at once returns their union and ignores negative points – measured.)"""
     shape = next(m.shape for m in (prompt_mask, plus_mask, minus_mask) if m is not None)
     b = lambda m: (m > thr) if m is not None else np.zeros(shape, bool)
@@ -137,7 +137,7 @@ def combine_prompt_points(prompt_mask: Optional[np.ndarray], plus_mask: Optional
 
 
 class Sam3Runner:
-    """Runs SAM3 graphs through a ComfyClient-like object (real or mock)."""
+    """Runs SAM 3.1 graphs through a ComfyClient-like object (real or mock)."""
 
     def __init__(self, client: Any, scratch_dir: Path, ckpt: Optional[str] = None, io_mode: str = "exr"):
         from engine.comfy_io import EXR, PNG8
@@ -147,6 +147,9 @@ class Sam3Runner:
         self.scratch = Path(scratch_dir)
         self.ckpt = ckpt or default_checkpoint()
         self.io_mode = io_mode
+        # EXR mode: frames > SAM_RES downscaled before tracking (png8 always did); MD_SAM_FULLRES=1 = the old full crop
+        import os
+        self.sam_downscale = os.environ.get("MD_SAM_FULLRES", "0") != "1"
         self._soft: Optional[bool] = None
 
     def soft_available(self) -> bool:
@@ -166,10 +169,10 @@ class Sam3Runner:
             raise RuntimeError(busy)
         sub = self.client.queue_prompt(graph)
         if not sub.get("success"):
-            raise RuntimeError(f"Comfy odrzucił graf SAM3: {sub.get('error')}")
+            raise RuntimeError(f"Comfy odrzucił graf SAM 3.1: {sub.get('error')}")
         res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=1800)
         if not res.get("success"):
-            raise RuntimeError(f"SAM3 nie powiódł się: {res.get('error')}")
+            raise RuntimeError(f"SAM 3.1 nie powiódł się: {res.get('error')}")
         result: Dict[str, List[np.ndarray]] = {}
         for nid in nodes:
             imgs = res.get("outputs", {}).get(nid, {}).get("images", [])
@@ -208,7 +211,7 @@ class Sam3Runner:
         """frames: list of HxWx3 display images (constant crop!), init_mask for frames[0]. Returns len(frames) masks;
         with `soft=True` (node SAM3_VideoTrackSoft available) a tuple (masks, soft probabilities 0..1) – the masks
         are bit-identical to the plain run (same track_data, same SAM3_TrackToMask)."""
-        from engine.comfy_io import job_progress
+        from engine.comfy_io import fit_sam_res, job_progress
         job = self.scratch / f"track_{uuid.uuid4().hex[:8]}"
         n = len(frames)
         soft = bool(soft) and self.soft_available()
@@ -216,11 +219,23 @@ class Sam3Runner:
             from engine.comfy_io import require_vhs
             require_vhs(self.client)
             return self._track_png8(job, frames, init_mask, soft)
-        for i, f in enumerate(frames):
-            _write_exr(job / f"f_{i:04d}.exr", f)
-            job_progress("SAM3: zapis klatek do Comfy", i + 1, n)
+        # SAM 3.1 resizes every frame to SAM_RES² itself (bicubic, comfy/ldm/sam3/tracker.py), so a larger crop only costs
+        # time: 96 frames of a 2688 px crop were 4 GB of float EXR and ~8 GB in Comfy, which froze it (SH010 2026-10-21).
+        # Frames are downscaled here with the SAME filter (bicubic: A/B on SH010 20 fr IoU 0.9988, 19/20 frames >= 0.998;
+        # INTER_AREA gave 0.9947), the key mask with INTER_AREA, the masks come back to the input size (INTER_LINEAR).
+        # MatAnyone2 still gets full resolution.
+        in_hw, down = (0, 0), False
+        for i, f in enumerate(frames):                       # each frame read once (lazy sequences load on access)
+            f = np.asarray(f)
+            if i == 0:
+                in_hw = f.shape[:2]
+                down = self.sam_downscale and max(in_hw) > SAM_RES
+            _write_exr(job / f"f_{i:04d}.exr", fit_sam_res(f, SAM_RES, cv2.INTER_CUBIC) if down else f)
+            job_progress("SAM 3.1: zapis klatek do Comfy", i + 1, n)
         job.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(job / "k_0000.png"), (np.clip(init_mask, 0, 1) * 255).astype(np.uint8))
+        k0 = np.clip(np.asarray(init_mask, np.float32), 0, 1)
+        k0 = fit_sam_res(k0, SAM_RES) if down else k0
+        cv2.imwrite(str(job / "k_0000.png"), (k0 * 255).round().astype(np.uint8) if down else (k0 * 255).astype(np.uint8))
         prefix = f"matte_desk/{job.name}/t"
         g = track_graph(str(job / "f_####.exr").replace("\\", "/"), len(frames),
                         str(job / "k_####.png").replace("\\", "/"), prefix, self.ckpt)
@@ -230,12 +245,14 @@ class Sam3Runner:
         masks = outs["8"]
         if len(masks) != len(frames):
             raise RuntimeError(f"SAM3_VideoTrack zwrócił {len(masks)} masek zamiast {len(frames)}")
+        h, w = in_hw
+        back = (lambda ms: [m if m.shape[:2] == (h, w) else cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR) for m in ms])
         if not soft:
-            return masks
+            return back(masks) if down else masks
         softs = outs["10"]
         if len(softs) != len(frames):
             raise RuntimeError(f"SAM3_VideoTrackSoft zwrócił {len(softs)} miękkich masek zamiast {len(frames)}")
-        return masks, softs
+        return (back(masks), back(softs)) if down else (masks, softs)
 
     def _track_png8(self, job: Path, frames: Sequence[np.ndarray], init_mask: np.ndarray, soft: bool = False):
         """8-bit sources: PNG frames (downscaled to fit SAM_RES) in job/frames, initial mask in job/init. Returns a
@@ -247,7 +264,7 @@ class Sam3Runner:
             if in_hw is None:
                 in_hw = f.shape[:2]
             write_png8(job / "frames" / f"f_{i:04d}.png", fit_sam_res(f, SAM_RES))
-            job_progress("SAM3: zapis klatek do Comfy", i + 1, n)
+            job_progress("SAM 3.1: zapis klatek do Comfy", i + 1, n)
         small = fit_sam_res(np.ascontiguousarray(np.clip(init_mask, 0, 1), np.float32), SAM_RES)
         write_png8(job / "init" / "k_0000.png", small)
         prefix = f"matte_desk/{job.name}/t"

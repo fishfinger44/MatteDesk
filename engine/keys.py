@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """engine/keys.py - Building user keys and the undo/redo history (SPEC 7.1, 6 pkt 5, stage E4).
 
-A key = full, hard object mask in one frame, built as: current core of the frame (or a SAM3 preview mask)
+A key = full, hard object mask in one frame, built as: current core of the frame (or a SAM 3.1 preview mask)
 +/- brush strokes / polygons (plate px). Saving or deleting a key is recorded in `history.json` with the previous
 state of the key files, so Ctrl+Z / Ctrl+Shift+Z restore exactly. Strokes and points before saving are client-side.
 """

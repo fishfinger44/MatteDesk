@@ -35,9 +35,10 @@ def test_stage_layout_brush_matanyone_export(proj):
     od = store.dir("obj")
     st, d = _steps(api)
     # right after the core: export open, CoTracker optional (done), MatAnyone to do, ViTMatte open on the mask 1+2
-    assert [s["n"] for s in d["steps"]] == [1, 2, 3, 4, 5, 6, 7, 8]    # 4 = VideoMaMa, 7 = LTX Alpha-Gen (2026-10-16)
+    # 4 = VideoMaMa, 7 = LTX Alpha-Gen (2026-10-16), 8 = Final Touch (2026-10-22, optional, no model)
+    assert [s["n"] for s in d["steps"]] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     assert st == {"sam3": "done", "cotracker": "done", "matanyone": "todo", "videomama": "todo", "vitmatte": "todo", "final": "todo",
-                  "ltx": "todo", "export": "todo"}
+                  "ltx": "todo", "final_touch": "done", "export": "todo"}
     assert "etap opcjonalny" in next(s for s in d["steps"] if s["id"] == "cotracker")["why"]
 
     # a brush correction (stage 2): "+" just above the object in the start frame, an empty key (end) in the last frame
@@ -133,6 +134,24 @@ def test_matanyone_gets_every_key_and_the_brush_frames(proj):
     r = api.post("/api/object/obj/finalize", json={"stage": "matanyone"})
     assert r.status_code == 200, r.text
     assert far in r.json()["report"]["keys_used"] and start in r.json()["report"]["keys_used"]
+
+
+def test_vitmatte_apply_computes_only_the_work_area(proj):
+    """User report 2026-10-22: stage 5 „Zastosuj na ujęcie” computed the whole shot, not the work area (stages 3 / 4 do)."""
+    app_module, api, shot, pipe, frames, start = proj
+    api.put("/api/object/obj/settings", json={"vitmatte_base": "core"})
+    wa = [frames[1], frames[-2]]
+    assert api.put("/api/project/work_area", json={"range": wa}).status_code == 200
+    r = api.post("/api/object/obj/zones/new", json={"mode": "add", "criterion": "all", "frame": start, "polygon": [[1, 1], [9, 1], [9, 9]],
+                                                     "strokes": [], "params": {"source": "brush", "track": "rigid"}})
+    zid = r.json()["zone"]["zone_id"]
+    assert api.post("/api/object/obj/core_fix").status_code == 200
+    r = api.post(f"/api/object/obj/zones/{zid}/apply?stage=vitmatte")
+    assert r.status_code == 200, r.text
+    vm = r.json()["run"]
+    runs = {x["run"]: x for x in api.get("/api/object/obj/runs").json()["runs"]}
+    assert runs[vm]["coverage"] == [wa], runs[vm]["coverage"]
+    assert runs[vm]["edge_engine"] == "vitmatte"                   # HUD ⇄: which engine computed the version
 
 
 def test_vitmatte_base_mask_1_2_and_the_comparison(proj):

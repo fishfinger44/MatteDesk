@@ -263,7 +263,7 @@ def _download_hf(url: str, dst: Path, token: Optional[str], progress: Optional[C
 
 def install_ltx(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,
                 keys: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Stage „LTX Alpha-Gen”: the five LTX-2.5 files (~40 GB) into models_dir, from the gated Lightricks repos with the
+    """Stage „LTX-2.5 Alpha-Gen”: the five LTX-2.5 files (~40 GB) into models_dir, from the gated Lightricks repos with the
     user's HF login. Present files are skipped; interrupted downloads resume."""
     from engine.ltx_alpha import HF_PATH, LTX_MODELS
     models_dir = cfg.get("models_dir") or ""
@@ -284,7 +284,7 @@ def install_ltx(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], No
         if dst.exists() and dst.stat().st_size > 0.9 * gb * 1e9:
             log.append(f"już jest: {dst}")
             continue
-        _step(f"LTX: {fn} ({gb:.1f} GB)")
+        _step(f"LTX-2.5: {fn} ({gb:.1f} GB)")
         download(f"https://huggingface.co/{repo}/resolve/main/{HF_PATH[key]}{fn}", dst)
         log.append(f"pobrane: {dst} ({dst.stat().st_size / 2 ** 30:.1f} GB)")
     log.append("Odśwież listę modeli w ComfyUI (klawisz R) albo zrestartuj Comfy.")
@@ -555,3 +555,40 @@ def install_vitmatte(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.r
         log.append((r.stderr or r.stdout or "")[-800:])
         return {"success": False, "log": log}
     return {"success": True, "log": log, "model": mid}
+
+
+def install_birefnet(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.run, python: Optional[str] = None,
+                     model_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    """BiRefNet_HR-matting / Lucida (optional edge models of the ViTMatte zone engine, MIT weights) run in ComfyUI's
+    Python (engine/birefnet_worker.py). Their remote code needs timm, kornia, einops (+ torchvision): the missing ones
+    are pip-installed there – never torch / torchvision (that would change ComfyUI's PyTorch). Then the weights go into
+    the Hugging Face cache (444 MB + 885 MB)."""
+    from engine import birefnet, birefnet_worker
+    log: List[str] = []
+    py = python or (str(comfy_python(cfg)) if comfy_python(cfg) else "")
+    if not py:
+        return {"success": False, "log": ["Nie znaleziono Pythona ComfyUI (ustaw comfy_dir / comfy_python w config.local.json)."]}
+    missing = [p for p in birefnet_worker.REMOTE_CODE_PACKAGES
+               if run([py, "-c", f"import {p}"], capture_output=True, text=True).returncode != 0]
+    if "torchvision" in missing:
+        return {"success": False, "log": ["W Pythonie ComfyUI brak torchvision – Doktor go nie instaluje (zmieniłby PyTorch "
+                                          "ComfyUI). Zaktualizuj ComfyUI albo doinstaluj torchvision zgodny z jego torch."]}
+    if missing:
+        _step(f"pip install {' '.join(missing)} (Python ComfyUI)")
+        r = run([py, "-m", "pip", "install", *missing], capture_output=True, text=True)
+        log.append(f"pip install {' '.join(missing)} (Python ComfyUI) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
+        if r.returncode:
+            log.append((r.stderr or r.stdout or "")[-800:])
+            return {"success": False, "log": log}
+    else:
+        log.append("timm / kornia / einops w Pythonie ComfyUI: już są")
+    for mid in (model_ids or list(birefnet.MODELS.values())):
+        _step(f"wagi {mid} (cache Hugging Face)")
+        r = run([py, "-I", str(birefnet.WORKER), "--download", mid], capture_output=True, text=True)
+        log.append(f"wagi {mid} -> {'pobrane' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
+        if r.returncode:
+            log.append((r.stderr or r.stdout or "")[-800:])
+            return {"success": False, "log": log}
+    from engine import vitmatte
+    vitmatte._CHECK_CACHE.clear()
+    return {"success": True, "log": log}

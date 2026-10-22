@@ -10,7 +10,7 @@ Repair the plates once. Generate alpha mattes for multiple objects – the tool 
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
-[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.32/MatteDesk-0.32-setup.exe)
+[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.35/MatteDesk-0.35-setup.exe)
 
 Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all versions: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -19,12 +19,6 @@ Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all vers
 Version: file [`VERSION`](VERSION) (also shown in the top-left corner of the UI) · history: [CHANGELOG.md](CHANGELOG.md)
 
 </div>
-
-
-https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
-
-
-
 
 ---
 
@@ -50,7 +44,7 @@ MatteDesk turns that into a short, controlled flow:
 | | Step | What happens |
 |:-:|---|---|
 | 🩹 | **Repair the plates** | The tool checks the input frames and repairs broken ones – **once** – and the repaired plate is used everywhere downstream |
-| 💬 | **Say what to cut out** | Type a phrase (SAM3 understands English) or mark the object: click `+`/`−`, box, brush |
+| 💬 | **Say what to cut out** | Type a phrase (SAM 3.1 understands English) or mark the object: click `+`/`−`, box, brush |
 | 🔍 | **Automatic cropping** | The object gets a tight square crop, and the mask is computed for the whole shot |
 | 👁 | **Frame-by-frame review** | Timeline with QA flags, A/B compare, wipe, diff, contours, comp preview over different backgrounds |
 | ✋ | **Fix only the bad frames** | Your correction becomes a hard *key* – the mask is recomputed from it forwards and backwards |
@@ -77,9 +71,9 @@ flowchart LR
     S -.->|bad frame: key| S
 ```
 
-Every object goes through the stage bar **0 Plates · 1 SAM3 · 2 CoTracker · 3 MatAnyone · 4 VideoMaMa · 5 ViTMatte · 6 Experiments ·
-7 LTX · 8 Export**. Stages 2, 4–7 are optional; Export is available as soon as the SAM3 core exists, and you choose its source
-(core, MatAnyone, VideoMaMa, ViTMatte, LTX or any version). Each stage panel says what it does and what it is best for. The stage bar
+Every object goes through the stage bar **0 Plates · 1 SAM 3.1 · 2 CoTracker3 · 3 MatAnyone2 · 4 VideoMaMa · 5 ViTMatte · 6 Experiments ·
+7 LTX-2.5 · 8 Export**. Stages 2, 4–7 are optional; Export is available as soon as the SAM 3.1 core exists, and you choose its source
+(core, MatAnyone2, VideoMaMa, ViTMatte, LTX-2.5 or any version). Each stage panel says what it does and what it is best for. The stage bar
 shows what is ready and what needs recomputing after your correction; undo is always available, and every change creates a new version
 you can compare with the previous one (A / B / difference).
 
@@ -137,6 +131,14 @@ The **Doctor** button checks ComfyUI, nodes, models, ffmpeg and the GPU. When so
 gives each item an **Install** button with a progress bar (MB, speed, time left), plus a batch **"Install all missing"**.
 It also switches between **ComfyUI Desktop** and **ComfyUI from git**, and shows the licence of every third-party component.
 
+### 🐞 Report a problem
+The **🐞 Report a problem** button (in the header, in the "About" window and in every error window) sends the author a short
+description with diagnostics: MatteDesk version, Windows, Python, GPU, ComfyUI version and VRAM, Doctor items that are not OK, the
+last jobs and their errors, the tail of the log and – only if you tick it – a screenshot of the window. Paths, shot and object
+names, your user name and computer name are replaced with placeholders (`<path>`, `<shot>`, `<obj>`, `<user>`), and **before
+sending you see the whole package** and have to tick a consent box. The e-mail field is optional. Nothing is sent without
+clicking "Send"; the report goes through a small relay to the author's private issue tracker (the app never holds a GitHub token).
+
 ### 🤖 API for AI agents and scripts
 Everything the UI does is available over a local REST API and a command line, `tools/md.py` (standard library only) – documented
 in [docs/AGENT_API.md](docs/AGENT_API.md). An AI coding agent (e.g. Claude Code) or a pipeline script can open a shot, start stages
@@ -177,14 +179,15 @@ whether an edge is good) stay with the artist in the UI. Exports and other write
 | **SAM3.1** weights (`sam3.1_multiplex_fp16`) | Hugging Face `Comfy-Org/sam3.1` | 1.7 GB | ✅ |
 | **MatAnyone2** weights | GitHub `pq-yang/MatAnyone2` | 135 MB | ✅ |
 | **CoTracker3** (package for ComfyUI's Python + weights) | pip `--no-deps` + Hugging Face `facebook/cotracker3` | 100 MB | recommended |
-| **ViTMatte** weights ("hair" zones / `vitmatte` engine; runs in ComfyUI's Python) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, only if missing) | 390 MB | ✅ for hair zones |
+| **ViTMatte** weights ("hair" zones / `vitmatte` engine; runs in ComfyUI's Python) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, only if missing) | 390 MB | ✅ for hair zones (weights **non-commercial only** – Adobe-trained) |
+| **BiRefNet_HR-matting / Lucida** weights (optional edge models of the ViTMatte zone, MIT – for commercial work; ComfyUI's Python) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, only if missing) | 444 + 885 MB | ❌ optional |
 | **Plate alignment on the GPU** (`engine/align_gpu_worker.py` in ComfyUI's Python; check only – uses ComfyUI's torch and CUDA) | – | 0 | no (speed-up; CPU otherwise) |
-| **VideoHelperSuite** nodes (`VHS_LoadImagesPath` – 8-bit PNG/JPG shots in SAM3, MatAnyone2, zones) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + its requirements (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ for 8-bit shots |
+| **VideoHelperSuite** nodes (`VHS_LoadImagesPath` – 8-bit PNG/JPG shots in SAM 3.1, MatAnyone2, zones) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + its requirements (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ for 8-bit shots |
 | **DepthCrafter** nodes ("Depth" feature) | GitHub `akatz-ai` (the 4–6 GB model downloads on first use) | < 1 MB | optional |
 | **MiniMax-Remover** nodes + weights (future Inpainting module) | GitHub `1038lab` + Hugging Face `zibojia/minimax-remover` | 2.6 GB | no (not used yet) |
 | `comfyui-inpaint-nodes` nodes + **LaMa** weights | GitHub `Acly` + `big-lama.pt` | 196 MB | optional |
 | **ComfyUI-VideoMaMa** node + weights (stage 4 "VideoMaMa": VideoMaMa UNet, SVD-xt fp16 image encoder + VAE → `models/videomama/`) | `git clone` github.com/okdalto/ComfyUI-VideoMaMa into custom_nodes (+ `requirements.txt`) and Hugging Face `SammyLim/VideoMaMa` + parts of `stabilityai/stable-video-diffusion-img2vid-xt`; ComfyUI restart after the node install; not part of "Install all" | ~7.1 GB | optional (~8 GB VRAM at a 448 px crop, ~16 GB at 1280 px) |
-| **LTX-2.5 Alpha-Gen** models (stage 7 "LTX": int8 transformer, int8 Gemma, video + audio VAE, IC-LoRA Alpha-Gen; the nodes are in ComfyUI core ≥ 0.39) | Hugging Face `Lightricks/LTX-2.5` + `Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen` – "gated" repos: first `hf auth login` and "Agree and Access" (LTX-2.x licence); downloads resume after an interruption; not part of "Install all" | ~40 GB | optional (24 GB VRAM + ≥ 64 GB RAM) |
+| **LTX-2.5 Alpha-Gen** models (stage 7 "LTX-2.5": int8 transformer, int8 Gemma, video + audio VAE, IC-LoRA Alpha-Gen; the nodes are in ComfyUI core ≥ 0.39) | Hugging Face `Lightricks/LTX-2.5` + `Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen` – "gated" repos: first `hf auth login` and "Agree and Access" (LTX-2.x licence); downloads resume after an interruption; not part of "Install all" | ~40 GB | optional (24 GB VRAM + ≥ 64 GB RAM) |
 
 It does not install ComfyUI itself (when it is missing, the Doctor shows a "ComfyUI (installation)" item linking to ComfyUI Desktop: https://www.comfy.org/download) or Python (MatteDesk runs on it – `start_v….bat` installs it). MatteDesk **has no PyTorch of its own** – everything computed on the GPU (SAM3.1, MatAnyone2, DepthCrafter, CoTracker3) runs in ComfyUI's Python (ViTMatte too – as a persistent process `engine/vitmatte_worker.py`; plate alignment – `engine/align_gpu_worker.py`,
 `align_device` = auto | gpu | cpu in `config.local.json`, the CPU version stays as a fallback; the same worker computes "Alpha motion blur" –
@@ -304,7 +307,7 @@ After UI changes refresh the browser (Ctrl+F5).
   the result of each step (✅ / ❌) and a readable error; installing several things as a list of steps with progress.
 - 🔁 **Clear ComfyUI restart notice** – after installing nodes a large, persistent banner "Restart ComfyUI, otherwise the nodes will not work"
   (with a list of what waits for the restart), a "waiting for restart" tag on installed items and detection that Comfy has been restarted.
-- ⚡ **Performance and quality** – faster SAM3 frame preview, full-resolution overlays, finishing the tests on real shots.
+- ⚡ **Performance and quality** – faster SAM 3.1 frame preview, full-resolution overlays, finishing the tests on real shots.
 
 **Later**
 - 🐧 **Linux and macOS versions** – start script, installer and Doctor without Windows assumptions.
@@ -328,7 +331,7 @@ After UI changes refresh the browser (Ctrl+F5).
 | Path | Contents |
 |---|---|
 | `app.py`, `comfy_client.py`, `doctor.py` | server, ComfyUI client, Doctor |
-| `engine/` | engine: plate check and repair, cropping, SAM3, keys, QA, export, installer, configuration |
+| `engine/` | engine: plate check and repair, cropping, SAM 3.1, keys, QA, export, installer, configuration |
 | `static/` | user interface (HTML / JS / CSS); `static/i18n/en.json` = English catalog |
 | `handoff/` | ComfyUI nodes to install |
 | `docs/` | agent / CLI API (`AGENT_API.md`), data contract (`DATA_CONTRACT.md`) |

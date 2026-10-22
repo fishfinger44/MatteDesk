@@ -8,16 +8,18 @@ This module does (4)-(5) and the bookkeeping:
 - matanyone: one continuous MatAnyone2RunKeyframes pass per crop segment (every key user+auto + brush-correction frames; the node keeps <= 3 permanent,
   start = start key, bidirectional, max_mem_frames 5) -> MatAnyone2CoreCombine (fills false holes) ->
   limited to the edge band (outside: core) -> temporal median with motion_limit;
-- core: antialiased SAM3 core (no MatAnyone -> no flicker);
+- core: antialiased SAM 3.1 core (no MatAnyone2 -> no flicker);
 - crop-segment overlaps: linear alpha crossfade over the 8 frames;
-- ma_scale: object option ma_scale_mode auto | 1.0 | 0.75 | 0.5. auto = 9-frame test batch at 1.0, VRAM from
-  /system_stats; > 11 GB -> 0.75 -> 0.5 (logged); a fixed value skips the probe (VRAM still logged per segment);
+- ma_scale: object option ma_scale_mode auto | 1.0 | 0.75 | 0.5. auto = 9-frame test batch at 1.0 (crop > 2048 px:
+  0.75, > 2600 px: 0.5), VRAM from /system_stats + GPU memory spilled to system RAM (Windows counter); > 11 GB or
+  > 0.5 GB spilled -> next scale (logged); a fixed value skips the probe (VRAM still logged per segment);
+  Comfy down / OOM on a MatAnyone2 crop -> the error names the crop size and the scale to set;
 - MatAnyone2RunKeyframes >= 1.1.0 (installed node checked via /object_info): vram_release_frac (conditional
   empty_cache) and max_mem_frames 0 = auto from defaults.json "matanyone"; an older node gets the old inputs;
 - each run -> runs/v###/ (alpha per crop segment rgb=a half ZIP, core PNG, run.json).
 Comfy input files (engine/comfy_io.py): "exr" = float32 EXR + PlateLoadEXR / PlateLoadMaskSeq -> PlateSaveEXR
 (unchanged); "png8" (8-bit sources, MatAnyone2 only) = 8-bit PNG folders + VHS_LoadImagesPath / ImageToMask ->
-SaveImage (8-bit alpha PNG, downloaded). Backlit (scene-linear plate) and LTX (user's workflow) stay EXR.
+SaveImage (8-bit alpha PNG, downloaded). Backlit (scene-linear plate) and LTX-2.5 (user's workflow) stay EXR.
 """
 
 from __future__ import annotations
@@ -41,7 +43,11 @@ SMOOTHING = {"weak": (1, 0.5), "normal": (2, 0.35), "strong": (4, 0.25)}   # (ra
 # fixed band half-widths per edge mode until the adaptive band (7.8 pkt 2, E5b); x band_scale
 BAND_PX = {"matanyone": 6.0, "core": 2.0, "backlit": 40.0, "ltx": 16.0}
 VRAM_LIMIT_GB = 11.0
+SPILL_LIMIT_GB = 0.5   # GPU memory moved to system RAM during the probe (Windows WDDM) above this = scale too big
 TEST_BATCH = 9
+PROBE_SCALES = (1.0, 0.75, 0.5)
+# auto probe start by crop side (beatch 2026-10-18: a 2784 px crop probed at 1.0 aborted the whole Comfy process)
+PROBE_START_BY_SIDE = ((2600, 0.5), (2048, 0.75))
 MA_SCALE_MODES = ("auto", "1.0", "0.75", "0.5")
 MA_NODE_DEFAULTS = {"vram_release_frac": 0.85, "max_mem_frames": 0,   # defaults.json "matanyone" overrides
                     # node >= 1.2.0 (2026-10-16): soft re-anchoring on the non-start key frames (were as hard as SAM3)
@@ -92,7 +98,7 @@ def ma_extra_inputs(client: Any, opts: Optional[Dict[str, Any]] = None) -> Dict[
 
 
 def core_soft_supported(client: Any) -> bool:
-    """MatAnyone2CoreCombine >= 1.1.2 has `core_mode` (soft start of the band from SAM3 probabilities)."""
+    """MatAnyone2CoreCombine >= 1.1.2 has `core_mode` (soft start of the band from SAM 3.1 probabilities)."""
     try:
         return "core_mode" in node_input_names(client.get_object_info("MatAnyone2CoreCombine"), "MatAnyone2CoreCombine")
     except Exception:
@@ -100,7 +106,7 @@ def core_soft_supported(client: Any) -> bool:
 
 
 def core_soft_start_on(obj: Dict[str, Any]) -> bool:
-    """Object option `core_soft_start` (default on): MatAnyone's core starts from the SAM3 probabilities where maps exist."""
+    """Object option `core_soft_start` (default on): MatAnyone2's core starts from the SAM 3.1 probabilities where maps exist."""
     v = obj.get("core_soft_start")
     return True if v is None else bool(v)
 
@@ -110,6 +116,25 @@ def key_band_same_on(obj: Dict[str, Any]) -> bool:
     other frames instead of the spec's +-3 px (no hard one-frame jump of the edge at every key)."""
     v = obj.get("key_band_same")
     return True if v is None else bool(v)
+
+
+def probe_start_scale(side: int) -> float:
+    """First scale of the auto probe for a crop of `side` px: > 2600 -> 0.5, > 2048 -> 0.75, else 1.0."""
+    for limit, scale in PROBE_START_BY_SIDE:
+        if side > limit:
+            return scale
+    return 1.0
+
+
+def comfy_failure_hint(err: str, side: int, scale: float) -> str:
+    """What to change when Comfy died / ran out of memory on a MatAnyone2 crop of `side` px ('' = nothing to add)."""
+    if not any(t in err for t in ("nie odpowiada", "pamięci GPU", "pamięci RAM", "zadanie utracone")):
+        return ""
+    lower = [s for s in PROBE_SCALES if s < scale]
+    if not lower:
+        return f" – kadr {side} px już przy MatAnyone2 scale {scale}: skróć zakres pracy albo zamknij inne programy na GPU"
+    return (f" – kadr {side} px przy MatAnyone2 scale {scale}: ustaw MatAnyone2 scale "
+            f"{' / '.join(str(s) for s in lower)} (etap MatAnyone2 → „Skala MatAnyone2”) i policz ponownie")
 
 
 def ma_scale_mode(obj: Dict[str, Any]) -> str:
@@ -169,6 +194,13 @@ def temporal_median(alphas: np.ndarray, radius: int, motion_limit: float, band: 
     return out
 
 
+def _drop_flows(cache: Dict[Tuple[int, int], Any], lo: int) -> None:
+    """Frame i of a temporal window needs the pairs (i, j) / (j, i) with |i - j| <= radius; the frames go up, so a pair
+    with a frame below i - radius is never used again: dropped (the flows of every pair of a 4K shot do not fit in RAM)."""
+    for k in [k for k in cache if min(k) < lo]:
+        del cache[k]
+
+
 def temporal_median_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 2, band: Optional[np.ndarray] = None,
                          occl_px: float = 1.0, motion_limit: float = 0.35,
                          preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM) -> np.ndarray:
@@ -196,6 +228,7 @@ def temporal_median_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 2,
 
     out = alphas.copy()
     for i in range(n):
+        _drop_flows(flows, i - radius)   # pairs no later frame needs (RAM: 4K x2 flows, user report 2026-10-22)
         samples = []
         for d in range(-radius, radius + 1):
             j = min(n - 1, max(0, i + d))
@@ -299,6 +332,8 @@ def temporal_mean_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 3, s
     tex = None
     out = alphas.copy()
     for i in range(n):
+        _drop_flows(flows, i - radius)   # pairs no later frame needs (RAM: 4K x2 flows, user report 2026-10-22)
+        _drop_flows(fbs, i - radius)
         samples, tw, conf_w, raw = [], [], [], []
         if conf and tex_k > 0:
             t = _min_eig(u8[i].astype(np.float32) / 255.0)
@@ -438,7 +473,7 @@ def backlit_graph(backlit_pattern: str, n: int, core_pattern: str, out_pattern: 
 
 
 def ltx_batches(n: int, max_len: int = 25, overlap: int = 8) -> List[Tuple[int, int]]:
-    """Index ranges of 8k+1 frames (LTX), consecutive batches overlapping by `overlap` frames."""
+    """Index ranges of 8k+1 frames (LTX-2.5), consecutive batches overlapping by `overlap` frames."""
     max_len = max(9, (max_len - 1) // 8 * 8 + 1)
     if n <= max_len:
         L = (n - 1) // 8 * 8 + 1
@@ -457,7 +492,7 @@ def ltx_batches(n: int, max_len: int = 25, overlap: int = 8) -> List[Tuple[int, 
 
 
 def ltx_side(side: int, max_side: int = 1088, snap: int = 32) -> int:
-    """LTX input side: <= 1088 (downscale only for LTX), multiple of 32."""
+    """LTX-2.5 input side: <= 1088 (downscale only for LTX-2.5), multiple of 32."""
     return max(snap, min(max_side, side) // snap * snap)
 
 
@@ -538,6 +573,26 @@ def _vram_used_gb(client: Any) -> Optional[float]:
     return None
 
 
+def _comfy_shared_reader(client: Any) -> Optional[Callable[[], Optional[float]]]:
+    """Reader of the Comfy process' shared (spilled) GPU memory: a real ComfyClient on Windows only; MD_SHARED_PROBE=0
+    turns it off (synthetic tests). The PID is looked up once, on the first read."""
+    import os
+    try:
+        port = getattr(client, "port", None)
+    except Exception:   # stand-in clients may refuse unknown attributes
+        port = None
+    if os.name != "nt" or os.environ.get("MD_SHARED_PROBE", "1") == "0" or not isinstance(port, int):
+        return None
+    from engine.sysinfo import gpu_shared_gb, pid_on_port
+    state: Dict[str, Any] = {}
+
+    def read() -> Optional[float]:
+        if "pid" not in state:
+            state["pid"] = pid_on_port(port)
+        return gpu_shared_gb(state["pid"]) if state["pid"] else None
+    return read
+
+
 def contiguous_chunks(frames: Sequence[int]) -> List[List[int]]:
     """Frames split where they are not consecutive (gaps = the object outside its life range)."""
     out: List[List[int]] = []
@@ -575,6 +630,8 @@ class Finalizer:
         self.backlit_params = backlit_params or {}
         self.ltx_workflow = ltx_workflow
         self.ltx_max_frames = ltx_max_frames
+        # GPU memory of the Comfy process spilled to system RAM (GB) – read during the auto probe; None = not measured
+        self.shared_gb: Optional[Callable[[], Optional[float]]] = _comfy_shared_reader(client)
 
     def _backlit_segment(self, seg: CropSegment, frames: List[int], core: Dict[int, np.ndarray],
                          grow_px: float) -> Dict[int, np.ndarray]:
@@ -604,10 +661,10 @@ class Finalizer:
         return {f: read_alpha(frame_path(out, i)) for i, f in enumerate(frames)}
 
     def _ltx_segment(self, seg: CropSegment, frames: List[int], core: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
-        """User's LTX Alpha Gen workflow (PlateLoadEXR in -> PlateSaveEXR out), batches 8k+1 with 8-frame overlap,
-        crop downscaled to <= 1088 px (multiple of 32) for LTX only; result region-limited by the core."""
+        """User's LTX-2.5 Alpha Gen workflow (PlateLoadEXR in -> PlateSaveEXR out), batches 8k+1 with 8-frame overlap,
+        crop downscaled to <= 1088 px (multiple of 32) for LTX-2.5 only; result region-limited by the core."""
         if not self.ltx_workflow:
-            raise RuntimeError("tryb LTX: brak workflowu LTX Alpha Gen (config.json → ltx_alpha_workflow)")
+            raise RuntimeError("tryb LTX-2.5: brak workflowu LTX-2.5 Alpha Gen (config.json → ltx_alpha_workflow)")
         from engine.comfy_graph import one_node, ui_to_api
         side = seg.side
         ls = ltx_side(side)
@@ -618,7 +675,7 @@ class Finalizer:
             for i, f in enumerate(frames[a:b + 1]):
                 img = cv2.resize(self.load(f, seg, 1.0), (ls, ls), interpolation=cv2.INTER_AREA)
                 cv2.imwrite(str(job / f"f_{i:04d}.exr"), np.ascontiguousarray(img, np.float32))
-                job_progress("LTX: zapis klatek do Comfy", i + 1, b - a + 1)
+                job_progress("LTX-2.5: zapis klatek do Comfy", i + 1, b - a + 1)
             g = ui_to_api(self.ltx_workflow)
             _, ld = one_node(g, "PlateLoadEXR")
             _, sv = one_node(g, "PlateSaveEXR")
@@ -662,9 +719,9 @@ class Finalizer:
         return res
 
     def _release_comfy_cache(self) -> None:
-        """After a MatAnyone prompt: `POST /free {free_memory}` – Comfy's output cache otherwise keeps every tensor of the
+        """After a MatAnyone2 prompt: `POST /free {free_memory}` – Comfy's output cache otherwise keeps every tensor of the
         graph in RAM (frames, core, alpha, matte, fg: 9.5 GB for 279 x 704^2, ~60 GB for 514 x 1440^2) until the next
-        prompt evicts it. Models are not unloaded (unload_models False); MatAnyone's model is reloaded by the next
+        prompt evicts it. Models are not unloaded (unload_models False); MatAnyone2's model is reloaded by the next
         prompt (~2 s). Best effort: a failure here never fails the pass."""
         try:
             self.client.free_vram(unload_models=False, free_memory=True)
@@ -680,7 +737,7 @@ class Finalizer:
         return out
 
     def _soft_crop(self, soft: Optional[Dict[int, np.ndarray]], f: int, seg: CropSegment, ss: int) -> Optional[np.ndarray]:
-        """SAM3 probability crop of frame f at the MatAnyone size (float 0..1), or None (no map / no soft start)."""
+        """SAM 3.1 probability crop of frame f at the MatAnyone2 size (float 0..1), or None (no map / no soft start)."""
         if not soft or f not in soft:
             return None
         p = soft[f]
@@ -690,7 +747,19 @@ class Finalizer:
     def _matanyone_segment(self, seg: CropSegment, frames: List[int], core: Dict[int, np.ndarray],
                            keys: Dict[int, np.ndarray], start: int, scale: float, tag: str,
                            soft: Optional[Dict[int, np.ndarray]] = None) -> Dict[int, np.ndarray]:
-        """`soft` (frame -> SAM3 probability map, full frame, consistent with `core`): soft start of the band – those
+        """One MatAnyone2 pass on a crop segment; Comfy down / out of memory -> the error names the crop and the scale to set."""
+        try:
+            return self._matanyone_segment_run(seg, frames, core, keys, start, scale, tag, soft)
+        except RuntimeError as e:
+            hint = comfy_failure_hint(str(e), seg.side, scale)
+            if not hint:
+                raise
+            raise RuntimeError(f"{e}{hint}") from e
+
+    def _matanyone_segment_run(self, seg: CropSegment, frames: List[int], core: Dict[int, np.ndarray],
+                               keys: Dict[int, np.ndarray], start: int, scale: float, tag: str,
+                               soft: Optional[Dict[int, np.ndarray]] = None) -> Dict[int, np.ndarray]:
+        """`soft` (frame -> SAM 3.1 probability map, full frame, consistent with `core`): soft start of the band – those
         frames' core files carry the probabilities and CoreCombine runs with core_mode=soft (the caller checks the
         installed node). Without it: the old graph and files bit for bit."""
         job = _mk(self.io / f"ma_{seg.seg_id}_{tag}")
@@ -794,19 +863,39 @@ class Finalizer:
 
     def probe_scale(self, seg: CropSegment, frames: List[int], core: Dict[int, np.ndarray],
                     keys: Dict[int, np.ndarray], start: int, rep: FinalizeReport) -> float:
-        """9-frame test batch at 1.0 -> 0.75 -> 0.5 until VRAM <= 11 GB (SPEC 5.4)."""
+        """9-frame test batch 1.0 -> 0.75 -> 0.5 until VRAM <= 11 GB (SPEC 5.4) and <= 0.5 GB spilled to system RAM.
+        Large crops start lower (probe_start_scale): the first trial at 1.0 on a 2784 px crop killed Comfy."""
+        from engine.sysinfo import SpillSampler
         test = frames[:TEST_BATCH]
-        for scale in (1.0, 0.75, 0.5):
+        first = probe_start_scale(seg.side)
+        if first < 1.0:
+            rep.vram_log.append(f"kadr {seg.side} px: próba od ma_scale {first}")
+        idle = None
+        if self.shared_gb is not None:   # read once: what an earlier trial left in shared memory is not idle
+            try:
+                idle = self.shared_gb()
+            except Exception:
+                idle = None
+        for scale in [s for s in PROBE_SCALES if s <= first]:
             t0 = time.time()
-            self._matanyone_segment(seg, test, core, {**keys, test[0]: keys.get(test[0], core[test[0]])},
-                                    test[0], scale, f"probe{int(scale * 100)}")
+            sampler = SpillSampler(self.shared_gb, base=idle) if self.shared_gb is not None else None
+            if sampler is not None:
+                sampler.__enter__()
+            try:
+                self._matanyone_segment(seg, test, core, {**keys, test[0]: keys.get(test[0], core[test[0]])},
+                                        test[0], scale, f"probe{int(scale * 100)}")
+            finally:
+                if sampler is not None:
+                    sampler.__exit__(None, None, None)
             used = _vram_used_gb(self.client)
-            rep.vram_log.append(f"ma_scale {scale}: VRAM {used if used is None else round(used, 2)} GB, "
+            spill = sampler.spill_gb if sampler is not None else None
+            rep.vram_log.append(f"ma_scale {scale}: VRAM {used if used is None else round(used, 2)} GB"
+                                f"{'' if spill is None else f', przelane do RAM {spill:.2f} GB'}, "
                                 f"{time.time() - t0:.1f} s / {len(test)} kl.")
-            if used is None or used <= VRAM_LIMIT_GB:
+            if (used is None or used <= VRAM_LIMIT_GB) and (spill is None or spill <= SPILL_LIMIT_GB):
                 rep.vram_gb = used
                 return scale
-        return 0.5
+        return PROBE_SCALES[-1]
 
     def finalize(self, obj: Dict[str, Any], segs: Sequence[CropSegment], frames: Sequence[int],
                  core: Dict[int, np.ndarray], keys: Dict[int, np.ndarray], start: int, run_dir: Path,
@@ -815,12 +904,13 @@ class Finalizer:
                  soft_override: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
                  band_fn: Optional[Callable[[int, CropSegment, np.ndarray, float], np.ndarray]] = None,
                  soft_feather: float = ZONE_FEATHER_PX,
+                 soft_weights: Optional[Dict[int, np.ndarray]] = None,
                  keep_holes: Optional[Dict[int, np.ndarray]] = None,
                  core_soft: Optional[Dict[int, np.ndarray]] = None
                  ) -> Tuple[Dict[int, np.ndarray], FinalizeReport]:
         """`exclude`: full-frame pixels removed by Remove zones (+2 px) – out of the edge band, never restored;
         `soft_override`: full-frame (alpha, area) of soft zones – applied last, wins over everything in its area;
-        `core_soft`: SAM3 probabilities (uint8, consistent with `core`) of the frames that have them – soft start of the
+        `core_soft`: SAM 3.1 probabilities (uint8, consistent with `core`) of the frames that have them – soft start of the
         band in matanyone mode when the installed CoreCombine has core_mode (else binary as before, noted in the report)."""
         t0 = time.time()
         frames = list(frames)
@@ -829,8 +919,9 @@ class Finalizer:
         band_px = BAND_PX.get(edge_mode, 6.0) * float(obj.get("band_scale", 1.0))
         rep = FinalizeReport(run=run_dir.name, edge_mode=edge_mode, segments=[s.seg_id for s in segs],
                              smoothing=smoothing, band_px=band_px)
-        # ma_scale_mode (object option): auto = probe (1.0 -> 0.75 -> 0.5 by VRAM); a fixed value skips the probe.
-        # auto starts from 1.0 every time (not from the scale stored by the previous run, so going back from a
+        # ma_scale_mode (object option): auto = probe (1.0 -> 0.75 -> 0.5 by VRAM and spill to RAM; crops > 2048 px
+        # start at 0.75, > 2600 px at 0.5); a fixed value skips the probe.
+        # auto starts from probe_start_scale every time (not from the scale stored by the previous run, so going back from a
         # fixed 0.5 to auto is not stuck at 0.5).
         smode = ma_scale_mode(obj)
         rep.ma_scale_mode = smode
@@ -897,7 +988,16 @@ class Finalizer:
                 if exclude and f in exclude:
                     band &= ~(extract_crop(exclude[f].astype(np.float32), seg) > 0.5)
                 fe = float(obj.get("band_in_feather_px") or 0.0)
-                if fe > 0:
+                fo = float(obj.get("band_out_feather_px") or 0.0)
+                if fo > 0:
+                    # one band system (2026-10-22): the outer feather blends the edge result into the core (0 there) from
+                    # the outer band edge, the inset feather from the inner edge; they never overlap (zones.feather_maps)
+                    from engine.zones import feather_maps
+                    d_in, d_out, li, lo = feather_maps(band, c, fe, fo)
+                    w_in = np.clip(d_in / li, 0.0, 1.0) if fe > 0 else 1.0
+                    w = np.minimum(w_in, np.clip(d_out / lo, 0.0, 1.0))
+                    res[f] = np.where(band, w * soft[f] + (1.0 - w) * c.astype(np.float32), c.astype(np.float32))
+                elif fe > 0:
                     # feather of the core inset (user request 2026-10-17): near the deep core the edge result fades into
                     # the core over `fe` px instead of a hard switch (a visible line at the inner band edge)
                     deep = c & ~band
@@ -932,7 +1032,8 @@ class Finalizer:
                     arr[i] = np.clip(arr[i], 0, 1).astype(np.float16).astype(np.float32)
                     sa, sarea = soft_override[f]
                     area = extract_crop(sarea.astype(np.float32), seg) > 0.5
-                    arr[i] = apply_soft_override(arr[i], extract_crop(sa.astype(np.float32), seg), area, soft_feather)
+                    sw = (extract_crop(soft_weights[f], seg) if soft_weights and f in soft_weights else None)
+                    arr[i] = apply_soft_override(arr[i], extract_crop(sa.astype(np.float32), seg), area, soft_feather, sw)
             per_seg[seg.seg_id] = {f: arr[i] for i, f in enumerate(sf)}
             # write crop-only alpha + core (runs/v###/alpha/<seg>/a_####.exr)
             for i, f in enumerate(sf):
@@ -962,9 +1063,15 @@ def _mk(p: Path) -> Path:
     return p
 
 
-def apply_soft_override(base: np.ndarray, sa: np.ndarray, area: np.ndarray, feather_px: float = ZONE_FEATHER_PX) -> np.ndarray:
+def apply_soft_override(base: np.ndarray, sa: np.ndarray, area: np.ndarray, feather_px: float = ZONE_FEATHER_PX,
+                        weight: Optional[np.ndarray] = None) -> np.ndarray:
     """Soft-zone alpha `sa` wins inside `area`, feathered over `feather_px` INSIDE the area (no step at the polygon
-    border); pixels outside the area are returned untouched (bit-identical). Used by finalize and by "Zastosuj"."""
+    border); pixels outside the area are returned untouched (bit-identical). Used by finalize and by "Zastosuj".
+    `weight` (uint8 0..255, zones.ZoneResult.weights): a precomputed blend weight instead – a zone with its own
+    outer-edge feather (2026-10-21)."""
+    if weight is not None:
+        w = weight.astype(np.float32) / 255.0
+        return np.where(area, w * sa + (1.0 - w) * base, base).astype(np.float32)
     w = np.clip(cv2.distanceTransform(area.astype(np.uint8), cv2.DIST_L2, 5) / float(feather_px), 0, 1)
     return np.where(area, w * sa + (1.0 - w) * base, base).astype(np.float32)
 

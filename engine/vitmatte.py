@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 r"""engine/vitmatte.py - ViTMatte (hustvl, HF transformers) as a per-frame matte-zone engine.
 
-ViTMatte is allowed (user decision 2026-10-14; it started as the 2026-10-13 experiment "MatAnyone vs ViTMatte on
+ViTMatte is allowed (user decision 2026-10-14; it started as the 2026-10-13 experiment "MatAnyone2 vs ViTMatte on
 the zone crop", SH020 `osoba`, zone z_02, when CLAUDE.md still banned it). Weights from the HF cache
 (`hustvl/vitmatte-base-composition-1k`, ~390 MB).
 
@@ -140,16 +140,17 @@ def worker_python() -> Optional[Path]:
 
 
 def check_worker_python(python: Optional[Union[str, Path]], model_ids: Optional[List[str]] = None,
-                        env: Optional[Dict[str, str]] = None) -> Tuple[bool, str, List[str]]:
-    """(ok, device or the reason, model ids already in the HF cache): can ComfyUI's Python run ViTMatte?
-    Cached per interpreter (the installer clears `_CHECK_CACHE`)."""
+                        env: Optional[Dict[str, str]] = None,
+                        worker: Path = WORKER) -> Tuple[bool, str, List[str]]:
+    """(ok, device or the reason, model ids already in the HF cache): can ComfyUI's Python run `worker`
+    (ViTMatte by default; engine/birefnet.py passes its own)? Cached per interpreter (the installer clears `_CHECK_CACHE`)."""
     if not python or not Path(python).exists():
         return False, "nie znaleziono Pythona ComfyUI (ustaw comfy_dir / comfy_python)", []
     ids = list(model_ids or MODELS.values())
-    key = str(python) + "|" + ",".join(ids)
+    key = str(python) + "|" + str(worker) + "|" + ",".join(ids)
     if key not in _CHECK_CACHE:
         try:
-            r = subprocess.run([str(python), "-I", str(WORKER), "--check", *ids], capture_output=True, text=True,
+            r = subprocess.run([str(python), "-I", str(worker), "--check", *ids], capture_output=True, text=True,
                                timeout=180, env=env)
             out = (r.stdout or r.stderr or "").strip()
             if r.returncode == 0 and out.startswith("ok"):
@@ -168,6 +169,10 @@ class ComfyVitMatteRunner:
     Same `run()` contract and attributes as `VitMatteRunner`."""
 
     backend = "comfy"
+    label = "ViTMatte"                 # in messages; engine/birefnet.py subclasses with its own worker
+    doctor_item = "Model: ViTMatte"
+    worker = WORKER
+    tmp_prefix = "md_vitmatte_"
 
     def __init__(self, model_id: str = DEFAULT_MODEL, python: Optional[Union[str, Path]] = None,
                  env: Optional[Dict[str, str]] = None, timeout_s: float = 600.0):
@@ -184,15 +189,15 @@ class ComfyVitMatteRunner:
         self._n = 0
 
     def available(self) -> Tuple[bool, str]:
-        ok, why, _ = check_worker_python(self.python, [self.model_id], env=self.env)
-        return (ok, "" if ok else f"ViTMatte niedostępny w Pythonie ComfyUI: {why}")
+        ok, why, _ = check_worker_python(self.python, [self.model_id], env=self.env, worker=self.worker)
+        return (ok, "" if ok else f"{self.label} niedostępny w Pythonie ComfyUI: {why}")
 
     def _start(self) -> None:
         if self._dir is None:
-            self._dir = tempfile.TemporaryDirectory(prefix="md_vitmatte_")
+            self._dir = tempfile.TemporaryDirectory(prefix=self.tmp_prefix)
         if self._log is None:
             self._log = open(Path(self._dir.name) / "worker.log", "a+", encoding="utf-8", errors="replace")
-        self._proc = subprocess.Popen([self.python, "-I", str(WORKER), "--serve", self.model_id],
+        self._proc = subprocess.Popen([self.python, "-I", str(self.worker), "--serve", self.model_id],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True,
                                       bufsize=1, env=self.env)
 
@@ -207,7 +212,7 @@ class ComfyVitMatteRunner:
     def _request(self, x_path: Path, out_path: Path) -> Dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             if not self.python or not Path(self.python).exists():
-                raise RuntimeError("ViTMatte: nie znaleziono Pythona ComfyUI (Doktor → „Model: ViTMatte”)")
+                raise RuntimeError(f"{self.label}: nie znaleziono Pythona ComfyUI (Doktor → „{self.doctor_item}”)")
             self._start()
         result: Dict[str, Any] = {}
 
@@ -224,14 +229,14 @@ class ComfyVitMatteRunner:
             alive = self._proc.poll() is None
             tail = self._log_tail()
             self.close()
-            raise RuntimeError("ViTMatte (Python ComfyUI) " + ("nie odpowiedział w czasie" if alive else "zakończył się")
+            raise RuntimeError(f"{self.label} (Python ComfyUI) " +("nie odpowiedział w czasie" if alive else "zakończył się")
                                + f": {tail}")
         return json.loads(line)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         with self._lock:
             if self._dir is None:
-                self._dir = tempfile.TemporaryDirectory(prefix="md_vitmatte_")
+                self._dir = tempfile.TemporaryDirectory(prefix=self.tmp_prefix)
             self._n += 1
             x_path = Path(self._dir.name) / f"x_{self._n}.npy"
             out_path = Path(self._dir.name) / f"a_{self._n}.npy"
@@ -239,7 +244,7 @@ class ComfyVitMatteRunner:
             try:
                 resp = self._request(x_path, out_path)
                 if not resp.get("ok"):
-                    raise RuntimeError(f"ViTMatte (Python ComfyUI): {resp.get('error')}")
+                    raise RuntimeError(f"{self.label} (Python ComfyUI): {resp.get('error')}")
                 self.device = resp.get("device") or self.device
                 self.load_seconds = float(resp.get("load_seconds") or self.load_seconds)
                 return np.load(out_path).astype(np.float32)

@@ -10,7 +10,7 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.32/MatteDesk-0.32-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.35/MatteDesk-0.35-setup.exe)
 
 Windows 10 / 11 · karta NVIDIA · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -43,7 +43,7 @@ MatteDesk zamienia to w krótki, kontrolowany przepływ:
 | | Krok | Co się dzieje |
 |:-:|---|---|
 | 🩹 | **Napraw plate'y** | Narzędzie sprawdza klatki wejściowe i naprawia uszkodzone – **raz**, a poprawiony plate jest używany wszędzie dalej |
-| 💬 | **Powiedz, co wyciąć** | Wpisujesz frazę (SAM3 rozumie ją po angielsku) albo zaznaczasz obiekt: klik `+`/`−`, prostokąt, pędzel |
+| 💬 | **Powiedz, co wyciąć** | Wpisujesz frazę (SAM 3.1 rozumie ją po angielsku) albo zaznaczasz obiekt: klik `+`/`−`, prostokąt, pędzel |
 | 🔍 | **Automatyczne kadrowanie** | Obiekt dostaje ciasny, kwadratowy wycinek, a maska jest liczona na całe ujęcie |
 | 👁 | **Przegląd klatka po klatce** | Oś czasu z flagami QA, porównania A/B, wipe, diff, kontury, podgląd compu na różnych tłach |
 | ✋ | **Popraw tylko złe klatki** | Twoje zaznaczenie staje się twardym *kluczem* – maska jest przeliczana od niego w przód i w tył |
@@ -70,9 +70,9 @@ flowchart LR
     S -.->|zła klatka: klucz| S
 ```
 
-Każdy obiekt przechodzi przez pasek etapów **0 Plate'y · 1 SAM3 · 2 CoTracker · 3 MatAnyone · 4 VideoMaMa · 5 ViTMatte · 6 Eksperymenty ·
-7 LTX · 8 Eksport**. Etapy 2 i 4–7 są opcjonalne; Eksport jest dostępny od razu po rdzeniu SAM3, a źródło wybierasz (rdzeń, MatAnyone,
-VideoMaMa, ViTMatte, LTX albo dowolna wersja). Panel każdego etapu mówi, co robi i do czego jest najlepszy. Pasek pokazuje, co jest gotowe,
+Każdy obiekt przechodzi przez pasek etapów **0 Plate'y · 1 SAM 3.1 · 2 CoTracker3 · 3 MatAnyone2 · 4 VideoMaMa · 5 ViTMatte · 6 Eksperymenty ·
+7 LTX-2.5 · 8 Eksport**. Etapy 2 i 4–7 są opcjonalne; Eksport jest dostępny od razu po rdzeniu SAM 3.1, a źródło wybierasz (rdzeń, MatAnyone2,
+VideoMaMa, ViTMatte, LTX-2.5 albo dowolna wersja). Panel każdego etapu mówi, co robi i do czego jest najlepszy. Pasek pokazuje, co jest gotowe,
 a co wymaga przeliczenia po Twojej poprawce; cofanie jest zawsze dostępne, a każda zmiana tworzy nową wersję do porównania (A / B / różnica).
 
 ---
@@ -129,6 +129,14 @@ Przycisk **Doktor** sprawdza ComfyUI, węzły, modele, ffmpeg i GPU. Gdy czegoś
 daje przycisk **Zainstaluj** z paskiem postępu (MB, prędkość, czas do końca) oraz zbiorczy **„Zainstaluj wszystkie brakujące”**.
 Jest też przełącznik między **ComfyUI Desktop** a **ComfyUI z gita**.
 
+### 🐞 Zgłoś problem
+Przycisk **🐞 Zgłoś problem** (w nagłówku, w oknie „O programie” i w każdym oknie błędu) wysyła autorowi krótki opis z diagnostyką:
+wersja MatteDesk, Windows, Python, GPU, wersja ComfyUI i VRAM, pozycje Doktora inne niż OK, ostatnie zadania i ich błędy, końcówka
+logu oraz – tylko gdy to zaznaczysz – zrzut okna. Ścieżki, nazwy ujęć i obiektów, nazwa użytkownika i komputera są zastępowane
+znacznikami (`<path>`, `<shot>`, `<obj>`, `<user>`), a **przed wysłaniem widzisz całą paczkę** i musisz zaznaczyć zgodę. Pole e-mail
+jest opcjonalne. Bez kliknięcia „Wyślij” nic nie wychodzi z komputera; zgłoszenie idzie przez mały pośrednik do prywatnej listy
+zgłoszeń autora (aplikacja nie ma żadnego tokenu GitHub).
+
 ### 🤖 API dla agentów AI i skryptów
 Wszystko, co robi interfejs, jest dostępne przez lokalne REST API i wiersz poleceń `tools/md.py` (sama biblioteka standardowa) –
 opis w [docs/AGENT_API.md](docs/AGENT_API.md). Agent AI (np. Claude Code) albo skrypt pipeline'u może otworzyć ujęcie, uruchomić
@@ -169,14 +177,15 @@ dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej 
 | Wagi **SAM3.1** (`sam3.1_multiplex_fp16`) | Hugging Face `Comfy-Org/sam3.1` | 1,7 GB | ✅ |
 | Wagi **MatAnyone2** | GitHub `pq-yang/MatAnyone2` | 135 MB | ✅ |
 | **CoTracker3** (pakiet do Pythona ComfyUI + wagi) | pip `--no-deps` + Hugging Face `facebook/cotracker3` | 100 MB | zalecane |
-| Wagi **ViTMatte** (strefy „włosy” / silnik `vitmatte`; liczy się w Pythonie ComfyUI) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, tylko gdy brak) | 390 MB | ✅ dla stref włosów |
+| Wagi **ViTMatte** (strefy „włosy” / silnik `vitmatte`; liczy się w Pythonie ComfyUI) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, tylko gdy brak) | 390 MB | ✅ dla stref włosów (wagi **tylko niekomercyjnie** – trenowane na zbiorze Adobe) |
+| Wagi **BiRefNet_HR-matting / Lucida** (opcjonalne modele krawędzi strefy ViTMatte, MIT – do pracy komercyjnej; Python ComfyUI) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, tylko gdy brak) | 444 + 885 MB | ❌ opcjonalne |
 | **Wyrównanie plate'ów na GPU** (`engine/align_gpu_worker.py` w Pythonie ComfyUI; tylko sprawdzenie – używa torcha i CUDA z ComfyUI) | – | 0 | nie (przyspieszenie; bez tego CPU) |
-| Węzły **VideoHelperSuite** (`VHS_LoadImagesPath` – ujęcia 8-bit PNG/JPG w SAM3, MatAnyone2, strefach) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + jego wymagania (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ dla ujęć 8-bit |
+| Węzły **VideoHelperSuite** (`VHS_LoadImagesPath` – ujęcia 8-bit PNG/JPG w SAM 3.1, MatAnyone2, strefach) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + jego wymagania (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ dla ujęć 8-bit |
 | Węzły **DepthCrafter** (funkcja „Głębia”) | GitHub `akatz-ai` (model 4–6 GB pobiera się przy 1. użyciu) | < 1 MB | opcjonalnie |
 | Węzły + wagi **MiniMax-Remover** (przyszły moduł Inpainting) | GitHub `1038lab` + Hugging Face `zibojia/minimax-remover` | 2,6 GB | nie (jeszcze nieużywane) |
 | Węzły `comfyui-inpaint-nodes` + wagi **LaMa** | GitHub `Acly` + `big-lama.pt` | 196 MB | opcjonalnie |
 | Węzeł **ComfyUI-VideoMaMa** + wagi (etap 4 „VideoMaMa”: UNet VideoMaMa, image encoder + VAE SVD-xt fp16 → `models/videomama/`) | `git clone` github.com/okdalto/ComfyUI-VideoMaMa do custom_nodes (+ `requirements.txt`) i Hugging Face `SammyLim/VideoMaMa` + części `stabilityai/stable-video-diffusion-img2vid-xt`; po instalacji węzła restart ComfyUI; nie wchodzi do „Zainstaluj wszystkie” | ~7,1 GB | opcjonalnie (~8 GB VRAM przy kadrze 448 px, ~16 GB przy 1280 px) |
-| Modele **LTX-2.5 Alpha-Gen** (etap 7 „LTX”: transformer int8, Gemma int8, VAE wideo + audio, IC-LoRA Alpha-Gen; węzły są w rdzeniu ComfyUI ≥ 0.39) | Hugging Face `Lightricks/LTX-2.5` + `Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen` – repo „gated”: najpierw `hf auth login` i „Agree and Access” (licencja LTX-2.x); pobieranie wznawia się po przerwaniu; nie wchodzi do „Zainstaluj wszystkie” | ~40 GB | opcjonalnie (24 GB VRAM + ≥ 64 GB RAM) |
+| Modele **LTX-2.5 Alpha-Gen** (etap 7 „LTX-2.5”: transformer int8, Gemma int8, VAE wideo + audio, IC-LoRA Alpha-Gen; węzły są w rdzeniu ComfyUI ≥ 0.39) | Hugging Face `Lightricks/LTX-2.5` + `Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen` – repo „gated”: najpierw `hf auth login` i „Agree and Access” (licencja LTX-2.x); pobieranie wznawia się po przerwaniu; nie wchodzi do „Zainstaluj wszystkie” | ~40 GB | opcjonalnie (24 GB VRAM + ≥ 64 GB RAM) |
 
 Nie instaluje: samego ComfyUI (gdy go brak, Doktor pokazuje pozycję „ComfyUI (instalacja)” z linkiem do ComfyUI Desktop: https://www.comfy.org/download) ani Pythona (MatteDesk na nim działa – instaluje go `start_v….bat`). MatteDesk **nie ma własnego PyTorcha** – wszystko, co liczy na GPU (SAM3.1, MatAnyone2, DepthCrafter, CoTracker3), działa w Pythonie ComfyUI (ViTMatte też – jako stały proces `engine/vitmatte_worker.py`; wyrównanie plate'ów – `engine/align_gpu_worker.py`,
 `align_device` = auto | gpu | cpu w `config.local.json`, wersja CPU zostaje jako zapasowa; ten sam worker liczy „Motion blur alfy” –
@@ -295,7 +304,7 @@ Po zmianach w interfejsie odśwież przeglądarkę (Ctrl+F5).
 - 🔁 **Wyraźna informacja o restarcie ComfyUI** – po instalacji węzłów duży, stały baner „Zrestartuj ComfyUI, inaczej węzły nie zadziałają”
   (z listą tego, co czeka na restart), znacznik „czeka na restart” przy zainstalowanych pozycjach i wykrycie, kiedy Comfy został już zrestartowany.
 - 🧪 **Pierwszy prawdziwy przebieg na tym komputerze** – instalacja przez Doktora, restart ComfyUI i test na ujęciu.
-- ⚡ **Wydajność i jakość** – szybszy podgląd klatki SAM3, pełna rozdzielczość nakładek, domknięcie testów na prawdziwych ujęciach.
+- ⚡ **Wydajność i jakość** – szybszy podgląd klatki SAM 3.1, pełna rozdzielczość nakładek, domknięcie testów na prawdziwych ujęciach.
 
 **Dalej**
 - 🐧 **Wersje na Linuxa i macOS** – skrypt startowy, instalator i Doktor bez założeń Windowsa.
@@ -320,7 +329,7 @@ Po zmianach w interfejsie odśwież przeglądarkę (Ctrl+F5).
 | Ścieżka | Zawartość |
 |---|---|
 | `app.py`, `comfy_client.py`, `doctor.py` | serwer, klient ComfyUI, Doktor |
-| `engine/` | silnik: kontrola i naprawa plate'ów, kadrowanie, SAM3, klucze, QA, eksport, instalator, konfiguracja |
+| `engine/` | silnik: kontrola i naprawa plate'ów, kadrowanie, SAM 3.1, klucze, QA, eksport, instalator, konfiguracja |
 | `static/` | interfejs (HTML / JS / CSS); `static/i18n/en.json` = słownik angielski |
 | `handoff/` | węzły ComfyUI do zainstalowania |
 | `docs/` | API dla agenta / CLI (`AGENT_API.md`), kontrakt danych (`DATA_CONTRACT.md`) |

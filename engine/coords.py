@@ -4,7 +4,7 @@
 
 Complies with SPEC_INTERACTIVE_MATTE_TOOL.md (Section 3, 4, 5.1, 12: Stage E1):
 - Single source of truth for all spatial transformations:
-    plate (full res) <-> proxy (UI display) <-> crop (square section) <-> 1008x1008 (SAM3 input)
+    plate (full res) <-> proxy (UI display) <-> crop (square section) <-> 1008x1008 (SAM 3.1 input)
 - Frame number mapping: global plate frame number (e.g. 1..193 or 1001..1193) <-> Comfy batch index (0..N-1).
 - Mirror padding & bounds calculation.
 - Round-trip accuracy guaranteed < 0.5 px.
@@ -23,7 +23,7 @@ class CropBox:
     Attributes:
         x: Left edge (int/float)
         y: Top edge (int/float)
-        w: Width (must equal h for SAM3 square crops)
+        w: Width (must equal h for SAM 3.1 square crops)
         h: Height
         pad_l: Left mirror padding pixels (if crop exceeds plate left bound)
         pad_t: Top mirror padding pixels
@@ -82,7 +82,7 @@ class FrameMapper:
 
 
 class CoordTransformer:
-    """Performs spatial coordinate conversions between plate, proxy, crop, and SAM3 (1008x1008)."""
+    """Performs spatial coordinate conversions between plate, proxy, crop, and SAM 3.1 (1008x1008)."""
 
     def __init__(self, plate_w: int, plate_h: int, proxy_max_side: int = 1920):
         self.plate_w = float(plate_w)
@@ -125,7 +125,7 @@ class CoordTransformer:
     # Crop <-> SAM3 1008x1008
     # -------------------------------------------------------------------------
     def crop_to_sam1008(self, cx: float, cy: float, crop: CropBox) -> Tuple[float, float]:
-        """Convert crop relative coords to 1008x1008 SAM3 input coords."""
+        """Convert crop relative coords to 1008x1008 SAM 3.1 input coords."""
         total_w = crop.total_w
         total_h = crop.total_h
         if total_w <= 0 or total_h <= 0:
@@ -135,7 +135,7 @@ class CoordTransformer:
         return (sx, sy)
 
     def sam1008_to_crop(self, sx: float, sy: float, crop: CropBox) -> Tuple[float, float]:
-        """Convert SAM3 1008x1008 coords back to crop relative coords."""
+        """Convert SAM 3.1 1008x1008 coords back to crop relative coords."""
         total_w = crop.total_w
         total_h = crop.total_h
         cx = sx * (total_w / 1008.0)
@@ -146,12 +146,12 @@ class CoordTransformer:
     # Plate <-> SAM3 1008x1008 (Full Pipeline)
     # -------------------------------------------------------------------------
     def plate_to_sam1008(self, x: float, y: float, crop: CropBox) -> Tuple[float, float]:
-        """Direct transformation from plate full res to SAM3 1008x1008."""
+        """Direct transformation from plate full res to SAM 3.1 1008x1008."""
         cx, cy = self.plate_to_crop(x, y, crop)
         return self.crop_to_sam1008(cx, cy, crop)
 
     def sam1008_to_plate(self, sx: float, sy: float, crop: CropBox) -> Tuple[float, float]:
-        """Direct transformation from SAM3 1008x1008 to plate full res."""
+        """Direct transformation from SAM 3.1 1008x1008 to plate full res."""
         cx, cy = self.sam1008_to_crop(sx, sy, crop)
         return self.crop_to_plate(cx, cy, crop)
 
@@ -167,7 +167,7 @@ class CoordTransformer:
         return res
 
     def points_sam1008_to_plate(self, points: Sequence[Dict[str, float]], crop: CropBox) -> List[Tuple[float, float]]:
-        """Convert KJNodes PointsEditor points from SAM3 1008 to plate coords."""
+        """Convert KJNodes PointsEditor points from SAM 3.1 1008 to plate coords."""
         res = []
         for pt in points:
             px, py = self.sam1008_to_plate(pt["x"], pt["y"], crop)
@@ -195,7 +195,7 @@ class CoordTransformer:
             min_side: Minimum required dimension (e.g. max(bbox_w, bbox_h))
             pad_ratio: Factor to scale dimension (default 1.10)
             margin_px: Minimum margin around object
-            snap_multiple: Multiple to snap side length to (16 for SAM3/MatAnyone, 32 for LTX)
+            snap_multiple: Multiple to snap side length to (16 for SAM 3.1/MatAnyone2, 32 for LTX-2.5)
             allow_shift: If True, shift crop to stay inside plate bounds before falling back to mirror pad.
         """
         # Snap side up to multiple (integer)

@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/segment.py - SAM3 core propagation from keys (SPEC 7.1-7.3, stages E3/E4).
+"""engine/segment.py - SAM 3.1 core propagation from keys (SPEC 7.1-7.3, stages E3/E4).
 
 Keys split the shot into intervals [K_i, K_i+1]. Per interval:
   1. forward  SAM3_VideoTrack from K_i (initial_mask = key K_i) to K_i+1,
@@ -8,7 +8,7 @@ Keys split the shot into intervals [K_i, K_i+1]. Per interval:
   3. blend forward/backward on signed distance fields with a linear time weight (no "two contours"),
   4. IoU(fwd, bwd) < 0.90 -> uncertain frame; suggested key = middle of the worst run,
   5. before the first key only backward, after the last only forward (no blend, stricter QA later),
-  6. result = binary full-shot SAM3 core (the only level where keys act; MatAnyone comes later, 7.3a),
+  6. result = binary full-shot SAM 3.1 core (the only level where keys act; MatAnyone2 comes later, 7.3a),
   8. an interval crossing crop segments is split at the segment boundary; the mask at the start of the
      overlap (old crop) -> full frame -> cut into the new crop -> initial mask of the continuation; the 8
      overlap frames are computed in both crops and blended on SDF.
@@ -98,7 +98,7 @@ def contour_points(mask: np.ndarray, step: float = 4.0, inset: float = 1.5, with
 
 class PointPropagator:
     """SPEC 7.2 pkt 7: contour propagation by point tracks (CoTracker3; LK only as a named fallback) – for intervals
-    where SAM3 loses the object. Works on display frames downscaled to <= 1024 px."""
+    where SAM 3.1 loses the object. Works on display frames downscaled to <= 1024 px."""
 
     def __init__(self, tracker: Any, load_full: Callable[[int], np.ndarray], plate_w: int, plate_h: int):
         self.tracker = tracker
@@ -209,7 +209,7 @@ class CorePropagator:
             mask = out[f][0]
 
     def _track_tiled(self, imgs: List[np.ndarray], init: np.ndarray, tiles: Sequence[Sequence[int]]) -> List[np.ndarray]:
-        """SPEC 5.2 pkt 5: SAM3 per 1008-px tile (25 % overlap), composed with a cos^2 window; tiles without the
+        """SPEC 5.2 pkt 5: SAM 3.1 per 1008-px tile (25 % overlap), composed with a cos^2 window; tiles without the
         object in the initial mask are skipped."""
         side = imgs[0].shape[0]
         acc = [np.zeros((side, side), np.float32) for _ in imgs]
@@ -355,7 +355,7 @@ class CorePropagator:
                     res.soft[f] = soft_part[f]
             res.fwd_bwd_iou.update(ious)
             if progress_cb:
-                progress_cb("Propagacja rdzenia SAM3", n_done + 1, len(spans))
+                progress_cb("Propagacja rdzenia SAM 3.1", n_done + 1, len(spans))
         res.uncertain = sorted(f for f, v in res.fwd_bwd_iou.items() if v < IOU_UNCERTAIN)
         res.suggested_keys = suggest_keys(res.uncertain)
         return res
@@ -427,14 +427,17 @@ class CorePropagator:
 
     def _interval(self, a: Optional[int], b: Optional[int], lo: int, hi: int, keys: Dict[int, np.ndarray]
                   ) -> Tuple[Dict[int, np.ndarray], Dict[int, float]]:
+        from engine.comfy_io import progress_prefix
         step = getattr(self, "_step", None) or (lambda d: None)
         self._soft_part: Dict[int, np.ndarray] = {}
         if a is not None and b is not None:
             step(f"w przód {a}→{b}")
-            fwd = self._run(a, b, keys[a])
+            with progress_prefix(f"Rdzeń w przód F{a}→F{b}"):
+                fwd = self._run(a, b, keys[a])
             sf = dict(self._last_soft)
             step(f"wstecz {b}→{a}")
-            bwd = self._run(b, a, keys[b])
+            with progress_prefix(f"Rdzeń wstecz F{b}→F{a}"):
+                bwd = self._run(b, a, keys[b])
             sb = dict(self._last_soft)
             empty = np.zeros((self.h, self.w), bool)
             for f in range(lo, hi + 1):
@@ -462,10 +465,12 @@ class CorePropagator:
         empty = np.zeros((self.h, self.w), bool)
         if a is None:  # before the first key: backward only
             step(f"wstecz {b}→{lo}")
-            part = self._run(b, lo, keys[b])
+            with progress_prefix(f"Rdzeń wstecz F{b}→F{lo}"):
+                part = self._run(b, lo, keys[b])
         else:
             step(f"w przód {a}→{hi}")
-            part = self._run(a, hi, keys[a])
+            with progress_prefix(f"Rdzeń w przód F{a}→F{hi}"):
+                part = self._run(a, hi, keys[a])
         if self.soft:
             self._soft_part = dict(self._last_soft)
         return {f: part.get(f, empty) for f in range(lo, hi + 1)}, {}

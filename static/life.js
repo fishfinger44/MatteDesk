@@ -86,7 +86,7 @@
     const n = Math.max(1, v.lastFrame - v.firstFrame + 1);
     const pc = (f) => 100 * (f - v.firstFrame) / n;
     const whole = !L.drag && !L.life;
-    const tip = 'Zakres życia obiektu: poza nim maska = pusta (alpha 0), SAM3 / MatAnyone tych klatek nie liczą, eksport zapisuje czarne klatki. ' +
+    const tip = 'Zakres życia obiektu: poza nim maska = pusta (alpha 0), SAM 3.1 / MatAnyone2 tych klatek nie liczą, eksport zapisuje czarne klatki. ' +
       'Przeciągnij [ / ] (dwuklik = całe ujęcie); przyciski „⟦ od tej klatki” / „⟧ do tej klatki” w panelu etapu';
     const mk = (cls, style, title) => { const d = document.createElement('div'); d.className = cls; d.style.cssText = style; if (title) d.title = title; layer.appendChild(d); return d; };
     let prev = v.firstFrame;
@@ -177,7 +177,7 @@
     const h = L.hints[0]; const sig = `${(v.projectData && v.projectData.manifest_path) || ''}:${L.obj}:${h.kind}:${h.frame}`;
     if (wasAsked(sig)) return;
     markAsked(sig);
-    const ok = await v.uiConfirm(`${hintText(h)}\n\nPoza zakresem życia maska jest pusta (alpha 0), SAM3 / MatAnyone tych klatek nie liczą, eksport zapisuje czarne klatki.`,
+    const ok = await v.uiConfirm(`${hintText(h)}\n\nPoza zakresem życia maska jest pusta (alpha 0), SAM 3.1 / MatAnyone2 tych klatek nie liczą, eksport zapisuje czarne klatki.`,
       { title: `„${L.obj}”: obiekt wychodzi z kadru`, ok: 'Ustaw zakres', cancel: 'Nie teraz' }).catch(() => false);
     if (ok) save(applyHint(h));
   }

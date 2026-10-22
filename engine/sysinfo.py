@@ -109,8 +109,96 @@ def job_details(client: Any, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
     job = None
     if j:
         eta = None
-        if j.get("total") and j.get("done"):
+        if j.get("total") and j.get("done") and j.get("unit", "frames") == "frames":   # % milestones: no ETA
             eta = round(j["elapsed_s"] / j["done"] * (j["total"] - j["done"]), 1)
-        job = {k: j.get(k) for k in ("id", "label", "step", "done", "total", "elapsed_s", "comfy", "comfy_info", "quiet")}
+        job = {k: j.get(k) for k in ("id", "label", "step", "done", "total", "elapsed_s", "comfy", "comfy_info", "quiet", "unit")}
         job["eta_s"] = eta
     return {"gpu": gpu_info(), "comfy": comfy_info(client), "job": job, "t": time.time()}
+
+
+# ---------------------------------------------------------------------------- GPU memory spilled to system RAM (Windows)
+# The NVIDIA driver on Windows (WDDM) moves what does not fit in the card to shared system memory: no OOM, the job just
+# gets many times slower – or the CUDA allocator aborts the whole Comfy process (beatch 2026-10-18, crop 2784 px).
+# /system_stats never shows it (VRAM stays <= the card), the per-process counter "GPU Process Memory\Shared Usage" does.
+
+def pid_on_port(port: int, run: Optional[Callable[..., Any]] = None) -> Optional[int]:
+    """PID of the process listening on localhost `port` (Windows, PowerShell); None elsewhere / unknown."""
+    import os
+    if run is None and os.name != "nt":
+        return None
+    ps = (f"$c=Get-NetTCPConnection -LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue | Select -First 1;"
+          "if($c){$c.OwningProcess}")
+    try:
+        out = (run or subprocess.run)(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                                      timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        v = (out.stdout or "").strip()
+        return int(v) if v.isdigit() else None
+    except Exception:
+        return None
+
+
+def gpu_shared_gb(pid: int, run: Optional[Callable[..., Any]] = None) -> Optional[float]:
+    """GPU memory of process `pid` held in shared system RAM (GB, summed over adapters); None when the counter is not
+    available. Get-Counter takes ~1-2 s – call it from a background thread."""
+    import os
+    if run is None and os.name != "nt":
+        return None
+    ps = (f"$s=(Get-Counter '\\GPU Process Memory(pid_{int(pid)}_*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples;"
+          "if($s){($s | Measure-Object CookedValue -Sum).Sum}")
+    try:
+        out = (run or subprocess.run)(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                                      timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        v = _num((out.stdout or "").strip().replace(",", "."))
+        return None if v is None else v / 2 ** 30
+    except Exception:
+        return None
+
+
+class SpillSampler:
+    """Peak of `read()` (shared GB) sampled every `interval_s` in a background thread while the `with` block runs.
+    `spill_gb` = peak - `base` (Comfy holds a little shared memory at idle; default = the value read when the block
+    starts – pass the value read before a series of runs so memory kept from an earlier run is not taken as idle);
+    None when the counter gave nothing. Never raises."""
+
+    def __init__(self, read: Callable[[], Optional[float]], interval_s: float = 3.0, base: Optional[float] = None):
+        self.read = read
+        self.interval = interval_s
+        self.base: Optional[float] = base
+        self._fixed_base = base is not None
+        self.peak: Optional[float] = None
+        self._stop = threading.Event()
+        self._th: Optional[threading.Thread] = None
+
+    def _sample(self) -> None:
+        try:
+            v = self.read()
+        except Exception:
+            v = None
+        if v is not None:
+            self.peak = v if self.peak is None else max(self.peak, v)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def __enter__(self) -> "SpillSampler":
+        if not self._fixed_base:
+            try:
+                self.base = self.read()
+            except Exception:
+                self.base = None
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=self.interval + 25)
+        self._sample()   # one reading right after the prompt (short probes may end between two samples)
+
+    @property
+    def spill_gb(self) -> Optional[float]:
+        if self.peak is None:
+            return None
+        return max(0.0, self.peak - (self.base or 0.0))

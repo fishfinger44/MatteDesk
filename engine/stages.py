@@ -5,7 +5,7 @@
 Fine-grained stages (`stages`, what the backend checks before an action):
   detect    – instance chosen / a key saved (points, prompt, candidate)
   crops     – crop segments -> crops.json (automatic in „▶▶ Przelicz całość”)
-  core      – SAM3 core over the shot -> core/core.json, newer than the keys and crops
+  core      – SAM 3.1 core over the shot -> core/core.json, newer than the keys and crops
   cotracker – brush corrections of the mask (zones `params.source = brush`, propagated by CoTracker3) applied on the
               shot -> core_fix/ (mask 1+2); optional: without corrections it is done
   matanyone – soft edge from the mask 1+2, matte zones skipped -> tool.stage_runs.matanyone (base version)
@@ -15,9 +15,11 @@ Fine-grained stages (`stages`, what the backend checks before an action):
   final     – „Przelicz finalnie” with everything (experiments: edge modes, threshold zones, edge fix) -> active run
   ltx       – LTX-2.5 Alpha-Gen (generative matte, guided by the mask 1+2; engine/ltx_alpha.py; optional, user decision
               2026-10-16: a stage of its own before the export, no longer an edge mode of the experiments) -> tool.stage_runs.ltx
+  final_touch – hand corrections of the alpha frame by frame (bitmap brush over a chosen base version, engine/final_touch.py;
+              PLAN_FINAL_TOUCH.md step 1, 2026-10-22): optional, no model, applied live (nothing to compute)
   export    – mattes exported (outputs.json has a current version of the object)
-Steps of the stage bar (`steps`): 1 SAM3 = detect + crops + core, 2 CoTracker, 3 MatAnyone, 4 VideoMaMa, 5 ViTMatte,
-6 Eksperymenty = final, 7 LTX, 8 Eksport (stage 0 Plate'y lives in the UI).
+Steps of the stage bar (`steps`): 1 SAM 3.1 = detect + crops + core, 2 CoTracker3, 3 MatAnyone2, 4 VideoMaMa, 5 ViTMatte,
+6 Eksperymenty = final, 7 LTX-2.5, 8 Final Touch, 9 Eksport (stage 0 Plate'y lives in the UI).
 
 State of a stage: "done" | "stale" (done, but its inputs changed since -> recompute) | "todo" (can run now) |
 "locked" (a stage it needs (NEEDS) is not done). The backend refuses an action whose stage is "locked" (HTTP 409)
@@ -31,19 +33,20 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-ORDER = ["detect", "crops", "core", "cotracker", "matanyone", "videomama", "vitmatte", "final", "ltx", "export"]
-LABEL = {"detect": "Wykryj (SAM3)", "crops": "Kadry", "core": "Rdzeń SAM3", "cotracker": "CoTracker (poprawki pędzlem)",
-         "matanyone": "MatAnyone (krawędź)", "videomama": "VideoMaMa (kosmyki)", "vitmatte": "ViTMatte (strefy)", "final": "Eksperymenty (Przelicz finalnie)",
-         "ltx": "LTX Alpha-Gen", "export": "Eksport"}
+ORDER = ["detect", "crops", "core", "cotracker", "matanyone", "videomama", "vitmatte", "final", "ltx", "final_touch", "export"]
+LABEL = {"detect": "Wykryj (SAM 3.1)", "crops": "Kadry", "core": "Rdzeń SAM 3.1", "cotracker": "CoTracker3 (poprawki pędzlem)",
+         "matanyone": "MatAnyone2 (krawędź)", "videomama": "VideoMaMa (kosmyki)", "vitmatte": "ViTMatte (strefy)", "final": "Eksperymenty (Przelicz finalnie)",
+         "ltx": "LTX-2.5 Alpha-Gen", "final_touch": "Final Touch (ręczne poprawki)", "export": "Eksport"}
 # what a stage needs done before it can run (2026-10-15: export right after the core, stages 2 / 5 optional)
 NEEDS = {"detect": [], "crops": ["detect"], "core": ["crops"], "cotracker": ["core"], "matanyone": ["core"],
-         "videomama": ["cotracker"], "vitmatte": ["matanyone"], "final": ["core"], "ltx": ["core"], "export": ["core"]}
+         "videomama": ["cotracker"], "vitmatte": ["matanyone"], "final": ["core"], "ltx": ["core"],
+         "final_touch": ["core"], "export": ["core"]}
 # the bar of the UI: step number -> fine-grained stages it shows
-STEPS = [(1, "sam3", "SAM3", ["detect", "crops", "core"]), (2, "cotracker", "CoTracker", ["cotracker"]),
-         (3, "matanyone", "MatAnyone", ["matanyone"]), (4, "videomama", "VideoMaMa", ["videomama"]),
-         (5, "vitmatte", "ViTMatte", ["vitmatte"]), (6, "final", "Eksperymenty", ["final"]), (7, "ltx", "LTX", ["ltx"]),
-         (8, "export", "Eksport", ["export"])]
-NEXT_CHAIN = ["detect", "crops", "core", "matanyone", "export"]   # the main path ("następny krok"); 2, 4–7 optional
+STEPS = [(1, "sam3", "SAM 3.1", ["detect", "crops", "core"]), (2, "cotracker", "CoTracker3", ["cotracker"]),
+         (3, "matanyone", "MatAnyone2", ["matanyone"]), (4, "videomama", "VideoMaMa", ["videomama"]),
+         (5, "vitmatte", "ViTMatte", ["vitmatte"]), (6, "final", "Eksperymenty", ["final"]), (7, "ltx", "LTX-2.5", ["ltx"]),
+         (8, "final_touch", "Final Touch", ["final_touch"]), (9, "export", "Eksport", ["export"])]
+NEXT_CHAIN = ["detect", "crops", "core", "matanyone", "export"]   # the main path ("następny krok"); 2, 4–8 optional
 # object settings the edge pass depends on (stage 3 is stale after a change)
 EDGE_KEYS = ("band_scale", "shift_px", "temporal_smoothing", "thin_lens", "lupa_box", "ma_scale_mode", "core_stabilize",
              "core_soft_start", "key_band_same")
@@ -52,12 +55,12 @@ BRUSH_SOURCE = "brush"     # zone params.source of the stage-2 brush corrections
 # (hard 0 / 1, stage 4 open right after stages 1 + 2), "matanyone" = the stage-3 version (default, the tested recipe),
 # "videomama" = the stage VideoMaMa version (2026-10-16)
 VITMATTE_BASES = ("matanyone", "core", "videomama")
-BASE_LABEL = {"matanyone": "wynik MatAnyone, etap 3", "core": "maska 1+2, etapy 1 + 2", "videomama": "wynik VideoMaMa"}
+BASE_LABEL = {"matanyone": "wynik MatAnyone2, etap 3", "core": "maska 1+2, etapy 1 + 2", "videomama": "wynik VideoMaMa"}
 
 
 def vitmatte_base(obj: Dict[str, Any]) -> str:
     """The base ViTMatte lays its zones on: the object's choice, else (nothing chosen yet, bug 2026-10-17: the stage
-    stayed locked behind MatAnyone while the mask 1+2 was ready) the best result that exists – MatAnyone, VideoMaMa,
+    stayed locked behind MatAnyone2 while the mask 1+2 was ready) the best result that exists – MatAnyone2, VideoMaMa,
     otherwise the mask 1+2."""
     b = obj.get("vitmatte_base")
     if b in VITMATTE_BASES:
@@ -74,9 +77,9 @@ def vmm_base(obj: Dict[str, Any]) -> str:
 
 def needs_of(obj: Dict[str, Any]) -> Dict[str, List[str]]:
     """NEEDS of this object: ViTMatte opens right after stage 2 whatever its base (the mask 1+2 is always a possible
-    base and the base selector lives inside the stage – locking it behind MatAnyone made the choice unreachable, bug
+    base and the base selector lives inside the stage – locking it behind MatAnyone2 made the choice unreachable, bug
     2026-10-17; a base without a result is refused when computing, with the reason); VideoMaMa on the mask 1+2 waits
-    for stage 2, on MatAnyone for stage 3."""
+    for stage 2, on MatAnyone2 for stage 3."""
     return {**NEEDS, "vitmatte": ["cotracker"],
             "videomama": ["cotracker"]}   # same for VideoMaMa: its base selector is inside the stage (bug 2026-10-17)
 
@@ -109,7 +112,7 @@ def zone_dicts(od: Path, kinds: Tuple[str, ...]) -> List[Dict[str, Any]]:
 
 
 def core_fix_sig(store: Any, name: str) -> str:
-    """Signature of the mask 1+2 (SAM3 core + brush corrections): core.json, the brush zones, core stabilisation."""
+    """Signature of the mask 1+2 (SAM 3.1 core + brush corrections): core.json, the brush zones, core stabilisation."""
     od = store.dir(name)
     try:
         cj = (od / "core" / "core.json").read_text(encoding="utf-8")
@@ -137,17 +140,42 @@ def mask_sig(store: Any, name: str) -> str:
 
 
 # px mode of the edge band (2026-10-16): part of the signature only when set – objects without it keep their signature
-EDGE_KEYS_OPT = ("band_out_px", "band_in_px", "band_in_feather_px")
+EDGE_KEYS_OPT = ("band_out_px", "band_in_px", "band_in_feather_px", "band_out_feather_px", "edge_band")
 
 
 def settings_sig(obj: Dict[str, Any]) -> str:
+    from engine.objband import edge_band
+    obj = {**obj, "edge_band": edge_band(obj)}   # the band points stage 3 works with (shared object band or its own)
     d = {k: obj.get(k) for k in EDGE_KEYS}
     d.update({k: obj[k] for k in EDGE_KEYS_OPT if obj.get(k) is not None})
     return _sha(d)
 
 
 def matte_sig(od: Path) -> str:
-    return _sha(zone_dicts(od, ("matte",)))
+    return _sha(matte_zone_dicts(od))
+
+
+def matte_zone_dicts(od: Path) -> List[Dict[str, Any]]:
+    """The ViTMatte zones; a whole-outline zone on the shared object band (2026-10-22) carries that band instead of
+    its own points (the same dict as a zone that owns those points – a migrated result stays current)."""
+    from engine.objband import zone_params
+    zones = zone_dicts(od, ("matte",))
+    obj = _read_json(Path(od) / "object.json")
+    if obj and isinstance(obj.get("band"), dict):
+        root = _read_json(Path(od).parent / obj["part_of"] / "object.json") if obj.get("part_of") else obj
+        out = []
+        for z in zones:
+            p = zone_params(z, obj, root or {})
+            out.append({**z, "params": p} if p != (z.get("params") or {}) else z)
+        zones = out
+    return zones
+
+
+def _read_json(p: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def _run_json(od: Path, run: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -191,9 +219,9 @@ def stage_run(store: Any, name: str, stage: str, base: Optional[str] = None) -> 
     if stage == "ltx":
         from engine.ltx_alpha import object_settings, settings_sig as ltx_sig
         if rj.get("core_fix_sig") != mask_sig(store, name):
-            return run, False, "rdzeń albo poprawki pędzlem zmienione od ostatniego liczenia LTX"
+            return run, False, "rdzeń albo poprawki pędzlem zmienione od ostatniego liczenia LTX-2.5"
         if rj.get("ltx_sig") != ltx_sig(object_settings(obj)):
-            return run, False, "ustawienia LTX zmienione od ostatniego liczenia"
+            return run, False, "ustawienia LTX-2.5 zmienione od ostatniego liczenia"
         return run, True, ""
     if stage == "videomama":
         from engine.videomama import object_settings as vmm_settings, settings_sig as vmm_sig
@@ -205,15 +233,15 @@ def stage_run(store: Any, name: str, stage: str, base: Optional[str] = None) -> 
         if s["base"] == "matanyone":
             m_run, m_ok, _ = stage_run(store, name, "matanyone")
             if rj.get("applied_from") != m_run or not m_ok:
-                return run, False, "baza (wynik MatAnyone, etap 3) zmieniona od tej wersji – „▶ Policz ponownie”"
+                return run, False, "baza (wynik MatAnyone2, etap 3) zmieniona od tej wersji – „▶ Policz ponownie”"
         return run, True, ""
     if stage in ("matanyone", "core_base"):
         core_t = _mtime(od / "core" / "core.json") or 0.0
         if (_mtime(od / "runs" / run / "run.json") or 0.0) < core_t or rj.get("core_fix_sig") != mask_sig(store, name):
-            return run, False, ("rdzeń albo poprawki pędzlem zmienione od ostatniego liczenia MatAnyone" if stage == "matanyone"
+            return run, False, ("rdzeń albo poprawki pędzlem zmienione od ostatniego liczenia MatAnyone2" if stage == "matanyone"
                                 else "rdzeń albo poprawki pędzlem zmienione – maska 1+2 do przeliczenia")
         if rj.get("settings_sig") != settings_sig(obj):
-            return run, False, "ustawienia krawędzi zmienione od ostatniego liczenia " + ("MatAnyone" if stage == "matanyone" else "maski 1+2")
+            return run, False, "ustawienia krawędzi zmienione od ostatniego liczenia " + ("MatAnyone2" if stage == "matanyone" else "maski 1+2")
         return run, True, ""
     b_run, b_ok, _ = stage_run(store, name, {"matanyone": "matanyone", "videomama": "videomama"}.get(base, "core_base"))
     if rj.get("applied_from") != b_run or not b_ok:
@@ -269,7 +297,7 @@ def denoise_changed(store: Any, name: str, mplate: Optional[bool]) -> bool:
 
 def plate_changes(work_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Z26: project.json -> plate_changed {plate: {at, frames}} – a plate repaired (`_fix` written / restored) in
-    stage 0. Results computed before `at` from that plate are stale: beauty -> the core (SAM3 reads it; everything
+    stage 0. Results computed before `at` from that plate are stale: beauty -> the core (SAM 3.1 reads it; everything
     after the core follows), an auxiliary plate (backlit / clean plate) -> the final pass (backlit edge, QA)."""
     try:
         d = json.loads((Path(work_dir) / "project.json").read_text(encoding="utf-8"))
@@ -384,10 +412,12 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
     core_t = _mtime(od / "core" / "core.json")
     run = tool.get("active_run")
     run_t = _mtime(od / "runs" / run / "run.json") if run else None
-    exp_ver = None    # version of the object's last export (outputs.json): a run, or "core" (mask 1+2)
+    exp_ver = None    # version of the object's last export (outputs.json): a run, "core" (mask 1+2) or "ft:<base>"
+    exp_ft = None     # Final Touch record of that export (base + corrections hash)
     try:
         out = json.loads((Path(work_dir) / "outputs.json").read_text(encoding="utf-8"))
-        exp_ver = next((e.get("version") for e in out.get("objects", []) if e.get("name") == name), None)
+        exp_e = next((e for e in out.get("objects", []) if e.get("name") == name), None) or {}
+        exp_ver, exp_ft = exp_e.get("version"), exp_e.get("final_touch")
     except (OSError, ValueError):
         exp_ver = None
 
@@ -446,12 +476,12 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
     fix_exists, fix_ok = core_fix_state(store, name) if core_t else (False, False)
     if not brush:
         st["cotracker"] = "done"
-        why["cotracker"] = "brak poprawek pędzlem – etap opcjonalny (maska = rdzeń SAM3)"
+        why["cotracker"] = "brak poprawek pędzlem – etap opcjonalny (maska = rdzeń SAM 3.1)"
     else:
         st["cotracker"] = "done" if fix_ok else ("stale" if fix_exists else "todo")
         if not fix_ok:
             why["cotracker"] = (f"poprawki pędzlem ({len(brush)} stref) jeszcze nie zastosowane na ujęciu – „▶▶ Zastosuj "
-                                "poprawki” (MatAnyone i tak je bierze)" if not fix_exists else
+                                "poprawki” (MatAnyone2 i tak je bierze)" if not fix_exists else
                                 "rdzeń albo poprawki zmienione od ostatniego „Zastosuj poprawki”")
     # stage 3 (MatAnyone on the mask 1+2, without matte zones) and stage 4 (ViTMatte zones on that base)
     ma_run, ma_ok, ma_why = stage_run(store, name, "matanyone")
@@ -463,7 +493,7 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
     st["videomama"] = "done" if vv_ok else ("stale" if vv_run else "todo")
     why["videomama"] = vv_why or ("" if vv_run else "opcjonalny – „▶ Policz VideoMaMa” (kosmyki włosów, detal krawędzi)")
     if not vv_ok and vmm_base(obj) == "matanyone" and st["matanyone"] != "done":
-        why["videomama"] = "baza VideoMaMa = wynik MatAnyone, a etap 3 nie jest policzony – najpierw MatAnyone albo baza „maska 1+2”"
+        why["videomama"] = "baza VideoMaMa = wynik MatAnyone2, a etap 3 nie jest policzony – najpierw MatAnyone2 albo baza „maska 1+2”"
     vbase = vitmatte_base(obj)
     vm_run, vm_ok, vm_why = stage_run(store, name, "vitmatte")
     st["vitmatte"] = "done" if vm_ok else ("stale" if vm_run else "todo")
@@ -472,19 +502,34 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
         why["vitmatte"] = vm_why
     elif not base_ok:   # the stage is open (2026-10-17), but the chosen base has no current result
         why["vitmatte"] = (f"baza {BASE_LABEL[vbase]} nie jest policzona – najpierw "
-                           f"{'etap 3 MatAnyone' if vbase == 'matanyone' else 'etap VideoMaMa'} albo baza ViTMatte = maska 1+2")
+                           f"{'etap 3 MatAnyone2' if vbase == 'matanyone' else 'etap VideoMaMa'} albo baza ViTMatte = maska 1+2")
     elif not vm_run:
         why["vitmatte"] = ("dodaj strefę ViTMatte (🖌 malowany pas albo cały obrys) i „Zastosuj na ujęcie”"
                            if not zone_dicts(od, ("matte",)) else f"„✚ Zastosuj na ujęcie” – strefy ViTMatte na bazie: {BASE_LABEL[vbase]}")
     # stage 6 LTX Alpha-Gen (optional, generative): its own version on the mask 1+2
     lx_run, lx_ok, lx_why = stage_run(store, name, "ltx")
     st["ltx"] = "done" if lx_ok else ("stale" if lx_run else "todo")
-    why["ltx"] = lx_why or ("" if lx_run else "opcjonalny – „▶ Policz LTX” (model generatywny, wymaga modeli LTX-2.5)")
-    # export: the last exported version must still be a current result (active run, stage run or the mask 1+2)
-    cur_ok = bool(exp_ver) and ((exp_ver == run and final_ok) or (exp_ver == ma_run and ma_ok) or
-                                (exp_ver == vm_run and vm_ok) or (exp_ver == lx_run and lx_ok) or
-                                (exp_ver == vv_run and vv_ok) or
-                                (exp_ver == "core" and fix_ok))
+    why["ltx"] = lx_why or ("" if lx_run else "opcjonalny – „▶ Policz LTX-2.5” (model generatywny, wymaga modeli LTX-2.5)")
+    # stage Final Touch (optional, no model): hand corrections over a base version, applied live
+    from engine.final_touch import base_run, corrections_sig, finish_active, frames_of, is_ft, load as ft_load
+    ft = ft_load(od)
+    ft_frames = frames_of(ft)
+    ft_fin = finish_active(ft.get("finish") or {})
+    st["final_touch"] = "done"
+    if ft_frames or ft_fin:
+        parts = ([f"korekty w {len(ft_frames)} klatkach"] if ft_frames else []) + (["wykończenie (poziomy / erode / rozmycie)"] if ft_fin else [])
+        why["final_touch"] = " + ".join(parts) + " – eksport bierze bazę + korekty"
+    else:
+        why["final_touch"] = "opcjonalny – ręczne poprawki alfy pędzlem, klatka po klatce, przed eksportem"
+    # export: the last exported version must still be a current result (active run, stage run or the mask 1+2; Final
+    # Touch: its base current and the corrections unchanged since)
+    ev = base_run(exp_ver) if exp_ver else exp_ver
+    cur_ok = bool(exp_ver) and ((ev == run and final_ok) or (ev == ma_run and ma_ok) or
+                                (ev == vm_run and vm_ok) or (ev == lx_run and lx_ok) or
+                                (ev == vv_run and vv_ok) or
+                                (ev == "core" and fix_ok))
+    if cur_ok and is_ft(exp_ver):
+        cur_ok = (exp_ft or {}).get("corrections_sig") == corrections_sig(ft)
     st["export"] = "done" if cur_ok else ("stale" if exp_ver else "todo")
 
     # a stage is locked while a stage it needs (NEEDS, transitively) is not done
@@ -500,7 +545,7 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
         if r is not None:
             st[s] = "locked"      # also a "done" optional stage (CoTracker without corrections) before the core
             # the lock reason wins over the stage's own note (e.g. "etap opcjonalny" of CoTracker before the core)
-            why[s] = ("najpierw: „▶▶ Przelicz całość” w etapie 1 SAM3" if r in ("crops", "core") and st[r] != "stale"
+            why[s] = ("najpierw: „▶▶ Przelicz całość” w etapie 1 SAM 3.1" if r in ("crops", "core") and st[r] != "stale"
                       else f"najpierw: {LABEL[r]}" + (f" – {why[r]}" if why.get(r) and st[r] == "stale" else ""))
     nxt = next((s for s in NEXT_CHAIN if st[s] != "done"), None)
     stale = stale_intervals(store, name, need, mplate) if keys else []
@@ -526,6 +571,7 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
                            **{f"vitmatte@{b}": stage_run(store, name, "vitmatte", b)[0] for b in VITMATTE_BASES}},
             "vitmatte_base": vbase,
             "brush_zones": len(brush), "exported": exp_ver,
+            "final_touch": {"frames": ft_frames, "base": ft.get("base"), "sig": corrections_sig(ft), "finish": ft_fin},
             "stale_intervals": stale}
 
 

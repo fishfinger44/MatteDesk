@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/stage_preview.py - "preview a few frames" in stages 3 MatAnyone, 4 VideoMaMa, 5 ViTMatte (user request
+"""engine/stage_preview.py - "preview a few frames" in stages 3 MatAnyone2, 4 VideoMaMa, 5 ViTMatte (user request
 2026-10-17: check the settings before the long run on the whole shot).
 
 The models are temporal (MatAnyone2 carries memory between frames, VideoMaMa works on batches), so a preview computes a
@@ -30,8 +30,14 @@ WINDOW = {"matanyone": 4, "videomama": 6, "vitmatte": 2}
 STAGES = tuple(WINDOW)
 
 
-def preview_dir(store: Any, name: str, stage: str) -> Path:
-    return store.dir(name) / "stage_preview" / stage
+def slot(stage: str, engine: Optional[str] = None) -> str:
+    """Folder / key of a preview: the stage, or for stage 5 with the BiRefNet engine "vitmatte@birefnet" – one preview
+    per engine, so both can be compared (user request 2026-10-22); the ViTMatte engine keeps the old folder."""
+    return f"{stage}@{engine}" if stage == "vitmatte" and engine and engine != "vitmatte" else stage
+
+
+def preview_dir(store: Any, name: str, stage: str, engine: Optional[str] = None) -> Path:
+    return store.dir(name) / "stage_preview" / slot(stage, engine)
 
 
 def window(frames: Sequence[int], f: int, half: int) -> List[int]:
@@ -59,27 +65,34 @@ def preview_sig(store: Any, name: str, stage: str) -> str:
             parts.append(stage_run(store, name, "matanyone")[0] or "")
     else:
         vb = vitmatte_base(obj)
-        parts += [vb, matte_sig(store.dir(name))]
+        # the zones without their engine model (switching the stage engine rewrites `vitmatte_model` in every zone –
+        # the other engine's preview must stay valid for the comparison, 2026-10-22)
+        from engine.stages import _sha, matte_zone_dicts
+        zs = [{**z, "params": {k: v for k, v in (z.get("params") or {}).items() if k != "vitmatte_model"}}
+              for z in matte_zone_dicts(store.dir(name))]
+        parts += [vb, _sha(zs)]
         if vb != "core":
             parts.append(stage_run(store, name, vb)[0] or "")
     return hashlib.sha1(json.dumps(parts, default=str).encode()).hexdigest()[:16]
 
 
-def read_meta(store: Any, name: str, stage: str) -> Optional[Dict[str, Any]]:
+def read_meta(store: Any, name: str, stage: str, engine: Optional[str] = None) -> Optional[Dict[str, Any]]:
     try:
-        m = json.loads((preview_dir(store, name, stage) / "meta.json").read_text(encoding="utf-8"))
+        m = json.loads((preview_dir(store, name, stage, engine) / "meta.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     m["stale"] = m.get("sig") != preview_sig(store, name, stage)
     return m
 
 
-def frame_path(store: Any, name: str, stage: str, f: int) -> Path:
-    return preview_dir(store, name, stage) / f"a_{f:04d}.png"
+def frame_path(store: Any, name: str, stage: str, f: int, engine: Optional[str] = None) -> Path:
+    return preview_dir(store, name, stage, engine) / f"a_{f:04d}.png"
 
 
-def run(pipe: Any, name: str, stage: str, f: int, frames: Sequence[int], models_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Compute the preview window of `stage` around frame `f` (frames = the shot / work frames to pick it from)."""
+def run(pipe: Any, name: str, stage: str, f: int, frames: Sequence[int], models_dir: Optional[Path] = None,
+        engine: Optional[str] = None) -> Dict[str, Any]:
+    """Compute the preview window of `stage` around frame `f` (frames = the shot / work frames to pick it from).
+    `engine` (stage 5): the stage engine the zones are set to right now – names the preview folder (slot)."""
     if stage not in STAGES:
         raise ValueError(f"stage: {' | '.join(STAGES)}")
     store = pipe.store
@@ -88,7 +101,7 @@ def run(pipe: Any, name: str, stage: str, f: int, frames: Sequence[int], models_
     if not win:
         raise ValueError("obiekt nie jest widoczny w tym zakresie klatek")
     t0 = time.time()
-    pdir = preview_dir(store, name, stage)
+    pdir = preview_dir(store, name, stage, engine)
     if pdir.exists():
         shutil.rmtree(pdir)
     pdir.mkdir(parents=True)
@@ -107,6 +120,7 @@ def run(pipe: Any, name: str, stage: str, f: int, frames: Sequence[int], models_
             a = np.clip(np.asarray(full[g], np.float32), 0, 1)
             cv2.imwrite(str(pdir / f"a_{g:04d}.png"), (a * 255 + 0.5).astype(np.uint8))
     meta = {"stage": stage, "center": int(f), "frames": [int(g) for g in win if g in full], "sig": sig,
+            **({"engine": engine, "slot": slot(stage, engine)} if stage == "vitmatte" and engine else {}),
             "seconds": round(time.time() - t0, 1), "created_at": datetime.now().isoformat(timespec="seconds")}
     (pdir / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return {**meta, "stale": False}
@@ -167,7 +181,7 @@ def _vitmatte(pipe: Any, name: str, frames: List[int]) -> Dict[int, np.ndarray]:
     else:
         run, ok, why = stage_run(pipe.store, name, vb)
         if not run or not ok:
-            raise ValueError(f"baza ViTMatte ({'MatAnyone' if vb == 'matanyone' else 'VideoMaMa'}) nie jest policzona"
+            raise ValueError(f"baza ViTMatte ({'MatAnyone2' if vb == 'matanyone' else 'VideoMaMa'}) nie jest policzona"
                              + (f" – {why}" if why else "") + " – policz ten etap albo wybierz bazę „maska 1+2”")
         base_alpha = run_alpha_loader(pipe.store.dir(name), run, pipe.w, pipe.h, sub="alpha_base")
         base = {f: base_alpha(f).astype(np.float32) for f in frames}
@@ -179,6 +193,7 @@ def _vitmatte(pipe: Any, name: str, frames: List[int]) -> Dict[int, np.ndarray]:
         if zres and f in zres.soft:
             sa, area = zres.soft[f]
             from engine.refine import ZONE_FEATHER_PX
-            a = apply_soft_override(a, sa.astype(np.float32), area > 0.5, zres.feather_px or ZONE_FEATHER_PX)
+            a = apply_soft_override(a, sa.astype(np.float32), area > 0.5, zres.feather_px or ZONE_FEATHER_PX,
+                                    zres.weights.get(f))
         out[f] = a
     return out

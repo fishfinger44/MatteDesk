@@ -7,7 +7,7 @@ Pure function `local_matte(img, core, region, ...)` -> LocalMatteResult (no zone
 - crop = bbox(region) + `pad` px, longer side scaled to <= `max_side` (INTER_AREA; alpha back with INTER_LINEAR);
 - trimap: FG = core eroded `fg_erode_px`, unknown = region \ FG, BG = rest of the crop ∪ forced BG ("-" strokes,
   holdout of front objects, accepted distractor masks, pixels removed by Remove zones) – forced BG wins over unknown
-  but never over the core (semantic core errors are a SAM3 key, not a zone);
+  but never over the core (semantic core errors are a SAM 3.1 key, not a zone);
 - engines on the unknown pixels:
   `chroma` – colour difference (ΔE in Lab of the display image) from the LOCAL background colour (mean of the
              background pixels in a 65 px window; pipette = one global colour); lo = local noise, hi = ΔE of the local
@@ -124,7 +124,7 @@ SOFT_BG_P = 0.05   # ... unknown where SOFT_BG_P < p < SOFT_FG_P
 def build_trimap(core: np.ndarray, region: np.ndarray, forced_bg: np.ndarray, fg_erode_px: int = 2,
                  prob: Optional[np.ndarray] = None) -> Trimap:
     """FG = core eroded, unknown = region \\ FG \\ forced BG, BG = rest (incl. forced BG).
-    `prob` (SAM3 probability 0..1, consistent with the core; user decision 2026-10-14): the trimap from SAM3's own
+    `prob` (SAM 3.1 probability 0..1, consistent with the core; user decision 2026-10-14): the trimap from SAM 3.1's own
     uncertainty instead of the erosion – FG = core ∩ p >= 0.95, unknown = region ∪ (0.05 < p < 0.95) ∪ the rest of the
     core rim; `fg_erode_px` unused."""
     core = core.astype(bool)

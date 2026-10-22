@@ -39,7 +39,7 @@ CORE_RUN = "core"     # export source "rdzeń (1+2)" (2026-10-15): the mask 1+2 
 
 
 def core_fix_loader(obj_dir: Path, w: int, h: int) -> Callable[[int], np.ndarray]:
-    """Full-frame 0 / 1 alpha of the mask 1+2 (core_fix/c_####.png, stage 2); a frame without it -> the SAM3 core."""
+    """Full-frame 0 / 1 alpha of the mask 1+2 (core_fix/c_####.png, stage 2); a frame without it -> the SAM 3.1 core."""
     def load(f: int) -> np.ndarray:
         for sub in ("core_fix", "core"):
             m = cv2.imread(str(Path(obj_dir) / sub / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
@@ -54,7 +54,11 @@ def core_fix_loader(obj_dir: Path, w: int, h: int) -> Callable[[int], np.ndarray
 def run_alpha_loader(obj_dir: Path, run: str, w: int, h: int, sub: str = "alpha") -> Callable[[int], np.ndarray]:
     """Full-frame alpha of a run version (crop segments pasted back, overlaps crossfaded). `sub="alpha_base"`: the
     version's base alpha (edge mode without zones, written when the version has zones). `run == CORE_RUN`: the
-    mask 1+2 (core_fix_loader)."""
+    mask 1+2 (core_fix_loader). `run == "ft:<base>"` (stage Final Touch): the base version + the object's hand
+    corrections (engine/final_touch.py)."""
+    from engine.final_touch import base_run, ft_loader, is_ft
+    if is_ft(run):
+        return ft_loader(obj_dir, run_alpha_loader(obj_dir, base_run(run), w, h, sub))
     if run == CORE_RUN:
         return core_fix_loader(obj_dir, w, h)
     rd = obj_dir / "runs" / run
@@ -182,7 +186,7 @@ class FrameAlphas:
         return None if m is None else m > 127
 
     def mask12_of(self, name: str, f: int) -> Optional[np.ndarray]:
-        """Mask 1+2 of an object (core_fix/, else the SAM3 core) – which part of a whole a pixel belongs to."""
+        """Mask 1+2 of an object (core_fix/, else the SAM 3.1 core) – which part of a whole a pixel belongs to."""
         for sub in ("core_fix", "core"):
             m = cv2.imread(str(self.work_dir / "objects" / name / sub / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
             if m is not None:
@@ -239,7 +243,8 @@ def group_of_run(work_dir: Path, o: Dict[str, Any]) -> Optional[List[str]]:
     if not run:
         return None
     try:
-        g = json.loads((Path(work_dir) / "objects" / run_owner(o) / "runs" / run / "run.json").read_text(encoding="utf-8")).get("group")
+        from engine.final_touch import base_run
+        g = json.loads((Path(work_dir) / "objects" / run_owner(o) / "runs" / base_run(run) / "run.json").read_text(encoding="utf-8")).get("group")
     except (OSError, ValueError):
         return None
     return list(g) if g else None
@@ -359,8 +364,10 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
     for o in objs:
         if o["name"] not in written:
             continue
-        rd = work_dir / "objects" / run_owner(o) / "runs" / o["tool"]["active_run"]
-        if o["tool"]["active_run"] == CORE_RUN:   # mask 1+2: no run.json / QA of its own
+        from engine.final_touch import base_run, corrections_sig, is_ft, load as ft_load
+        ver = o["tool"]["active_run"]
+        rd = work_dir / "objects" / run_owner(o) / "runs" / base_run(ver)
+        if base_run(ver) == CORE_RUN:   # mask 1+2: no run.json / QA of its own
             cf = work_dir / "objects" / o["name"] / "core_fix" / "core_fix.json"
             rj = {"edge_mode": "core", "params": json.loads(cf.read_text(encoding="utf-8")) if cf.exists() else None}
             qa = {}
@@ -371,7 +378,10 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
                         "core": str(out_root / f"{o['name']}_core" / f"{o['name']}_core_####.png").replace("\\", "/") if with_core else None,
                         "version": o["tool"]["active_run"], "qa_status": "ok" if qa.get("gate_ok") else ("flags" if qa else "none"),
                         "date": datetime.now().isoformat(timespec="seconds"), "params_hash": params_hash(o, rj),
-                        "edge_mode": rj.get("edge_mode")})
+                        "edge_mode": rj.get("edge_mode"),
+                        # Final Touch: which base and which corrections (hash) – the export is reproducible (plan §3)
+                        **({"final_touch": {"base": base_run(ver), "corrections_sig":
+                                            corrections_sig(ft_load(work_dir / "objects" / run_owner(o)))}} if is_ft(ver) else {})})
     data = load_outputs(work_dir)
     keep = [e for e in data.get("objects", []) if e["name"] not in written]
     update_outputs(work_dir, "objects", keep + entries)

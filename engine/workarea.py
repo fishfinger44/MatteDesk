@@ -241,7 +241,7 @@ def life_hints(areas: Dict[int, float], border: Dict[int, bool], life: Optional[
                min_gap: int = 2) -> List[Dict[str, Any]]:
     """`areas` = {frame: core area fraction}, `border` = {frame: core touches the frame border}. A hint where the core
     becomes empty right after a frame touching the border (`end`: object leaves from F) or appears at the border after
-    empty frames (`start`). Runs of empty frames shorter than `min_gap` are ignored (SAM3 drop-out, not an exit)."""
+    empty frames (`start`). Runs of empty frames shorter than `min_gap` are ignored (SAM 3.1 drop-out, not an exit)."""
     fs = sorted(areas)
     empty = {f: areas[f] < LIFE_EMPTY_FRAC for f in fs}
     out: List[Dict[str, Any]] = []

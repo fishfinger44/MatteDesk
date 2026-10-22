@@ -16,6 +16,9 @@
 (function () {
   const $ = (id) => document.getElementById(id);
   const V = () => window.viewer;
+  // drawing a zone area (brush / polygon, painted-area mode) is hidden for now (user decision 2026-10-21: it misled –
+  // the band of a whole-outline zone is set by control points); the code stays, true brings the tools back
+  const DRAW_TOOLS = false;
   let H = null;                      // hooks from objects.js (see init)
   const S = () => H.S;
   const obj = () => H.S.obj;
@@ -23,12 +26,14 @@
 
   const Z = {
     list: [], status: {}, active: null,        // zones of the object (GET /zones), card status, active zone id
+    engAligned: {},                            // zone id -> its model was moved to the stage 5 engine once (syncForm)
+    band: { data: {}, busy: {}, drag: null },   // band control points (2026-10-21): zid -> {f -> GET band/{f}}
     preset: 'hair', prompt: '', engine: 'matanyone', holdout: true,   // defaults of the NEXT new zone
     ov: 'alpha',                               // overlay of the preview: alpha | comp | trimap | engines | none
     preview: null,                             // { zid, f, data } of the last preview
     pvTimer: null, pvBusy: false, pvAgain: null,
     drawTimer: null, drawPending: null, drawBusy: false,
-    regionCache: {}, regionBusy: {},           // zid -> { f -> GET region/{f} }
+    regionCache: {}, regionBusy: {}, regionRetry: {},   // zid -> { f -> GET region/{f} }; retries while the app is busy
     undo: [],                                  // [{ zid, f, prev }] prev = key entry before the stroke, null = key created
     loupe: false, mouse: null,
     cp: null, cpNone: false,                   // GET /api/project/cleanplate_auto; "Bez clean plate'u" (per project, localStorage)
@@ -48,6 +53,19 @@
   const PRESET_ICON = Object.fromEntries(PRESETS.map((p) => [p[0], p[1]]));
   const PRESET_NAME = Object.fromEntries(PRESETS.map((p) => [p[0], p[2]]));
   const CRIT_LABEL = { dark: 'ciemne', bright: 'jasne', color: 'kolor', all: 'wszystko' };
+  // zone engine name as shown: the per-frame engine `vitmatte` is BiRefNet_HR-matting / Lucida when the zone's model is one
+  const zEngLabel = (z) => (z && z.matting === 'vitmatte' && EDGE_MODEL_LABEL[pval(z, 'vitmatte_model')]
+    ? EDGE_MODEL_LABEL[pval(z, 'vitmatte_model')] : (z ? ENGINE_LABEL[z.matting] || z.matting : ''));
+  // engine lists of the zone follow the stage 5 engine (user decision 2026-10-21): BiRefNet -> `vitmatte` shown as BiRefNet,
+  // MatAnyone2 (non-commercial) not offered; ViTMatte -> as before
+  function applyEngineOptions(sel) {
+    const bir = ((S().info && S().info.edge_engine) || 'vitmatte') === 'birefnet';
+    for (const o of sel.options) {
+      if (o.dataset.txt == null) o.dataset.txt = o.textContent;
+      if (o.value === 'vitmatte') o.textContent = bir ? 'BiRefNet' : o.dataset.txt;
+      if (o.value === 'matanyone') { o.hidden = bir; o.disabled = bir; }
+    }
+  }
   const ENGINE_LABEL = { matanyone: 'MatAnyone2', auto: 'auto', clean: 'clean', chroma: 'chroma', knn: 'knn', cf: 'cf', hybrid: 'hybrid', backlit: 'backlit', vitmatte: 'ViTMatte' };
   const STATE_LABEL = { policzona: ['✔ policzona', 'ok'], 'do przeliczenia': ['↻ do przeliczenia', 'warn'], liczona: ['⏳ liczona…', 'busy'], 'wyłączona': ['○ wyłączona', 'muted'] };
   const PALETTE = ['#f472b6', '#c8c8cc', '#34d399', '#fb923c', '#a78bfa', '#22d3ee', '#f87171', '#a3e635'];
@@ -69,7 +87,16 @@
   const TEMPORAL = [['none', 'brak'], ['median', 'mediana'], ['flow', 'mediana po przepływie'], ['flow_mean', 'średnia po przepływie (czerń/biel przed)']];
   const PARAM_DEF = { temporal: 'median', temporal_radius: 2, temporal_scale: 1, alpha_black: 0, alpha_white: 1, alpha_blur_px: 0,
     fg_erode_px: 2, force_core_erode_px: 0, alpha_black_after: 0, region: 'draw', outline_out_px: 40, exclude_objects: [], track: 'rigid',
-    vitmatte_model: 'base', model_px: 1008, unknown_value: 0.5 };
+    vitmatte_model: 'base', model_px: 1008, unknown_value: 0.5, outer_feather_px: 0 };
+  // edge model of the ViTMatte zone engine -> [licence line, non-commercial] (user decision 2026-10-21; doctor.py LICENSES)
+  const BIREFNET_MODELS = ['birefnet_hr_matting', 'lucida'];
+  const BIREFNET_PX = { birefnet_hr_matting: 2016, lucida: 1008 };
+  const VM_NC = '⚠ tylko niekomercyjnie';
+  const EDGE_MODEL_LICENCE = {
+    base: [VM_NC, true], small: [VM_NC, true], 'base-distinctions': [VM_NC, true],
+    birefnet_hr_matting: ['MIT – komercyjnie OK', false], lucida: ['MIT – komercyjnie OK', false] };
+  const EDGE_MODEL_LABEL = { base: 'ViTMatte base', small: 'ViTMatte small', 'base-distinctions': 'ViTMatte base – distinctions',
+    birefnet_hr_matting: 'BiRefNet_HR-matting', lucida: 'Lucida' };
   // band preview switch of the palette (user request 2026-10-16, like the MatAnyone palette): remembered in this browser
   const bandPvGet = () => { try { return localStorage.getItem('md_zone_bandpv') !== '0'; } catch (e) { return true; } };
   const bandPvSet = (on) => { try { localStorage.setItem('md_zone_bandpv', on ? '1' : '0'); } catch (e) { /* storage blocked */ } };
@@ -87,6 +114,10 @@
     return out;
   }
   const keyFrames = (z) => Object.keys(keysOf(z)).map(Number).sort((a, b) => a - b);
+  // the zone keys the user sees (user decision 2026-10-21): a whole-outline zone has no key of its own – only a drawn
+  // (old exclusion) key counts; its keys are the band point triangles
+  const drawnKey = (k) => !!(k && ((k.polygon || []).length || (k.strokes || []).length || (k.bg_strokes || []).length));
+  const laneKeys = (z) => (isOutline(z) ? keyFrames(z).filter((f) => drawnKey(keysOf(z)[f])) : keyFrames(z));
   function share(es) {
     const ks = Object.keys(es || {}); if (!ks.length) return '';
     return ks.sort((a, b) => es[b] - es[a]).map((k) => `${ENGINE_LABEL[k] || k} ${Math.round(es[k] * 100)} %`).join(' / ');
@@ -96,6 +127,12 @@
     if (i >= 0) Z.list[i] = zone; else Z.list.push(zone);
     if (st) Z.status[zone.zone_id] = st;
     delete Z.regionCache[zone.zone_id];
+    delete Z.band.data[zone.zone_id]; Z.band.live = null;   // the shown widths depend on the sliders: ask again
+    // a whole-outline zone shows the server's band: ask for it again now, not on the next frame change (user report
+    // 2026-10-21: after a slider the band was gone until the frame changed)
+    if (inZoneFlow() && Z.active === zone.zone_id && zone.criterion === 'matte' && isOutline(zone) && !hasDrawing(zone) && bandPvGet()) {
+      setTimeout(() => { const a = activeMatte(); if (a && a.zone_id === zone.zone_id) regionFor(a, curFrame(), false); }, 0);
+    }
   }
   function missingFront(e) { return e && e.status === 409 && e.detail && Array.isArray(e.detail.missing_front) ? e.detail : null; }
 
@@ -104,7 +141,7 @@
     return `<div class="sec-title">Strefy <span class="muted">(matting lokalny: włosy, futro, dym, włókna)</span></div>
       <div id="st4Zones" class="zone-list"></div>
       <div class="row"><button class="btn btn-secondary btn-sm" id="z4New">＋ Nowa strefa</button>
-        <button class="btn btn-secondary btn-sm" id="z4Propose" title="Zaproponuj strefę (krok 9): SAM3 z opisem strefy na kadrze obiektu minus rdzeń + miękkie krawędzie poza rdzeniem → propozycje (żółte wielokąty z numerami); ✓ tworzy strefę z wybranym presetem, ✕ odrzuca">✨ Zaproponuj</button>
+        <button class="btn btn-secondary btn-sm" id="z4Propose" title="Zaproponuj strefę (krok 9): SAM 3.1 z opisem strefy na kadrze obiektu minus rdzeń + miękkie krawędzie poza rdzeniem → propozycje (żółte wielokąty z numerami); ✓ tworzy strefę z wybranym presetem, ✕ odrzuca">✨ Zaproponuj</button>
         <span class="muted zone-hint" id="z4Hint"></span></div>
       <div id="z4Props" class="zone-props"></div>
       <div class="zone-presets" id="z4Presets">${PRESETS.map((p) => `<button class="tool-btn zp" data-preset="${p[0]}" title="${esc(p[3])}"><span class="tool-icon">${p[1]}</span><span class="tool-label">${p[2]}</span></button>`).join('')}</div>
@@ -143,21 +180,25 @@
         <label class="chk" title="Zielona alfa podglądu strefy na obrazie (w wycięciu „Na tle” podgląd zostaje – to jest wynik)"><input type="checkbox" id="zpAlphaPv" title="Zielona alfa podglądu strefy (wł. / wył.)"> 👁 alfa strefy</label></div>
       <div class="zp-none" id="zpNone"><span class="muted">Brak aktywnej strefy „matte”.</span>
         <button type="button" class="btn btn-primary btn-sm" id="zpNewOutline" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu (preset włosy). Potem zaznacz miejsca BEZ włosów tego obiektu (twarz, szyja, skóra) – ViTMatte ich nie liczy. Dłoń / obiekt z przodu: ustaw go w kolejności PRZED tym obiektem (holdout)">＋ Strefa ViTMatte: cały obrys</button>
-        <button type="button" class="btn btn-secondary btn-sm" id="zpNewPaint" title="Nowa strefa ViTMatte: namaluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń). Obszar idzie za obiektem (CoTracker, lokalnie); poprawka pędzlem w dowolnej klatce = klucz. Części obiektu (np. dłoń) są z obszaru wycinane same">🖌 Maluj obszar włosów (ViTMatte)</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="zpNewPaint" title="Nowa strefa ViTMatte: namaluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń). Obszar idzie za obiektem (CoTracker3, lokalnie); poprawka pędzlem w dowolnej klatce = klucz. Części obiektu (np. dłoń) są z obszaru wycinane same">🖌 Maluj obszar włosów (ViTMatte)</button>
         </div>
       <div class="zone-tune" id="z4Tune">
         <div class="zone-tune-sec" id="z4AreaSec"><span class="zp-sub">Obszar ViTMatte</span>
           <div class="seg zone-region" id="z4Region">
             <button type="button" data-r="draw" title="Strefa = obszar namalowany pędzlem (wielokąt też działa); idzie za obiektem, poprawka = klucz">Malowany obszar</button>
-            <button type="button" data-r="outline" title="Strefa = pas wokół całego obrysu rdzenia SAM3; rysunek i zaznaczone obiekty są z niego WYCIĘTE">Cały obrys − wykluczenia</button></div>
+            <button type="button" data-r="outline" title="Strefa = pas wokół całego obrysu rdzenia SAM 3.1; rysunek i zaznaczone obiekty są z niego WYCIĘTE">Cały obrys − wykluczenia</button></div>
           <div class="seg zone-brush" id="z4Brush">
             <button type="button" data-b="paint" title="Pędzel: maluj obszar, w którym liczy ViTMatte [G]; rozmiar: suwak pędzla po lewej albo [ ]">🖌 Maluj</button>
             <button type="button" data-b="erase" title="Pędzel: zmaż obszar (ViTMatte tu nie liczy) [R]">⌫ Zmaż</button>
             <button type="button" data-b="bg" title="Pędzel: wymuszone tło (np. linia na ścianie przechodząca przez włosy)">− Tło</button></div>
-          <label class="chk" id="z4TrackRow" title="Obszar przenoszony między klatkami punktami CoTrackera lokalnie (każdy fragment za najbliższymi punktami – nadąża za ruchem i deformacją włosów); punkty nigdy na częściach obiektu (np. dłoń) ani na obiektach z przodu. Wyłączone = sztywny kształt"><input type="checkbox" id="z4Track" title="Śledzenie lokalne obszaru (CoTracker): włączone = obszar nadąża za ruchem i deformacją włosów; wyłączone = sztywny kształt"> śledzenie lokalne (CoTracker)</label>
+          <label class="chk" id="z4TrackRow" title="Obszar przenoszony między klatkami punktami CoTrackera lokalnie (każdy fragment za najbliższymi punktami – nadąża za ruchem i deformacją włosów); punkty nigdy na częściach obiektu (np. dłoń) ani na obiektach z przodu. Wyłączone = sztywny kształt"><input type="checkbox" id="z4Track" title="Śledzenie lokalne obszaru (CoTracker3): włączone = obszar nadąża za ruchem i deformacją włosów; wyłączone = sztywny kształt"> śledzenie lokalne (CoTracker3)</label>
           <div class="zp-hint" id="z4RegionHint"></div>
-          <label class="zone-slider" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="10" max="120" step="2" title="Jak daleko poza obrys rdzenia SAM3 liczy ViTMatte (px plate'u). Podgląd na masce przy przeciąganiu: żółte = pas ViTMatte"><b id="z4OutV"></b></label>
-          <label class="zone-slider">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="30" step="1" title="Ile px w głąb rdzenia SAM3 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px. Podgląd na masce przy przeciąganiu: niebieskie = pewne (1), żółte = pas, o którym decyduje ViTMatte. 0–2 = twardy obrys SAM3"><b id="z4InsetV"></b></label>
+          <div class="zp-band" id="z4BandRow"><button type="button" class="btn btn-ghost btn-xs" id="z4BandTool" style="display:none" title="Dodawanie punktów kontrolnych pasa (Esc = koniec): klik na obrazie przy obrysie = nowy punkt; dwa wąsy – żółty = pas na zewnątrz (w tło), niebieski = do środka (w obiekt); przeciągnij koniec wąsa = grubość w tej klatce (klucz), przeciągnij punkt = jego położenie (klucz); 0 / 0 = przerwa w pasie (np. skóra, dłoń). Między kluczami grubość się animuje, punkty śledzi CoTracker3. PPM na punkcie = usuń klucz tej klatki (ostatni klucz usuwa punkt)">＋ Dodaj punkt pasa</button>
+            <button type="button" class="btn btn-ghost btn-xs" id="z4BandClear" title="Usuń wszystkie punkty bieżącej klatki kluczowej pasa (= usuń klatkę kluczową)">🗑 Usuń wszystkie punkty (ta klatka)</button>
+            <span class="zp-hint" id="z4BandInfo"></span><div class="band-mode" id="z4BandMode"></div></div>
+          <label class="zone-slider" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="10" max="120" step="2" title="Jak daleko poza obrys rdzenia SAM 3.1 liczy ViTMatte (px plate'u). Podgląd na masce przy przeciąganiu: żółte = pas ViTMatte"><b id="z4OutV"></b></label>
+          <label class="zone-slider" id="z4OutFeatherRow">Wtopienie krawędzi zewn. <input type="range" id="z4OutFeather" min="0" max="80" step="1" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa (od strony tła) wynik strefy przechodzi w bazę – cieńsza przerywana linia na podglądzie. 0 = jak „Wtopienie wcięcia” (jedna wartość dla obu krawędzi, jak dotąd). Nie przelicza modelu – tylko nakładanie"><b id="z4OutFeatherV"></b></label>
+          <label class="zone-slider">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="30" step="1" title="Ile px w głąb rdzenia SAM 3.1 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px. Podgląd na masce przy przeciąganiu: niebieskie = pewne (1), żółte = pas, o którym decyduje ViTMatte. 0–2 = twardy obrys SAM 3.1"><b id="z4InsetV"></b></label>
           <label class="zone-slider">Wtopienie wcięcia <input type="range" id="z4Feather" min="0" max="24" step="1" title="Na ilu px wynik ViTMatte przenika się z bazą (rdzeniem) przy granicach obszaru strefy – miękkie wtopienie wcięcia zamiast twardego przejścia. Działa na żywo w podglądzie (bez modelu) i przy „Zastosuj”. Domyślnie 8 px"><b id="z4FeatherV"></b></label>
           <div class="zp-excl" id="z4ExclRow"><span class="muted" title="Maski innych policzonych obiektów (alpha aktywnej wersji, bez niej rdzeń) wycinane z pasa ViTMatte – zostaje tam wynik bazowy. Dla części tego samego obiektu (twarz, szyja). Obiekt z przodu (dłoń) lepiej ustawić w kolejności przed tym obiektem: holdout = alfa 0 pod nim, a ViTMatte liczy włosy aż do jego krawędzi (CLIP2_A v069 vs v067)">Wyklucz obiekty</span><div id="z4Excl" class="zp-excl-list"></div></div></div>
         <div class="zone-tune-sec" id="z4TempSec"><span class="zp-sub">Wygładzanie w czasie</span>
@@ -170,20 +211,22 @@
         <div class="zone-tune-sec" id="z4GrpSec"><span class="zp-sub" title="Obiekt połączony z częściami szwem: strefa liczy na całości grupy. Zaznaczony członek = pewny pierwszy plan (wycięty z obszaru strefy, alfa 1); odznaczony = jego krawędź liczy silnik strefy (np. włosy części „głowa”)">Grupa – pewny pierwszy plan</span>
           <div id="z4Grp" class="zp-excl-list"></div>
           <div class="zp-hint">odznacz obiekt z włosami / futrem – wtedy jego krawędź liczy strefa</div></div>
-        <div class="zone-tune-sec" id="z4VmSec"><span class="zp-sub">ViTMatte (jak węzeł w Nuke'u)</span>
-          <label>Model<select id="z4VmModel" class="form-input" title="Wagi ViTMatte. base = „High detail” z Nuke'a (domyślnie, najlepsze kosmyki); small = szybszy, więcej mgiełki; base – distinctions = trenowany na innym zbiorze (czasem lepszy na futrze / włóknach). Modele są w cache Hugging Face (pobiera je Doktor / 1. użycie)"><option value="base">base (High detail)</option><option value="small">small (szybki)</option><option value="base-distinctions">base – distinctions</option></select></label>
-          <label>Rozdzielczość<select id="z4VmPx" class="form-input" title="Bok kadru strefy, który widzi model (Nuke „Downrez” odwrotnie): 1008 = kadr powiększony jak dla MatAnyone (≤ 3×, domyślnie); 504 = ½ (szybciej, pomiar CLIP2_A ≈ wynik Nuke'a); więcej = drobniejsze kosmyki, wolniej i więcej VRAM"><option value="504">504 (½, szybciej)</option><option value="756">756</option><option value="1008">1008 (domyślnie)</option><option value="1512">1512</option><option value="2016">2016 (wolno)</option></select></label>
+        <div class="zone-tune-sec" id="z4VmSec"><span class="zp-sub" id="z4VmTitle">ViTMatte (jak węzeł w Nuke'u)</span>
+          <label>Model<select id="z4VmModel" class="form-input" title="Model krawędzi w strefie. ViTMatte: base = „High detail” z Nuke'a (domyślnie, najlepsze kosmyki); small = szybszy, więcej mgiełki; base – distinctions = trenowany na innym zbiorze (czasem lepszy na futrze / włóknach) – wagi ViTMatte tylko do użytku niekomercyjnego (zbiór Adobe). BiRefNet_HR-matting (2048 px) / Lucida (1024 px) = wagi MIT, także komercyjnie; liczą alfę z samego obrazu, trimapa tylko przycina wynik do pasa. Modele są w cache Hugging Face (pobiera je Doktor)"><optgroup data-e="vitmatte" label="ViTMatte – tylko niekomercyjnie"><option value="base">ViTMatte base (High detail)</option><option value="small">ViTMatte small (szybki)</option><option value="base-distinctions">ViTMatte base – distinctions</option></optgroup><optgroup data-e="birefnet" label="BiRefNet – wagi MIT, komercyjnie"><option value="birefnet_hr_matting">BiRefNet_HR-matting</option><option value="lucida">Lucida</option></optgroup></select></label>
+          <div class="zp-hint" id="z4VmLic"></div>
+          <label>Rozdzielczość<select id="z4VmPx" class="form-input" title="Bok kadru strefy, który widzi model (Nuke „Downrez” odwrotnie): 1008 = kadr powiększony jak dla MatAnyone2 (≤ 3×, domyślnie); 504 = ½ (szybciej, pomiar CLIP2_A ≈ wynik Nuke'a); więcej = drobniejsze kosmyki, wolniej i więcej VRAM"><option value="504">504 (½, szybciej)</option><option value="756">756</option><option value="1008">1008 (domyślnie)</option><option value="1512">1512</option><option value="2016">2016 (wolno)</option></select></label>
           <label class="zone-slider">Fine tune <input type="range" id="z4VmUnk" min="0.2" max="0.8" step="0.05" title="Nuke „Fine Tune”: poziom, jaki pas „unknown” dostaje w kanale trimapy. 0.5 = neutralnie (domyślnie); mniej = model ostrożniej dodaje (0.3 obcina kosmyki); więcej = śmielej (0.7 = mgiełka w tle)"><b id="z4VmUnkV"></b></label>
           <div class="zp-hint">Wcięcie w rdzeń (wyżej) = „Erode” pewnego środka trimapy.</div></div>
         <div class="zone-tune-sec" id="z4FinSec"><span class="zp-sub">Wykończenie</span>
-          <label class="zone-slider">Czerń <input type="range" id="z4Black" min="0" max="0.3" step="0.01" title="Alfa poniżej tej wartości → 0 (usuwa mgiełkę i drobne śmieci w tle); liniowo do bieli, bez schodka. Przy średniej po przepływie działa PRZED wygładzaniem"><b id="z4BlackV"></b></label>
-          <label class="zone-slider" id="z4BlackAfterRow">Czerń po <input type="range" id="z4BlackAfter" min="0" max="0.3" step="0.01" title="Drugie obcięcie czerni PO wygładzaniu w czasie: średnia z sąsiednich klatek tworzy nowe niskie wartości (mgiełka przy szybkim ruchu, CLIP2_A F18) – ten suwak je usuwa (ViTMatte)"><b id="z4BlackAfterV"></b></label>
-          <label class="zone-slider">Biel <input type="range" id="z4White" min="0.6" max="1" step="0.01" title="Alfa powyżej tej wartości → 1 (domyka prawie pełne kosmyki i brzeg)"><b id="z4WhiteV"></b></label>
-          <label class="zone-slider">Rozmycie <input type="range" id="z4Blur" min="0" max="3" step="0.1" title="Rozmycie Gaussa alfy strefy w px (po wygładzaniu); rdzeń zostaje 1"><b id="z4BlurV"></b></label>
+          <label class="zone-slider" style="display:none">Czerń <input type="range" id="z4Black" min="0" max="0.3" step="0.01" title="Alfa poniżej tej wartości → 0 (usuwa mgiełkę i drobne śmieci w tle); liniowo do bieli, bez schodka. Przy średniej po przepływie działa PRZED wygładzaniem"><b id="z4BlackV"></b></label>
+          <label class="zone-slider" id="z4BlackAfterRow" style="display:none">Czerń po <input type="range" id="z4BlackAfter" min="0" max="0.3" step="0.01" title="Drugie obcięcie czerni PO wygładzaniu w czasie: średnia z sąsiednich klatek tworzy nowe niskie wartości (mgiełka przy szybkim ruchu, CLIP2_A F18) – ten suwak je usuwa (ViTMatte)"><b id="z4BlackAfterV"></b></label>
+          <label class="zone-slider" style="display:none">Biel <input type="range" id="z4White" min="0.6" max="1" step="0.01" title="Alfa powyżej tej wartości → 1 (domyka prawie pełne kosmyki i brzeg)"><b id="z4WhiteV"></b></label>
+          <label class="zone-slider" style="display:none">Rozmycie <input type="range" id="z4Blur" min="0" max="3" step="0.1" title="Rozmycie Gaussa alfy strefy w px (po wygładzaniu); rdzeń zostaje 1"><b id="z4BlurV"></b></label>
           <button class="btn btn-ghost btn-xs" id="z4TuneReset" title="Przywróć wygładzanie i wykończenie z presetu strefy">↺ z presetu</button></div>
+        <div class="muted" id="z4FinNote" title="Czerń / biel / rozmycie całej alfy są teraz w etapie Final Touch (na żywo, bez przeliczania). Tu zostaje tylko próg szumu z presetu, obcinany PRZED wygładzaniem w czasie – bez niego średnia po przepływie robi mgłę z szumu modelu"></div>
         <div class="zp-btns">
-          <button type="button" class="btn btn-primary btn-sm" id="z4PvFrame" title="Policz ViTMatte w tej klatce z bieżącymi ustawieniami i wykluczeniami (bez wygładzania w czasie – ono działa przy „Zastosuj”)">▶ Przelicz klatkę</button>
-          <button type="button" class="btn btn-secondary btn-sm" id="zpStagePv" title="Policz ViTMatte na wybranej bazie tylko na kilku klatkach wokół bieżącej (±2 kl.) – szybkie sprawdzenie ustawień przed długim liczeniem całości. To NIE jest wynik etapu: nic się nie zapisuje jako wersja i nic się nie odblokowuje. Modele czasowe dostają mniej kontekstu niż w pełnym przebiegu – krawędź może się trochę różnić">👁 Podgląd klatek</button>
+          <button type="button" class="btn btn-primary btn-sm" id="z4PvFrame" style="display:none" title="Policz ViTMatte w tej klatce z bieżącymi ustawieniami i wykluczeniami (bez wygładzania w czasie – ono działa przy „Zastosuj”)">▶ Przelicz klatkę</button>
+          <button type="button" class="btn btn-primary btn-sm" id="zpStagePv" title="Policz ViTMatte na wybranej bazie tylko na kilku klatkach wokół bieżącej (±2 kl.) – szybkie sprawdzenie ustawień przed długim liczeniem całości. To NIE jest wynik etapu: nic się nie zapisuje jako wersja i nic się nie odblokowuje. Modele czasowe dostają mniej kontekstu niż w pełnym przebiegu – krawędź może się trochę różnić">👁 Podgląd klatek</button>
           <button type="button" class="btn btn-secondary btn-sm" id="zpApply" title="Policz strefę na całym ujęciu (nowa wersja)">✚ Zastosuj na ujęcie</button></div>
       </div>
     </div>`;
@@ -204,9 +247,11 @@
     const z = activeMatte();
     $('zpBandPv').checked = bandPvGet();
     $('zpAlphaPv').checked = Z.ov !== 'none';
-    $('zpNone').style.display = z ? 'none' : '';
+    const auto = !z && wantsAutoZone();   // the band comes by itself
+    $('zpNone').style.display = z || auto ? 'none' : '';
+    if (auto) ensureOutlineZone();
     $('z4Tune').style.display = z ? '' : 'none';
-    $('zpTitle').textContent = z ? `Strefa ${z.zone_id} · ${ENGINE_LABEL[z.matting] || z.matting}${isOutline(z) ? ' · cały obrys' : ''}` : 'Strefa';
+    $('zpTitle').textContent = z ? `Strefa ${z.zone_id} · ${zEngLabel(z)}${isOutline(z) ? ' · cały obrys' : ''}` : 'Strefa';
     const w = $('canvasWrapper');
     if (w && H.placeFloating) H.placeFloating(box, w, palPos.get());
   }
@@ -256,7 +301,7 @@
         const rs = st.run_stats;
         const stats = rs ? ` · ${ENGINE_LABEL[rs.engine] || rs.engine || ''}${rs.engine_share && Object.keys(rs.engine_share).length ? ' (' + share(rs.engine_share) + ')' : ''}`
           + (rs.seconds != null && rs.frames ? ` · ${(rs.seconds / rs.frames).toFixed(2)} s/kl.` : '') : '';
-        const sub = matte ? `${z.zone_id} · ${PRESET_NAME[z.preset] || z.preset} · ${ENGINE_LABEL[z.matting] || z.matting}${z.holdout === false ? ' · bez holdoutu' : ''}`
+        const sub = matte ? `${z.zone_id} · ${PRESET_NAME[z.preset] || z.preset} · ${zEngLabel(z)}${z.holdout === false ? ' · bez holdoutu' : ''}`
                           : `${z.zone_id} · ${z.mode === 'add' ? 'Dodaj' : 'Usuń'} ${CRIT_LABEL[z.criterion] || z.criterion}${z.soft ? ' (miękko)' : ''}`;
         return `<div class="zone-card ${z.zone_id === Z.active ? 'cur' : ''} ${z.enabled ? '' : 'off'}" data-z="${esc(z.zone_id)}" style="--zc:${zoneColour(z.zone_id)}" title="Klik = aktywna strefa (jej klucze na osi czasu, kreski trafiają do niej)">
           <span class="zone-ic" title="${esc(matte ? 'preset ' + (PRESET_NAME[z.preset] || z.preset) : 'strefa progowa')}">${icon}</span>
@@ -284,6 +329,8 @@
     const preset = z ? z.preset : Z.preset;
     document.querySelectorAll('#z4Presets .zp').forEach((b) => b.classList.toggle('active', b.dataset.preset === preset));
     if (document.activeElement !== $('z4Prompt')) $('z4Prompt').value = z ? (z.prompt || '') : Z.prompt;   // not while typing
+    applyEngineOptions($('z4Engine'));
+    if (Z.engine === 'matanyone' && ((S().info && S().info.edge_engine) === 'birefnet')) Z.engine = 'vitmatte';   // new zones: BiRefNet
     $('z4Engine').value = z ? z.matting : Z.engine;
     if (![...$('z4Engine').options].some((o) => o.value === $('z4Engine').value)) $('z4Engine').value = 'auto';
     $('z4Holdout').checked = z ? z.holdout !== false : Z.holdout;
@@ -326,22 +373,48 @@
     const vm = !!z && z.matting === 'vitmatte';
     $('z4VmSec').style.display = vm ? '' : 'none';
     if (document.activeElement !== $('zpEngine')) $('zpEngine').value = z ? z.matting : 'vitmatte';
-    $('zpEngHint').textContent = z && !vm ? `Ustawienia ViTMatte (model, rozdzielczość, fine tune, wygładzanie w czasie) są przy silniku ViTMatte – ta strefa liczy ${ENGINE_LABEL[z.matting] || z.matting}.` : '';
+    applyEngineOptions($('zpEngine'));
+    $('zpEngHint').textContent = z && !vm ? `Ustawienia modelu (model, rozdzielczość, wygładzanie w czasie) są przy silniku ${$('zpEngine').querySelector('option[value="vitmatte"]').textContent} – ta strefa liczy ${zEngLabel(z)}.` : '';
     if (vm) {
+      // models of the stage 5 engine only (objects.js arrow menu). A zone on the other engine's model (set before the
+      // engine switch moved zones, 2026-10-21) is moved to the stage engine's default model once, as the switch does
+      const stEng = (S().info && S().info.edge_engine) || 'vitmatte';
+      const zEng = BIREFNET_MODELS.includes(pval(z, 'vitmatte_model')) ? 'birefnet' : 'vitmatte';
+      if (zEng !== stEng && S().info && inZoneFlow() && !Z.engAligned[z.zone_id]) {   // only in the open stage 5, never in the background
+        Z.engAligned[z.zone_id] = true;
+        patchTune({ vitmatte_model: stEng === 'birefnet' ? 'birefnet_hr_matting' : 'base' }, `model ${stEng === 'birefnet' ? 'BiRefNet_HR-matting' : 'ViTMatte base'} (silnik etapu)`);
+      }
+      $('z4VmModel').querySelectorAll('optgroup').forEach((g) => { const on = g.dataset.e === stEng || g.dataset.e === zEng; g.hidden = !on; g.disabled = !on; });
+      $('z4VmTitle').textContent = zEng === 'birefnet' ? 'BiRefNet' : "ViTMatte (jak węzeł w Nuke'u)";
       if (document.activeElement !== $('z4VmModel')) $('z4VmModel').value = pval(z, 'vitmatte_model');
-      if (document.activeElement !== $('z4VmPx')) $('z4VmPx').value = String(pval(z, 'model_px'));
+      // BiRefNet default: one crop at about its own input side (engine/zones.py BIREFNET_MODEL_PX)
+      const pxDef = BIREFNET_PX[pval(z, 'vitmatte_model')];
+      if (document.activeElement !== $('z4VmPx')) $('z4VmPx').value = String(z.params && z.params.model_px != null ? z.params.model_px : (pxDef || PARAM_DEF.model_px));
       if (document.activeElement !== $('z4VmUnk')) $('z4VmUnk').value = pval(z, 'unknown_value');
       $('z4VmUnkV').textContent = (+$('z4VmUnk').value).toFixed(2);
+      const lic = EDGE_MODEL_LICENCE[pval(z, 'vitmatte_model')] || EDGE_MODEL_LICENCE.base;
+      $('z4VmLic').textContent = lic[0];
+      $('z4VmLic').classList.toggle('zp-hint-nc', lic[1]);
+      $('z4VmUnk').parentElement.style.display = BIREFNET_MODELS.includes(pval(z, 'vitmatte_model')) ? 'none' : '';   // no trimap input
     }
-    $('z4BlackAfterRow').style.display = $('z4TempSec').style.display;
+    $('z4BlackAfterRow').style.display = 'none';   // finish sliders live in Final Touch (2026-10-22)
     const out = isOutline(z);
     $('z4Region').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.r === (out ? 'outline' : 'draw')));
     $('z4OutRow').style.display = out ? '' : 'none';
+    $('z4OutFeatherRow').style.display = out ? '' : 'none';
+    $('z4BandRow').style.display = out ? '' : 'none';
+    if (!out && bandTool()) H.setTool(S().tool);   // tool off
+    bandInfo();
     $('z4ExclRow').style.display = out ? '' : 'none';
-    $('z4TrackRow').style.display = out ? 'none' : '';
+    $('z4TrackRow').style.display = out || !DRAW_TOOLS ? 'none' : '';
+    $('z4Region').style.display = DRAW_TOOLS ? '' : 'none';
+    $('z4Brush').style.display = DRAW_TOOLS ? '' : 'none';
     $('z4Track').checked = pval(z, 'track') === 'local';
     $('z4Brush').querySelectorAll('button').forEach((b) => b.classList.toggle('active', Z.brush === b.dataset.b));
-    $('z4RegionHint').innerHTML = out
+    $('z4RegionHint').innerHTML = !DRAW_TOOLS
+      ? (out ? 'Strefa = pas wokół <b>całego obrysu</b>. Grubość ustawiasz <b>punktami pasa</b>: narzędzie „Dodaj punkt” (G) na pasku po lewej, potem klik przy obrysie; wąsy: żółty = na zewnątrz, niebieski = do środka; 0 / 0 = przerwa (skóra, dłoń).'
+        : 'Ta strefa ma <b>malowany obszar</b> (starszy tryb) – rysowanie jest teraz wyłączone; nowe strefy: „Nowa strefa – cały obrys”.')
+      : out
       ? 'ViTMatte liczy wzdłuż <b>całego obrysu</b>. Pędzel G / wielokąt P zaznaczają miejsca, których ViTMatte ma <b>NIE</b> brać pod uwagę (twarz, szyja, skóra); R = tło. Tam zostaje wynik bazowy. Dłoń / obiekt z przodu: ustaw go w kolejności <b>przed</b> tym obiektem (holdout), nie wykluczaj.'
       : 'Namaluj pas wzdłuż krawędzi <b>włosy–tło</b> (może wjechać na dłoń). ViTMatte liczy tylko w nim; obszar idzie za obiektem, poprawka pędzlem w dowolnej klatce = <b>klucz</b>. Części obiektu (np. dłoń, „część” na liście obiektów) są wycinane z obszaru same i liczą się jako pewny pierwszy plan; obiekty z przodu = holdout.';
     if (out) renderExcl(z);
@@ -360,7 +433,12 @@
     set('z4BlackAfter', 'alpha_black_after', (v) => v.toFixed(2));
     set('z4White', 'alpha_white', (v) => v.toFixed(2));
     set('z4Blur', 'alpha_blur_px', (v) => `${v.toFixed(1)} px`);
+    {   // the finish lives in Final Touch now (user decision 2026-10-22): say what the preset still clips here
+      const n = $('z4FinNote');
+      if (n) n.textContent = `Próg szumu przed wygładzaniem: czerń ${(+pval(z, 'alpha_black')).toFixed(2)} / biel ${(+pval(z, 'alpha_white')).toFixed(2)} (preset). Poziomy, erode i rozmycie całej alfy: etap Final Touch.`;
+    }
     set('z4Out', 'outline_out_px', (v) => `${v} px`);
+    set('z4OutFeather', 'outer_feather_px', (v) => (+v ? `${v} px` : 'jak wcięcie'));
     renderPalette();
   }
   // live inset preview on the mask (user 2026-10-15): distance of every core pixel to the core edge (chamfer 3-4, two
@@ -424,7 +502,7 @@
     box.style.display = '';
     const parts = [];
     parts.push(`preset: <b>${esc(pl.preset ? PRESET_NAME[pl.preset] || pl.preset : 'bez zmian')}</b>`);
-    if (pl.fg_en) parts.push(`SAM3: „${esc(pl.fg_en)}”`);
+    if (pl.fg_en) parts.push(`SAM 3.1: „${esc(pl.fg_en)}”`);
     if (pl.distractors && pl.distractors.length) parts.push(`tło: ${esc(pl.distractors.join('; '))}`);
     if (pl.engine_hints && Object.keys(pl.engine_hints).length) parts.push(`silniki: ${esc(HINT_TXT(pl.engine_hints))}${pl.forced_engine ? ` (tylko ${esc(ENGINE_LABEL[pl.forced_engine] || pl.forced_engine)})` : ''}`);
     let html = `→ ${parts.join(' · ')}`;
@@ -473,12 +551,12 @@
     const f = curFrame();
     const z = activeMatte();
     const prompt = z ? (z.prompt || '') : ($('z4Prompt') ? $('z4Prompt').value.trim() : '');
-    status(`F${f}: szukam propozycji strefy (SAM3 na kadrze obiektu minus rdzeń + miękkie krawędzie)…`);
+    status(`F${f}: szukam propozycji strefy (SAM 3.1 na kadrze obiektu minus rdzeń + miękkie krawędzie)…`);
     const d = await api('POST', `/api/object/${obj()}/zones/propose`, { frame: f, prompt: prompt || null });
     Z.props = { f, list: d.proposals || [], preset: d.preset || Z.preset, hover: null, fg: d.fg, sam3: d.sam3 };
     renderProps();
-    status(Z.props.list.length ? `F${f}: ${Z.props.list.length} propozycji (SAM3 „${d.fg || '–'}”${d.sam3 ? '' : ' bez maski'}) – ✓ tworzy strefę, ✕ odrzuca, najechanie podświetla`
-                                : `F${f}: brak propozycji – rdzeń pokrywa wszystko, co SAM3 widzi; narysuj strefę ręcznie (G / P)`, Z.props.list.length ? 'ok' : 'warn');
+    status(Z.props.list.length ? `F${f}: ${Z.props.list.length} propozycji (SAM 3.1 „${d.fg || '–'}”${d.sam3 ? '' : ' bez maski'}) – ✓ tworzy strefę, ✕ odrzuca, najechanie podświetla`
+                                : `F${f}: brak propozycji – rdzeń pokrywa wszystko, co SAM 3.1 widzi; narysuj strefę ręcznie (G / P)`, Z.props.list.length ? 'ok' : 'warn');
     V().render();
   }
   function renderProps() {
@@ -487,7 +565,7 @@
     if (!P || !P.list.length) { box.innerHTML = ''; box.style.display = 'none'; return; }
     box.style.display = '';
     box.innerHTML = `<div class="muted">Propozycje stref F${P.f} (preset ${esc(PRESET_NAME[P.preset] || P.preset)}):</div>` + P.list.map((pr) =>
-      `<div class="zone-prop" data-i="${pr.id}" title="Propozycja #${pr.id}: ${pr.area_px} px, ${esc(pr.side)}, źródło ${esc(pr.source === 'both' ? 'SAM3 + miękka krawędź' : pr.source === 'sam3' ? 'SAM3 poza rdzeniem' : 'miękka krawędź')}">
+      `<div class="zone-prop" data-i="${pr.id}" title="Propozycja #${pr.id}: ${pr.area_px} px, ${esc(pr.side)}, źródło ${esc(pr.source === 'both' ? 'SAM 3.1 + miękka krawędź' : pr.source === 'sam3' ? 'SAM 3.1 poza rdzeniem' : 'miękka krawędź')}">
         <span>#${pr.id} · ${esc(pr.side)} · ${pr.area_px} px</span>
         <button class="btn btn-primary btn-xs" data-acc="${pr.id}" title="Utwórz strefę „matte” z tego wielokąta (klucz w tej klatce) i policz podgląd">✓ strefa</button>
         <button class="btn btn-ghost btn-xs" data-rej="${pr.id}" title="Odrzuć propozycję">✕</button></div>`).join('')
@@ -545,7 +623,7 @@
     const z = activeMatte();
     if (z && z.prompt) api('POST', `/api/object/${obj()}/zones/interpret`, { prompt: z.prompt }).then((d) => { Z.plan = { ...d, f: null }; renderPlan(d.plan, null); }).catch(() => renderPlan(null));
     else renderPlan(null);
-    if (z) status(`Strefa ${z.zone_id} aktywna (${PRESET_NAME[z.preset] || z.preset}, ${ENGINE_LABEL[z.matting] || z.matting}): maluj G / R / P w klatce = klucz; „Zastosuj na ujęcie”, gdy podgląd pasuje.`);
+    if (z) status(`Strefa ${z.zone_id} aktywna (${PRESET_NAME[z.preset] || z.preset}, ${zEngLabel(z)}): maluj G / R / P w klatce = klucz; „Zastosuj na ujęcie”, gdy podgląd pasuje.`);
     onFrame();
     V().render();
   }
@@ -557,7 +635,7 @@
       renderList();
       // the model runs only on demand (user rule 2026-10-17: sliders never start the model – it loads the system):
       // „▶ Przelicz klatkę” / „👁 Podgląd klatek” / a change of the ViTMatte base; finish sliders stay live without it
-      const pvNote = !opts.noPreview && Z.active === zid ? ' · podgląd modelu: „▶ Przelicz klatkę” albo „👁 Podgląd klatek”' : '';
+      const pvNote = !opts.noPreview && Z.active === zid ? ' · podgląd modelu: „👁 Podgląd klatek”' : '';
       status(`Strefa ${zid}: ${what || d.changed.join(', ')} – etap ${H.ST.VITMATTE} ViTMatte do przeliczenia („Zastosuj na ujęcie”)${pvNote}`, 'ok');
       H.loadStages().catch(() => {});
       if (opts.preview && Z.active === zid && (keyFrames(d.zone).includes(curFrame()) || isOutline(d.zone))) schedulePreview(curFrame(), 0);
@@ -583,8 +661,36 @@
     Z.list = (d.zones || []).filter((z) => !(z.params && z.params.source === 'brush')); Z.status = d.status || {};   // brush = stage 2 (brush.js)
     Z.regionCache = {};
     if (Z.active && !Z.list.some((z) => z.zone_id === Z.active)) Z.active = null;
-    if (!Z.active) { const m = Z.list.filter((z) => z.criterion === 'matte'); if (m.length === 1) Z.active = m[0].zone_id; }
+    if (!Z.active) { const m = Z.list.filter((z) => z.criterion === 'matte'); const o = m.filter(isOutline); if (o.length === 1 || m.length === 1) Z.active = (o[0] || m[0]).zone_id; }
+    Z.loadedObj = obj();
     renderList();
+    // the cache is empty now: ask for this frame's band at once (a finished job reloads the object – the lines vanished
+    // until the next frame change, user report 2026-10-22); as replaceZone
+    const a = activeMatte();
+    if (a && inZoneFlow() && isOutline(a) && bandPvGet()) setTimeout(() => { const b = activeMatte(); if (b && b.zone_id === a.zone_id && !(Z.regionCache[b.zone_id] || {})[curFrame()]) regionFor(b, curFrame(), false); }, 0);
+  }
+  // stage 5 opens on the band of the chosen base mask (user decision 2026-10-21): the whole-outline zone is created by
+  // itself – no preview, no undo entry, no key on the lane; keys come only from band points
+  // a part (part_of) is matted with its parent's group: no zone of its own by itself
+  const wantsAutoZone = () => { const me = (S().objects || []).find((x) => x.name === obj());
+    return !!obj() && !(me && me.part_of) && !(Z.autoFailed || {})[obj()] && !Z.list.some((x) => x.criterion === 'matte'); };
+  async function ensureOutlineZone() {
+    const o = obj();
+    if (!o || Z.autoBusy || Z.loadedObj !== o || !wantsAutoZone()) return;
+    Z.autoBusy = true;
+    try {
+      let def = {};
+      try { def = (await api('GET', '/api/zones/preset_defaults/hair')).params || {}; } catch (e) { /* older server: engine defaults */ }
+      const body = { mode: 'add', criterion: 'matte', frame: curFrame(), polygon: [], strokes: [], bg_strokes: [], preset: 'hair', matting: 'vitmatte',
+                     prompt: '', holdout: Z.holdout, static: false, bg_static: true, params: { ...def, region: 'outline', vitmatte_model: undefined } };   // model: the stage engine (server)
+      const d = await api('POST', `/api/object/${o}/zones/new`, body);
+      if (obj() !== o) return;
+      Z.active = d.zone.zone_id;
+      await load(); H.loadStages().catch(() => {}); onFrame(); V().render();
+    } catch (e) {
+      (Z.autoFailed = Z.autoFailed || {})[o] = true; renderPalette();
+      status(`Pas „cały obrys” nie powstał sam (${e.message || e}) – „＋ Strefa ViTMatte: cały obrys”`, 'warn');
+    } finally { Z.autoBusy = false; }
   }
   function reset() {   // object (re)load: a different object forgets the active zone / undo / preview; the same one (after a job) keeps them
     const same = Z.obj === obj();
@@ -611,7 +717,7 @@
   }
 
   // ------------------------------------------------------------------------------------------------ drawing -> zone / key
-  function wantsDraw() { return inZoneFlow(); }
+  function wantsDraw() { return DRAW_TOOLS && inZoneFlow(); }
   function onDraw(f) {
     clearTimeout(Z.drawTimer); Z.drawPending = f;
     Z.drawTimer = setTimeout(() => commitDraw(f).catch(() => {}), 600);
@@ -699,10 +805,24 @@
 
   async function undo(f) {
     const u = Z.undo[Z.undo.length - 1];
-    if (!u || !obj()) return false;
+    if (!obj()) return false;
+    if (!u) { status('Nic do cofnięcia w tym etapie', 'warn'); return true; }   // never the SAM 3.1 key history from here
     Z.undo.pop();
     try {
-      if (u.created && u.prev === null && Z.list.some((z) => z.zone_id === u.zid) && keyFrames(Z.list.find((z) => z.zone_id === u.zid)).length <= 1) {
+      if (u.band) {
+        const z = Z.list.find((x) => x.zone_id === u.zid); if (!z) throw new Error(`brak strefy ${u.zid}`);
+        if (u.shared) {   // the shared object band (2026-10-22): restored as a whole, every stage on it follows
+          await api('PUT', `/api/object/${obj()}/band/params`, { band_points: u.prev, band_ref_out: u.ref_out, band_ref_in: u.ref_in });
+          bandDirty(z); await load(); if (window.MD_BANDPTS) window.MD_BANDPTS.dirty();
+        } else {
+          const params = { ...(z.params || {}), band_points: u.prev, band_ref_out: u.ref_out, band_ref_in: u.ref_in };
+          if (!u.prev.length) { delete params.band_points; params.band_ref_out = null; params.band_ref_in = null; }
+          const d = await api('PATCH', `/api/object/${obj()}/zones/${u.zid}`, { params });
+          bandDirty(z); replaceZone(d.zone);
+        }
+        renderList(); onFrame(); renderLane();
+        status(`Cofnięto: ${u.what} (F${u.f})`, 'ok');
+      } else if (u.created && u.prev === null && Z.list.some((z) => z.zone_id === u.zid) && keyFrames(Z.list.find((z) => z.zone_id === u.zid)).length <= 1) {
         await api('DELETE', `/api/object/${obj()}/zones/${u.zid}`);
         if (Z.active === u.zid) Z.active = null;
         Z.preview = null; await load(); status(`Cofnięto: strefa ${u.zid} usunięta (była tylko jedna kreska)`, 'ok');
@@ -749,10 +869,29 @@
     if (c[f]) return c[f];
     const k = `${z.zone_id}_${f}`;
     if (Z.regionBusy[k]) return wait ? Z.regionBusy[k] : null;
+    let stale = false, busy409 = false;
     const p = (async () => {
-      try { const d = await api('GET', `/api/object/${obj()}/zones/${z.zone_id}/region/${f}`); c[f] = d; if (curFrame() === f) V().render(); return d; }
-      catch (e) { if (e.status !== 409) c[f] = { contours: [], error: e.message }; return null; }
-      finally { delete Z.regionBusy[k]; }
+      try {
+        const d = await api('GET', `/api/object/${obj()}/zones/${z.zone_id}/region/${f}`);
+        // the zone changed while this was asked (a slider, a band point – its cache was dropped): the answer belongs
+        // to the old settings, ask again for this frame (user report 2026-10-21: the band vanished after a slider)
+        stale = Z.regionCache[z.zone_id] !== c;
+        if (!stale) { c[f] = d; if (curFrame() === f) V().render(); }
+        return stale ? null : d;
+      }
+      catch (e) {
+        if (e.status !== 409 && Z.regionCache[z.zone_id] === c) c[f] = { contours: [], error: e.message };
+        if (e.status === 409) busy409 = true;   // another job runs (e.g. the zone preview): try again shortly
+        return null;
+      }
+      finally {
+        delete Z.regionBusy[k];
+        const a = activeMatte();
+        const again = a && a.zone_id === z.zone_id && curFrame() === f && bandPvGet();
+        if (stale && again) regionFor(a, f, false);
+        else if (busy409 && again && (Z.regionRetry[k] = (Z.regionRetry[k] || 0) + 1) <= 20) setTimeout(() => regionFor(activeMatte() || a, f, false), 600);
+        else if (!busy409) delete Z.regionRetry[k];
+      }
     })();
     Z.regionBusy[k] = p;
     return wait ? p : null;
@@ -772,8 +911,15 @@
     const cheap = isOutline(z) && !hasDrawing(z);
     frameTimer = setTimeout(() => {
       if (curFrame() !== f || !bandPvGet()) return;
-      if (cheap) { if (!document.body.classList.contains('job-busy')) regionFor(z, f, false); }
-      else status(`F${f}: obszar strefy ${z.zone_id} jeszcze niepoliczony w tej klatce – „▶ Przelicz klatkę” policzy go (CoTracker) razem z podglądem`);
+      if (cheap) {
+        const ask = (n) => {   // busy (another job): ask again a little later instead of skipping (user report 2026-10-21)
+          if (curFrame() !== f || (Z.regionCache[z.zone_id] || {})[f]) return;
+          if (!document.body.classList.contains('job-busy')) regionFor(z, f, false);
+          else if (n > 0) setTimeout(() => ask(n - 1), 500);
+        };
+        ask(20);
+      }
+      else status(`F${f}: obszar strefy ${z.zone_id} jeszcze niepoliczony w tej klatce – „👁 Podgląd klatek” policzy go (CoTracker3) razem z podglądem`);
     }, 350);
   }
 
@@ -784,14 +930,19 @@
     const ap = $('zpAlphaPv'); if (ap) ap.checked = k !== 'none';
     V().render();
   }
+  // one-frame model preview („▶ Przelicz klatkę”) switched off (user decision 2026-10-22): it blended the zone with a
+  // ramp of its own in the browser and had no temporal smoothing, so it did not match „Zastosuj”; „👁 Podgląd klatek”
+  // (±2 frames, the same code as the result) is the preview. The code stays behind this switch.
+  const FRAME_PV = false;
   function schedulePreview(f, delay) {
     clearTimeout(Z.pvTimer);
+    if (!FRAME_PV) return;
     Z.pvTimer = setTimeout(() => runPreview(f).catch(() => {}), delay == null ? 600 : delay);
   }
   async function runPreview(f) {
     const z = activeMatte(); if (!z || !obj()) return;
     if (Z.pvBusy) { Z.pvAgain = f; return; }
-    Z.pvBusy = true; const info = $('z4PvInfo'); if (info) info.textContent = `⏳ liczę podgląd F${f} (${ENGINE_LABEL[z.matting] || z.matting})…`;
+    Z.pvBusy = true; const info = $('z4PvInfo'); if (info) info.textContent = `⏳ liczę podgląd F${f} (${zEngLabel(z)})…`;
     try {
       const d = await api('POST', `/api/object/${obj()}/zones/${z.zone_id}/preview/${f}`);
       setPreview(z.zone_id, f, d.preview);
@@ -945,6 +1096,208 @@
     const ov = H.overlayFor('zone_alpha', f);
     return ov && ov !== 'missing' ? ov : null;
   }
+  // ------------------------------------------------------------------------------------------------ band control points
+  // (2026-10-21, engine/bandmap.py): an outline zone's band width set by points on the outline – yellow whisker = band
+  // into the background (out), blue = into the object (in); a drag = a key in this frame; 0 / 0 = a gap in the band
+  const bandPts = (z) => ((z && z.params && z.params.band_points) || []);
+  const bandState = (z, f) => ((Z.band.data[z.zone_id] || {})[f]) || null;
+  const bandKeyFrames = (z) => [...new Set(bandPts(z).flatMap((p) => Object.keys(p.keys || {}).map(Number)))].sort((a, b) => a - b);
+  async function loadBand(z, f) {
+    const k = `${z.zone_id}_${f}`;
+    if (Z.band.busy[k]) return;
+    Z.band.busy[k] = true;
+    try {
+      const d = await api('GET', `/api/object/${obj()}/zones/${z.zone_id}/band/${f}`);
+      (Z.band.data[z.zone_id] = Z.band.data[z.zone_id] || {})[f] = d;
+      // the server tracks the points in the background (2026-10-21): nearest keys' positions now, ask again until done
+      if (d.tracking) { Z.band.tracking = true; setTimeout(() => bandPoll(z), 2000); }
+      else if (Z.band.tracking) { Z.band.tracking = false; delete Z.regionCache[z.zone_id]; onFrame(); }
+      bandInfo(); V().render();
+    } catch (e) { /* busy / no core in this frame: tried again on the next draw */ }
+    finally { delete Z.band.busy[k]; }
+  }
+  function bandPoll(z) {
+    const a = activeMatte(); if (!a || a.zone_id !== z.zone_id) { Z.band.tracking = false; return; }
+    delete (Z.band.data[z.zone_id] || {})[curFrame()];
+    loadBand(z, curFrame());
+  }
+  function bandDirty(z) { delete Z.band.data[z.zone_id]; delete Z.regionCache[z.zone_id]; Z.band.live = null; }
+  async function bandSave(z, f, body, what, del) {
+    const p = z.params || {};   // Ctrl+Z = this band as it was (2026-10-21: undo went back past the whole zone)
+    Z.undo.push({ band: true, zid: z.zone_id, f, what, prev: JSON.parse(JSON.stringify(p.band_points || [])),
+                  ref_out: p.band_ref_out ?? null, ref_in: p.band_ref_in ?? null, shared: z.band_mode === 'shared' });
+    try {
+      if (del != null) await api('DELETE', `/api/object/${obj()}/zones/${z.zone_id}/band${del === '' || del[0] === '?' ? '' : '/'}${del}`);
+      else await api('PUT', `/api/object/${obj()}/zones/${z.zone_id}/band/${f}`, body);
+      bandDirty(z); await load(); if (window.MD_BANDPTS) window.MD_BANDPTS.dirty();   // the shared band: stages 3 / 4 / 7 too
+      status(`Pas ${z.zone_id} F${f}: ${what} – „👁 Podgląd klatek” / „Zastosuj na ujęcie” policzy strefę z nową grubością`, 'ok');
+    } catch (e) { Z.undo.pop(); bandDirty(z); toast(`Punkt pasa: ${e.message || e}`, 6000); }
+    onFrame(); renderLane(); V().render();
+  }
+  // band keys in frame f (2026-10-21: playback bar 🔑✕ / Delete / RMB on the triangle); a point left without keys goes too
+  async function deleteBandKeys(z, f) {
+    const ids = bandPts(z).filter((p) => (p.keys || {})[f]).map((p) => p.id);
+    if (!ids.length) { toast(`F${f}: brak kluczy pasa`); return false; }
+    const gone = bandPts(z).filter((p) => (p.keys || {})[f] && Object.keys(p.keys).length === 1).map((p) => p.id);
+    const msg = `Usunąć klucze pasa w klatce ${f} (${ids.join(', ')})?` + (gone.length ? `\nPunkty bez innych kluczy znikną: ${gone.join(', ')}` : '');
+    if (!(await V().uiConfirm(msg, { ok: 'Usuń', tone: 'error' }))) return false;
+    await bandSave(z, f, null, `klucze pasa usunięte (${ids.join(', ')})`, `?frame=${f}`);
+    return true;
+  }
+  function bandInfo() {
+    const el = $('z4BandInfo'); const z = activeMatte(); if (!el || !z) return;
+    const d = Z.band.drag;
+    const tr = (t) => (window.mdT ? window.mdT(t) : t);   // words inside a joined text: i18n.js cannot match them there
+    if (d) { el.textContent = d.kind === 'move' ? `${d.p.id}: przesuwanie` : `${d.p.id}: ${tr(d.kind === 'out' ? 'na zewnątrz' : 'do środka')} ${d.val} px`; return; }
+    if (Z.band.tracking) { el.textContent = '⏳ śledzę punkty (CoTracker3) – na razie położenie z najbliższego klucza'; return; }
+    const n = bandPts(z).length;
+    el.textContent = n ? `${n} ${tr(n === 1 ? 'punkt' : 'pkt')} · klucze: ${bandKeyFrames(z).map((f) => 'F' + f).join(' ')}`
+      + ' · PPM na punkcie = usuń'
+      : (bandTool() === 'band_add' ? 'klik przy obrysie = nowy punkt (Esc = koniec)' : 'brak – pas o stałej grubości; narzędzie „Dodaj punkt” (G) na pasku po lewej, potem klik przy obrysie');
+    if (bandTool() === 'band_remove') el.textContent = 'klik na punkt = usuń punkt (Esc = koniec)';
+    // the shared object band badge (2026-10-22): asked again only when the zone / its mode / its point count change
+    const ms = `${obj()}|${z.zone_id}|${z.band_mode}|${n}|${bandKeyFrames(z).join(',')}`;
+    if (Z.band.modeSig !== ms && window.MD_BANDPTS && window.MD_BANDPTS.renderModeInto) {
+      Z.band.modeSig = ms;
+      window.MD_BANDPTS.renderModeInto($('z4BandMode'), `zone:${z.zone_id}`, [],
+        async () => { Z.band.modeSig = null; bandDirty(z); await load(); onFrame(); renderLane(); V().render(); });
+    }
+    const kf = bandKeyFrames(z).includes(curFrame());
+    $('z4BandClear').style.display = n ? '' : 'none';
+    $('z4BandClear').disabled = !kf;
+    $('z4BandClear').title = kf ? `Usuń wszystkie punkty tej klatki kluczowej (F${curFrame()}) = usuń klatkę kluczową pasa; punkt bez innych kluczy znika (Ctrl+Z cofa)`
+      : `F${curFrame()} nie jest klatką kluczową pasa – przejdź na trójkąt na osi`;
+  }
+  // geometry of a point in plate px: the outline pixel, the normal, the widths (live values while dragged)
+  function bandGeom(p) {
+    if (!p.visible || p.sx == null) return null;
+    const d = Z.band.drag && Z.band.drag.p.id === p.id ? Z.band.drag : null;
+    const g = { sx: p.sx, sy: p.sy, nx: p.nx, ny: p.ny, out: p.out, in: p.in };
+    if (Z.band.live) { g.out *= Z.band.live.out; g.in *= Z.band.live.in; }   // a slider being dragged (2026-10-21)
+    if (d && d.kind === 'move') { g.sx = d.x; g.sy = d.y; }
+    if (d && d.kind === 'out') g.out = d.val;
+    if (d && d.kind === 'in') g.in = d.val;
+    return g;
+  }
+  function plateScale() { const img = V().getCurrentImage(); const ps = H.plateSize && H.plateSize(); return img && ps ? img.width / ps[0] : 1; }
+  const MIN_WHISKER_SCREEN = 14;           // a 0 px whisker still has a handle this far from the point (screen px)
+  function bandEnds(g) {
+    const m = MIN_WHISKER_SCREEN / (V().zoom * plateScale());
+    const lo = Math.max(g.out, m), li = Math.max(g.in, m);
+    return { o: [g.sx + g.nx * lo, g.sy + g.ny * lo], i: [g.sx - g.nx * li, g.sy - g.ny * li] };
+  }
+  function bandHit(st, p) {
+    const tol = 9 / (V().zoom * plateScale());
+    const near = (q) => Math.hypot(q[0] - p[0], q[1] - p[1]) <= tol;
+    for (const pt of st.points) {
+      const g = bandGeom(pt); if (!g) continue;
+      const e = bandEnds(g);
+      if (near(e.o)) return { kind: 'out', p: pt };
+      if (near(e.i)) return { kind: 'in', p: pt };
+      if (near([g.sx, g.sy])) return { kind: 'move', p: pt };
+    }
+    return null;
+  }
+  function drawBand(ctx, z, k, f) {
+    if (!bandPts(z).length) return;
+    const st = bandState(z, f);
+    if (!st) { loadBand(z, f); return; }
+    const v = V(); const lw = 2 / v.zoom; const r = 5 / v.zoom; const h = 4 / v.zoom;
+    for (const p of st.points) {
+      const g = bandGeom(p);
+      if (!g) {   // occluded (CoTracker3 visibility 0): does not shape the band in this frame
+        if (p.x != null) { ctx.strokeStyle = 'rgba(190,190,190,0.8)'; ctx.lineWidth = lw; ctx.beginPath(); ctx.arc(p.x * k, p.y * k, r, 0, 2 * Math.PI); ctx.stroke(); }
+        continue;
+      }
+      const e = bandEnds(g);
+      for (const [end, col] of [[e.o, '#ffd400'], [e.i, '#4da3ff']]) {
+        ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = lw;
+        ctx.beginPath(); ctx.moveTo(g.sx * k, g.sy * k); ctx.lineTo(end[0] * k, end[1] * k); ctx.stroke();
+        ctx.fillRect(end[0] * k - h, end[1] * k - h, 2 * h, 2 * h);
+      }
+      ctx.beginPath(); ctx.arc(g.sx * k, g.sy * k, r, 0, 2 * Math.PI);
+      ctx.fillStyle = p.key ? '#ffffff' : zoneColour(z.zone_id); ctx.fill();
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 1 / v.zoom; ctx.stroke();
+    }
+  }
+  // „Pas na zewnątrz” / „Wcięcie w rdzeń” size the whole band, the points shape it (user decision 2026-10-21): while
+  // dragging, the whiskers scale by the slider ratio (the server's band follows on release)
+  function liveBandScale() {
+    const z = activeMatte(); if (!z || !bandPts(z).length) { Z.band.live = null; return; }
+    const inPx = (fg, fc) => (z.params && z.params.outline_in_px != null ? +z.params.outline_in_px : Math.max(fg, fc) + 4);
+    const o0 = +pval(z, 'outline_out_px') || 1;
+    const i0 = inPx(+pval(z, 'fg_erode_px'), +pval(z, 'force_core_erode_px')) || 1;
+    const n = +$('z4Inset').value;
+    Z.band.live = { out: (+$('z4Out').value) / o0, in: inPx(n, n) / i0 };
+    V().render();
+  }
+
+  // band point tools on the left rail (user decision 2026-10-22): objects.js S.tool band_add / band_remove
+  const bandTool = () => (H && inZoneFlow() && ['band_add', 'band_remove'].includes(S().tool) ? S().tool : null);
+  function setBandTool(on) { if (H.setTool && !!on !== (S().tool === 'band_add')) H.setTool('band_add'); }
+  function onTool() {   // objects.js updateDrawTools: the rail tool changed
+    const t = bandTool();
+    if (t && Z.brush) setBrush(Z.brush);              // the palette brush off: a click is a point now
+    $('z4BandTool').classList.toggle('active', t === 'band_add');
+    V().canvas.style.cursor = t ? 'crosshair' : '';
+    bandInfo(); V().render();
+  }
+  function wireBand(cv) {
+    cv.addEventListener('pointerdown', (e) => {
+      const z = activeMatte();
+      if (e.button !== 0 || e.altKey || !inZoneFlow() || !z || !isOutline(z)) return;
+      const f = curFrame(); const st = bandState(z, f);
+      const p = H.canvasToPlate(e); if (!p) return;
+      const hit = st ? bandHit(st, p) : null;
+      const tool = bandTool();
+      if (tool === 'band_remove') {   // click on a point = the point goes (all its keys; Ctrl+Z brings it back)
+        if (!hit) return;
+        e.preventDefault(); e.stopPropagation(); e.mdHandled = true;
+        bandSave(z, f, null, `punkt ${hit.p.id} usunięty`, hit.p.id);
+        return;
+      }
+      if (!hit && tool !== 'band_add') return;
+      e.preventDefault(); e.stopPropagation(); e.mdHandled = true;
+      if (!hit) { bandSave(z, f, { x: p[0], y: p[1] }, 'nowy punkt'); return; }
+      try { cv.setPointerCapture(e.pointerId); } catch (er) { /* not capturable */ }
+      Z.band.drag = { ...hit, pid: e.pointerId, z, f, x0: p[0], y0: p[1], x: p[0], y: p[1],
+                      val: hit.kind === 'out' ? hit.p.out : hit.kind === 'in' ? hit.p.in : 0 };
+      bandInfo();
+    }, true);
+    cv.addEventListener('pointermove', (e) => {
+      const d = Z.band.drag; if (!d || e.pointerId !== d.pid) return;
+      const p = H.canvasToPlate(e); if (!p) return;
+      if (d.kind === 'move') { d.x = p[0]; d.y = p[1]; }
+      else {
+        const sg = d.kind === 'out' ? 1 : -1;
+        d.val = Math.max(0, Math.round(sg * ((p[0] - d.p.sx) * d.p.nx + (p[1] - d.p.sy) * d.p.ny)));
+      }
+      bandInfo(); V().render();
+    }, true);
+    const up = (e) => {
+      const d = Z.band.drag; if (!d || e.pointerId !== d.pid) return;
+      Z.band.drag = null;
+      if (d.kind === 'move') {
+        if (Math.hypot(d.x - d.x0, d.y - d.y0) < 1) { bandInfo(); V().render(); return; }   // a click, not a move
+        bandSave(d.z, d.f, { id: d.p.id, x: d.x, y: d.y }, `punkt ${d.p.id} przesunięty (klucz)`);
+      } else {
+        const side = d.kind === 'out' ? 'na zewnątrz' : 'do środka';
+        bandSave(d.z, d.f, { id: d.p.id, [d.kind]: d.val }, `${d.p.id}: ${window.mdT ? window.mdT(side) : side} ${d.val} px (klucz)`);
+      }
+    };
+    cv.addEventListener('pointerup', up, true);
+    cv.addEventListener('pointercancel', up, true);
+    cv.addEventListener('contextmenu', async (e) => {   // RMB on a point: its key in this frame (the last key = the point)
+      const z = activeMatte();
+      if (!inZoneFlow() || !z || !isOutline(z)) return;
+      const f = curFrame(); const st = bandState(z, f); const p = H.canvasToPlate(e);
+      const hit = st && p ? bandHit(st, p) : null; if (!hit) return;
+      e.preventDefault(); e.stopPropagation();
+      if (hit.p.key) bandSave(z, f, null, `klucz punktu ${hit.p.id} usunięty`, `${hit.p.id}?frame=${f}`);
+      else if (await V().uiConfirm(`Usunąć punkt pasa ${hit.p.id} (wszystkie klucze: ${hit.p.keys.map((x) => 'F' + x).join(', ')})?`, { ok: 'Usuń', tone: 'error' })) bandSave(z, f, null, `punkt ${hit.p.id} usunięty`, hit.p.id);
+    }, true);
+  }
+
   function draw(ctx, img, k, f) {
     if (!H || !obj() || S().auxMode || S().stage !== H.ST.VITMATTE) return;
     drawProps(ctx, k, f);   // step 9 proposals (also without an active zone)
@@ -963,10 +1316,29 @@
         const reg = (Z.regionCache[z.zone_id] || {})[f];
         ctx.lineWidth = 1.5 / v.zoom;
         if (reg && reg.contours && bandPvGet()) {
-          ctx.strokeStyle = col; ctx.setLineDash([6 / v.zoom, 4 / v.zoom]);
-          for (const cnt of reg.contours) { poly(cnt); ctx.stroke(); }
+          if (reg.band_contours && reg.band_contours.length) {
+            // the band from the server – outer + inner edge, its width follows the band points – as dashed lines only
+            // (user decision 2026-10-21: a fill hid the hair being judged); thinner dashes = where the inner and the
+            // outer feather end (full zone weight between them, 2026-10-22)
+            ctx.strokeStyle = 'rgba(255,212,0,0.95)'; ctx.lineWidth = 1.6 / v.zoom; ctx.setLineDash([6 / v.zoom, 4 / v.zoom]);
+            for (const cnt of reg.band_contours) { poly(cnt); ctx.stroke(); }
+            if (reg.feather_contours && reg.feather_contours.length) {   // end of the outer feather (from the outer edge)
+              ctx.strokeStyle = 'rgba(255,212,0,0.8)'; ctx.lineWidth = 0.8 / v.zoom; ctx.setLineDash([3 / v.zoom, 3 / v.zoom]);
+              for (const cnt of reg.feather_contours) { poly(cnt); ctx.stroke(); }
+            }
+            if (reg.inset_feather_contours && reg.inset_feather_contours.length) {   // end of the inset feather (from the inner edge)
+              // the same thin yellow dashes as the outer one (a blue line vanished on the blue core overlay, 2026-10-22)
+              ctx.strokeStyle = 'rgba(255,212,0,0.8)'; ctx.lineWidth = 0.8 / v.zoom; ctx.setLineDash([3 / v.zoom, 3 / v.zoom]);
+              for (const cnt of reg.inset_feather_contours) { poly(cnt); ctx.stroke(); }
+            }
+            ctx.lineWidth = 1.5 / v.zoom;
+          } else {
+            ctx.strokeStyle = col; ctx.setLineDash([6 / v.zoom, 4 / v.zoom]);
+            for (const cnt of reg.contours) { poly(cnt); ctx.stroke(); }
+          }
           ctx.setLineDash([]);
         }
+        drawBand(ctx, z, k, f);
         ctx.strokeStyle = 'rgba(255,70,70,0.95)'; ctx.fillStyle = 'rgba(255,70,70,0.18)';
         if (key) {
           if (key.polygon && key.polygon.length >= 3) { poly(key.polygon); ctx.fill(); ctx.stroke(); }
@@ -992,15 +1364,19 @@
           ctx.setLineDash([]);
         }
       }
-      if (Z.inset && (bandPvGet() || Z.inset.live)) {   // "Pas na zewnątrz" / "Wcięcie w rdzeń" band (blue = sure 1, yellow = ViTMatte's band), any frame; while dragging also with the band preview off (2026-10-17)
-        const core = H.overlayFor('core', f);
-        const dist = core && core !== 'missing' ? coreDistance(core, `${obj()}_${f}`) : null;
+      if (Z.inset && (bandPvGet() || Z.inset.live) && !(isOutline(z) && bandPts(z).length)) {   // "Pas na zewnątrz" / "Wcięcie w rdzeń" band (blue = sure 1, yellow = ViTMatte's band), any frame; while dragging also with the band preview off (2026-10-17)
+        // a group: the core the zone is computed on (members joined with the seam, as stages 3 / 4), not the object's
+        // own core – that one has a hole where the hand is, the band went round it (user report 2026-10-21)
+        const kind = groupMembers().length ? 'zone_core' : 'core';
+        const core = H.overlayFor(kind, f);
+        const dist = core && core !== 'missing' ? coreDistance(core, `${obj()}_${kind}_${f}`) : null;
         if (dist) {
           ctx.drawImage(insetCanvas(dist, Z.inset.n, Z.inset.out || 0), 0, 0, img.width, img.height);
           if (Z.inset.live) return;   // while dragging: the band alone; after release the zone preview is drawn too
         }
       }
-      if (Z.preview && Z.preview.f === f && Z.preview.zid === z.zone_id && Z.ov !== 'none') {
+      const maskOff = !!(window.MD_OBJ && window.MD_OBJ.maskHidden && window.MD_OBJ.maskHidden());   // 👁 of the object off
+      if (Z.preview && Z.preview.f === f && Z.preview.zid === z.zone_id && Z.ov !== 'none' && !maskOff) {
         const o = obj();
         const fc = finishedCanvas(f);
         // „👁 podgląd pasa” off: the trimap (blue sure / yellow band) is the band too – the zone alpha instead (2026-10-16)
@@ -1018,8 +1394,8 @@
           }
         } else if (ov === 'comp') {
           const za = H.overlayFor('zone_alpha', f); const core = H.overlayFor(S().keys.some((x) => x.frame === f) ? 'key' : 'core', f);
-          if (za && za !== 'missing' && core && core !== 'missing') ctx.drawImage(H.compCanvas(img, unionCanvas(core, za, `zunion_${o}_${f}_`), `${o}_zcomp_${f}`), 0, 0);
-          else if (za && za !== 'missing') ctx.drawImage(H.compCanvas(img, za, `${o}_zcomp_${f}`), 0, 0);
+          if (za && za !== 'missing' && core && core !== 'missing') ctx.drawImage(H.compCanvas(img, unionCanvas(core, za, `zunion_${o}_${f}_`), `${o}_zcomp_${f}`, f), 0, 0);
+          else if (za && za !== 'missing') ctx.drawImage(H.compCanvas(img, za, `${o}_zcomp_${f}`, f), 0, 0);
         } else if (ov === 'trimap') {
           const tm = H.overlayFor('zone_trimap', f);
           if (tm && tm !== 'missing') ctx.drawImage(trimapCanvas(tm, `ztri_${o}_${f}_`), 0, 0, img.width, img.height);
@@ -1049,7 +1425,7 @@
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(img, ix - sw / 2, iy - sw / 2, sw, sw, cx - R, cy - R, 2 * R, 2 * R);
       const za = previewImage(v.currentFrame);
-      if (za && Z.ov !== 'none') {
+      if (za && Z.ov !== 'none' && !(window.MD_OBJ && window.MD_OBJ.maskHidden && window.MD_OBJ.maskHidden())) {
         const t = H.tintCanvas(za, [60, 255, 90], `${obj()}_zone_alpha_${v.currentFrame}`);
         const s = t.width / img.width;
         ctx.globalAlpha = 0.7; ctx.drawImage(t, (ix - sw / 2) * s, (iy - sw / 2) * s, sw * s, sw * s, cx - R, cy - R, 2 * R, 2 * R); ctx.globalAlpha = 1;
@@ -1084,11 +1460,11 @@
     if (!z) return;
     const col = zoneColour(z.zone_id);
     const range = Math.max(1, v.lastFrame - v.firstFrame);
-    const ks = keyFrames(z);
+    const ks = laneKeys(z);
     const bar = document.createElement('div'); bar.className = 'zone-range';
     bar.style.cssText = `left:${100 * (ks[0] - v.firstFrame) / range}%;width:${Math.max(0.3, 100 * (ks[ks.length - 1] - ks[0]) / range)}%;background:${col}`;
     bar.title = `Strefa ${z.zone_id}: klucze F${ks[0]}–F${ks[ks.length - 1]}; poza nimi obszar jedzie z obiektem (propagacja)`;
-    lane.appendChild(bar);
+    if (ks.length) lane.appendChild(bar);
     for (const f of ks) {
       const m = document.createElement('div');
       m.className = `zone-key ${f === v.currentFrame ? 'cur' : ''} ${f === +z.frame ? 'base' : ''}`;
@@ -1097,6 +1473,15 @@
       m.title = `Klucz strefy ${z.zone_id} F${f}${f === +z.frame ? ' (bazowy)' : ''}${kn ? ` · uwaga: ${kn}` : ''} · klik = skok · PPM = usuń klucz`;
       m.addEventListener('click', (e) => { e.stopPropagation(); v.goToFrame(f); });
       m.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); deleteKey(z.zone_id, f); });
+      lane.appendChild(m);
+    }
+    for (const f of bandKeyFrames(z)) {   // band point keys (2026-10-21): triangles, apart from the zone keys
+      const m = document.createElement('div');
+      m.className = `band-key ${f === v.currentFrame ? 'cur' : ''}`;
+      m.style.left = `${100 * (f - v.firstFrame) / range}%`;
+      m.title = `Klucz punktów pasa F${f}: ${bandPts(z).filter((p) => (p.keys || {})[f]).map((p) => p.id).join(', ')} · klik = skok · PPM = usuń klucze pasa`;
+      m.addEventListener('click', (e) => { e.stopPropagation(); v.goToFrame(f); });
+      m.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); v.goToFrame(f); deleteBandKeys(z, f); });
       lane.appendChild(m);
     }
     if (Z.preview && Z.preview.zid === z.zone_id) {
@@ -1148,7 +1533,7 @@
     let def = {};
     try { def = (await api('GET', '/api/zones/preset_defaults/hair')).params || {}; } catch (e) { /* older server: engine defaults */ }
     const body = { mode: 'add', criterion: 'matte', frame: f, polygon: [], strokes: [], bg_strokes: [], preset: 'hair', matting: 'vitmatte',
-                   prompt: Z.prompt, holdout: Z.holdout, static: false, bg_static: true, params: { ...def, region: 'outline' } };
+                   prompt: Z.prompt, holdout: Z.holdout, static: false, bg_static: true, params: { ...def, region: 'outline', vitmatte_model: undefined } };   // model: the stage engine (server)
     let d;
     // creating the zone computes its first preview (ViTMatte on this frame): say so – it looked frozen (2026-10-17)
     status(`Tworzę strefę ViTMatte wzdłuż całego obrysu i liczę podgląd F${f} (ViTMatte, kilka sekund)…`);
@@ -1172,7 +1557,7 @@
     if (!z) { status('Brak strefy „matte” do zastosowania – narysuj strefę (G / P)', 'warn'); return; }
     await H.ensurePointsSaved();
     if (Z.drawPending != null) await commitDraw(Z.drawPending);
-    const base = (S().info && S().info.vitmatte_base) === 'core' ? `masce 1+2 (etapy ${H.ST.SAM3} + ${H.ST.BRUSH})` : `wersji MatAnyone (etap ${H.ST.MATANYONE})`;
+    const base = (S().info && S().info.vitmatte_base) === 'core' ? `masce 1+2 (etapy ${H.ST.SAM3} + ${H.ST.BRUSH})` : `wersji MatAnyone2 (etap ${H.ST.MATANYONE})`;
     status(`Zastosuj ${z.zone_id}: przeliczam strefy ViTMatte na ujęciu na ${base} (poza strefami baza bez zmian)…`);
     let d;
     try { d = await api('POST', `/api/object/${obj()}/zones/${z.zone_id}/apply?stage=vitmatte`); }
@@ -1227,7 +1612,7 @@
 
   // ------------------------------------------------------------------------------------------------ wiring
   function wire() {
-    $('z4New').addEventListener('click', () => { setActive(null); status(`Nowa strefa: wybierz preset, opcjonalnie opis i silnik, potem maluj G (obszar) / R (tło) albo wielokąt P – pierwsza kreska tworzy strefę i klucz tej klatki`, 'ok'); });
+    $('z4New').addEventListener('click', () => { setActive(null); status(DRAW_TOOLS ? `Nowa strefa: wybierz preset, opcjonalnie opis i silnik, potem maluj G (obszar) / R (tło) albo wielokąt P – pierwsza kreska tworzy strefę i klucz tej klatki` : `Nowa strefa: „Nowa strefa – cały obrys” w palecie, potem grubość pasa punktami („＋ Dodaj punkt pasa”)`, 'ok'); });
     document.querySelectorAll('#z4Presets .zp').forEach((b) => b.addEventListener('click', () => {
       const z = activeMatte();
       if (z) patchZone(z.zone_id, { preset: b.dataset.preset }, `preset ${PRESET_NAME[b.dataset.preset]}`);
@@ -1264,8 +1649,8 @@
       const z = activeMatte(); const e = $('zpEngine').value;
       if (z) patchZone(z.zone_id, { matting: e }, `silnik ${ENGINE_LABEL[e] || e}`);
     });
-    $('z4VmModel').addEventListener('change', () => patchTune({ vitmatte_model: $('z4VmModel').value }, `model ViTMatte ${$('z4VmModel').value}`));
-    $('z4VmPx').addEventListener('change', () => patchTune({ model_px: +$('z4VmPx').value }, `rozdzielczość ViTMatte ${$('z4VmPx').value}`));
+    $('z4VmModel').addEventListener('change', () => patchTune({ vitmatte_model: $('z4VmModel').value }, `model ${EDGE_MODEL_LABEL[$('z4VmModel').value] || $('z4VmModel').value}`));
+    $('z4VmPx').addEventListener('change', () => patchTune({ model_px: +$('z4VmPx').value }, `rozdzielczość modelu ${$('z4VmPx').value}`));
     $('z4VmUnk').addEventListener('input', () => { $('z4VmUnkV').textContent = (+$('z4VmUnk').value).toFixed(2); });
     $('z4VmUnk').addEventListener('change', () => patchTune({ unknown_value: +$('z4VmUnk').value }, `fine tune ${(+$('z4VmUnk').value).toFixed(2)}`));
     $('z4Holdout').addEventListener('change', () => {
@@ -1285,7 +1670,7 @@
       const z = activeMatte();
       Z.inset = { f: curFrame(), n: +$('z4Inset').value, out: isOutline(z) ? +$('z4Out').value : 0, live }; V().render();
     };
-    $('z4Inset').addEventListener('input', () => { $('z4InsetV').textContent = `${$('z4Inset').value} px`; livePreview(); });
+    $('z4Inset').addEventListener('input', () => { $('z4InsetV').textContent = `${$('z4Inset').value} px`; liveBandScale(); livePreview(); });
     // feather: only the number while dragging (the live recompute of the blend weights lagged, 2026-10-17); applied to the
     // preview cut-out once on release – no model
     $('z4Feather').addEventListener('input', () => { $('z4FeatherV').textContent = `${$('z4Feather').value} px`; });
@@ -1293,13 +1678,20 @@
     // the live band of „Pas na zewnątrz” / „Wcięcie” ends with the pointer – also when no „change” comes (a click
     // without moving, release outside the slider): it stayed on with the band preview off (2026-10-17)
     window.addEventListener('pointerup', () => { if (Z.inset && Z.inset.live) { Z.inset.live = false; V().render(); } });
-    $('z4Out').addEventListener('input', () => { $('z4OutV').textContent = `${$('z4Out').value} px`; livePreview(); });
+    $('z4Out').addEventListener('input', () => { $('z4OutV').textContent = `${$('z4Out').value} px`; liveBandScale(); livePreview(); });
     $('z4Inset').addEventListener('change', async () => {
       const n = +$('z4Inset').value;
       await patchTune({ fg_erode_px: n, force_core_erode_px: n }, `wcięcie w rdzeń ${n} px`);
       // the model does not run on a slider (2026-10-17): keep the live band with the saved values (it vanished waiting
       // for a server trimap that is no longer recomputed)
       livePreview(false);
+    });
+    $('z4OutFeather').addEventListener('input', () => { $('z4OutFeatherV').textContent = +$('z4OutFeather').value ? `${$('z4OutFeather').value} px` : 'jak wcięcie'; });
+    $('z4OutFeather').addEventListener('change', async () => {
+      const z = activeMatte(); const n = +$('z4OutFeather').value;
+      await patchTune({ outer_feather_px: n }, n ? `wtopienie krawędzi zewnętrznej ${n} px` : 'wtopienie krawędzi zewnętrznej = jak wcięcie', { noPreview: true });
+      if (z) delete Z.regionCache[z.zone_id];   // the feather line comes with the band area
+      onFrame(); V().render();
     });
     $('z4Out').addEventListener('change', async () => {
       const n = +$('z4Out').value;
@@ -1315,8 +1707,9 @@
       patchTune({ exclude_objects: [...cur] }, c.checked ? `wykluczony obiekt ${c.dataset.ex}` : `obiekt ${c.dataset.ex} znów w pasie ViTMatte`);
     });
     $('zpNewOutline').addEventListener('click', () => H.run('zpNewOutline', newOutlineZone));
+    if (!DRAW_TOOLS) $('zpNewPaint').style.display = 'none';
     $('z4Brush').querySelectorAll('button').forEach((b) => b.addEventListener('click', () => setBrush(b.dataset.b)));
-    $('z4Track').addEventListener('change', () => patchTune({ track: $('z4Track').checked ? 'local' : 'rigid' }, $('z4Track').checked ? 'śledzenie lokalne (CoTracker)' : 'śledzenie sztywne'));
+    $('z4Track').addEventListener('change', () => patchTune({ track: $('z4Track').checked ? 'local' : 'rigid' }, $('z4Track').checked ? 'śledzenie lokalne (CoTracker3)' : 'śledzenie sztywne'));
     $('zpNewPaint').addEventListener('click', () => {
       Z.newPainted = true; Z.engine = 'vitmatte'; $('z4Engine').value = 'vitmatte'; setBrush('paint');
       status('Maluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń) – pierwsza kreska tworzy strefę ViTMatte ze śledzeniem lokalnym', 'ok');
@@ -1360,6 +1753,9 @@
     if (adv) adv.addEventListener('toggle', () => { renderLane(); syncForm(); V().render(); });
 
     const cv = V().canvas;
+    wireBand(cv);
+    $('z4BandTool').addEventListener('click', () => setBandTool(S().tool !== 'band_add'));
+    $('z4BandClear').addEventListener('click', () => { const z = activeMatte(); if (z) deleteBandKeys(z, curFrame()); });
     cv.addEventListener('pointermove', (e) => { if (Z.loupe && S().stage === H.ST.VITMATTE) { Z.mouse = [e.clientX, e.clientY]; V().render(); } });
     cv.addEventListener('pointerleave', () => { if (Z.mouse) { Z.mouse = null; V().render(); } });
     window.addEventListener('keydown', (e) => {
@@ -1380,11 +1776,18 @@
   }
 
   // playback bar 🔑✕ / Delete in stage ViTMatte (objects.js): the key of the active zone in frame f, else of any zone there
-  const zoneWithKeyAt = (f) => { const a = activeMatte(); if (a && keyFrames(a).includes(f)) return a; return Z.list.find((z) => keyFrames(z).includes(f)) || null; };
-  const hasKeyAt = (f) => !!zoneWithKeyAt(f);
-  async function deleteKeyAt(f) { const z = zoneWithKeyAt(f); if (!z) { toast(`F${f}: brak klucza strefy`); return false; } await deleteKey(z.zone_id, f); return true; }
+  // band point keys of the active zone go first (user report 2026-10-21: 🔑✕ did not remove the band key frame)
+  const zoneWithKeyAt = (f) => { const a = activeMatte(); if (a && laneKeys(a).includes(f)) return a; return Z.list.find((z) => laneKeys(z).includes(f)) || null; };
+  const bandZoneAt = (f) => { const a = activeMatte(); return a && isOutline(a) && bandKeyFrames(a).includes(f) ? a : null; };
+  const hasKeyAt = (f) => !!(bandZoneAt(f) || zoneWithKeyAt(f));
+  async function deleteKeyAt(f) {
+    const b = bandZoneAt(f); if (b) return deleteBandKeys(b, f);
+    const z = zoneWithKeyAt(f); if (!z) { toast(`F${f}: brak klucza strefy`); return false; }
+    await deleteKey(z.zone_id, f); return true;
+  }
   window.MD_ZONES = {
-    hasKeyAt, deleteKeyAt, previewMatte, refreshPreview,
+    hasKeyAt, deleteKeyAt, previewMatte, refreshPreview, onTool,
+    get alphaPvOn() { return Z.ov !== 'none'; },   // „👁 alfa strefy” – objects.js hides the stage preview tint with it (2026-10-22)
     // instant band from a mask (blue = stays, yellow = the model decides): objects.js uses it for the MatAnyone band
     // while its slider is dragged – the exact (adaptive) band comes from the server after the release (2026-10-17)
     liveBand(maskImg, key, inPx, outPx) { const d = coreDistance(maskImg, key); return d ? insetCanvas(d, inPx, outPx) : null; },
@@ -1393,10 +1796,12 @@
       else if (Z.beforeComp) { const b = Z.beforeComp; Z.beforeComp = null; bandPvSet(b.band); Z.ovUserOff = b.off; setOv(b.ov || 'none'); }
       if ($('zpBandPv')) { $('zpBandPv').checked = bandPvGet(); $('zpAlphaPv').checked = Z.ov !== 'none'; }
     },
+    drawTools: DRAW_TOOLS,
     init, load, reset, draw, drawLoupe, renderLane, onFrame, wantsDraw, onDraw, undo, runDetailsHtml,
     onShow() { loadCleanplate().catch(() => {}); renderList(); onFrame(); },
     onStage() { renderLane(); renderPalette(); },
     onStages() { syncForm(); },   // object stages reloaded (objects.js loadStages): lock of „Zastosuj” (needs stage 3)
+    reload() { return load(); },  // zones changed on the server (stage 5 engine switch, objects.js)
     get state() { return Z; },
     hasPending() { return Z.drawPending != null; },
     flush() { return Z.drawPending != null ? commitDraw(Z.drawPending) : Promise.resolve(); },

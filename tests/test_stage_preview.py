@@ -104,3 +104,49 @@ def test_auto_sliders_version_reused_unless_referenced(proj):
     assert pipe.run_referenced("obj", "v102")
     d, _ = pipe._refinish_dir("obj", "v102", auto, auto=True)
     assert d.name != "v102"
+
+
+def test_zone_drawn_outside_the_frames_is_followed_to_them(proj):
+    """User report 2026-10-22 (CLIP_A): ViTMatte preview around F21 with the zone drawn in F24 → KeyError: 24 (the zone
+    transforms needed the core of the drawing frame, outside the preview window). The zone is now followed from its
+    drawing frame to the asked frames."""
+    app_module, api, shot, pipe, frames, start = proj
+    far = frames[-1] if frames[-1] != start else frames[0]
+    cx, cy, s = shot.centers[far]
+    poly = [[cx - 60, cy - 260], [cx + 60, cy - 260], [cx + 60, cy - 120], [cx - 60, cy - 120]]
+    r = api.post("/api/object/obj/zones/new", json={"mode": "add", "criterion": "matte", "frame": far, "polygon": poly,
+                                                     "matting": "chroma", "preset": "hair"})
+    assert r.status_code == 200, r.text
+    sub = [f for f in frames if abs(f - far) >= 2][:2]                 # frames that do not contain the drawing frame
+    assert sub and far not in sub
+    core = pipe.load_core("obj", sub)
+    res = pipe.apply_zones("obj", sub, core, pipe.keys("obj"), kinds=("matte",))
+    assert res is not None and set(res.core) >= set(sub)
+
+
+def test_vitmatte_preview_is_kept_per_engine(proj):
+    """User request 2026-10-22: switching the stage-5 engine and computing the preview again must not throw away the
+    other engine's preview – both are kept (slot "vitmatte" / "vitmatte@birefnet"), both stay valid although the engine
+    switch rewrites `vitmatte_model` in the zones, and the HUD ⇄ can show either."""
+    from engine.stage_preview import slot
+    assert slot("vitmatte") == "vitmatte" and slot("vitmatte", "vitmatte") == "vitmatte"
+    assert slot("vitmatte", "birefnet") == "vitmatte@birefnet" and slot("matanyone", "birefnet") == "matanyone"
+    app_module, api, shot, pipe, frames, start = proj
+    assert api.put("/api/object/obj/settings", json={"vitmatte_base": "core"}).status_code == 200
+    r = api.post(f"/api/object/obj/stage_preview/{start}?stage=vitmatte")
+    assert r.status_code == 200, r.text
+    assert r.json()["engine"] == "vitmatte" and r.json()["slot"] == "vitmatte"
+    assert (pipe.store.dir("obj") / "stage_preview" / "vitmatte" / "meta.json").exists()
+    assert api.get("/api/object/obj/stage_preview/vitmatte?engine=vitmatte").json()["exists"] is True
+    assert api.get("/api/object/obj/stage_preview/vitmatte?engine=birefnet").json()["exists"] is False
+    assert api.get("/api/object/obj/stage_preview/vitmatte?engine=nope").status_code == 400
+    assert api.get(f"/api/object/obj/stage_preview/vitmatte/{start}?engine=vitmatte").status_code == 200
+    assert api.get(f"/api/object/obj/stage_preview/vitmatte/{start}?engine=birefnet").status_code == 404
+    # the stage engine switched to BiRefNet: the default slot is now the (missing) BiRefNet preview, the ViTMatte one
+    # is still there and still current (the zones' model change is not a settings change of that preview)
+    r = api.put("/api/object/obj/edge_engine", json={"engine": "birefnet"})
+    assert r.status_code == 200, r.text
+    d = api.get("/api/object/obj/stage_preview/vitmatte").json()
+    assert d["exists"] is False and d["engine"] == "birefnet" and d["slot"] == "vitmatte@birefnet"
+    d = api.get("/api/object/obj/stage_preview/vitmatte?engine=vitmatte").json()
+    assert d["exists"] is True and d["stale"] is False

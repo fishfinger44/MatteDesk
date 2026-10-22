@@ -107,6 +107,7 @@ class FakeComfyServer:
     def __init__(self, client, at: Optional[Dict[float, Callable[["FakeComfyServer"], None]]] = None):
         self.t = 0.0
         self.alive = True
+        self.busy = False           # True -> every request times out (Comfy alive but its HTTP server blocked)
         self.running: List[str] = []
         self.pending: List[str] = []
         self.history: Dict[str, Any] = {}
@@ -130,6 +131,9 @@ class FakeComfyServer:
         self.requests.append(f"{method} {endpoint}")
         if not self.alive:
             return 0, "[WinError 10061] connection refused"
+        if self.busy:
+            self.sleep(min(timeout, 10.0))   # the request itself takes its timeout (scheduled events fire)
+            return 0, "<urlopen error timed out>"
         if endpoint == "/system_stats":
             return 200, self.stats
         if endpoint == "/queue" and method == "GET":

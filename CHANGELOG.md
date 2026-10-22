@@ -1,5 +1,21 @@
 # MatteDesk – changelog
 
+## 0.35 – 2026-10-22
+- **Final Touch (stage 8):** paint corrections over any computed alpha – add / remove / eraser with pen pressure, kept as strokes
+  per frame; black / white / gamma / erode / blur and motion blur whose strength is measured on the plate; export source "Final Touch".
+- **One edge band in every stage with a band** (3 MatAnyone2, 4 VideoMaMa, 5 ViTMatte / BiRefNet, 7 LTX-2.5): the sliders size the
+  band, band points tracked by CoTracker3 shape it, inner / outer feathers blend into the core, preview = dashed band lines.
+- **Shared object band:** one set of band points per object, read by every stage with its own sliders; "detach" gives a stage its
+  own band, "set as shared" makes it the object's band. Older projects are migrated on opening.
+- **Stage 5 engine:** ViTMatte or BiRefNet (arrow next to the stage); a preview of a few frames is kept per engine.
+- **Deflicker:** one button with settings from a measurement of the plate, 1024 px preview, no ghosts of moving objects, choose
+  the folder of the EXR output. Large plates no longer run out of memory; alignment limits its workers by free RAM.
+- **Report a problem:** an anonymised report you see in full and agree to before it is sent.
+- **Faster:** stage 3 band lines 1.3 s → 0.2 s per new frame (the mask 1+2 is saved right after stage 1); stepping frames in
+  stage 5 no longer unloads the ComfyUI models.
+- **Fixed:** the eye of the selected object hides every mask overlay, stage previews included; ← / → step frames even when a slider
+  has the focus; the Alpha view is black and white.
+
 ## 0.32 – 2026-10-18
 - **Video plates:** an .mp4 / .mov / .mkv / .avi / .mxf file given as a plate (project wizard, Manage plates, reopening a project)
   is decoded once into a PNG sequence in `<shot>/matte_desk/source/<name>/` (8- or 16-bit like the source) and used everywhere.
