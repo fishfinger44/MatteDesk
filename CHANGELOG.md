@@ -1,5 +1,10 @@
 # MatteDesk – changelog
 
+## 0.37 – 2026-10-23
+- **Fixed: "Reload ComfyUI"** (the lost-connection banner) closes a hung ComfyUI again – in 0.36 it failed with
+  "No module named 'psutil'". psutil is now bundled with the installer; a copy from git / ZIP whose environment was made
+  earlier closes the process with the Windows `taskkill` instead. A process that is not ComfyUI is still never closed.
+
 ## 0.36 – 2026-10-23
 - **New: "Propose band (Sapiens2)"** – Sapiens2-seg-0.4B recognises body parts in the frame and sets the band points of the
   object band: wide on hair, narrow on clothes, thin on skin (never less than the automatic width). People only; one key frame,

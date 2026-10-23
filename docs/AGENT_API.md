@@ -97,6 +97,8 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/report/send` | – | Sends exactly the previewed package (only with the user's consent) to the report proxy. |
 | GET | `/api/config/comfy` | – | Doctor: which ComfyUI is used (Desktop / from git), its folders, port and autostart. |
 | POST | `/api/config/comfy` | when_idle | Doctor's switch: ComfyUI Desktop <-> ComfyUI from git |
+| GET | `/api/models/removable` | – | Doctor's 🗑: optional models whose weights are on disk, with every path and its size (engine/model_trash.py). |
+| POST | `/api/models/remove` | when_idle | Removes ONLY the weights of one optional model (the user confirmed the listed files in the Doctor). |
 | GET | `/api/update` | – | Newer MatteDesk in the public GitHub releases? (at most once a day unless force; engine/updates.py) |
 | POST | `/api/update/skip` | – |  |
 | POST | `/api/update/settings` | – |  |

@@ -42,7 +42,8 @@ MatteDesk keeps working without these components. The features that need them ar
 | Component | Licence |
 |---|---|
 | FastAPI, Pydantic, PyMatting | MIT |
-| Uvicorn, httpx, websockets, NumPy, SciPy, OpenEXR, PyTorch | BSD |
+| Uvicorn, httpx, websockets, NumPy, SciPy, OpenEXR, PyTorch, psutil | BSD |
+| pystray | LGPL-3.0 |
 | OpenCV, Transformers, huggingface_hub | Apache-2.0 |
 | Fonts Inter, JetBrains Mono (Google Fonts) | SIL Open Font License 1.1 |
 | html2canvas 1.4.1 (loaded from cdnjs only when a report includes a window screenshot) | MIT |

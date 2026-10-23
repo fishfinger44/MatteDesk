@@ -198,7 +198,7 @@ def test_reload_leaves_answering_or_remote_comfy_alone():
 
 
 def test_kill_tree_refuses_a_process_that_is_not_comfy(monkeypatch):
-    import psutil
+    psutil = pytest.importorskip("psutil")
 
     class P:
         def name(self):
@@ -206,6 +206,25 @@ def test_kill_tree_refuses_a_process_that_is_not_comfy(monkeypatch):
     monkeypatch.setattr(psutil, "Process", lambda pid: P())
     with pytest.raises(RuntimeError, match="nie ComfyUI"):
         cl._kill_tree(123)
+
+
+def test_kill_tree_without_psutil_uses_taskkill():
+    """A .venv made before psutil was required: tasklist gives the name, taskkill /T /F closes the tree; not-ComfyUI is
+    refused before anything is killed."""
+    from types import SimpleNamespace as NS
+    calls = []
+
+    def run(name):
+        def r(cmd, **kw):
+            calls.append(cmd[0])
+            return NS(stdout=f'"{name}","4242","Console","1","1 000 K"' + chr(10), stderr="", returncode=0)
+        return r
+    assert cl._kill_tree_taskkill(4242, run=run("python.exe")) == "python.exe"
+    assert calls == ["tasklist", "taskkill"]
+    calls.clear()
+    with pytest.raises(RuntimeError, match="nie ComfyUI"):
+        cl._kill_tree_taskkill(4242, run=run("nginx.exe"))
+    assert calls == ["tasklist"]
 
 
 def test_probe_tells_refused_from_silent():

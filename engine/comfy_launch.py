@@ -30,7 +30,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 STATE: Dict[str, Any] = {"state": "idle"}
 _LOCK = threading.Lock()
@@ -258,13 +258,41 @@ def comfy_probe(cfg: Dict[str, Any], timeout: float = 2.0) -> str:
         return "busy"
 
 
-def _kill_tree(pid: int, wait_s: float = 10.0) -> str:
-    """Close process `pid` and its children (psutil). Returns its name; RuntimeError when it is not a ComfyUI process."""
-    import psutil
-    p = psutil.Process(pid)
-    name = p.name()
+def _refuse_not_comfy(name: str, pid: int) -> None:
     if not any(t in name.lower() for t in _COMFY_EXES):
         raise RuntimeError(f"Port ComfyUI zajmuje proces „{name}” (PID {pid}) – to nie ComfyUI, nie zamykam go.")
+
+
+def _kill_tree_taskkill(pid: int, run: Optional[Callable[..., Any]] = None) -> str:
+    """Windows without psutil (a .venv made before psutil was required – start_v*.bat installs requirements only on the
+    first start): the name from `tasklist`, then `taskkill /T /F` (the process and its children)."""
+    run = run or subprocess.run
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    out = run(["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+              timeout=20, creationflags=flags)
+    line = (out.stdout or "").strip().splitlines()
+    name = line[0].split('","')[0].strip('"') if line and line[0].startswith('"') else ""
+    if not name:
+        raise RuntimeError(f"Nie znaleziono procesu PID {pid} zajmującego port ComfyUI.")
+    _refuse_not_comfy(name, pid)
+    r = run(["taskkill", "/PID", str(int(pid)), "/T", "/F"], capture_output=True, text=True, timeout=30, creationflags=flags)
+    if r.returncode:
+        raise RuntimeError(f"Nie udało się zamknąć {name} (PID {pid}): {(r.stderr or r.stdout or '').strip()[-200:]}")
+    return name
+
+
+def _kill_tree(pid: int, wait_s: float = 10.0) -> str:
+    """Close process `pid` and its children (psutil; taskkill on Windows without it). Returns its name; RuntimeError
+    when it is not a ComfyUI process."""
+    try:
+        import psutil
+    except ImportError:
+        if os.name == "nt":
+            return _kill_tree_taskkill(pid)
+        raise RuntimeError("Brak modułu psutil – nie mogę zamknąć zawieszonego ComfyUI (pip install psutil).")
+    p = psutil.Process(pid)
+    name = p.name()
+    _refuse_not_comfy(name, pid)
     procs = p.children(recursive=True) + [p]
     for c in procs:
         try:
