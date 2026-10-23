@@ -9,7 +9,9 @@ a window with that list, a link to the full CHANGELOG and: Update / Later / Skip
 
 - Installed with the Windows installer (`python/` next to the code, no `.git`): "Update" downloads the new setup
   (resume + SHA-256 from GitHub) and starts it; the setup replaces the program in place, config.local.json stays.
-- A git checkout: no setup – the window says `git pull` (+ restart).
+- A git checkout: no setup – the window says `git pull` (+ restart with the new `start_v<version>.bat`).
+- A ZIP of the source (no `.git`, no `python/`): the window links the new ZIP (unpack over the old folder –
+  config.local.json is not in the ZIP, so it stays) and the setup (one-click updates from then on).
 Settings in config.local.json: `update_check` (on by default; switch in the Doctor), `update_skip` (skipped version),
 `update_last` (time + result of the last check, so a restart does not ask GitHub again).
 """
@@ -40,8 +42,15 @@ def parse_version(v: str) -> tuple:
 
 
 def install_kind(app_dir: Path) -> str:
-    """installer | git"""
-    return "installer" if (app_dir / "python" / "python.exe").exists() and not (app_dir / ".git").exists() else "git"
+    """installer | git | zip (the source downloaded as a ZIP from GitHub: no `.git`, no bundled Python – `git pull`
+    does not work there, the window links the new ZIP and the setup instead; 2026-10-23)"""
+    if (app_dir / ".git").exists():
+        return "git"
+    return "installer" if (app_dir / "python" / "python.exe").exists() else "zip"
+
+
+def source_zip_url(version: str) -> str:
+    return f"https://github.com/{REPO}/archive/refs/tags/v{version}.zip"
 
 
 def short_notes(body: str, n: int = NOTES_LINES) -> str:
@@ -112,7 +121,7 @@ def check(current: str, cfg: Dict[str, Any], app_dir: Path, force: bool = False,
     out.update(version=rel["version"], notes=rel.get("notes", ""), url=rel.get("url", RELEASES),
                available=newer, skipped=newer and str(cfg.get("update_skip") or "") == rel["version"],
                can_install=newer and out["kind"] == "installer" and bool(rel.get("setup")),
-               setup=rel.get("setup"))
+               setup=rel.get("setup"), zip_url=source_zip_url(rel["version"]))
     return out
 
 

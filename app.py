@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -59,7 +60,18 @@ async def _lifespan(_app: FastAPI):
         comfy_launch.autostart(load_config())
     except Exception as e:  # never block the MatteDesk start
         logging.getLogger("matte_desk").warning("autostart ComfyUI: %s", e)
+    # the slow ComfyUI-Python checks of the Doctor, in the background: the first „Doktor” then opens in ~1–3 s
+    if os.environ.get("MD_DOCTOR_PREWARM", "1") != "0":
+        threading.Thread(target=lambda: _quiet(lambda: EnvironmentDoctor().prewarm_python_checks()), daemon=True,
+                         name="doctor-prewarm").start()
     yield
+
+
+def _quiet(fn):
+    try:
+        fn()
+    except Exception as e:  # the Doctor reports it when opened
+        logging.getLogger("matte_desk").info("doctor prewarm: %s", e)
 
 
 def _read_version() -> str:
@@ -483,6 +495,7 @@ class ComfyFlavorRequest(BaseModel):
     comfy_port: Optional[int] = None
     shared_models: Optional[bool] = None          # git: use ComfyUI Desktop's models folder
     autostart: Optional[bool] = None              # start ComfyUI with MatteDesk (comfy_autostart)
+    desktop: Optional[Dict[str, Any]] = None      # Desktop: {comfy_dir, models_dir, comfy_port}; "" = autodetect
 
 
 @app.get("/api/config/comfy")
@@ -494,6 +507,8 @@ def get_comfy_config():
     return {"flavor": cfg.get("comfy_flavor"), "kind": kind(cfg), "comfy_dir": cfg.get("comfy_dir"),
             "models_dir": cfg.get("models_dir"),
             "comfy_port": cfg.get("comfy_port"), "git": local.get("comfy_git") or {},
+            "desktop": {k: local.get(k) or "" for k in engine_config.DESKTOP_KEYS},
+            "desktop_auto": engine_config.desktop_autodetect(),
             "autostart": bool(cfg.get("comfy_autostart", True)),
             "update_check": cfg.get("update_check", True) is not False,
             "app_browser": "edge" if str(cfg.get("app_browser") or "") == "edge" else "default"}
@@ -506,12 +521,36 @@ def set_comfy_config(req: ComfyFlavorRequest):
     prof = {k: v for k, v in (("comfy_dir", req.comfy_dir), ("comfy_port", req.comfy_port),
                               ("shared_models", req.shared_models)) if v is not None}
     try:
+        if req.desktop is not None:
+            engine_config.set_desktop_paths(req.desktop)
         engine_config.set_comfy_flavor(req.flavor, prof or None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if req.autostart is not None:
         engine_config.write_local({"comfy_autostart": bool(req.autostart)})
     return get_comfy_config()
+
+
+@app.get("/api/models/removable")
+def models_removable():
+    """Doctor's 🗑: optional models whose weights are on disk, with every path and its size (engine/model_trash.py)."""
+    from engine import model_trash
+    return {"models": model_trash.listing(load_config())}
+
+
+class ModelRemoveRequest(BaseModel):
+    key: str
+
+
+@app.post("/api/models/remove")
+@when_idle("Usuwanie modelu")
+def models_remove(req: ModelRemoveRequest):
+    """Removes ONLY the weights of one optional model (the user confirmed the listed files in the Doctor)."""
+    from engine import model_trash
+    try:
+        return model_trash.remove(load_config(), req.key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 class UpdateSkipRequest(BaseModel):
@@ -567,7 +606,7 @@ def update_install():
     from engine import updates
     info = updates.check(APP_VERSION, load_config(), engine_config.REPO_DIR, force=True)
     if not info.get("can_install"):
-        raise HTTPException(status_code=409, detail="Brak instalatora do pobrania (kopia z gita: git pull).")
+        raise HTTPException(status_code=409, detail="Brak instalatora do pobrania (kopia z gita: git pull; kopia z ZIP-a: nowy ZIP albo instalator).")
 
     import threading
     import time as _t
@@ -598,6 +637,27 @@ def comfy_start():
     return comfy_launch.start_comfy(load_config())
 
 
+@app.get("/api/comfy/health")
+def comfy_health():
+    """Banner 'ComfyUI nie odpowiada': up | down | busy + the launch state (polled every few seconds by comfy_watch.js)."""
+    from engine import comfy_launch
+    cfg = load_config()
+    return {"comfy": comfy_launch.comfy_probe(cfg), "launch": comfy_launch.STATE.get("state", "idle"),
+            "local": str(cfg.get("comfy_host") or "127.0.0.1").lower() in comfy_launch._LOCAL_HOSTS,
+            "port": int(cfg.get("comfy_port") or 8188)}
+
+
+@app.post("/api/comfy/reload")
+def comfy_reload():
+    """Banner button 'Przeładuj ComfyUI': close a hung local ComfyUI on our port and start it again (no idle check –
+    a job waiting on a dead ComfyUI fails by itself)."""
+    from engine import comfy_launch
+    try:
+        return comfy_launch.reload_comfy(load_config())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/api/install/progress")
 def install_progress():
     """Live state of the running "Zainstaluj" (step, file, done/total bytes) - the Doctor polls it for the progress bar."""
@@ -626,6 +686,8 @@ def install_component(what: str):
             res = installer.install_vitmatte(cfg)
         elif what == "birefnet":
             res = installer.install_birefnet(cfg)
+        elif what == "sapiens2":
+            res = installer.install_sapiens2(cfg)
         elif what == "ltx":
             res = installer.install_ltx(cfg)
         elif what == "videomama":
@@ -636,7 +698,7 @@ def install_component(what: str):
             res = installer.install_git_node(cfg, what)
         else:
             installer.progress_end(False, "unknown")
-            raise HTTPException(status_code=404, detail="ffmpeg | git | nodes | cotracker | vitmatte | birefnet | ltx | videomama | sam3 | matanyone2_weights | lama | matanyone2_node | inpaint_nodes | vhs_nodes | restart_comfy")
+            raise HTTPException(status_code=404, detail="ffmpeg | git | nodes | cotracker | vitmatte | birefnet | sapiens2 | ltx | videomama | sam3 | matanyone2_weights | lama | matanyone2_node | inpaint_nodes | vhs_nodes | restart_comfy")
     except HTTPException:
         raise
     except Exception as e:  # report, the doctor re-checks afterwards
@@ -2798,6 +2860,9 @@ def get_object_stages(name: str):
     inst = edge_engines(cfg)
     info["edge_engines"] = inst
     info["edge_engine"] = effective_edge_engine(_objects().get(name).get("edge_engine"), inst)
+    from engine.sapiens2 import DEFAULT_MODEL as _SAPIENS2
+    from engine.stage_models import hf_cached
+    info["band_seed"] = hf_cached(_SAPIENS2)      # „Zaproponuj pas (Sapiens2-seg-0.4B)” available (2026-10-22)
     block = _plate_gate()["block"]
     if block:   # Z26: plate QA undecided -> nothing of the object can run (results on disk stay visible)
         for x in info["stages"] + info["steps"]:
@@ -5037,6 +5102,60 @@ def set_object_band_from(name: str, req: BandFromRequest):
     _set_band_mode(src.obj_name, src.key, "shared")
     store.update(root, tool={"final_valid": False})
     return {"success": True, "points": len(pts), "keys": sorted({int(k) for p in pts for k in p["keys"]})}
+
+
+class BandProposeRequest(BaseModel):
+    frame: int
+    stage: str                           # the band being edited: a stage (matanyone | videomama | ltx) or "zone:<id>"
+    replace: bool = False                # the band already has points: replace them (the UI asks first)
+
+
+@app.post("/api/object/{name}/band/propose")
+@object_edit
+@long_job("Propozycja pasa (Sapiens2-seg-0.4B): {name}", quiet=True)
+def propose_band(name: str, req: BandProposeRequest):
+    """„Zaproponuj pas” (plan docs/PLAN_SAPIENS2.md point 1, user decisions 2026-10-22): Sapiens2-seg-0.4B body parts
+    of the person in `frame` -> band points of the band the stage works with (the shared object band unless the stage
+    is detached), one key in `frame`: hair wide, clothing narrow, skin thin, each point max(rule, automatic width
+    measured on the plate). Only people. Points the band already has are replaced only with `replace` (409 asks)."""
+    from engine import sapiens2
+    from engine.bandmap import band_points
+    from engine.bandseed import MIN_PERSON, person_share, propose
+    from engine.edge import adaptive_band_width
+    ow = _stage_owner(name, req.stage)
+    have = band_points(ow.params)
+    if have and not req.replace:
+        raise HTTPException(status_code=409, detail=f"Pas ma już {len(have)} punktów – zastąpić je propozycją?")
+    pipe = _pipeline()
+    try:
+        core = np.asarray(pipe.preview_core(ow.obj_name, [req.frame])[req.frame]) > 0.5
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not core.any():
+        raise HTTPException(status_code=404, detail=f"Pusta maska obiektu w klatce {req.frame}")
+    img = np.clip(np.asarray(pipe.loader.frame(req.frame), np.float32), 0, 1)
+    pipe.release_comfy_gpu("sapiens2")
+    try:
+        cls = sapiens2.segment_object(sapiens2.get_runner(), img, core)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if person_share(core, cls) < MIN_PERSON:
+        raise HTTPException(status_code=422, detail="Sapiens2 nie widzi tu osoby – propozycja pasa działa tylko dla ludzi")
+    g = img.mean(axis=2)
+    flow = None
+    fr = _shot_frames()
+    if fr and req.frame - 1 >= fr[0]:
+        u8 = lambda x: np.clip(x * 255, 0, 255).astype(np.uint8)
+        gp = np.clip(np.asarray(pipe.loader.frame(req.frame - 1), np.float32), 0, 1).mean(axis=2)
+        flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST).calc(u8(gp), u8(g), None)
+    auto_w = adaptive_band_width(core, g, flow, pipe.shutter, 1.0)
+    pts, stats = propose(core, cls, req.frame, auto_w, (ow.out, ow.inn))
+    if not pts:
+        raise HTTPException(status_code=422, detail="Brak części ciała na obrysie – pas zostaje stały")
+    ow.params = {**ow.params, **ow.refs()}      # the sliders as they are now = scale 1 for these points
+    ow.store(pts)
+    return {"success": True, "points": len(pts), "keys": [req.frame], "replaced": len(have), **stats,
+            "model": sapiens2.LABEL}
 
 
 from collections import OrderedDict

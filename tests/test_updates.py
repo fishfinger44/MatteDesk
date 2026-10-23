@@ -57,6 +57,13 @@ def test_git_copy_no_installer_and_disabled(tmp_path):
     assert not u["available"] and not called and not u["enabled"]
 
 
+def test_zip_copy_links_the_new_zip(tmp_path):
+    """Source ZIP from GitHub: no .git, no bundled python -> kind zip (not „git pull”), link to the tag's ZIP."""
+    u = up.check("0.3", {}, tmp_path, now=1.0, api_get=lambda url: REL)
+    assert u["kind"] == "zip" and u["available"] and not u["can_install"]
+    assert u["zip_url"] == "https://github.com/fishfinger44/MatteDesk/archive/refs/tags/v0.4.zip"
+
+
 def test_no_release_yet_and_offline(tmp_path):
     def e404(url):
         raise urllib.error.HTTPError(url, 404, "nf", Message(), None)

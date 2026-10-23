@@ -15,7 +15,7 @@
   let H = null;
   const S = () => H.S;
   const obj = () => H.S.obj;
-  const B = { data: {}, lines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false };
+  const B = { data: {}, lines: {}, lastLines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false };
   // the stage whose band is edited: 4 VideoMaMa, 3 MatAnyone2 (px mode of the edge band)
   const STAGE_OF = () => (!H ? null : S().stage === H.ST.VIDEOMAMA ? 'videomama' : S().stage === H.ST.MATANYONE ? 'matanyone'
     : S().stage === H.ST.LTX ? 'ltx' : null);
@@ -44,7 +44,7 @@
     finally { delete B.busy[k]; }
   }
   function dirty() { B.data = {}; dirtyLines(); B.live = null; }
-  function dirtyLines() { B.lines = {}; }
+  function dirtyLines() { B.lines = {}; B.lastLines = {}; }
   // preview lines of the band: the palette's slider values (live while dragging = the whiskers scale, lines after release)
   async function loadLines(f, params, prefetch) {
     const q = Object.entries(params || {}).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
@@ -135,8 +135,49 @@
          ${me.points ? `<button type="button" class="btn btn-ghost btn-xs" data-bm="from" title="Punkty tego etapu stają się wspólnym pasem obiektu – zmienią się wszystkie etapy na wspólnym pasie (↻)">⇧ ${tr('ustaw jako wspólny')}</button>` : ''}`
       : `<span class="muted" title="Jedne punkty pasa dla etapów 3 / 4 / 5 / 7 – każdy etap skaluje je własnymi suwakami; zmiana punktu = ↻ we wszystkich etapach na wspólnym pasie">🔗 ${tr('pas obiektu (wspólny)')} · ${d.points} ${pk(d.points)}${keys ? ` · ${tr('klucze')} ${keys}` : ''}</span>${idle}
          <button type="button" class="btn btn-ghost btn-xs" data-bm="own" title="Odłącz → własny pas: ten etap dostaje kopię punktów i dalej zmiany wspólnego pasa go nie dotyczą">⛓ ${tr('odłącz')}</button>`;
+    renderSeed(document.getElementById(el.id.replace(/BandMode$/, 'BandSeed')), bkey, own, after);
     for (const c of copyEls || []) if (c) c.style.display = own ? '' : 'none';
     el.querySelectorAll('[data-bm]').forEach((b) => b.addEventListener('click', () => setMode(bkey, b.dataset.bm, after)));
+  }
+  // „Zaproponuj pas” (Sapiens2-seg-0.4B, 2026-10-22), under „👁 podgląd pasa” of the stage palette: always shown,
+  // greyed out with a Doctor hint until the model is downloaded (info.band_seed; user decision 2026-10-23)
+  const SEED_ICON = '<svg class="bs-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="2.6" fill="currentColor"/>'
+    + '<path d="M8.2 20.5v-6.2c0-2.4 1.7-4.2 3.8-4.2s3.8 1.8 3.8 4.2v6.2z" fill="currentColor"/>'
+    + '<path d="M12 1.2c3 0 5.4 2.3 5.4 5.1 0 1.3-.5 2.4-1.3 3.3 1.9 1.1 3.1 3.1 3.1 5.5v6.4M12 1.2c-3 0-5.4 2.3-5.4 5.1 0 1.3.5 2.4 1.3 3.3-1.9 1.1-3.1 3.1-3.1 5.5v6.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-dasharray="2.2 1.8" opacity=".85"/></svg>';
+  function renderSeed(el, bkey, own, after) {
+    if (!el) return;
+    const ready = !!(S().info && S().info.band_seed);
+    el.innerHTML = `<button type="button" class="btn band-seed-btn" data-bseed="1"${ready ? '' : ' disabled'} title="${ready
+      ? 'Sapiens2 rozpoznaje części ciała w tej klatce i ustawia punkty pasa: włosy szeroko, ubranie wąsko, skóra cienko (zawsze co najmniej tyle, ile automat mierzy na rozmyciu). Tylko ludzie. Jeden klucz w tej klatce, dalej punkty śledzi CoTracker3; poprawiasz wąsami. Ctrl+Z cofa.'
+      : 'Brak modelu Sapiens2-seg-0.4B – Doktor → Zainstaluj Sapiens2'}">${SEED_ICON}<span>${tr('Zaproponuj pas (Sapiens2)')}</span></button>`
+      + (ready ? '' : `<div class="band-seed-hint">${tr('Brak modelu Sapiens2-seg-0.4B – zainstaluj go w')} <a href="#" data-bdoc="1">🩺 ${tr('Doktorze')}</a> (${tr('Zainstaluj Sapiens2')}, 1,63 GB).</div>`);
+    const b = el.querySelector('[data-bseed]');
+    if (ready) b.addEventListener('click', () => proposeBand(bkey, own, after));
+    const doc = el.querySelector('[data-bdoc]');
+    if (doc) doc.addEventListener('click', (e) => { e.preventDefault(); const d = document.getElementById('openDoctorBtn'); if (d) d.click(); });
+  }
+  async function proposeBand(bkey, own, after) {
+    const f = V().currentFrame;
+    // Ctrl+Z: the band as it was (shared: the object band; a detached stage: its own params; a detached zone: no undo)
+    const url = !own ? `/api/object/${obj()}/band` : (bkey.startsWith('zone:') ? null : `/api/object/${obj()}/stage_band/${bkey}`);
+    let prev = null;
+    if (url) { try { prev = await H.api('GET', `${url}/params`); } catch (e) { prev = null; } }
+    const go = async (replace) => H.api('POST', `/api/object/${obj()}/band/propose`, { frame: f, stage: bkey, replace });
+    H.status('Sapiens2: rozpoznaję części ciała…', 'info');
+    try {
+      let d;
+      try { d = await go(false); } catch (e) {
+        if (e.status !== 409 || !/zastąpić/.test(e.message || '')) throw e;
+        if (!(await V().uiConfirm(`${e.message}`, { ok: 'Zastąp', tone: 'error' }))) return;
+        d = await go(true);
+      }
+      if (prev) B.undo.push({ stage: STAGE_OF(), url, f, what: 'propozycja pasa (Sapiens2)',
+                              prev: { band_points: prev.band_points || [], band_ref_out: prev.band_ref_out ?? null, band_ref_in: prev.band_ref_in ?? null } });
+      dirty(); await reloadStage(); renderLane(); V().render();
+      const sh = d.edge_share || {};
+      H.status(`Pas z Sapiens2: ${d.points} pkt w F${f} (włosy ${Math.round((sh.hair || 0) * 100)} %, ubranie ${Math.round((sh.cloth || 0) * 100)} %, skóra ${Math.round((sh.skin || 0) * 100)} % obrysu)`, 'ok');
+    } catch (e) { H.toast(`Propozycja pasa: ${e.message || e}`, 7000); }
+    if (after) after(); else renderMode();
   }
   async function setMode(bkey, what, after) {
     try {
@@ -193,14 +234,25 @@
   }
   const poly = (ctx, k, cnt) => { ctx.beginPath(); cnt.forEach((q, i) => (i ? ctx.lineTo(q[0] * k, q[1] * k) : ctx.moveTo(q[0] * k, q[1] * k))); ctx.closePath(); };
   // the band preview lines (the stage palette calls it when „👁 podgląd pasa” is on)
-  function drawLines(ctx, img, f, params) {
+  // opts.live (a palette slider is held): one lines request of this frame at a time (the latest values are asked once
+  // it returns), and with band points the last lines of this frame stay, dimmed – the browser's live band ignores points
+  function drawLines(ctx, img, f, params, opts = {}) {
     if (!on()) return false;
     const k = img.width / ((H.plateSize && H.plateSize()[0]) || img.width);
     const q = Object.entries(params || {}).map(([kk, v]) => `${kk}=${encodeURIComponent(v)}`).join('&');
-    const L = B.lines[`${key(f)}|${q}`];
-    if (!L) { loadLines(f, params); return false; }
+    let L = B.lines[`${key(f)}|${q}`];
+    let dim = false;
+    if (!L) {
+      const pre = `${key(f)}|`;
+      if (!(opts.live && Object.keys(B.busy).some((b) => b.startsWith(pre)))) loadLines(f, params);
+      L = opts.live && pts(f).length ? B.lastLines[key(f)] : null;
+      if (!L) return false;
+      dim = true;
+    }
+    B.lastLines[key(f)] = L;
     const v = V();
     ctx.save();
+    if (dim) ctx.globalAlpha = 0.5;
     try {
       ctx.strokeStyle = 'rgba(255,212,0,0.95)'; ctx.lineWidth = 1.6 / v.zoom; ctx.setLineDash([6 / v.zoom, 4 / v.zoom]);
       for (const c of L.band_contours || []) { poly(ctx, k, c); ctx.stroke(); }
@@ -323,7 +375,7 @@
     if (clr) { clr.style.display = n ? '' : 'none'; clr.disabled = !hasKeyAt(f); }
   }
   function onFrame() { if (on()) { if (!st(V().currentFrame)) load(V().currentFrame); renderLane(); info(); } else renderLane(); }
-  function reset() { B.data = {}; B.lines = {}; B.undo = []; B.live = null; B.drag = null; renderLane(); }
+  function reset() { B.data = {}; B.lines = {}; B.lastLines = {}; B.undo = []; B.live = null; B.drag = null; renderLane(); }
 
   function init(hooks) {
     H = hooks;

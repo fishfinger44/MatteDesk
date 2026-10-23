@@ -167,3 +167,55 @@ def test_missing_desktop_app_is_a_readable_failure(monkeypatch, no_desktop2):
     monkeypatch.setattr(cl, "desktop_exe", lambda cfg: None)
     st = cl.start_comfy({"comfy_flavor": "desktop"}, popen=lambda *a, **k: 1 / 0)
     assert st["state"] == "failed" and "Comfy Desktop" in st["error"]
+
+
+# ---------------------------------------------------------------------------- "Przeładuj ComfyUI" (banner, 2026-10-23)
+
+def test_reload_kills_hung_comfy_on_port_then_starts(monkeypatch):
+    _reset()
+    killed, started = [], []
+    res = cl.reload_comfy({"comfy_port": 8001}, probe=lambda cfg: "busy", pid_finder=lambda port: 4242,
+                          killer=lambda pid: killed.append(pid) or "python.exe",
+                          starter=lambda cfg: started.append(cfg) or {"state": "starting"})
+    assert killed == [4242] and len(started) == 1
+    assert res["state"] == "starting" and res["killed"] == "python.exe (PID 4242)"
+
+
+def test_reload_crashed_comfy_just_starts():
+    _reset()
+    res = cl.reload_comfy({}, probe=lambda cfg: "down", pid_finder=lambda port: None,
+                          killer=lambda pid: pytest.fail("nothing to kill"), starter=lambda cfg: {"state": "starting"})
+    assert res == {"state": "starting"}
+
+
+def test_reload_leaves_answering_or_remote_comfy_alone():
+    _reset()
+    res = cl.reload_comfy({}, probe=lambda cfg: "up", pid_finder=lambda port: pytest.fail("no kill"),
+                          starter=lambda cfg: pytest.fail("no start"))
+    assert res["state"] == "running"
+    with pytest.raises(RuntimeError, match="innym komputerze"):
+        cl.reload_comfy({"comfy_host": "192.168.1.20"}, probe=lambda cfg: "down")
+
+
+def test_kill_tree_refuses_a_process_that_is_not_comfy(monkeypatch):
+    import psutil
+
+    class P:
+        def name(self):
+            return "nginx.exe"
+    monkeypatch.setattr(psutil, "Process", lambda pid: P())
+    with pytest.raises(RuntimeError, match="nie ComfyUI"):
+        cl._kill_tree(123)
+
+
+def test_probe_tells_refused_from_silent():
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)   # accepts, never answers -> busy
+    try:
+        assert cl.comfy_probe({"comfy_port": port}, timeout=0.5) == "busy"
+    finally:
+        srv.close()
+    assert cl.comfy_probe({"comfy_port": port}, timeout=0.5) == "down"

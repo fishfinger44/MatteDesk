@@ -77,9 +77,9 @@
             <label style="display:flex;gap:6px;align-items:flex-start;"><input id="rpConsent" type="checkbox" style="margin-top:3px;">
               <span>Zgadzam się na wysłanie powyższych danych autorowi MatteDesk w celu naprawienia problemu.</span></label>
           </div>
-          <div id="rpMsg" style="font-size:12px;"></div>
         </div>
-        <div style="padding:12px 18px;border-top:1px solid #2a2a2e;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+        <div style="padding:12px 18px;border-top:1px solid #2a2a2e;display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap;">
+          <div id="rpMsg" aria-live="polite" style="font-size:12px;flex:1 1 240px;"></div>
           <button type="button" class="btn btn-secondary" id="rpCopy" hidden title="Kopiuje całe zgłoszenie (tekst) do schowka – np. do wklejenia na GitHubie">Kopiuj zgłoszenie</button>
           <button type="button" class="btn btn-secondary" id="rpCancel">Zamknij</button>
           <button type="button" class="btn btn-secondary" id="rpShow">Pokaż, co zostanie wysłane</button>
@@ -135,9 +135,12 @@
       busy = true; sync(); msg('Wysyłam…');
       try {
         const r = await postJSON('/api/report/send', { id: preview.id, consent: true });
-        msg(`Wysłano – zgłoszenie nr ${esc(r.number ?? '?')}. Dziękuję!`, 'ok');
-        $('rpShow').hidden = true; $('rpSend').hidden = true; $('rpCopy').hidden = true;
-        preview = null;
+        // sent: this window closes and a plain confirmation with OK takes its place (user request 2026-10-23)
+        close();
+        const text = `Zgłoszenie nr ${esc(r.number ?? '?')} zostało wysłane do autora MatteDesk. Dziękuję!`;
+        if (window.viewer && window.viewer.uiDialog) window.viewer.uiDialog({ title: '✅ Zgłoszenie wysłane', tone: 'ok', html: text });
+        else alert(text.replace(/<[^>]+>/g, ''));
+        return;
       } catch (e) { msg(esc(e.message), 'err'); }
       busy = false; sync();
     });

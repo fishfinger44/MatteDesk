@@ -105,6 +105,8 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/update/install` | when_idle | Installer copy only: download the new setup, start it, then stop this server (the setup replaces the files). |
 | GET | `/api/comfy/launch` | – | State of the ComfyUI start by MatteDesk: idle / starting / running / failed (+ how / error). |
 | POST | `/api/comfy/start` | – | Doctor button "Uruchom ComfyUI": start the chosen ComfyUI (Desktop app / ComfyUI from git) in the background. |
+| GET | `/api/comfy/health` | – | Banner 'ComfyUI nie odpowiada': up / down / busy + the launch state (polled every few seconds by comfy_watch.js). |
+| POST | `/api/comfy/reload` | – | Banner button 'Przeładuj ComfyUI': close a hung local ComfyUI on our port and start it again (no idle check – a job waiting on a dead ComfyUI fails by itself). |
 | GET | `/api/install/progress` | – | Live state of the running "Zainstaluj" (step, file, done/total bytes) - the Doctor polls it for the progress bar. |
 | POST | `/api/install/{what}` | when_idle | Doctor's "Zainstaluj" button (user-triggered): our Comfy node packages, third-party packs, weights, CoTracker3. |
 | POST | `/api/project/open` | when_idle |  |
@@ -208,6 +210,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | PUT | `/api/object/{name}/band/params` | object_edit | The shared band exactly as given (Ctrl+Z of „odłącz” / „ustaw jako wspólny” / a band edit). |
 | DELETE | `/api/object/{name}/band` | object_edit | Keys of the shared band in `frame` (?frame=N), or the whole shared band (every stage on it = constant band). |
 | POST | `/api/object/{name}/band/from` | object_edit | „Ustaw jako wspólny”: the points of a detached stage / zone become the shared band of the object (as stored, with their reference – the source's result does not |
+| POST | `/api/object/{name}/band/propose` | long_job (quiet), object_edit | „Zaproponuj pas” (plan docs/PLAN_SAPIENS2.md point 1, user decisions 2026-10-22): Sapiens2-seg-0.4B body parts of the person in `frame` -> band points of the ba |
 | GET | `/api/object/{name}/stage_band/{stage}/{frame}/lines` | – | Preview lines of a stage band in `frame` (plate px): band edges (dashed), where the inset / outer feather end (thin dashes) – the same drawing as the stage-5 zo |
 | POST | `/api/object/{name}/zones/{zone_id}/apply` | long_job | „Zastosuj” (plan step 4): only the zones are recomputed (cache) on the base alpha of the active version -> a new version runs/v### (QA + edge report); 409 with  |
 | GET | `/api/object/{name}/color_lab/{frame}` | – | Pipette of the "color" zone criterion (Z24): median Lab of 5 x 5 px of the plate-to-mask display image (the image the zone key is computed on) around (x, y) in  |

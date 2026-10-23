@@ -250,6 +250,14 @@
   // the new image arrives: S.overlayNext holds the replacement load); 'missing' entries are dropped so they are asked again.
   const OVERLAY_LIMIT = 600;    // proxy-size mask PNGs kept in memory (a whole shot of a few layers)
   const SWEEP_PAR = 4;          // background sweep: at most 4 overlay requests in flight
+  // derived overlay canvases (tint / black-white / band edges …): the newest COMP_KEEP are kept. The old form put the new
+  // entry first and kept the 12 OLDEST, so the overlays of the frame on screen were dropped and recomputed (a CPU
+  // pixel loop, ~25 ms each) on every render – stage 4 drew in ~46 ms per render (measured 2026-10-23)
+  const COMP_KEEP = 16;
+  function putComp(ck, c) {
+    delete S.compCache[ck];
+    S.compCache = { ...Object.fromEntries(Object.entries(S.compCache).slice(-(COMP_KEEP - 1))), [ck]: c };
+  }
   function clearOverlays() { S.overlay = {}; S.compCache = {}; S.overlayNext = {}; renderLoadBar(); }
   function invalidateFrame(f) {
     for (const k of Object.keys(S.overlay)) {
@@ -314,13 +322,14 @@
   function drawBand(ctx, img, layer, q, ov, key) {
     S.pvLast = S.pvLast || {};
     if (ov && ov !== 'missing') {
-      const c = edgePvCanvas(ov, key);
+      const c = bandEdges(ov, key);
+      if (!c) return false;
       ctx.drawImage(c, 0, 0, img.width, img.height);
       S.pvLast[layer] = { obj: S.obj, q, c };
       return true;
     }
     const l = S.pvLast[layer];
-    if (!ov && l && l.obj === S.obj && l.q === q) {
+    if (!ov && l && l.obj === S.obj && (l.q === q || S.pvDrag === layer)) {   // a slider held: the last lines of the layer
       ctx.save(); ctx.globalAlpha = 0.45; ctx.drawImage(l.c, 0, 0, img.width, img.height); ctx.restore();
       return true;
     }
@@ -529,7 +538,7 @@
     tg.clearRect(0, 0, t.width, t.height); tg.drawImage(ov, 0, 0, t.width, t.height); const a = tg.getImageData(0, 0, t.width, t.height);
     for (let i = 0; i < b.data.length; i += 4) { const al = a.data[i] / 255; for (let k = 0; k < 3; k++) b.data[i + k] = p.data[i + k] * al + b.data[i + k] * (1 - al); }
     g.putImageData(b, 0, 0);
-    S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
+    putComp(ck, c);
     return c;
   }
   // ---- overlay look per layer (core / alpha / key): colour, opacity, fill or outline; kept in localStorage
@@ -593,7 +602,7 @@
       for (let i = 0; i < p.length; i += 4) { const a = p[i]; p[i] = rgb[0]; p[i + 1] = rgb[1]; p[i + 2] = rgb[2]; p[i + 3] = a; }
     }
     g.putImageData(d, 0, 0);
-    S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
+    putComp(ck, c);
     return c;
   }
   // the Alpha view = the alpha channel itself, black / white (user decision 2026-10-22), opaque, no overlay colour
@@ -605,7 +614,7 @@
     const d = g.getImageData(0, 0, c.width, c.height); const p = d.data;
     for (let i = 0; i < p.length; i += 4) { const a = p[i] * p[i + 3] / 255; p[i] = p[i + 1] = p[i + 2] = a; p[i + 3] = 255; }
     g.putImageData(d, 0, 0);
-    S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
+    putComp(ck, c);
     return c;
   }
   const alphaBw = () => S.view === 'alpha' && !!S.obj && !S.auxMode;
@@ -1208,7 +1217,7 @@
           p[i + 3] = 255;
         }
         g.putImageData(bd, 0, 0);
-        S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
+        putComp(ck, c);
       }
       return { img: S.compCache[ck], key, kind: 'alpha', run: `${m.run || 'baza'} + podgląd strefy F${f}` };
     };
@@ -2228,11 +2237,12 @@
   function edgeSettingsHtml() {
     return `<div class="pts-palette edge-palette" id="edgePalette" style="display:none">
       <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> Krawędź (MatAnyone2)</div>
-      <label class="chk" title="Podgląd przed liczeniem: żółte = pas, w którym MatAnyone2 decyduje o alfie (adaptacyjny – szerszy przy rozmyciu / ruchu), niebieskie = maska, która zostaje (maska 1+2 + Przesuń środek konturu). Wyłącz, gdy oglądasz policzony wynik"><input type="checkbox" id="ePv" title="Podgląd pasa krawędzi na obrazie (wł. / wył.)"> 👁 podgląd pasa krawędzi</label>
+      <label class="chk" title="Podgląd przed liczeniem: przerywane linie = krawędzie pasa, w którym MatAnyone2 decyduje o alfie (adaptacyjny – szerszy przy rozmyciu / ruchu), cienkie przerywane = koniec wtopień; w środku zostaje maska 1+2. Wyłącz, gdy oglądasz policzony wynik"><input type="checkbox" id="ePv" title="Podgląd pasa krawędzi na obrazie (wł. / wył.)"> 👁 podgląd pasa krawędzi</label>
+      <div class="band-seed" id="epBandSeed"></div>
       <div class="muted pp-hint" id="ePvInfo"></div>
       <div class="pp-sec edge-settings" id="edgeSettings">
-      <label class="edge-px" title="Jak daleko poza krawędź maski 1+2 sięga żółty pas, w którym MatAnyone2 liczy miękką alfę (kosmyki, rozmycie). To minimum: tam, gdzie automat mierzy większe rozmycie ostrości / ruchu, pas sam jest szerszy. Maska się nie przesuwa. Suwak 0–60 px, w polu dowolna wartość (do 200 px)">Pas na zewnątrz <input id="o4Out" type="range" min="0" max="60" step="1" value="0"><input id="o4OutV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
-      <label class="edge-px" title="Ile px w głąb maski 1+2 oddajemy MatAnyone2 (żółte do środka); dalej w środku alfa = 1 (niebieskie). Minimum jak wyżej – automat może dać więcej przy rozmyciu. 0 = sam automat (3–24 px). Suwak 0–30 px, w polu do 200 px">Wcięcie w rdzeń <input id="o4In" type="range" min="0" max="30" step="1" value="0"><input id="o4InV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
+      <label class="edge-px" title="Jak daleko poza krawędź maski 1+2 sięga pas (zewnętrzna przerywana linia), w którym MatAnyone2 liczy miękką alfę (kosmyki, rozmycie). To minimum: tam, gdzie automat mierzy większe rozmycie ostrości / ruchu, pas sam jest szerszy. Maska się nie przesuwa. Suwak 0–60 px, w polu dowolna wartość (do 200 px)">Pas na zewnątrz <input id="o4Out" type="range" min="0" max="60" step="1" value="0"><input id="o4OutV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
+      <label class="edge-px" title="Ile px w głąb maski 1+2 oddajemy MatAnyone2 (wewnętrzna przerywana linia pasa); dalej w środku alfa = 1. Minimum jak wyżej – automat może dać więcej przy rozmyciu. 0 = sam automat (3–24 px). Suwak 0–30 px, w polu do 200 px">Wcięcie w rdzeń <input id="o4In" type="range" min="0" max="30" step="1" value="0"><input id="o4InV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
       <label class="edge-px" title="Na ilu px wynik MatAnyone2 przenika się z wnętrzem rdzenia na wewnętrznym brzegu pasa (wcięcia). 0 = twarde przejście (jak dotąd) – może zostać widoczna linia na granicy wcięcia; kilka px = miękkie wtopienie">Wtopienie wcięcia <input id="o4Feather" type="range" min="0" max="24" step="1" value="0" title="Wtopienie wcięcia (px)"><input id="o4FeatherV" type="number" class="form-input edge-num" min="0" max="64" step="1" value="0" title="Wtopienie wcięcia (px, 0–64)"> px</label>
       <label class="edge-px" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa wynik MatAnyone2 przechodzi w rdzeń (zwykle czerń) – cieńsza przerywana linia na podglądzie. Nie nachodzi na wtopienie wcięcia. 0 = twarde cięcie (jak dotąd)">Wtopienie krawędzi zewn. <input id="o4OutFeather" type="range" min="0" max="80" step="1" value="0" title="Wtopienie krawędzi zewnętrznej (px)"><input id="o4OutFeatherV" type="number" class="form-input edge-num" min="0" max="200" step="1" value="0" title="Wtopienie krawędzi zewnętrznej (px, 0–200)"> px</label>
       <div class="pp-sec vm-band-pts"><div class="band-mode" id="epBandMode"></div><span class="muted pp-hint" id="epBandInfo"></span>
@@ -2278,20 +2288,14 @@
     if (!S.edgePv) $('ePvInfo').textContent = 'Podgląd wyłączony – widać policzony wynik';
     placeFloating(box, w, epPos.get());
   }
-  function edgePvCanvas(ov, key) {   // 255 -> blue (mask kept), 128 -> yellow (band), 0 -> transparent
+  // a server band PNG (255 kept / 128 band / 0 outside) as its dashed band edges – one band system (2026-10-22): a band
+  // preview is never a fill (the old yellow / blue fill came back in stages 3 / 4 / 7, user report 2026-10-23)
+  function bandEdges(ov, key) {
     const ck = `epv_${key}`;
     if (S.compCache[ck]) return S.compCache[ck];
-    const c = document.createElement('canvas'); c.width = ov.naturalWidth; c.height = ov.naturalHeight;
-    const g = c.getContext('2d'); g.drawImage(ov, 0, 0);
-    const d = g.getImageData(0, 0, c.width, c.height); const px = d.data;
-    for (let i = 0; i < px.length; i += 4) {
-      const v = px[i];
-      if (v > 200) { px[i] = 80; px[i + 1] = 160; px[i + 2] = 255; px[i + 3] = 80; }
-      else if (v > 90) { px[i] = 250; px[i + 1] = 204; px[i + 2] = 21; px[i + 3] = 190; }
-      else px[i + 3] = 0;
-    }
-    g.putImageData(d, 0, 0);
-    S.compCache = { [ck]: c, ...Object.fromEntries(Object.entries(S.compCache).slice(-12)) };
+    const c = window.MD_ZONES && window.MD_ZONES.bandPngEdges ? window.MD_ZONES.bandPngEdges(ov) : null;
+    if (!c) return null;
+    putComp(ck, c);
     return c;
   }
   // ---- stage preview (user request 2026-10-17): stages 3 MatAnyone / 4 VideoMaMa / 5 ViTMatte on a few frames around
@@ -2359,22 +2363,24 @@
     const dragging = S.pvDrag === 'edge';
     const p = dragging ? edgePvParams() : (S.epvParams || edgePvParams());
     const q = p.px ? `band_out_px=${p.o}&band_in_px=${p.i}` : `band_scale=${p.b}&shift_px=${p.s}`;
-    // instant band from the mask 1+2 in the browser (fixed px, no adaptive widening): while the slider is dragged and
-    // until the server's exact band is loaded – the server needs ~seconds per frame (user report 2026-10-17)
+    // instant band edges from the mask 1+2 in the browser (fixed px, no adaptive widening, dashed lines – no fill):
+    // while the slider is dragged until the server's exact lines are loaded (user reports 2026-10-17 / 2026-10-23)
     const live = () => {
       if (!p.px || !(window.MD_ZONES && window.MD_ZONES.liveBand)) return null;
       const kind = S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core';
       const m = overlayFor(kind, f);
       return m && m !== 'missing' ? window.MD_ZONES.liveBand(m, `${S.obj}_${kind}_${f}`, p.i, p.o) : null;
     };
-    if (dragging) {
-      const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height);
+    // one band system (2026-10-22): dashed band edges + thin feather-end lines, no fill – in the px mode and in the
+    // automatic (adaptive) mode too (user report 2026-10-22: stage 3 still showed the old filled preview at 0 / 0);
+    // the adaptive band comes from the saved settings (no reach / inset in the request)
+    const lp = { feather_px: +$('o4FeatherV').value || 0, outer_feather_px: +$('o4OutFeatherV').value || 0,
+                 ...(p.px ? { reach_px: p.o, inset_px: p.i } : { band_scale: p.b, shift_px: p.s }) };
+    if (dragging) {   // a slider held (user report 2026-10-23: the old filled band came back while dragging)
+      if (!(window.MD_BANDPTS && window.MD_BANDPTS.ready && window.MD_BANDPTS.drawLines(ctx, img, f, lp, { live: true }))) {
+        const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height);
+      }
     } else {
-      // one band system (2026-10-22): dashed band edges + thin feather-end lines, no fill – in the px mode and in the
-      // automatic (adaptive) mode too (user report 2026-10-22: stage 3 still showed the old filled preview at 0 / 0);
-      // the adaptive band comes from the saved settings (no reach / inset in the request)
-      const lp = { feather_px: +$('o4FeatherV').value || 0, outer_feather_px: +$('o4OutFeatherV').value || 0,
-                   ...(p.px ? { reach_px: p.o, inset_px: p.i } : { band_scale: p.b, shift_px: p.s }) };
       if (window.MD_BANDPTS && window.MD_BANDPTS.ready) {
         // while the lines load nothing is drawn (user report 2026-10-22: the old filled band flashed on every stage
         // change before the lines replaced it)
@@ -2389,8 +2395,8 @@
     }
     const info = $('ePvInfo');
     const desc = p.px ? `na zewnątrz ≥ ${p.o} px, w rdzeń ≥ ${p.i} px (więcej, gdzie rozmycie)` : `pas automatyczny z rozmycia ×${p.b}, środek ${p.s} px`;
-    if (info) info.textContent = `F${f}: ${desc} – żółte = MatAnyone2 decyduje, niebieskie = maska zostaje`;
-    return `Podgląd pasa krawędzi (${desc}) – przed liczeniem; wyłącz „👁 podgląd” w palecie Krawędź`;
+    if (info) info.textContent = `F${f}: ${desc} – przerywane = krawędzie pasa (między nimi decyduje MatAnyone2), cienkie = koniec wtopień`;
+    return '';   // no banner: the lines say it (one band system, 2026-10-22)
   }
   // ---- palette „Eksperymenty” (user request 2026-10-16): first the BASE version (MatAnyone / ViTMatte / LTX / mask 1+2 /
   // any version), then QA and the edge-correction proposals are computed on it (measured once, into that version);
@@ -2512,8 +2518,9 @@
       <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> LTX-2.5 Alpha-Gen</div>
       <label title="Maska, która przycina i kieruje LTX-2.5: maska 1+2 (SAM 3.1 + poprawki; grupa = całość ze szwem) albo wynik etapu ${ST.MATANYONE} / ${ST.VITMATTE} (alfa > 0,5)">Maska<select id="lx6Mask" class="form-input" title="Z której maski korzysta LTX-2.5">
         <option value="core">Maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH})</option><option value="matanyone">MatAnyone2 (etap ${ST.MATANYONE})</option><option value="vitmatte">ViTMatte (etap ${ST.VITMATTE})</option></select></label>
-      <div class="pp-chk"><label class="chk" title="Żółte = gdzie zostaje alfa LTX-2.5 (maska + pas na zewnątrz), niebieskie = wymuszone 1 (wynik „+ wnętrze”)"><input type="checkbox" id="lxPvBand" title="Podgląd pasa LTX-2.5 (wł. / wył.)"> 👁 podgląd pasa</label>
+      <div class="pp-chk"><label class="chk" title="Przerywane linie = krawędzie obszaru, w którym zostaje alfa LTX-2.5 (maska + pas na zewnątrz; w środku wymuszone 1 przy „+ wnętrze” / „pas”), cienkie = koniec wtopień"><input type="checkbox" id="lxPvBand" title="Podgląd pasa LTX-2.5 (wł. / wył.)"> 👁 podgląd pasa</label>
         <label class="chk" title="Wynik LTX-2.5 tej klatki przycięty bieżącymi suwakami (z zapisanej surowej alfy LTX-2.5 – bez liczenia modelu)"><input type="checkbox" id="lxPvAlpha" title="Wynik LTX-2.5 z bieżącymi suwakami (wł. / wył.)"> 👁 wynik</label></div>
+      <div class="band-seed" id="lxBandSeed"></div>
       <div class="muted pp-hint" id="lxPvInfo"></div>
       <div class="pp-sec">
       <label title="Co model dostaje jako obraz. Izoluj = kadr z zamalowanymi INNYMI obiektami projektu (ich maski 1+2) – model sam wybiera pierwszy plan, więc tak go kierujemy na ten obiekt. Czysty kadr = obraz bez zmian. Izoluj + rozmyj tło = dodatkowo rozmyte wszystko poza obiektem (gdy obiekt nie jest najbliżej kamery)">Przewodnik<select id="lx6Guide" class="form-input" title="Obraz, który dostaje model (izolacja innych obiektów)">
@@ -2575,13 +2582,13 @@
     if (al && al !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.75; ctx.drawImage(tintCanvas(al, [60, 255, 90], `${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`), 0, 0, img.width, img.height); ctx.globalAlpha = pa; note = `Wynik LTX-2.5 ${S.ltx.run} z bieżącymi suwakami (zielone)`; }
     if (ltxPvGet('band', true) || S.pvDrag === 'ltx') {
       // band mode = the one band system (2026-10-22): dashed band edges + thin feather-end lines, no fill
+      // the other result modes (region / + interior / raw): the edges of the server's result area, dashed too (2026-10-23)
       const lp = { reach_px: p.region_px, inset_px: p.core_erode_px, feather_px: p.feather_px, outer_feather_px: p.region_soft_px };
-      if (!(p.combine === 'band' && window.MD_BANDPTS && window.MD_BANDPTS.ready && window.MD_BANDPTS.drawLines(ctx, img, f, lp))) {
+      if (!(p.combine === 'band' && window.MD_BANDPTS && window.MD_BANDPTS.ready && window.MD_BANDPTS.drawLines(ctx, img, f, lp, { live: S.pvDrag === 'ltx' }))) {
         const key = `${S.obj}_ltxb_${q}_${f}`;
         const ov = settledOverlay(key, `/api/object/${S.obj}/ltx_preview/${f}?what=band&${q}`, f);
         drawBand(ctx, img, 'ltx', q, ov, key);
       }
-      note = note ? `${note} · pas: żółte = alfa LTX-2.5 zostaje, niebieskie = 1` : 'Pas LTX-2.5: żółte = alfa LTX-2.5 zostaje, niebieskie = wymuszone 1';
     }
     const info = $('lxPvInfo');
     if (info) info.textContent = `F${f}: pas na zewnątrz ${p.region_px} px, wcięcie ${p.core_erode_px} px, maska: ${{ core: '1+2', matanyone: 'MatAnyone2', vitmatte: 'ViTMatte' }[p.mask_source]}`;
@@ -2594,12 +2601,13 @@
       <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> VideoMaMa</div>
       <label title="Na co nakłada się wynik VideoMaMa. Maska 1+2 (domyślnie) – VideoMaMa robi całą krawędź (na CLIP2_A najspokojniejsza twarda krawędź). MatAnyone2 (etap ${ST.MATANYONE}) – twarda krawędź MatAnyone2 zostaje w pasie ochrony, VideoMaMa dokłada kosmyki dalej. VideoMaMa zawsze prowadzi maska 1+2">Baza<select id="vmBase" class="form-input" title="Na co nakłada się wynik VideoMaMa">
         <option value="core">Maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH})</option><option value="matanyone">MatAnyone2 (etap ${ST.MATANYONE})</option></select></label>
-      <div class="pp-chk"><label class="chk" title="Żółte = gdzie VideoMaMa dokłada (max z bazą), niebieskie = pas ochrony (przy krawędzi wygrywa baza)"><input type="checkbox" id="vmPvBand" title="Podgląd pasa VideoMaMa (wł. / wył.)"> 👁 podgląd pasa</label>
+      <div class="pp-chk"><label class="chk" title="Przerywane linie = krawędzie pasa, w którym decyduje VideoMaMa (pas na zewnątrz + wcięcie), cienkie = koniec wtopień; w środku zostaje baza"><input type="checkbox" id="vmPvBand" title="Podgląd pasa VideoMaMa (wł. / wył.)"> 👁 podgląd pasa</label>
         <label class="chk" title="Wynik VideoMaMa tej klatki nałożony na bazę bieżącymi suwakami (z zapisanej surowej alfy – bez liczenia modelu)"><input type="checkbox" id="vmPvAlpha" title="Wynik VideoMaMa z bieżącymi suwakami (wł. / wył.)"> 👁 wynik</label></div>
+      <div class="band-seed" id="vmBandSeed"></div>
       <div class="muted pp-hint" id="vmPvInfo"></div>
       <div class="pp-sec">
         <label class="edge-px" title="Jak daleko od krawędzi bazy VideoMaMa może dokładać (kosmyki, odstające włosy); dalej zostaje baza – wysepki w tle odcięte. Suwak 0–120, w polu do 400">Pas na zewnątrz <input id="vmReachS" type="range" min="0" max="120" step="1" title="Zasięg od krawędzi bazy (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmReach" type="number" min="0" max="400" step="1" class="form-input edge-num" title="Zasięg od krawędzi bazy (px)"> px</label>
-        <label class="edge-px" title="Ile px w głąb bazy VideoMaMa ZASTĘPUJE bazę (żółte do środka); dalej w środku zostaje baza (niebieskie). 0 = VideoMaMa tylko od krawędzi bazy na zewnątrz. Suwak 0–30, w polu do 200">Wcięcie w rdzeń <input id="vmInsetS" type="range" min="0" max="30" step="1" title="Wcięcie w rdzeń (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmInset" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wcięcie w rdzeń (px)"> px</label>
+        <label class="edge-px" title="Ile px w głąb bazy VideoMaMa ZASTĘPUJE bazę (wewnętrzna przerywana linia pasa); dalej w środku zostaje baza. 0 = VideoMaMa tylko od krawędzi bazy na zewnątrz. Suwak 0–30, w polu do 200">Wcięcie w rdzeń <input id="vmInsetS" type="range" min="0" max="30" step="1" title="Wcięcie w rdzeń (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmInset" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wcięcie w rdzeń (px)"> px</label>
         <label class="edge-px" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa wynik VideoMaMa przechodzi w rdzeń (bazę; zwykle czerń) – cieńsza przerywana linia na podglądzie. Nie nachodzi na wtopienie wcięcia. 0 = twarde cięcie">Wtopienie krawędzi zewn. <input id="vmOuterFeatherS" type="range" min="0" max="80" step="1" title="Wtopienie krawędzi zewnętrznej (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmOuterFeather" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wtopienie krawędzi zewnętrznej (px)"> px</label>
         <label class="edge-px" title="Na ilu px wynik VideoMaMa przenika się z głębszą bazą na wewnętrznym brzegu pasa. 0 = twarde przejście">Wtopienie wcięcia <input id="vmFeatherS" type="range" min="0" max="24" step="1" title="Wtopienie wcięcia (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmFeather" type="number" min="0" max="64" step="1" class="form-input edge-num" title="Wtopienie wcięcia (px)"> px</label>
       </div>
@@ -2660,18 +2668,20 @@
         const m = overlayFor(kind, f);
         return m && m !== 'missing' ? window.MD_ZONES.liveBand(m, `${S.obj}_${kind}_${f}`, +lp.inset_px || 0, +lp.reach_px || 0) : null;
       };
-      if (S.pvDrag === 'vmm') { const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height); }
-      else {
-        // one band system (2026-10-22): dashed band edges + thin dashes where the feathers end, no fill
-        const lp2 = { reach_px: p.reach_px, inset_px: p.inset_px, feather_px: p.feather_px, outer_feather_px: p.outer_feather_px };
-        if (!(window.MD_BANDPTS && window.MD_BANDPTS.ready && window.MD_BANDPTS.drawLines(ctx, img, f, lp2))) {
+      // one band system (2026-10-22): dashed band edges + thin dashes where the feathers end, no fill – also while a
+      // slider is held (user report 2026-10-23: the old filled band came back while dragging)
+      const lp2 = { reach_px: lp.reach_px, inset_px: lp.inset_px, feather_px: lp.feather_px, outer_feather_px: lp.outer_feather_px };
+      const pts = window.MD_BANDPTS && window.MD_BANDPTS.ready;
+      if (S.pvDrag === 'vmm') {
+        if (!(pts && window.MD_BANDPTS.drawLines(ctx, img, f, lp2, { live: true }))) { const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height); }
+      } else {
+        if (!(pts && window.MD_BANDPTS.drawLines(ctx, img, f, lp2))) {
           const key = `${S.obj}_vmmb_${q}_${f}`;
           const ov = settledOverlay(key, `/api/object/${S.obj}/videomama_preview/${f}?what=band&${q}`, f);
           if (ov) drawBand(ctx, img, 'vmm', q, ov, key);
           else { const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height); }
         }
       }
-      note = note ? `${note} · pas: żółte = decyduje VideoMaMa, niebieskie = zostaje baza` : 'Pas VideoMaMa: żółte = decyduje VideoMaMa (pas na zewnątrz + wcięcie), niebieskie = zostaje baza';
     }
     const info = $('vmPvInfo');
     if (info) info.textContent = `F${f}: baza ${p.base === 'matanyone' ? 'MatAnyone2' : 'maska 1+2'}, pas na zewnątrz ${p.reach_px} px, wcięcie ${p.inset_px} px, wtopienie ${p.feather_px} / ${p.outer_feather_px || 0} px`;
@@ -3857,7 +3867,7 @@
     v0.frameReady = frameReady;   // Z20: Play waits for the plate + the overlay of the view
     wire();
     wireOverlayStyle();
-    const hooks = { S, ST, api, el, esc, toast, status, run, invalidateFrame, clearOverlays, overlayFor, tintCanvas, compCanvas,
+    const hooks = { S, ST, api, el, esc, toast, status, run, invalidateFrame, clearOverlays, overlayFor, tintCanvas, putComp, compCanvas,
                     drawVarStroke, plateSize, loadStages, loadQA, setView, ensurePointsSaved, tileOverlays,
                     makeFloating, placeFloating, setTool, stageState, canvasToPlate, renderKeysLane, loadOverlay,
                     reloadStageBand: async () => {

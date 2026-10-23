@@ -110,3 +110,25 @@ def test_set_flavor_and_write_local_active(tmp_path):
     assert json.loads(local.read_text())["comfy_flavor"] == "git"
     with pytest.raises(ValueError):
         set_comfy_flavor("standalone", None, local)
+
+
+def test_set_desktop_paths_validates_and_clears(tmp_path):
+    from engine.config import desktop_autodetect, set_desktop_paths
+    comfy = tmp_path / "MyComfy"
+    (comfy / "custom_nodes").mkdir(parents=True)
+    models = tmp_path / "models"
+    models.mkdir()
+    local = _w(tmp_path / "config.local.json", {"comfy_flavor": "desktop", "last_work_dir": "X:/w"})
+    set_desktop_paths({"comfy_dir": str(comfy), "models_dir": str(models), "comfy_port": 8001}, local)
+    c = load_config(tmp_path / "none.json", local, appdata="")
+    assert c["comfy_dir"] == str(comfy).replace("\\", "/") and c["models_dir"] == str(models).replace("\\", "/")
+    assert c["comfy_port"] == 8001 and json.loads(local.read_text())["last_work_dir"] == "X:/w"
+    with pytest.raises(ValueError):
+        set_desktop_paths({"comfy_dir": str(models)}, local)          # no main.py / custom_nodes
+    with pytest.raises(ValueError):
+        set_desktop_paths({"comfy_dir": str(tmp_path / "missing")}, local)
+    # empty = back to autodetect
+    set_desktop_paths({"comfy_dir": "", "models_dir": "", "comfy_port": 0}, local)
+    d = json.loads(local.read_text())
+    assert not {"comfy_dir", "models_dir", "comfy_port"} & set(d)
+    assert desktop_autodetect(appdata="", localappdata="")["comfy_dir"] == ""

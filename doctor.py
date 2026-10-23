@@ -100,6 +100,7 @@ VHS_FIX = ("Wymagane teraz: TAK – ujęcia 8-bitowe (PNG/JPG, np. CLIP2_A, SH02
            "Kliknij „Zainstaluj” albo ComfyUI Manager: „ComfyUI-VideoHelperSuite”.")
 
 BIREFNET_LABEL = "Model: BiRefNet_HR-matting / Lucida"
+SAPIENS2_LABEL = "Model: Sapiens2-seg-0.4B"
 
 # Licences of third-party components (not part of MatteDesk; the user downloads them and accepts them).
 # key = LINKS key -> (text, non-commercial). Keep in sync with THIRD_PARTY_LICENSES.md.
@@ -114,6 +115,7 @@ LICENSES = {
     "cotracker3": ("CC BY-NC 4.0", True),
     "vitmatte": ("wagi trenowane na zbiorze Adobe", True),
     "birefnet": ("MIT", False),
+    "sapiens2": ("Sapiens2 License (bez nadzoru / biometrii / deepfake)", False),
     "depthcrafter": ("Tencent, tylko badawczo", True),
     "local_nodes": ("GPL-3.0 (MatteDesk)", False),
     "inpaint_lama": ("Apache-2.0 / GPL-3.0", False),
@@ -128,7 +130,8 @@ LICENSES = {
 # "research" (non-commercial / research only = LICENSES nc) | "check" (licence not established).
 LICENCE_SUMMARY = [
     ("ComfyUI", "comfyui", "commercial"), ("SAM 3.1", "sam3", "commercial"),
-    ("BiRefNet_HR-matting / Lucida", "birefnet", "commercial"), ("LaMa", "inpaint_lama", "commercial"),
+    ("BiRefNet_HR-matting / Lucida", "birefnet", "commercial"), ("Sapiens2-seg-0.4B", "sapiens2", "commercial"),
+    ("LaMa", "inpaint_lama", "commercial"),
     ("LTX-2.5 Alpha-Gen", "ltx", "commercial"), ("VideoHelperSuite", "vhs", "commercial"),
     ("MatAnyone2", "matanyone2_weights", "research"), ("CoTracker3", "cotracker3", "research"),
     ("ViTMatte", "vitmatte", "research"), ("VideoMaMa", "videomama", "research"),
@@ -160,6 +163,8 @@ LINKS = {
                  "https://github.com/hustvl/ViTMatte"],
     "birefnet": ["https://huggingface.co/ZhengPeng7/BiRefNet_HR-matting (444 MB)",
                  "https://huggingface.co/egeorcun/lucida (885 MB)"],
+    "sapiens2": ["https://huggingface.co/facebook/sapiens2-seg-0.4b (1,63 GB)",
+                 "https://github.com/facebookresearch/sapiens2/blob/main/LICENSE.md (Sapiens2 License)"],
     "depthcrafter": ["https://github.com/akatz-ai/ComfyUI-DepthCrafter-Nodes (model pobiera się sam przy 1. użyciu)",
                      "https://github.com/Tencent/DepthCrafter"],
     "local_nodes": ["handoff/comfy/custom_nodes/ w repo MatteDesk (nie ma ich w internecie)"],
@@ -250,7 +255,7 @@ class EnvironmentDoctor:
         model_actions = {"Model: MiniMax-Remover": "install_minimax_weights", "Model: LTX-2.5 Alpha-Gen": "install_ltx",
                          "Model: VideoMaMa": "install_videomama",
                          "Model: CoTracker3": "install_cotracker", "Model: ViTMatte": "install_vitmatte", "Model: SAM 3.1": "install_sam3",
-                         BIREFNET_LABEL: "install_birefnet",
+                         BIREFNET_LABEL: "install_birefnet", SAPIENS2_LABEL: "install_sapiens2",
                        "Model: MatAnyone2": "install_matanyone2_weights", "Model: LaMa (big-lama.pt)": "install_lama"}
         node_actions = {"ComfyUI-MatAnyone2": "install_matanyone2_node",
                         "Inpaint LaMa (comfyui-inpaint-nodes)": "install_inpaint_nodes",
@@ -289,7 +294,7 @@ class EnvironmentDoctor:
                      "SAM 3.1 Core Nodes": "comfyui", "SAM 3.1 Node Signatures": "comfyui", "Model: SAM 3.1": "sam3",
                      "ComfyUI-MatAnyone2": "matanyone2_node", "Model: MatAnyone2": "matanyone2_weights",
                      "Model: CoTracker3": "cotracker3", "Model: ViTMatte": "vitmatte", "ComfyUI-DepthCrafter-Nodes": "depthcrafter",
-                     BIREFNET_LABEL: "birefnet",
+                     BIREFNET_LABEL: "birefnet", SAPIENS2_LABEL: "sapiens2",
                      "ComfyUI-PlateMatte": "local_nodes", "ComfyUI-MatAnyone2-Keyframes": "local_nodes",
                      "Custom Nodes (Filesystem)": "local_nodes",
                      "Inpaint LaMa (comfyui-inpaint-nodes)": "inpaint_lama", "Model: LaMa (big-lama.pt)": "inpaint_lama",
@@ -368,6 +373,23 @@ class EnvironmentDoctor:
                 fix_suggestion="Utwórz venv narzędzia: python -m venv --system-site-packages .venv",
                 fix_command="python -m venv --system-site-packages .venv"
             )
+
+    def _other_comfy_on_port(self, url: str) -> Optional[str]:
+        """Two ComfyUIs on one machine (Desktop, git, portable) may both use 8188: the running server tells its
+        custom_nodes folder (/internal/folder_paths). Returns that folder when it is NOT the chosen comfy_dir's."""
+        want = self.config.get("comfy_dir") or ""
+        if not want:
+            return None
+        try:
+            req = urllib.request.Request(f"{url}/internal/folder_paths", headers={"User-Agent": "MatteDeskDoctor"})
+            with urllib.request.urlopen(req, timeout=1.5) as r:
+                dirs = json.loads(r.read().decode("utf-8")).get("custom_nodes") or []
+        except Exception:
+            return None   # older ComfyUI without the route: cannot tell, do not warn
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))
+        if not dirs or norm(Path(want) / "custom_nodes") in {norm(d) for d in dirs}:
+            return None
+        return str(Path(dirs[0]).parent)
 
     def check_gpu(self) -> CheckItem:
         """GPU as ComfyUI sees it (/system_stats): all GPU work (SAM 3.1, MatAnyone2, DepthCrafter, CoTracker3) runs in
@@ -586,12 +608,33 @@ class EnvironmentDoctor:
                             self.comfy_vram_gb = max(d.get("vram_total", 0) for d in data.get("devices", [])) / 1024 ** 3
                         except (ValueError, TypeError):
                             pass
-                        if p != comfy_port:  # the tool talks to config.json's port only
+                        if p != comfy_port:  # the tool talks to the configured port only
+                            other = self._other_comfy_on_port(url)   # which install answers there (2026-10-23)
+                            if other:
+                                return CheckItem(
+                                    name="ComfyUI Service", category="ComfyUI", status="error",
+                                    message=f"Na porcie {comfy_port} (ustawionym) ComfyUI nie odpowiada. Na {url} działa INNY "
+                                            f"ComfyUI ({other}) – nie ten wybrany ({self.config.get('comfy_dir') or '-'}).",
+                                    details={"url": url, "running_custom_nodes": other},
+                                    fix_suggestion="Uruchom wybrany ComfyUI („▶ Uruchom ComfyUI”) albo w „Używany ComfyUI” "
+                                                   f"wybierz tamten (folder {other}, port {p})."
+                                ), None
                             return CheckItem(
                                 name="ComfyUI Service", category="ComfyUI", status="error",
-                                message=f"ComfyUI działa na {url}, ale config.json ma comfy_port = {comfy_port}.",
+                                message=f"Wybrany ComfyUI działa na {url}, ale w MatteDesk ustawiony jest port {comfy_port}.",
                                 details={"url": url, "stats": data},
-                                fix_suggestion=f"Ustaw \"comfy_port\": {p} w config.json MatteDesk (albo zmień port w Comfy)."
+                                fix_suggestion=f"W Doktorze → „Używany ComfyUI” ustaw port {p} i „Zapisz”."
+                            ), url
+                        other = self._other_comfy_on_port(url)
+                        if other:
+                            return CheckItem(
+                                name="ComfyUI Service", category="ComfyUI", status="error",
+                                message=f"Na {url} działa INNY ComfyUI ({other}) niż wybrany w MatteDesk "
+                                        f"({self.config.get('comfy_dir') or '-'}). Węzły i modele trafią do wybranego, "
+                                        f"a liczy ten działający.",
+                                details={"url": url, "running_custom_nodes": other},
+                                fix_suggestion="Zamknij tamten ComfyUI albo w „Używany ComfyUI” wybierz go "
+                                               "(folder / port), albo uruchom go na innym porcie."
                             ), url
                         return CheckItem(
                             name="ComfyUI Service",
@@ -922,7 +965,36 @@ class EnvironmentDoctor:
                 details={"error": str(e)}
             )
 
+    def prewarm_python_checks(self) -> None:
+        """The ComfyUI-Python checks (ViTMatte, BiRefNet, Sapiens2, GPU alignment, CoTracker3) each start ComfyUI's Python and import
+        torch (~6 s each). Run them side by side, so the checks below only read their caches (~24 s -> ~7 s cold)."""
+        if self.simulation:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        from engine import align_gpu, birefnet, sapiens2
+        from engine import vitmatte as vm
+        from engine.installer import comfy_python
+        from engine.tracking import check_tracker_python
+        py = comfy_python(self.config)
+        if py is None:
+            return
+        jobs =[lambda: vm.check_worker_python(py, [vm.DEFAULT_MODEL]),
+                lambda: vm.check_worker_python(py, list(birefnet.MODELS.values()), worker=birefnet.WORKER),
+                lambda: vm.check_worker_python(py, [sapiens2.DEFAULT_MODEL], worker=sapiens2.WORKER),
+                lambda: align_gpu.check_worker(py),
+                lambda: check_tracker_python(py)]
+        with ThreadPoolExecutor(len(jobs)) as ex:
+            for fut in [ex.submit(j) for j in jobs]:
+                try:
+                    fut.result()
+                except Exception:
+                    pass   # the check itself reports it
+
     def check_model_weights(self) -> List[CheckItem]:
+        try:
+            self.prewarm_python_checks()
+        except Exception:
+            pass
         items: List[CheckItem] = []
         models_dir = Path(self.config.get("models_dir", "ComfyUI/models"))
         models_path = str(models_dir).replace("/", "\\")
@@ -1058,7 +1130,7 @@ class EnvironmentDoctor:
                 vm_where = "w Pythonie ComfyUI"
         except Exception as e:
             vm_ok, vm_dev, vm_cached, vm_where = False, str(e), [], ""
-        vm_need = ("Wymagane teraz: TAK – strefy z presetem „włosy” i silnik strefy „vitmatte”. Pobiera: wagi "
+        vm_need = ("Wymagane teraz: NIE – silnik ViTMatte w etapie 5 (wagi tylko niekomercyjne); bez niego etap 5 liczy BiRefNet_HR-matting / Lucida (wymagany). Pobiera: wagi "
                    "hustvl/vitmatte-base-composition-1k (~390 MB, cache Hugging Face); transformers tylko, jeśli ich brak "
                    "(ComfyUI ma je zwykle sam). Kliknij „Zainstaluj”. Opcjonalnie (wybór „Model” w palecie Strefa): "
                    "small / base – distinctions pobierają się same przy pierwszym użyciu (~100 / ~390 MB).")
@@ -1067,18 +1139,20 @@ class EnvironmentDoctor:
                                    message=f"ViTMatte gotowy (liczy {vm_where} na {vm_dev})",
                                    details={"device": vm_dev, "cached": vm_cached}))
         elif vm_ok:
-            items.append(CheckItem(name="Model: ViTMatte", category="Models", status="warning",
-                                   message=f"ViTMatte: brak wag w cache Hugging Face – pobiorą się przy 1. użyciu strefy "
+            items.append(CheckItem(name="Model: ViTMatte", category="Models", status="info",
+                                   message=f"Opcjonalne: ViTMatte – brak wag w cache Hugging Face – pobiorą się przy 1. użyciu strefy "
                                            f"(~390 MB); liczy {vm_where} na {vm_dev}",
                                    details={"device": vm_dev, "cached": vm_cached}, fix_suggestion=vm_need))
         else:
-            items.append(CheckItem(name="Model: ViTMatte", category="Models", status="warning",
-                                   message=f"ViTMatte niedostępny ({vm_dev}) – strefy z presetem „włosy” / silnikiem "
-                                           "„vitmatte” nie policzą się",
+            items.append(CheckItem(name="Model: ViTMatte", category="Models", status="info",
+                                   message=f"Opcjonalne: ViTMatte niedostępny ({vm_dev}) – etap 5 liczy "
+                                           "BiRefNet_HR-matting / Lucida",
                                    details={"reason": vm_dev}, fix_suggestion=vm_need))
 
-        # 4b. BiRefNet_HR-matting / Lucida – optional edge models of the ViTMatte zone engine (MIT weights, 2026-10-21)
+        # 4b. BiRefNet_HR-matting / Lucida – the REQUIRED stage-5 edge engine (MIT weights; ViTMatte optional since 2026-10-23)
         items.append(self.check_birefnet())
+        # 4c. Sapiens2-seg-0.4B – optional „Zaproponuj pas” (body parts -> band points, 2026-10-22)
+        items.append(self.check_sapiens2())
 
         # 5. Plate alignment on the GPU (engine/align_gpu_worker.py in ComfyUI's Python; numpy + torch only)
         items.append(self.check_align_gpu())
@@ -1087,9 +1161,9 @@ class EnvironmentDoctor:
 
     def check_birefnet(self) -> CheckItem:
         """BiRefNet_HR-matting / Lucida in ComfyUI's Python (engine/birefnet_worker.py): packages + weights in the HF cache.
-        Optional: chosen per zone in „Model” of the ViTMatte section – the commercial alternative to ViTMatte."""
+        Required since 2026-10-23 (user decision): the stage-5 edge engine that stays when ViTMatte is removed."""
         from engine import birefnet
-        need = ("Wymagane teraz: NIE – opcjonalny model krawędzi w strefie ViTMatte (paleta „Strefa” → „Model”). Do czego: "
+        need = ("Wymagane teraz: TAK – silnik krawędzi etapu 5 (zostaje, gdy ViTMatte jest usunięty). Do czego: "
                 "alternatywa ViTMatte do pracy komercyjnej (wagi MIT; wagi ViTMatte są tylko niekomercyjne). Pobiera: "
                 "BiRefNet_HR-matting 444 MB + Lucida 885 MB do cache Hugging Face; timm (~3 MB, czasem też kornia / einops) "
                 "do Pythona ComfyUI, tylko jeśli ich brak – PyTorch ComfyUI zostaje bez zmian. Kliknij „Zainstaluj”.")
@@ -1108,11 +1182,38 @@ class EnvironmentDoctor:
                              details={"device": dev, "cached": cached})
         if ok:
             miss = [n for n in names.values() if n not in have]
-            return CheckItem(name=BIREFNET_LABEL, category="Models", status="info",
-                             message=f"Opcjonalne: brak wag {', '.join(miss)}" + (f" (są: {', '.join(have)})" if have else ""),
+            return CheckItem(name=BIREFNET_LABEL, category="Models", status="warning",
+                             message=f"Brak wag {', '.join(miss)}" + (f" (są: {', '.join(have)})" if have else ""),
                              details={"device": dev, "cached": cached}, fix_suggestion=need)
-        return CheckItem(name=BIREFNET_LABEL, category="Models", status="info",
-                         message=f"Opcjonalne: BiRefNet_HR-matting / Lucida niedostępne w Pythonie ComfyUI ({dev})",
+        return CheckItem(name=BIREFNET_LABEL, category="Models", status="warning",
+                         message=f"BiRefNet_HR-matting / Lucida niedostępne w Pythonie ComfyUI ({dev}) – etap 5 bez nich "
+                                 "liczy tylko ViTMatte",
+                         details={"reason": dev}, fix_suggestion=need)
+
+    def check_sapiens2(self) -> CheckItem:
+        """Sapiens2-seg-0.4B in ComfyUI's Python (engine/sapiens2_worker.py): transformers with Sapiens2 + weights in the
+        HF cache. Optional: the „Zaproponuj pas (Sapiens2)” button of the band (people only)."""
+        from engine import sapiens2
+        need = ("Wymagane teraz: NIE – opcjonalny przycisk „Zaproponuj pas (Sapiens2)” przy punktach pasa (etapy 3 / 4 / 5 / 7): "
+                "rozpoznaje części ciała (włosy, skóra, ubranie) i ustawia pas sam – tylko dla ludzi. Pobiera: wagi "
+                "Sapiens2-seg-0.4B 1,63 GB do cache Hugging Face; potrzebuje transformers ≥ 5 w Pythonie ComfyUI (Doktor go nie "
+                "aktualizuje). Licencja Sapiens2 License (Meta): praca komercyjna dozwolona, zakaz nadzoru / biometrii / deepfake. "
+                "Kliknij „Zainstaluj”.")
+        try:
+            from engine.installer import comfy_python
+            from engine.vitmatte import check_worker_python
+            ok, dev, cached = check_worker_python(comfy_python(self.config), [sapiens2.DEFAULT_MODEL], worker=sapiens2.WORKER)
+        except Exception as e:
+            ok, dev, cached = False, str(e), []
+        if ok and sapiens2.DEFAULT_MODEL in cached:
+            return CheckItem(name=SAPIENS2_LABEL, category="Models", status="ok",
+                             message=f"Sapiens2-seg-0.4B gotowy (liczy w Pythonie ComfyUI na {dev})",
+                             details={"device": dev, "cached": cached})
+        if ok:
+            return CheckItem(name=SAPIENS2_LABEL, category="Models", status="info",
+                             message="Opcjonalne: brak wag Sapiens2-seg-0.4B", details={"device": dev}, fix_suggestion=need)
+        return CheckItem(name=SAPIENS2_LABEL, category="Models", status="info",
+                         message=f"Opcjonalne: Sapiens2 niedostępny w Pythonie ComfyUI ({dev})",
                          details={"reason": dev}, fix_suggestion=need)
 
     def check_align_gpu(self) -> CheckItem:

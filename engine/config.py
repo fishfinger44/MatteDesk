@@ -213,6 +213,51 @@ def set_comfy_flavor(flavor: str, profile: Optional[Dict[str, Any]] = None, loca
     return write_local(vals, local)
 
 
+DESKTOP_KEYS = ("comfy_dir", "models_dir", "comfy_port")
+
+
+def desktop_autodetect(appdata: Optional[str] = None, localappdata: Optional[str] = None) -> Dict[str, Any]:
+    """What load_config would find for ComfyUI Desktop with no paths set (the Doctor shows it as the default)."""
+    out: Dict[str, Any] = {}
+    base = desktop_base_path(appdata)
+    if base:
+        out["comfy_dir"] = base.replace("\\", "/")
+    d2 = desktop2_paths(appdata, localappdata)
+    out.setdefault("comfy_dir", d2.get("comfy_dir", ""))
+    out["models_dir"] = d2.get("models_dir") or (str(Path(out["comfy_dir"]) / "models").replace("\\", "/")
+                                                 if out["comfy_dir"] else "")
+    out["comfy_port"] = 8188 if d2 else DEFAULTS["comfy_port"]
+    return out
+
+
+def set_desktop_paths(values: Dict[str, Any], local: Optional[Path] = None) -> Path:
+    """Doctor: ComfyUI Desktop folders / port (top level of config.local.json). An empty value removes the key,
+    so the path is autodetected again. A folder must exist; the ComfyUI folder must hold main.py or custom_nodes/."""
+    local = LOCAL if local is None else local
+    cur = _read(local)
+    for k in DESKTOP_KEYS:
+        if k not in values:
+            continue
+        v = values[k]
+        if v in ("", None, 0):
+            cur.pop(k, None)
+            continue
+        if k == "comfy_port":
+            v = int(v)
+            if not 1 <= v <= 65535:
+                raise ValueError("port: 1–65535")
+        else:
+            v = str(v).strip().strip('"').replace("\\", "/")
+            p = Path(resolve_path(v))
+            if not p.is_dir():
+                raise ValueError(f"Nie ma folderu: {v}")
+            if k == "comfy_dir" and not ((p / "main.py").is_file() or (p / "custom_nodes").is_dir()):
+                raise ValueError(f"To nie jest folder ComfyUI (brak main.py i custom_nodes/): {v}")
+        cur[k] = v
+    local.write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return local
+
+
 RECENT_MAX = 5
 
 

@@ -230,3 +230,69 @@ def autostart(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if not cfg.get("comfy_autostart", True):
         return {"state": "idle", "autostart": False}
     return start_comfy(cfg)
+
+
+# ---------------------------------------------------------------------------- lost connection: probe + "Reload ComfyUI"
+# The UI keeps a banner up while ComfyUI is gone (user request 2026-10-23); its button kills a hung ComfyUI listening on
+# our port and starts the chosen one again. Only a local ComfyUI – a remote one (second PC) is restarted over there.
+
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0", "")
+_COMFY_EXES = ("python", "comfy")   # process names we may close (python*.exe, ComfyUI*.exe, Comfy Desktop*.exe)
+
+
+def comfy_probe(cfg: Dict[str, Any], timeout: float = 2.0) -> str:
+    """'up' (answers), 'down' (connection refused: closed / crashed) or 'busy' (accepts, no answer in time: busy or hung).
+    A bare TCP connect first: Windows refuses a closed localhost port only after ~2 s of SYN retries, so an HTTP timeout
+    alone cannot tell "down" from "busy"; a listening socket is accepted by the kernel even when ComfyUI hangs."""
+    import socket
+    host = str(cfg.get("comfy_host") or "127.0.0.1")
+    try:
+        socket.create_connection((host, int(cfg.get("comfy_port") or 8188)), timeout=max(timeout, 4.0)).close()
+    except OSError:
+        return "down"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(comfy_url(cfg) + "/system_stats",
+                                                           headers={"User-Agent": "MatteDesk"}), timeout=timeout) as r:
+            return "up" if r.status == 200 else "busy"
+    except Exception:
+        return "busy"
+
+
+def _kill_tree(pid: int, wait_s: float = 10.0) -> str:
+    """Close process `pid` and its children (psutil). Returns its name; RuntimeError when it is not a ComfyUI process."""
+    import psutil
+    p = psutil.Process(pid)
+    name = p.name()
+    if not any(t in name.lower() for t in _COMFY_EXES):
+        raise RuntimeError(f"Port ComfyUI zajmuje proces „{name}” (PID {pid}) – to nie ComfyUI, nie zamykam go.")
+    procs = p.children(recursive=True) + [p]
+    for c in procs:
+        try:
+            c.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(procs, timeout=wait_s)
+    return name
+
+
+def reload_comfy(cfg: Dict[str, Any], probe=None, pid_finder=None, killer=None, starter=None) -> Dict[str, Any]:
+    """'Przeładuj ComfyUI': a hung ComfyUI on our port is closed, then the chosen ComfyUI is started (start_comfy).
+    A ComfyUI that answers is left alone. Returns the launch state (the UI polls GET /api/comfy/launch)."""
+    from engine.sysinfo import pid_on_port
+    probe, pid_finder = probe or comfy_probe, pid_finder or pid_on_port
+    killer, starter = killer or _kill_tree, starter or start_comfy
+    if STATE.get("state") == "starting":
+        return dict(STATE)
+    host = str(cfg.get("comfy_host") or "127.0.0.1").lower()
+    if host not in _LOCAL_HOSTS:
+        raise RuntimeError(f"ComfyUI działa na innym komputerze ({host}) – zrestartuj go tam.")
+    if probe(cfg) == "up":
+        STATE.clear()
+        STATE.update(state="running", how="już działał", since=time.time())
+        return dict(STATE)
+    pid = pid_finder(int(cfg.get("comfy_port") or 8188))
+    killed = killer(pid) if pid else None
+    res = starter(cfg)
+    if killed:
+        res["killed"] = f"{killed} (PID {pid})"
+    return res

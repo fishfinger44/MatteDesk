@@ -366,3 +366,38 @@ def test_one_mask_source_chooser_2026_10_21():
         assert call in js, call
     order = [js.index(f"{{ k: '{k}', label:") for k in ("core", "matanyone", "videomama", "vitmatte", "ltx")]
     assert order == sorted(order)                    # one order everywhere: 1+2, 3, 4, 5, 7
+
+
+def test_band_preview_lines_only_2026_10_23():
+    """One band system (user decision 2026-10-22, report 2026-10-23): the band preview of stages 3 MatAnyone2 /
+    4 VideoMaMa / 5 ViTMatte / 7 LTX-2.5 is dashed lines only – no yellow / blue fill, also while a slider is held, and no
+    old yellow banner „Podgląd pasa krawędzi (…) – przed liczeniem”."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    zon = (STATIC / "zones.js").read_text(encoding="utf-8")
+    bp = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
+    # the old fill colours of the band (yellow 250,204,21 / blue 80,160,255) are gone from the band canvases
+    assert "function edgePvCanvas" not in obj and "px[i] = 250; px[i + 1] = 204" not in obj
+    ins = zon[zon.index("function insetCanvas("):zon.index("function bandPngEdges(")]
+    assert "p[o] = 250" not in ins and "p[o] = 80" not in ins and "bandEdgeCanvas(cls" in ins
+    assert "bandPngEdges," in zon and "window.MD_ZONES.bandPngEdges(ov)" in obj
+    # no banner from the stage-3 preview, no yellow / blue legend notes in stages 4 / 7
+    assert "przed liczeniem; wyłącz „👁 podgląd” w palecie Krawędź`" not in obj
+    assert "żółte = MatAnyone2 decyduje" not in obj and "Pas VideoMaMa: żółte" not in obj and "Pas LTX-2.5: żółte" not in obj
+    # a held slider draws the server lines (live, one request at a time) and falls back to the browser's band edges
+    assert "function drawLines(ctx, img, f, params, opts = {})" in bp and "opts.live" in bp
+    edge = obj[obj.index("function drawEdgePreview("):obj.index("function expPaletteHtml(")]
+    assert "drawLines(ctx, img, f, lp, { live: true })" in edge and "return '';" in edge
+    assert "drawLines(ctx, img, f, lp2, { live: true })" in obj
+    assert "drawLines(ctx, img, f, lp, { live: S.pvDrag === 'ltx' })" in obj
+
+
+def test_overlay_cache_keeps_newest_2026_10_23():
+    """Derived overlay canvases (tint / black-white / band edges): the cache keeps the NEWEST entries (measured
+    2026-10-23: the old `{ [ck]: c, ...slice(-12) }` kept the 12 oldest, every render of stage 4 recomputed its
+    overlays on the CPU, ~46 ms)."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    zon = (STATIC / "zones.js").read_text(encoding="utf-8")
+    for js in (obj, zon):
+        assert not re.search(r"compCache = \{ \[\w+\]: c, \.\.\.", js)
+    assert "function putComp(ck, c)" in obj and "slice(-(COMP_KEEP - 1))), [ck]: c }" in obj
+    assert "tintCanvas, putComp," in obj and "H.putComp(key, c)" in zon

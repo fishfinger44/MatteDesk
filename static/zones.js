@@ -178,6 +178,7 @@
       <div id="zpBaseSlot"></div>
       <div class="zp-pv"><label class="chk" title="Przerywany obrys obszaru ViTMatte (pas, w którym liczy) i podgląd „Wcięcie w rdzeń” przy przeciąganiu. Wyłącz, żeby oglądać sam wynik"><input type="checkbox" id="zpBandPv" title="Podgląd pasa ViTMatte na obrazie (wł. / wył.)"> 👁 podgląd pasa</label>
         <label class="chk" title="Zielona alfa podglądu strefy na obrazie (w wycięciu „Na tle” podgląd zostaje – to jest wynik)"><input type="checkbox" id="zpAlphaPv" title="Zielona alfa podglądu strefy (wł. / wył.)"> 👁 alfa strefy</label></div>
+      <div class="band-seed" id="z4BandSeed"></div>
       <div class="zp-none" id="zpNone"><span class="muted">Brak aktywnej strefy „matte”.</span>
         <button type="button" class="btn btn-primary btn-sm" id="zpNewOutline" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu (preset włosy). Potem zaznacz miejsca BEZ włosów tego obiektu (twarz, szyja, skóra) – ViTMatte ich nie liczy. Dłoń / obiekt z przodu: ustaw go w kolejności PRZED tym obiektem (holdout)">＋ Strefa ViTMatte: cały obrys</button>
         <button type="button" class="btn btn-secondary btn-sm" id="zpNewPaint" title="Nowa strefa ViTMatte: namaluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń). Obszar idzie za obiektem (CoTracker3, lokalnie); poprawka pędzlem w dowolnej klatce = klucz. Części obiektu (np. dłoń) są z obszaru wycinane same">🖌 Maluj obszar włosów (ViTMatte)</button>
@@ -196,9 +197,9 @@
           <div class="zp-band" id="z4BandRow"><button type="button" class="btn btn-ghost btn-xs" id="z4BandTool" style="display:none" title="Dodawanie punktów kontrolnych pasa (Esc = koniec): klik na obrazie przy obrysie = nowy punkt; dwa wąsy – żółty = pas na zewnątrz (w tło), niebieski = do środka (w obiekt); przeciągnij koniec wąsa = grubość w tej klatce (klucz), przeciągnij punkt = jego położenie (klucz); 0 / 0 = przerwa w pasie (np. skóra, dłoń). Między kluczami grubość się animuje, punkty śledzi CoTracker3. PPM na punkcie = usuń klucz tej klatki (ostatni klucz usuwa punkt)">＋ Dodaj punkt pasa</button>
             <button type="button" class="btn btn-ghost btn-xs" id="z4BandClear" title="Usuń wszystkie punkty bieżącej klatki kluczowej pasa (= usuń klatkę kluczową)">🗑 Usuń wszystkie punkty (ta klatka)</button>
             <span class="zp-hint" id="z4BandInfo"></span><div class="band-mode" id="z4BandMode"></div></div>
-          <label class="zone-slider" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="10" max="120" step="2" title="Jak daleko poza obrys rdzenia SAM 3.1 liczy ViTMatte (px plate'u). Podgląd na masce przy przeciąganiu: żółte = pas ViTMatte"><b id="z4OutV"></b></label>
+          <label class="zone-slider" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="10" max="120" step="2" title="Jak daleko poza obrys rdzenia SAM 3.1 liczy ViTMatte (px plate'u). Podgląd przy przeciąganiu: przerywane linie = krawędzie pasa ViTMatte"><b id="z4OutV"></b></label>
           <label class="zone-slider" id="z4OutFeatherRow">Wtopienie krawędzi zewn. <input type="range" id="z4OutFeather" min="0" max="80" step="1" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa (od strony tła) wynik strefy przechodzi w bazę – cieńsza przerywana linia na podglądzie. 0 = jak „Wtopienie wcięcia” (jedna wartość dla obu krawędzi, jak dotąd). Nie przelicza modelu – tylko nakładanie"><b id="z4OutFeatherV"></b></label>
-          <label class="zone-slider">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="30" step="1" title="Ile px w głąb rdzenia SAM 3.1 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px. Podgląd na masce przy przeciąganiu: niebieskie = pewne (1), żółte = pas, o którym decyduje ViTMatte. 0–2 = twardy obrys SAM 3.1"><b id="z4InsetV"></b></label>
+          <label class="zone-slider">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="30" step="1" title="Ile px w głąb rdzenia SAM 3.1 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px. Podgląd przy przeciąganiu: przerywane linie = krawędzie pasa, o którym decyduje ViTMatte (w środku pewne 1). 0–2 = twardy obrys SAM 3.1"><b id="z4InsetV"></b></label>
           <label class="zone-slider">Wtopienie wcięcia <input type="range" id="z4Feather" min="0" max="24" step="1" title="Na ilu px wynik ViTMatte przenika się z bazą (rdzeniem) przy granicach obszaru strefy – miękkie wtopienie wcięcia zamiast twardego przejścia. Działa na żywo w podglądzie (bez modelu) i przy „Zastosuj”. Domyślnie 8 px"><b id="z4FeatherV"></b></label>
           <div class="zp-excl" id="z4ExclRow"><span class="muted" title="Maski innych policzonych obiektów (alpha aktywnej wersji, bez niej rdzeń) wycinane z pasa ViTMatte – zostaje tam wynik bazowy. Dla części tego samego obiektu (twarz, szyja). Obiekt z przodu (dłoń) lepiej ustawić w kolejności przed tym obiektem: holdout = alfa 0 pod nim, a ViTMatte liczy włosy aż do jego krawędzi (CLIP2_A v069 vs v067)">Wyklucz obiekty</span><div id="z4Excl" class="zp-excl-list"></div></div></div>
         <div class="zone-tune-sec" id="z4TempSec"><span class="zp-sub">Wygładzanie w czasie</span>
@@ -475,19 +476,42 @@
     }
     return d;
   }
-  // n = inset, out = band outside (outline mode, 0 = none), both in plate px; the mask may be a proxy -> scaled to its width
+  // n = inset, out = band outside (outline mode, 0 = none), both in plate px; the mask may be a proxy -> scaled to its width.
+  // One band system (user decision 2026-10-22): the band is drawn as its dashed edges only, no fill (the old yellow / blue
+  // fill hid the edge being judged)
   function insetCanvas(dist, n, out) {
-    const c = document.createElement('canvas'); c.width = dist.w; c.height = dist.h;
     const ps = H.plateSize ? H.plateSize() : null; const k = ps && ps[0] ? dist.w / ps[0] : 1;
-    const g = c.getContext('2d'); const im = g.createImageData(dist.w, dist.h); const p = im.data;
     const lim = n * 3 * k, limOut = (out || 0) * 3 * k;   // chamfer units
-    for (let i = 0; i < dist.d.length; i++) {
-      const o = i * 4;
-      if (dist.inside[i]) {
-        if (dist.d[i] > lim) { p[o] = 80; p[o + 1] = 160; p[o + 2] = 255; p[o + 3] = 90; } else { p[o] = 250; p[o + 1] = 204; p[o + 2] = 21; p[o + 3] = 170; }
-      } else if (limOut && dist.dOut[i] <= limOut) { p[o] = 250; p[o + 1] = 204; p[o + 2] = 21; p[o + 3] = 110; }
+    const cls = new Uint8Array(dist.d.length);   // 0 outside, 1 band, 2 kept core
+    for (let i = 0; i < cls.length; i++) {
+      if (dist.inside[i]) cls[i] = dist.d[i] > lim ? 2 : 1;
+      else if (limOut && dist.dOut[i] <= limOut) cls[i] = 1;
+    }
+    return bandEdgeCanvas(cls, dist.w, dist.h);
+  }
+  // dashed edges of the band class (1) of a class image: a band pixel next to another class is an edge pixel, dashed
+  // along x + y (the same yellow as the server's band lines)
+  function bandEdgeCanvas(cls, w, h) {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); const im = g.createImageData(w, h); const p = im.data;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x; if (cls[i] !== 1 || ((x + y) & 15) >= 10) continue;
+      if ((x > 0 && cls[i - 1] !== 1) || (x < w - 1 && cls[i + 1] !== 1) || (y > 0 && cls[i - w] !== 1) || (y < h - 1 && cls[i + w] !== 1)) {
+        const o = i * 4; p[o] = 255; p[o + 1] = 212; p[o + 2] = 0; p[o + 3] = 240;
+      }
     }
     g.putImageData(im, 0, 0); return c;
+  }
+  // a server band PNG (255 kept / 128 band / 0 outside) -> its dashed band edges
+  function bandPngEdges(img) {
+    const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+    if (!w || !h) return null;
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+    const px = g.getImageData(0, 0, w, h).data;
+    const cls = new Uint8Array(w * h);
+    for (let i = 0; i < cls.length; i++) { const v = px[i * 4]; cls[i] = v > 200 ? 2 : v > 90 ? 1 : 0; }
+    return bandEdgeCanvas(cls, w, h);
   }
   async function patchTune(upd, what, opts = {}) {
     const z = activeMatte(); if (!z) return;
@@ -995,7 +1019,7 @@
     const cc = S().compCache;
     if (cc[key]) return cc[key];
     const c = make();
-    S().compCache = { [key]: c, ...Object.fromEntries(Object.entries(cc).slice(-12)) };
+    H.putComp(key, c);   // the newest kept (objects.js putComp)
     return c;
   }
   function trimapCanvas(ov, key) {
@@ -1364,7 +1388,7 @@
           ctx.setLineDash([]);
         }
       }
-      if (Z.inset && (bandPvGet() || Z.inset.live) && !(isOutline(z) && bandPts(z).length)) {   // "Pas na zewnątrz" / "Wcięcie w rdzeń" band (blue = sure 1, yellow = ViTMatte's band), any frame; while dragging also with the band preview off (2026-10-17)
+      if (Z.inset && (bandPvGet() || Z.inset.live) && !(isOutline(z) && bandPts(z).length)) {   // "Pas na zewnątrz" / "Wcięcie w rdzeń" band (dashed band edges, no fill – one band system 2026-10-22), any frame; while dragging also with the band preview off (2026-10-17)
         // a group: the core the zone is computed on (members joined with the seam, as stages 3 / 4), not the object's
         // own core – that one has a hole where the hand is, the band went round it (user report 2026-10-21)
         const kind = groupMembers().length ? 'zone_core' : 'core';
@@ -1788,9 +1812,10 @@
   window.MD_ZONES = {
     hasKeyAt, deleteKeyAt, previewMatte, refreshPreview, onTool,
     get alphaPvOn() { return Z.ov !== 'none'; },   // „👁 alfa strefy” – objects.js hides the stage preview tint with it (2026-10-22)
-    // instant band from a mask (blue = stays, yellow = the model decides): objects.js uses it for the MatAnyone band
-    // while its slider is dragged – the exact (adaptive) band comes from the server after the release (2026-10-17)
+    // instant band from a mask (dashed band edges, no fill): objects.js uses it for the stage 3 / 4 band while a slider
+    // is dragged – the exact (adaptive, band points) lines come from the server (2026-10-17, lines 2026-10-23)
     liveBand(maskImg, key, inPx, outPx) { const d = coreDistance(maskImg, key); return d ? insetCanvas(d, inPx, outPx) : null; },
+    bandPngEdges,   // a server band PNG as dashed edges (objects.js: previews without a lines endpoint, e.g. LTX-2.5 region)
     compareMode(covers) {   // objects.js 'md-compare': band / zone alpha off in the cut-out view, previous state back after it
       if (covers) { Z.beforeComp = { band: bandPvGet(), ov: Z.ov, off: Z.ovUserOff }; bandPvSet(false); if (Z.ov !== 'none') setOv('none'); }
       else if (Z.beforeComp) { const b = Z.beforeComp; Z.beforeComp = null; bandPvSet(b.band); Z.ovUserOff = b.off; setOv(b.ov || 'none'); }

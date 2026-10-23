@@ -10,7 +10,7 @@ Repair the plates once. Generate alpha mattes for multiple objects – the tool 
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
-[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.35/MatteDesk-0.35-setup.exe)
+[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.36/MatteDesk-0.36-setup.exe)
 
 Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all versions: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -129,7 +129,12 @@ measured against the image gradient. After two failed automatic attempts the too
 ### 🩺 Environment Doctor
 The **Doctor** button checks ComfyUI, nodes, models, ffmpeg and the GPU. When something is missing it opens by itself at start-up and
 gives each item an **Install** button with a progress bar (MB, speed, time left), plus a batch **"Install all missing"**.
-It also switches between **ComfyUI Desktop** and **ComfyUI from git**, and shows the licence of every third-party component.
+It also switches between **ComfyUI Desktop** and **ComfyUI from git** (folder, models folder and port editable for both; empty = detected
+automatically), warns when a **different** ComfyUI answers on the port (two installs on one machine), and shows the licence of every
+third-party component. **Installed models** (LTX-2.5, VideoMaMa, MatAnyone2, ViTMatte, Sapiens2, MiniMax-Remover, LaMa) get a 🗑 button that
+deletes **only their weights** after showing every file and its size – the stage that needs the model is then locked. SAM 3.1,
+CoTracker3 and BiRefNet_HR-matting / Lucida (the stage-5 edge engine that stays without ViTMatte) have no bin. Nothing installs by
+itself – only on a click.
 
 ### 🐞 Report a problem
 The **🐞 Report a problem** button (in the header, in the "About" window and in every error window) sends the author a short
@@ -181,6 +186,7 @@ whether an edge is good) stay with the artist in the UI. Exports and other write
 | **CoTracker3** (package for ComfyUI's Python + weights) | pip `--no-deps` + Hugging Face `facebook/cotracker3` | 100 MB | recommended |
 | **ViTMatte** weights ("hair" zones / `vitmatte` engine; runs in ComfyUI's Python) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, only if missing) | 390 MB | ✅ for hair zones (weights **non-commercial only** – Adobe-trained) |
 | **BiRefNet_HR-matting / Lucida** weights (optional edge models of the ViTMatte zone, MIT – for commercial work; ComfyUI's Python) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, only if missing) | 444 + 885 MB | ❌ optional |
+| **Sapiens2-seg-0.4B** weights (optional „Propose band” – body parts → band points, people only; Sapiens2 License, commercial use allowed; ComfyUI's Python with transformers ≥ 5) | Hugging Face `facebook/sapiens2-seg-0.4b` | 1.63 GB | ❌ optional |
 | **Plate alignment on the GPU** (`engine/align_gpu_worker.py` in ComfyUI's Python; check only – uses ComfyUI's torch and CUDA) | – | 0 | no (speed-up; CPU otherwise) |
 | **VideoHelperSuite** nodes (`VHS_LoadImagesPath` – 8-bit PNG/JPG shots in SAM 3.1, MatAnyone2, zones) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + its requirements (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ for 8-bit shots |
 | **DepthCrafter** nodes ("Depth" feature) | GitHub `akatz-ai` (the 4–6 GB model downloads on first use) | < 1 MB | optional |

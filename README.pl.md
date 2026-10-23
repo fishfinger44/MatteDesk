@@ -10,7 +10,7 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.35/MatteDesk-0.35-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.36/MatteDesk-0.36-setup.exe)
 
 Windows 10 / 11 · karta NVIDIA · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -179,6 +179,7 @@ dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej 
 | **CoTracker3** (pakiet do Pythona ComfyUI + wagi) | pip `--no-deps` + Hugging Face `facebook/cotracker3` | 100 MB | zalecane |
 | Wagi **ViTMatte** (strefy „włosy” / silnik `vitmatte`; liczy się w Pythonie ComfyUI) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, tylko gdy brak) | 390 MB | ✅ dla stref włosów (wagi **tylko niekomercyjnie** – trenowane na zbiorze Adobe) |
 | Wagi **BiRefNet_HR-matting / Lucida** (opcjonalne modele krawędzi strefy ViTMatte, MIT – do pracy komercyjnej; Python ComfyUI) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, tylko gdy brak) | 444 + 885 MB | ❌ opcjonalne |
+| Wagi **Sapiens2-seg-0.4B** (opcjonalne „Zaproponuj pas” – części ciała → punkty pasa, tylko ludzie; Sapiens2 License, komercyjnie OK; Python ComfyUI z transformers ≥ 5) | Hugging Face `facebook/sapiens2-seg-0.4b` | 1,63 GB | ❌ opcjonalne |
 | **Wyrównanie plate'ów na GPU** (`engine/align_gpu_worker.py` w Pythonie ComfyUI; tylko sprawdzenie – używa torcha i CUDA z ComfyUI) | – | 0 | nie (przyspieszenie; bez tego CPU) |
 | Węzły **VideoHelperSuite** (`VHS_LoadImagesPath` – ujęcia 8-bit PNG/JPG w SAM 3.1, MatAnyone2, strefach) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + jego wymagania (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ dla ujęć 8-bit |
 | Węzły **DepthCrafter** (funkcja „Głębia”) | GitHub `akatz-ai` (model 4–6 GB pobiera się przy 1. użyciu) | < 1 MB | opcjonalnie |

@@ -93,7 +93,9 @@ class MatteDeskViewer {
       <div><a href="${this.esc(u.changelog)}" target="_blank" rel="noopener" style="color:#e8a33d;">Pełna lista zmian (CHANGELOG)</a> ·
         <a href="${this.esc(u.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">strona wydania</a></div>
       <div style="margin-top:8px;color:#9a9aa0;">${inst ? 'Zaktualizuj = pobranie instalatora i jego uruchomienie; MatteDesk się zamknie, ustawienia zostają.'
-        : 'Kopia z gita: zaktualizuj przez <code>git pull</code> w folderze MatteDesk i uruchom MatteDesk ponownie.'}</div>
+        : u.kind === 'zip'
+          ? `Kopia z pliku ZIP: <a href="${this.esc(u.zip_url || u.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">pobierz nowy ZIP</a> i rozpakuj go na stary folder MatteDesk (ustawienia z <code>config.local.json</code> zostają – nie ma go w ZIP-ie), zamknij MatteDesk i uruchom nowy <code>start_v${this.esc(u.version)}.bat</code>.${u.setup ? ` Wygodniej: <a href="${this.esc(u.setup.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">instalator</a> – kolejne aktualizacje jednym kliknięciem.` : ''}`
+          : `Kopia z gita: zaktualizuj przez <code>git pull</code> w folderze MatteDesk, zamknij MatteDesk i uruchom nowy <code>start_v${this.esc(u.version)}.bat</code> (stary skrót do <code>.bat</code> przestanie działać).`}</div>
       <label style="display:block;margin-top:8px;"><input type="checkbox" id="updSkip"> Nie przypominaj o tej wersji</label>`;
     const yes = await this.uiDialog({ title: `Nowa wersja MatteDesk ${u.version}`, html, ok: inst ? 'Zaktualizuj' : 'OK', cancel: 'Później', tone: 'info' });
     const skip = document.getElementById('updSkip');
@@ -1826,7 +1828,7 @@ class MatteDeskViewer {
   showInstallResults(results) {
     const names = { nodes: 'Węzły MatteDesk (PlateMatte, MatAnyone2-Keyframes)', matanyone2_node: 'Węzeł ComfyUI-MatAnyone2',
       inpaint_nodes: 'Węzły inpaint (LaMa)', depthcrafter_nodes: 'Węzły DepthCrafter', minimax_nodes: 'Węzły MiniMax-Remover', vhs_nodes: 'Węzły VideoHelperSuite', minimax_weights: 'Wagi MiniMax-Remover', sam3: 'Wagi SAM3.1', matanyone2_weights: 'Wagi MatAnyone2', lama: 'Wagi LaMa',
-      cotracker: 'CoTracker3', vitmatte: 'ViTMatte', birefnet: 'BiRefNet_HR-matting / Lucida', ltx: 'Modele LTX-2.5 Alpha-Gen', videomama: 'VideoMaMa (węzeł + wagi)', restart_comfy: 'Restart ComfyUI' };
+      cotracker: 'CoTracker3', vitmatte: 'ViTMatte', birefnet: 'BiRefNet_HR-matting / Lucida', sapiens2: 'Sapiens2-seg-0.4B', ltx: 'Modele LTX-2.5 Alpha-Gen', videomama: 'VideoMaMa (węzeł + wagi)', restart_comfy: 'Restart ComfyUI' };
     const allOk = results.every((r) => r.ok);
     const needsRestart = results.some((r) => r.ok && ['nodes', 'matanyone2_node', 'inpaint_nodes', 'depthcrafter_nodes', 'minimax_nodes', 'vhs_nodes', 'videomama'].includes(r.what));
     const rows = results.map((r) => {
@@ -1912,8 +1914,9 @@ class MatteDeskViewer {
         install_git: ['git', 'Wymagane teraz: TAK – Doktor klonuje nim węzły ComfyUI z GitHuba (MatAnyone2, VideoHelperSuite, DepthCrafter) i instaluje CoTracker3. Instaluje Git for Windows przez winget (Git.Git, ok. 60 MB, akceptuje jego licencję w Twoim imieniu); Windows może zapytać o zgodę administratora.'],
         install_nodes: ['nodes', 'Kopiuje węzły PlateMatte i MatAnyone2-Keyframes do custom_nodes ComfyUI (stara wersja → backups/).'],
         install_cotracker: ['cotracker', 'Instaluje pakiet CoTracker3 w Pythonie ComfyUI (< 1 MB, PyTorch ComfyUI zostaje bez zmian) i pobiera wagi scaled_offline.pth (97 MB). CoTracker3 liczy się potem na GPU przez ComfyUI.'],
-        install_vitmatte: ['vitmatte', 'Wymagane teraz: TAK – strefy z presetem „włosy” i silnik „vitmatte”. Pobiera wagi ViTMatte (hustvl/vitmatte-base-composition-1k, ~390 MB) do cache Hugging Face; transformers doinstaluje w Pythonie ComfyUI tylko, jeśli ich brak. ViTMatte liczy się potem na GPU w Pythonie ComfyUI.'],
-        install_birefnet: ['birefnet', 'Wymagane teraz: NIE – opcjonalny model krawędzi w strefie ViTMatte (wagi MIT, do pracy komercyjnej). Pobiera BiRefNet_HR-matting (444 MB) i Lucida (885 MB) do cache Hugging Face; timm (~3 MB, czasem kornia / einops) doinstaluje w Pythonie ComfyUI tylko, jeśli ich brak – PyTorch ComfyUI bez zmian.'],
+        install_vitmatte: ['vitmatte', 'Wymagane teraz: NIE – silnik ViTMatte w etapie 5 (wagi tylko niekomercyjne); bez niego etap 5 liczy BiRefNet_HR-matting / Lucida. Pobiera wagi ViTMatte (hustvl/vitmatte-base-composition-1k, ~390 MB) do cache Hugging Face; transformers doinstaluje w Pythonie ComfyUI tylko, jeśli ich brak. ViTMatte liczy się potem na GPU w Pythonie ComfyUI.'],
+        install_birefnet: ['birefnet', 'Wymagane teraz: TAK – silnik krawędzi etapu 5 (wagi MIT, do pracy komercyjnej; zostaje, gdy ViTMatte jest usunięty). Pobiera BiRefNet_HR-matting (444 MB) i Lucida (885 MB) do cache Hugging Face; timm (~3 MB, czasem kornia / einops) doinstaluje w Pythonie ComfyUI tylko, jeśli ich brak – PyTorch ComfyUI bez zmian.'],
+        install_sapiens2: ['sapiens2', 'Wymagane teraz: NIE – opcjonalny przycisk „Zaproponuj pas (Sapiens2)” przy punktach pasa (tylko ludzie). Pobiera wagi Sapiens2-seg-0.4B (1,63 GB) do cache Hugging Face; potrzebuje transformers ≥ 5 w Pythonie ComfyUI (Doktor go nie aktualizuje). Licencja Sapiens2 License (Meta): komercyjnie OK, zakaz nadzoru / biometrii / deepfake.'],
         install_sam3: ['sam3','Pobiera wagi SAM 3.1 (sam3.1_multiplex_fp16.safetensors, ~1,7 GB) z huggingface.co/Comfy-Org/sam3.1 do models/checkpoints.'],
         install_matanyone2_weights: ['matanyone2_weights', 'Pobiera wagi MatAnyone2 (matanyone2.pth, ~135 MB) z github.com/pq-yang/MatAnyone2 do models/matanyone2.'],
         install_matanyone2_node: ['matanyone2_node', 'Klonuje węzeł ComfyUI-MatAnyone2 (github.com/spiritform/comfy-matanyone2) do custom_nodes ComfyUI (jeśli go nie ma), instaluje jego wymagania i uruchamia jego install.py w Pythonie ComfyUI (pakiet matanyone2 z GitHub pq-yang/MatAnyone2, hydra-core, thinplate; kilka MB, PyTorch bez zmian).'],
@@ -1938,7 +1941,7 @@ class MatteDeskViewer {
         // not items only waiting for a ComfyUI restart
         // MiniMax-Remover: future Inpainting module, not used by the program yet -> only its own buttons
         // LTX-2.5: optional stage 6, ~40 GB behind a Hugging Face login -> only its own button
-        const notInBatch = ['minimax_nodes', 'minimax_weights', 'ltx', 'videomama', 'birefnet'];
+        const notInBatch = ['minimax_nodes', 'minimax_weights', 'ltx', 'videomama', 'vitmatte', 'sapiens2'];   // BiRefNet required, ViTMatte optional (2026-10-23)
         if (act && !isRestart && !notInBatch.includes(act[0]) && (it.status === 'error' || it.status === 'warning')
             && !required.some((r) => r[0] === act[0])) { required.push(act); if (it.status === 'error') nRequired++; }
         // third-party licence: the user downloads the component and accepts its licence (non-commercial ones highlighted)
@@ -1972,7 +1975,10 @@ class MatteDeskViewer {
       try {
         const cc = await (await fetch('/api/config/comfy')).json();
         const pf = cc.git || {};
+        const dk = cc.desktop || {};
+        const da = cc.desktop_auto || {};
         const isP = cc.flavor === 'git';
+        const q = (v) => String(v || '').replace(/"/g, '&quot;');
         const inp = 'style="background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-radius:4px;padding:2px 6px;font-size:12px;"';
         html = `<div style="margin-bottom:12px;padding:10px;border:1px solid #3c3c42;border-radius:6px;font-size:12px;">
           <b>Używany ComfyUI:</b>
@@ -1982,6 +1988,13 @@ class MatteDeskViewer {
             port: <input id="comfyPortPort" size="5" value="${pf.comfy_port || 8188}" ${inp}>
             <label><input type="checkbox" id="comfyPortShared"${pf.shared_models ? ' checked' : ''}> modele wspólne z Desktopem</label>
           </span>
+          <div id="comfyDesktopBox" style="display:${isP ? 'none' : 'block'};margin-top:6px;">
+            folder ComfyUI (z main.py / custom_nodes): <input id="comfyDeskDir" size="52" value="${q(dk.comfy_dir)}" placeholder="auto: ${q(da.comfy_dir || 'nie wykryto')}" ${inp}>
+            modele: <input id="comfyDeskModels" size="44" value="${q(dk.models_dir)}" placeholder="auto: ${q(da.models_dir || 'nie wykryto')}" ${inp}>
+            port: <input id="comfyDeskPort" size="5" value="${q(dk.comfy_port)}" placeholder="${q(da.comfy_port || 8188)}" ${inp}>
+            <button class="btn btn-secondary" id="comfyDeskAuto" style="padding:2px 8px;font-size:12px;" title="Czyści pola – ścieżki i port wykrywane automatycznie">Wykryj automatycznie</button>
+            <span style="color:#9a9aa0;">puste pole = wykryte automatycznie</span>
+          </div>
           <label style="margin-left:10px;"><input type="checkbox" id="comfyAutostart"${cc.autostart === false ? '' : ' checked'}> uruchamiaj ComfyUI razem z MatteDesk</label>
           <label style="margin-left:10px;">okno MatteDesk: <select id="appBrowserSel" ${inp}><option value="default"${cc.app_browser === 'edge' ? '' : ' selected'}>domyślna przeglądarka</option><option value="edge"${cc.app_browser === 'edge' ? ' selected' : ''}>Edge</option></select></label>
           <label style="margin-left:10px;"><input type="checkbox" id="updCheckBox"${cc.update_check === false ? '' : ' checked'}> sprawdzaj aktualizacje MatteDesk przy starcie</label>
@@ -2004,16 +2017,58 @@ class MatteDeskViewer {
         html = `<div style="margin-bottom:12px;padding:10px;border:2px solid #ef4444;border-radius:6px;background:rgba(239,68,68,.12);font-weight:600;">
           ⚠ ${this.serverStale} Raport może być niepełny (brak przycisków, „port undefined”). Zamknij okno konsoli MatteDesk i uruchom ponownie <code>start_v….bat</code>.</div>` + html;
       }
+      // 🗑 weights of optional models (2026-10-23): only weights – nodes / packages stay; required models have no bin
+      let removable = [];
+      try { removable = (await (await fetch('/api/models/removable')).json()).models || []; } catch (e) { removable = []; }
+      const gb = (b) => (b >= 1e9 ? `${(b / 2 ** 30).toFixed(1).replace('.', ',')} GB` : `${Math.max(1, Math.round(b / 2 ** 20))} MB`);
+      if (removable.length) {
+        html += `<div style="margin-top:14px;padding:10px;border:1px solid #3c3c42;border-radius:6px;font-size:12px;">
+          <b>Zainstalowane modele opcjonalne</b> <span style="color:#9a9aa0;">– 🗑 usuwa tylko wagi (węzły ComfyUI zostają); wymagane modele nie mają kosza. Ponowna instalacja: „Zainstaluj” wyżej.</span>
+          ${removable.map((m) => `<div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+            <span style="flex:1;">${this.esc(m.label)} <span style="color:#9a9aa0;">· ${gb(m.bytes)} · ${this.esc(m.affects)}</span></span>
+            <button class="btn btn-secondary doctor-trash" data-key="${this.esc(m.key)}" style="padding:2px 10px;font-size:12px;" title="Usuń wagi ${this.esc(m.label)} (${gb(m.bytes)}) – przed usunięciem zobaczysz listę plików">🗑 Usuń</button></div>`).join('')}
+        </div>`;
+      }
       this.doctorReportContent.innerHTML = html;
+      this.doctorReportContent.querySelectorAll('.doctor-trash').forEach((b) => b.addEventListener('click', async () => {
+        const m = removable.find((x) => x.key === b.dataset.key);
+        if (!m) return;
+        const files = m.paths.map((p) => `<li><code style="word-break:break-all;">${this.esc(p.path)}</code> – ${gb(p.bytes)}</li>`).join('');
+        const yes = await this.uiDialog({ title: `Usunąć wagi ${m.label}?`, tone: 'warn',ok: `Usuń (${gb(m.bytes)})`, cancel: 'Anuluj',
+          html: `Pliki zostaną usunięte z dysku na stałe (bez kosza Windows):<ul style="margin:6px 0 6px 18px;padding:0;">${files}</ul>
+                 Przestanie działać: ${this.esc(m.affects)}. Węzły ComfyUI zostają – model wróci po „Zainstaluj”.` });
+        if (!yes) return;
+        b.disabled = true; b.textContent = 'Usuwam…';
+        const r = await fetch('/api/models/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: m.key }) });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || (d.errors && d.errors.length)) {
+          await this.uiDialog({ title: 'Nie wszystko usunięto', tone: 'error', html: this.esc(d.detail || (d.errors || []).join('\n')).replace(/\n/g, '<br>') });
+        } else {
+          await this.uiDialog({ title: `Usunięto wagi ${m.label}`, tone: 'ok', html: `Zwolniono ${gb(d.freed_bytes || 0)}.` });
+        }
+        this.fetchDoctorReport(); this.checkDoctorStatus();
+      }));
       const flSel = document.getElementById('comfyFlavorSel');
       if (flSel) {
-        flSel.addEventListener('change', () => { document.getElementById('comfyGitBox').style.display = flSel.value === 'git' ? 'inline' : 'none'; });
+        flSel.addEventListener('change', () => {
+          document.getElementById('comfyGitBox').style.display = flSel.value === 'git' ? 'inline' : 'none';
+          document.getElementById('comfyDesktopBox').style.display = flSel.value === 'git' ? 'none' : 'block';
+        });
+        document.getElementById('comfyDeskAuto').addEventListener('click', () => {
+          ['comfyDeskDir', 'comfyDeskModels', 'comfyDeskPort'].forEach((id) => { document.getElementById(id).value = ''; });
+        });
         document.getElementById('comfySaveBtn').addEventListener('click', async () => {
           const body = { flavor: flSel.value, autostart: document.getElementById('comfyAutostart').checked };
           if (flSel.value === 'git') {
             body.comfy_dir = document.getElementById('comfyPortDir').value.trim();
             body.comfy_port = parseInt(document.getElementById('comfyPortPort').value, 10) || 8188;
             body.shared_models = document.getElementById('comfyPortShared').checked;
+          } else {
+            body.desktop = {
+              comfy_dir: document.getElementById('comfyDeskDir').value.trim(),
+              models_dir: document.getElementById('comfyDeskModels').value.trim(),
+              comfy_port: parseInt(document.getElementById('comfyDeskPort').value, 10) || 0,
+            };
           }
           fetch('/api/config/app_browser', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ app_browser: document.getElementById('appBrowserSel').value }) });
           fetch('/api/update/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: document.getElementById('updCheckBox').checked }) });

@@ -1,5 +1,28 @@
 # MatteDesk – changelog
 
+## 0.36 – 2026-10-23
+- **New: "Propose band (Sapiens2)"** – Sapiens2-seg-0.4B recognises body parts in the frame and sets the band points of the
+  object band: wide on hair, narrow on clothes, thin on skin (never less than the automatic width). People only; one key frame,
+  CoTracker3 tracks the points, you fix them with the whiskers. Optional model (Sapiens2 License, commercial use allowed).
+- **ComfyUI lost connection:** a banner in the middle of the screen with "Reload ComfyUI"; the footer shows the live ComfyUI status.
+- **Band preview:** dashed lines only in stages 3 / 4 / 5 / 7, also while a slider is held.
+- **Doctor – ComfyUI Desktop paths:** the ComfyUI folder, the models folder and the port of ComfyUI Desktop can be changed in
+  "ComfyUI in use" (empty field = detected automatically, the detected value is shown greyed out).
+- **Doctor – two ComfyUIs on one machine** (Desktop, portable, from git): the Doctor asks the running ComfyUI for its folder and
+  warns when a DIFFERENT install answers on the port – on the configured port or on another one.
+- **Doctor opens faster:** the checks that start ComfyUI's Python run side by side and are prepared in the background at start-up
+  (first open ~24 s → under 1 s).
+- **Doctor – delete model weights:** installed models get a 🗑 button (LTX-2.5, VideoMaMa, MatAnyone2, ViTMatte, Sapiens2,
+  MiniMax-Remover, LaMa). It lists every file with its size first and deletes only the weights – ComfyUI nodes stay; the stage that
+  needs the model is then locked. SAM 3.1, CoTracker3 and BiRefNet_HR-matting / Lucida have no bin.
+- **BiRefNet_HR-matting / Lucida is now the required stage-5 edge engine** (MIT weights, included in "Install all missing");
+  ViTMatte (non-commercial weights) is optional.
+- **"Propose band (Sapiens2)"** is always shown under "👁 band preview" in stages 3 / 4 / 5 / 7, with a new icon; without the
+  model it is greyed out with a hint to install it in the Doctor.
+- **Report a problem:** after "Send" the window closes and a confirmation with OK opens (before, the status line was out of view).
+- **Update window:** a copy downloaded as a source ZIP gets a link to the new ZIP and to the installer instead of "git pull";
+  a git copy is told to start the new `start_v<version>.bat`.
+
 ## 0.35 – 2026-10-22
 - **Final Touch (stage 8):** paint corrections over any computed alpha – add / remove / eraser with pen pressure, kept as strokes
   per frame; black / white / gamma / erode / blur and motion blur whose strength is measured on the plate; export source "Final Touch".

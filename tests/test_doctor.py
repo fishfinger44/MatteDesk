@@ -149,3 +149,17 @@ def test_licence_summary_matches_licences():
         assert (use == "research") == nc, name
     assert {r["name"]: r["use"] for r in rows}["ViTMatte"] == "research"
     assert {r["name"]: r["use"] for r in rows}["BiRefNet_HR-matting / Lucida"] == "commercial"
+
+
+def test_doctor_detects_another_comfy_on_the_port(monkeypatch, tmp_path):
+    """Desktop + git / portable on one machine, both on 8188: the running server's custom_nodes folder decides."""
+    import io
+    import urllib.request
+    mine, other = tmp_path / "Desktop" / "ComfyUI", tmp_path / "ComfyUI_git"
+    running = {"custom_nodes": [str(other / "custom_nodes")]}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=0: io.BytesIO(json.dumps(running).encode()))
+    doc = EnvironmentDoctor()
+    doc.config["comfy_dir"] = str(mine)
+    assert doc._other_comfy_on_port("http://127.0.0.1:8188") == str(other)
+    running["custom_nodes"] = [str(mine / "custom_nodes")]
+    assert doc._other_comfy_on_port("http://127.0.0.1:8188") is None

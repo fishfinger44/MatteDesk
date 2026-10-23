@@ -557,6 +557,31 @@ def install_vitmatte(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.r
     return {"success": True, "log": log, "model": mid}
 
 
+def install_sapiens2(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.run, python: Optional[str] = None
+                     ) -> Dict[str, Any]:
+    """Sapiens2-seg-0.4B (optional „Zaproponuj pas”, Sapiens2 License) in ComfyUI's Python (engine/sapiens2_worker.py):
+    needs transformers with Sapiens2 (5.x) there – never upgraded here (it could break other nodes); the weights go into
+    the Hugging Face cache (1.63 GB)."""
+    from engine import sapiens2
+    log: List[str] = []
+    py = python or (str(comfy_python(cfg)) if comfy_python(cfg) else "")
+    if not py:
+        return {"success": False, "log": ["Nie znaleziono Pythona ComfyUI (ustaw comfy_dir / comfy_python w config.local.json)."]}
+    r = run([py, "-c", "from transformers import Sapiens2ForSemanticSegmentation"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return {"success": False, "log": ["W Pythonie ComfyUI brak transformers z Sapiens2 (potrzebny transformers ≥ 5) – Doktor "
+                                          "go nie aktualizuje (mógłby zepsuć inne węzły). Zaktualizuj ComfyUI."]}
+    _step(f"wagi {sapiens2.DEFAULT_MODEL} (cache Hugging Face, 1,63 GB)")
+    r = run([py, "-I", str(sapiens2.WORKER), "--download", sapiens2.DEFAULT_MODEL], capture_output=True, text=True)
+    log.append(f"wagi {sapiens2.DEFAULT_MODEL} -> {'pobrane' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
+    if r.returncode:
+        log.append((r.stderr or r.stdout or "")[-800:])
+        return {"success": False, "log": log}
+    from engine import vitmatte
+    vitmatte._CHECK_CACHE.clear()
+    return {"success": True, "log": log}
+
+
 def install_birefnet(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.run, python: Optional[str] = None,
                      model_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """BiRefNet_HR-matting / Lucida (optional edge models of the ViTMatte zone engine, MIT weights) run in ComfyUI's

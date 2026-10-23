@@ -1577,3 +1577,13 @@ canvas.edge-hot { cursor: pointer !important; }
 /* shared object band badge (2026-10-22, static/bandpoints.js renderModeInto) */
 .band-mode { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 2px 0; font-size: 11px; }
 .band-mode:empty { display: none; }
+/* „Zaproponuj pas (Sapiens2)” under „👁 podgląd pasa” – always visible, greyed out without the model (2026-10-23) */
+.band-seed { margin: 4px 0 2px; }
+.band-seed:empty { display: none; }
+.band-seed-btn { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 10px; font-size: 12px; font-weight: 600;
+  color: var(--accent-primary); background: rgba(232, 163, 61, .1); border: 1px solid rgba(232, 163, 61, .55); border-radius: 5px; cursor: pointer; }
+.band-seed-btn:hover:not(:disabled) { background: rgba(232, 163, 61, .2); border-color: var(--accent-primary); }
+.band-seed-btn:disabled { color: #77777d; background: rgba(255, 255, 255, .03); border: 1px dashed #4a4a50; cursor: not-allowed; }
+.band-seed-btn .bs-ico { width: 18px; height: 18px; flex: none; }
+.band-seed-hint { margin-top: 3px; font-size: 11px; color: #9a9aa0; line-height: 1.35; }
+.band-seed-hint a { color: var(--accent-primary); }
