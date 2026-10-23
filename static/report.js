@@ -83,7 +83,7 @@
           <button type="button" class="btn btn-secondary" id="rpCopy" hidden title="Kopiuje całe zgłoszenie (tekst) do schowka – np. do wklejenia na GitHubie">Kopiuj zgłoszenie</button>
           <button type="button" class="btn btn-secondary" id="rpCancel">Zamknij</button>
           <button type="button" class="btn btn-secondary" id="rpShow">Pokaż, co zostanie wysłane</button>
-          <button type="button" class="btn btn-primary" id="rpSend" disabled style="background:#e8a33d;border-color:#e8a33d;">Wyślij</button>
+          <button type="button" class="btn btn-primary" id="rpSend" style="background:#e8a33d;border-color:#e8a33d;">Wyślij</button>
         </div></div>`;
     document.body.appendChild(bg);
     const $ = (id) => bg.querySelector('#' + id);
@@ -91,9 +91,22 @@
     let shot = null, preview = null, busy = false;
 
     const invalidate = () => { preview = null; $('rpPreview').hidden = true; $('rpConsent').checked = false; $('rpCopy').hidden = true; sync(); };
-    const sync = () => { $('rpSend').disabled = busy || !preview || !preview.configured || !$('rpConsent').checked; };
+    // "Wyślij" is clickable before the preview / consent (a disabled-looking-active button that does nothing read as a
+    // bug, user report 2026-10-23): the click says what is missing instead; disabled only while busy / not configured
+    const sync = () => {
+      const b = $('rpSend');
+      b.disabled = busy || !!(preview && !preview.configured);
+      b.style.opacity = b.disabled ? '.45' : (preview && $('rpConsent').checked ? '1' : '.8');
+    };
+    const needConsent = () => {
+      const c = $('rpConsent').closest('label');
+      c.style.outline = '2px solid #ef4444'; c.style.outlineOffset = '3px';
+      c.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      msg('Zaznacz zgodę pod podglądem i kliknij „Wyślij” jeszcze raz.', 'err');
+    };
     ['rpWhat', 'rpSteps', 'rpEmail'].forEach((id) => $(id).addEventListener('input', invalidate));
-    $('rpConsent').addEventListener('change', sync);
+    $('rpConsent').addEventListener('change', () => { $('rpConsent').closest('label').style.outline = ''; msg(''); sync(); });
+    sync();
 
     $('rpShot').addEventListener('change', async () => {
       invalidate();
@@ -109,8 +122,9 @@
       } finally { bg.style.visibility = ''; }
     });
 
-    $('rpShow').addEventListener('click', async () => {
-      if (busy) return;
+    const showPreview = async () => {
+      if (busy) return false;
+      if (!$('rpWhat').value.trim()) { msg('Opisz, co się stało (pole „Co się stało?”).', 'err'); $('rpWhat').focus(); return false; }
       busy = true; sync(); msg('Zbieram diagnostykę (wersje, GPU, Doktor, ostatnie zadania, log)…');
       try {
         preview = await postJSON('/api/report/preview', { what: $('rpWhat').value, steps: $('rpSteps').value,
@@ -122,7 +136,9 @@
           : 'Wysyłanie nie jest jeszcze skonfigurowane w tej wersji – skopiuj zgłoszenie i wklej je na GitHubie (link w „O programie”).', preview.configured ? '' : 'err');
       } catch (e) { preview = null; msg(esc(e.message), 'err'); }
       busy = false; sync();
-    });
+      return !!preview;
+    };
+    $('rpShow').addEventListener('click', showPreview);
 
     $('rpCopy').addEventListener('click', async () => {
       if (!preview) return;
@@ -131,7 +147,12 @@
     });
 
     $('rpSend').addEventListener('click', async () => {
-      if (!preview || !$('rpConsent').checked || busy) return;
+      if (busy) return;
+      if (!preview) {   // nothing leaves the computer unseen: build the preview first, then ask for the consent
+        if (await showPreview() && preview.configured) needConsent();
+        return;
+      }
+      if (!$('rpConsent').checked) { needConsent(); return; }
       busy = true; sync(); msg('Wysyłam…');
       try {
         const r = await postJSON('/api/report/send', { id: preview.id, consent: true });

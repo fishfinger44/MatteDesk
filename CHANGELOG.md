@@ -1,5 +1,12 @@
 # MatteDesk – changelog
 
+## 0.39 – 2026-10-23
+- **Fixed: "Report a problem" → "Send" did nothing visible** before the preview / consent. Now it asks for a description
+  when empty, builds the preview by itself and outlines the consent box in red; without consent the button looks dimmed.
+- **Final Touch on a hard base:** with the "mask 1+2" base (0 and 1 only) the palette explains that black / white / gamma
+  change only semi-transparency (here: soft brush strokes) and dims those sliders; erode, blur and motion blur act on the
+  whole alpha. Pick a soft-edged base (MatAnyone2, VideoMaMa, ViTMatte / BiRefNet, LTX-2.5) to grade the whole matte.
+
 ## 0.38 – 2026-10-23
 - **Fixed: "No key in the work area"** – the work area is shared by all objects (e.g. set while working on a second object),
   so "Compute all" of an object whose keys lie outside it was refused with no hint why. The dialog now lists the object's

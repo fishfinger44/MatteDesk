@@ -71,6 +71,7 @@
         <input type="range" id="ftShowO" min="0" max="100" step="5" value="${F.strokesOpacity}" style="width:70px" title="Krycie podglądu kresek (%)"><span class="muted" id="ftShowOV">${F.strokesOpacity} %</span></div>
       <div class="pp-sec">
         <div class="zp-sub" title="Grading alfy – cała alfa, po kreskach pędzla; na żywo, bez przeliczania modeli; to samo idzie do eksportu">Grade</div>
+        <div class="muted pp-hint warn" id="ftHardHint" style="display:none">Baza „maska 1+2” jest twarda (tylko 0 i 1): czerń / biel / gamma zmieniają tylko półprzezroczystość, więc tu działają wyłącznie na miękkich kreskach pędzla. Na całej alfie działają erode, rozmycie i motion blur; czerń / biel / gamma – na bazie z miękką krawędzią (MatAnyone2, VideoMaMa, ViTMatte / BiRefNet, LTX-2.5).</div>
         ${FIN.filter(([k]) => GRADE.includes(k)).map(finRow).join('')}
         <button type="button" class="btn btn-ghost btn-xs" id="ftFinReset" title="Wyzeruj grade i motion blur (baza bez zmian)">↺ bez wykończenia</button>
       </div>
@@ -118,6 +119,14 @@
     const info = $('ftBaseInfo');
     info.textContent = b.run ? `Baza: ${b.run === 'core' ? 'maska 1+2' : `wersja ${b.run}`} (${baseLabel(b.source)}${b.chosen ? '' : ', domyślna'})` : (b.why || 'Brak bazy');
     info.className = b.run ? 'muted' : 'muted warn';
+    // a hard base (mask 1+2 = 0 / 1 only): levels and gamma have no semi-transparency to act on (user report 2026-10-23
+    // "black / white sliders change nothing") – say so and dim them instead of leaving them looking broken
+    const hard = b.run === 'core';
+    $('ftHardHint').style.display = hard ? '' : 'none';
+    for (const k of ['black', 'white', 'gamma']) {
+      const row = document.querySelector(`#ftPalette [data-fin="${k}"]`);
+      if (row) row.closest('label').style.opacity = hard ? '.5' : '';
+    }
   }
   function renderList() {
     const box = $('ftList'); if (!box) return;
