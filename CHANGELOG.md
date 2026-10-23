@@ -1,5 +1,11 @@
 # MatteDesk – changelog
 
+## 0.38 – 2026-10-23
+- **Fixed: "No key in the work area"** – the work area is shared by all objects (e.g. set while working on a second object),
+  so "Compute all" of an object whose keys lie outside it was refused with no hint why. The dialog now lists the object's
+  key frames and offers "Extend the range to F…–…" (to the nearest key), which recomputes right away. An object without
+  any key gets "place SAM 3.1 points".
+
 ## 0.37 – 2026-10-23
 - **Fixed: "Reload ComfyUI"** (the lost-connection banner) closes a hung ComfyUI again – in 0.36 it failed with
   "No module named 'psutil'". psutil is now bundled with the installer; a copy from git / ZIP whose environment was made

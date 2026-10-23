@@ -3093,11 +3093,19 @@
 
   // ------------------------------------------------------------------------------------------------ actions
   // 409 of the work area (engine/workarea.py): missing frame intervals per object / no key inside the work area
-  function rangeErrorDialog(e) {
+  function rangeErrorDialog(e, retry) {
     const d = e && e.detail;
     if (!d || typeof d !== 'object' || !['range_missing', 'no_key_in_range'].includes(d.code)) return false;
     const iv = (l) => l.map(([a, b]) => (a === b ? `F${a}` : `F${a}–${b}`)).join(', ');
     let html;
+    if (d.code === 'no_key_in_range' && d.suggest && window.MD_WA) {
+      // the work area is one per shot (often set for another object): offer it extended to the object's nearest key
+      const [a, b] = d.suggest;
+      V().uiDialog({ title: 'Brak klucza w zakresie pracy', tone: 'warn', ok: `Rozszerz zakres do F${a}–${b}`, cancel: 'Zostaw',
+        html: `${esc(d.detail)}<br><br>Zakres pracy jest wspólny dla wszystkich obiektów: <b>F${d.range[0]}–${d.range[1]}</b> (znaczniki [ ] na osi czasu, Alt+X = całe ujęcie).` })
+        .then(async (yes) => { if (yes) { await window.MD_WA.set([a, b]); if (retry) retry(); } });
+      return true;
+    }
     if (d.code === 'no_key_in_range') {
       html = `${esc(d.detail)}<br><br>Zakres pracy: <b>F${d.range[0]}–${d.range[1]}</b> (znaczniki [ ] na osi czasu, Alt+X = całe ujęcie).`;
     } else {
@@ -3145,7 +3153,7 @@
 
   async function run(btnId, fn) {
     const b = $(btnId); if (b) b.disabled = true;
-    try { await fn(); } catch (e) { status(`Błąd: ${e.message}`, 'err'); if (!rangeErrorDialog(e)) toast(`Błąd: ${e.message}`, 5000); }
+    try { await fn(); } catch (e) { status(`Błąd: ${e.message}`, 'err'); if (!rangeErrorDialog(e, () => run(btnId, fn))) toast(`Błąd: ${e.message}`, 5000); }
     finally { if (b) b.disabled = false; loadStages().catch(() => {}); }
   }
   const curPts = () => { const pts = S.points[V().currentFrame] || []; return { positive: pts.filter((p) => p[2] > 0).map((p) => [p[0], p[1]]), negative: pts.filter((p) => p[2] < 0).map((p) => [p[0], p[1]]) }; };

@@ -2821,11 +2821,15 @@ def _core_frames(name: str) -> List[int]:
         return _shot_frames()
     keys = [int(k) for k in _objects().keys(name)]
     if not any(wa[0] <= k <= wa[1] for k in keys):
-        # user decision 2026-10-15: SAM3 needs at least one key inside the work area (no silent propagation from outside)
+        # user decision 2026-10-15: SAM3 needs at least one key inside the work area (no silent propagation from outside).
+        # The work area is one per shot (set e.g. for another object): the dialog offers it extended to the nearest key.
+        near = min(keys, key=lambda k: min(abs(k - wa[0]), abs(k - wa[1]))) if keys else None
         raise HTTPException(status_code=409, detail={
-            "code": "no_key_in_range", "range": wa,
-            "detail": f"W zakresie pracy F{wa[0]}–{wa[1]} musi być co najmniej jedna klatka kluczowa – dodaj klucz "
-                      f"(punkty + „▶ Przelicz klatkę”) albo zmień zakres"})
+            "code": "no_key_in_range", "range": wa, "keys": sorted(keys), "object": name,
+            "suggest": [min(wa[0], near), max(wa[1], near)] if near is not None else None,
+            "detail": (f"Obiekt „{name}” nie ma klatki kluczowej w zakresie pracy F{wa[0]}–{wa[1]} (jego klucze: "
+                       f"{', '.join(f'F{k}' for k in sorted(keys))}) – rozszerz zakres albo dodaj klucz w zakresie"
+                       if keys else f"Obiekt „{name}” nie ma jeszcze żadnej klatki kluczowej – postaw punkty SAM 3.1")})
     a, b = expand_to_keys(wa, keys, _shot_range())
     return list(range(a, b + 1))
 

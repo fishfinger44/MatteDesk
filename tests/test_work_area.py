@@ -73,6 +73,13 @@ def test_api_work_area_core_final_export(tmp_path, monkeypatch):
     api.put("/api/project/work_area", json={"range": [lo, lo + 2]})
     r = api.post("/api/object/puppet/compute_all")
     assert r.status_code == 409 and r.json()["detail"]["code"] == "no_key_in_range", r.text
+    # the dialog offers the work area extended to the object's nearest key (the work area is shared by all objects)
+    d = r.json()["detail"]
+    assert d["keys"] == keys and f"F{k0}" in d["detail"]
+    near = min(keys, key=lambda k: min(abs(k - lo), abs(k - lo - 2)))
+    assert d["suggest"] == [min(lo, near), max(lo + 2, near)]
+    api.put("/api/project/work_area", json={"range": d["suggest"]})
+    assert api.post("/api/object/puppet/compute_all").status_code == 200
 
     # work area around the key: core only there (extended to the nearest keys), not the whole shot
     wa = [max(shot.first, k0 - 2), min(shot.last, k0 + 3)]
