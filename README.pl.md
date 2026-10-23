@@ -10,7 +10,7 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.4/MatteDesk-0.4-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.40/MatteDesk-0.40-setup.exe)
 
 Windows 10 / 11 · karta NVIDIA · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -360,7 +360,7 @@ Po zmianach w interfejsie odśwież przeglądarkę (Ctrl+F5).
 | `tests/` | testy (syntetyczne; `real` tylko na stacji z danymi ujęć) |
 | `config.json` / `config.local.json` | konfiguracja wspólna / konfiguracja tego komputera (poza gitem) |
 
-Wersje: mała zmiana 0.11 → 0.12 (`python tools/bump_version.py "opis"`), większa 0.2 (`--major`).
+Wersje: mała zmiana 0.11 → 0.12 (`python tools/bump_version.py "opis"`), większa 0.40 → 0.50 (`--major`; zawsze dwie cyfry, żeby GitHub sortował 0.50 nad 0.49).
 
 ---
 

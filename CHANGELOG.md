@@ -1,6 +1,6 @@
 # MatteDesk – changelog
 
-## 0.4 – 2026-10-24
+## 0.40 – 2026-10-24
 - **Viewport overlays on the GPU:** mask tint, outlines, the Alpha view and the comp are drawn on the graphics card (the CPU path
   stays as a fallback) – smoother scrubbing and zoom on 4K shots.
 - **App-styled controls:** sliders (amber fill, grey when disabled), checkboxes, radio buttons, selects, the file button and

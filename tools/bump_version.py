@@ -4,7 +4,7 @@
 
 Scheme (user decision 2026-10-14): 0.D = feature release, 0.DS = small change in it.
     python tools/bump_version.py "small fix"            # 0.1 -> 0.11 -> 0.12 ... -> 0.19
-    python tools/bump_version.py "big change" --major   # 0.1x -> 0.2 (0.9x -> 1.0)
+    python tools/bump_version.py "big change" --major   # 0.4x -> 0.50 (0.9x -> 1.0)
     python tools/bump_version.py "what changed" --set 0.5
 """
 import argparse
@@ -22,7 +22,7 @@ def next_version(old: str, major: bool) -> str:
         raise SystemExit(f"VERSION '{old}' is not N.D or N.DS")
     n, d, s = int(m.group(1)), int(m.group(2)), m.group(3)
     if major:
-        return f"{n + 1}.0" if d == 9 else f"{n}.{d + 1}"
+        return f"{n + 1}.0" if d == 9 else f"{n}.{d + 1}0"   # 0.40, not 0.4: GitHub sorts 0.4 below 0.35
     if not s:
         return f"{n}.{d}1"
     if s == "9":
@@ -33,7 +33,7 @@ def next_version(old: str, major: bool) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("message")
-    ap.add_argument("--major", action="store_true", help="feature release: 0.1x -> 0.2")
+    ap.add_argument("--major", action="store_true", help="feature release: 0.4x -> 0.50")
     ap.add_argument("--set", dest="new")
     a = ap.parse_args()
     old = (ROOT / "VERSION").read_text(encoding="utf-8").strip()

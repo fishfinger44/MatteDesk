@@ -32,4 +32,4 @@ def test_bump_scheme():
     b = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(b)
     assert [b.next_version(v, False) for v in ("0.1", "0.11", "0.18")] == ["0.11", "0.12", "0.19"]
-    assert [b.next_version(v, True) for v in ("0.1", "0.13", "0.9", "0.95")] == ["0.2", "0.2", "1.0", "1.0"]
+    assert [b.next_version(v, True) for v in ("0.1", "0.13", "0.9", "0.95")] == ["0.20", "0.20", "1.0", "1.0"]   # two digits: GitHub lists 0.4 below 0.35 (2026-10-24)

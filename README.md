@@ -10,7 +10,7 @@ Repair the plates once. Generate alpha mattes for multiple objects – the tool 
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
-[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.4/MatteDesk-0.4-setup.exe)
+[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.40/MatteDesk-0.40-setup.exe)
 
 Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all versions: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -361,7 +361,7 @@ After UI changes refresh the browser (Ctrl+F5).
 | `tests/` | tests (synthetic; `real` only on a station with shot data) |
 | `config.json` / `config.local.json` | shared configuration / configuration of this computer (outside git) |
 
-Versions: small change 0.11 → 0.12 (`python tools/bump_version.py "description"`), bigger one 0.2 (`--major`).
+Versions: small change 0.11 → 0.12 (`python tools/bump_version.py "description"`), bigger one 0.40 → 0.50 (`--major`; always two digits, so GitHub lists 0.50 above 0.49).
 
 **Translations:** Polish is the source language of the code; the browser translates the UI to English at run time from
 `static/i18n/en.json`. After adding UI text run `python tools/i18n_extract.py` – it lists the strings missing from the catalog.
