@@ -349,7 +349,7 @@ def life_changed(store: Any, name: str, frame_range: Optional[Tuple[int, int]]) 
         return []
     fl = [x for iv in (old or []) + (new or []) for x in iv]
     shot = (min([int(lo_hi[0])] + fl), max([int(lo_hi[1])] + fl))
-    return life_changed_intervals(old, new, shot)
+    return life_changed_intervals(old, new, shot, keys)
 
 
 def stale_intervals(store: Any, name: str, frame_range: Optional[Tuple[int, int]] = None,

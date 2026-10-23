@@ -118,7 +118,7 @@ def job_details(client: Any, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------------------- GPU memory spilled to system RAM (Windows)
 # The NVIDIA driver on Windows (WDDM) moves what does not fit in the card to shared system memory: no OOM, the job just
-# gets many times slower – or the CUDA allocator aborts the whole Comfy process (beatch 2026-10-18, crop 2784 px).
+# gets many times slower – or the CUDA allocator aborts the whole Comfy process (sh060 2026-10-18, crop 2784 px).
 # /system_stats never shows it (VRAM stays <= the card), the per-process counter "GPU Process Memory\Shared Usage" does.
 
 def pid_on_port(port: int, run: Optional[Callable[..., Any]] = None) -> Optional[int]:

@@ -269,6 +269,11 @@
     for (const k of Object.keys(S.compCache)) if (k.includes(`_${f}_`)) delete S.compCache[k];
     renderLoadBar();
   }
+  // front objects (smaller depth_order) without a core: nothing was subtracted from this object there (2026-10-23)
+  function frontMissingText(d) {
+    return (d.front_missing || []).map((m) => `\n⚠ ${m.message}`).join('');
+  }
+  function frontMissingKind(d) { return (d.front_missing || []).length ? 'warn' : 'ok'; }
   function invalidateIntervals(ivs) {   // [[a, b], …] from run / rerun_from: only the recomputed frames (Z20)
     for (const iv of ivs || []) { const [a, b] = iv; for (let f = a; f <= b; f++) invalidateFrame(f); }
   }
@@ -532,6 +537,8 @@
     if (bgImg) g.drawImage(bgImg, 0, 0, c.width, c.height);
     else if (bg === 'checker') { for (let y = 0; y < c.height; y += 16) for (let x = 0; x < c.width; x += 16) { g.fillStyle = ((x + y) / 16) % 2 ? '#999' : '#666'; g.fillRect(x, y, 16, 16); } }
     else { g.fillStyle = bg === 'pick' ? S.pickColor : bg; g.fillRect(0, 0, c.width, c.height); }
+    const gc = window.mdGpu && mdGpu.comp(img, ov, c, c.width, c.height);   // same pixels on the GPU, else the loop below
+    if (gc) { putComp(ck, gc); return gc; }
     const b = g.getImageData(0, 0, c.width, c.height);
     const t = document.createElement('canvas'); t.width = img.width; t.height = img.height;
     const tg = t.getContext('2d'); tg.drawImage(img, 0, 0); const p = tg.getImageData(0, 0, t.width, t.height);
@@ -587,6 +594,8 @@
   function tintCanvas(ov, rgb, key, line = false) {
     const ck = `tint_${key}_${rgb.join()}_${line ? 'l' : 'f'}`;
     if (S.compCache[ck]) return S.compCache[ck];
+    const gc = window.mdGpu && (line ? mdGpu.line(ov, rgb) : mdGpu.tint(ov, rgb));   // same pixels on the GPU, else the loop below
+    if (gc) { putComp(ck, gc); return gc; }
     const c = document.createElement('canvas'); c.width = ov.naturalWidth || ov.width; c.height = ov.naturalHeight || ov.height;
     const g = c.getContext('2d'); g.drawImage(ov, 0, 0);
     const d = g.getImageData(0, 0, c.width, c.height); const p = d.data; const W = c.width, H = c.height;
@@ -609,6 +618,8 @@
   function bwCanvas(ov, key) {
     const ck = `bw_${key}`;
     if (S.compCache[ck]) return S.compCache[ck];
+    const gc = window.mdGpu && mdGpu.bw(ov);
+    if (gc) { putComp(ck, gc); return gc; }
     const c = document.createElement('canvas'); c.width = ov.naturalWidth || ov.width; c.height = ov.naturalHeight || ov.height;
     const g = c.getContext('2d'); g.drawImage(ov, 0, 0);
     const d = g.getImageData(0, 0, c.width, c.height); const p = d.data;
@@ -812,7 +823,9 @@
           : cur ? `<button type="button" class="ol-eye ol-eye-sel" title="Pokaż / ukryj maskę wybranego obiektu na podglądzie (narzędzia – punkty, pędzel, strefy – zostają)">${S.hideSel ? '◌' : '👁'}</button>` + '<span></span>'
           : `<span class="ol-eye ol-eye-off" title="${inherit ? `Kolor jak „${esc(g)}”` : 'Brak wyniku – nie ma czego pokazać'}"></span>` +
             (inherit && has && !selIn ? `<span class="ol-swatch" style="background:${st.c}" title="Kolor jak „${esc(g)}”"></span>` : '<span></span>');
-        return `<div class="ol-row ${cur ? 'cur' : ''} ${g ? 'grp' : ''} ${offRow ? 'off' : ''}" data-o="${esc(o.name)}" draggable="true"
+        // group look (user request 2026-10-23): the main object left, its parts indented under it with a guide line
+        const gcls = g ? (o.name === g ? 'grp grp-main' : 'grp grp-part') : '';
+        return `<div class="ol-row ${cur ? 'cur' : ''} ${gcls} ${offRow ? 'off' : ''}" data-o="${esc(o.name)}" draggable="true"
             title="Klik = wybierz obiekt · przeciągnij na środek innego = jego część · na górną / dolną krawędź = kolejność głębi (0 = najbliżej kamery)">
           <span class="ol-drag">⋮⋮</span>${eye}${name}${tail}<button type="button" class="ol-del" title="Usuń obiekt ${esc(o.name)} (z potwierdzeniem)">🗑</button>
         </div>` + seamRow(o, all, st);
@@ -1438,8 +1451,10 @@
       (fl.length ? `\nUwagi kadrowania: ${fl.map(([k, v]) => `${k}: ${v}`).join('; ')}` : '') +
       (d.uncertain.length ? `\nNiepewne klatki: ${d.uncertain.slice(0, 12).join(', ')}` : '') +
       (d.suggested_keys.length ? `\nSugerowane klucze: ${d.suggested_keys.slice(0, 8).join(', ')}` : '') +
-      '\nObejrzyj klatki (←/→); złą klatkę popraw punktami (klucz) i „▶ Przelicz klatkę”, potem „▶▶ Przelicz zmiany”.', 'ok');
-    toast(`Maska ${d.whole_shot ? 'w każdej klatce' : `w F${d.frames[0]}–${d.frames[1]}`} gotowa${d.uncertain.length ? ` – niepewnych: ${d.uncertain.length}` : ''}`, 5000);
+      frontMissingText(d) +
+      '\nObejrzyj klatki (←/→); złą klatkę popraw punktami (klucz) i „▶ Przelicz klatkę”, potem „▶▶ Przelicz zmiany”.', frontMissingKind(d));
+    toast(`Maska ${d.whole_shot ? 'w każdej klatce' : `w F${d.frames[0]}–${d.frames[1]}`} gotowa${d.uncertain.length ? ` – niepewnych: ${d.uncertain.length}` : ''}` +
+      ((d.front_missing || []).length ? ` · ⚠ obiekt z przodu bez rdzenia: ${d.front_missing.map((m) => m.object).join(', ')}` : ''), 5000);
     renderPointsPalette();
   }
   async function refreshList(select) {
@@ -3242,7 +3257,7 @@
       const f = V().currentFrame;
       const d = await api('POST', `/api/object/${S.obj}/rerun_from/${f}`);
       invalidateIntervals(d.recomputed); setView('core');   // Z20: only the recomputed intervals reload (old overlay shown meanwhile)
-      status(`Przeliczono ${d.recomputed.length} przedz. (${d.seconds}s), z cache ${d.cached.length}.` + (d.suggested_keys.length ? `\nSugerowane klucze: ${d.suggested_keys.join(', ')}` : ''), 'ok');
+      status(`Przeliczono ${d.recomputed.length} przedz. (${d.seconds}s), z cache ${d.cached.length}.` + (d.suggested_keys.length ? `\nSugerowane klucze: ${d.suggested_keys.join(', ')}` : '') + frontMissingText(d), frontMissingKind(d));
     }));
     $('st3KeySave').addEventListener('click', () => run('st3KeySave', async () => {
       const f = V().currentFrame;

@@ -1,5 +1,20 @@
 # MatteDesk – changelog
 
+## 0.4 – 2026-10-24
+- **Viewport overlays on the GPU:** mask tint, outlines, the Alpha view and the comp are drawn on the graphics card (the CPU path
+  stays as a fallback) – smoother scrubbing and zoom on 4K shots.
+- **App-styled controls:** sliders (amber fill, grey when disabled), checkboxes, radio buttons, selects, the file button and
+  scrollbars match the app; native controls are dark.
+- **Layers panel:** the parts of a group are indented under the main object (guide line, main object in bold).
+- **Core:** a warning when an object in front has no core yet (nothing is subtracted there); trimming an object's life (no key in
+  the hidden frames) keeps its core valid.
+- **Edge band:** editing band points is faster; "Propose band (Sapiens2)" spaces the points with a ramp and respects inset 0.
+- **"Report a problem":** the page no longer freezes on long texts.
+- **Fixed: plates carried over from the previous shot.** The Open project dialog kept the backlit / clear plate paths of the
+  previously opened shot when the new one had none, and they were saved into the new project. The fields now take the shot's
+  values or are cleared, and opening or creating a project refuses a backlit / clear plate whose resolution differs from the beauty.
+- **README:** current stage list (Final Touch, BiRefNet / ViTMatte, shared edge band, Sapiens2) and the demo video.
+
 ## 0.39 – 2026-10-23
 - **Fixed: "Report a problem" → "Send" did nothing visible** before the preview / consent. Now it asks for a description
   when empty, builds the preview by itself and outlines the consent box in red; without consent the button looks dimmed.

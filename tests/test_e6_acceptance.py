@@ -123,6 +123,25 @@ def test_back_object_core_excludes_front(tmp_path):
     assert all(not (core_t[f] & inner(core_p[f])).any() for f in frames)
 
 
+def test_back_object_warns_when_front_core_missing(tmp_path):
+    """2026-10-23: a front object without a core in some frames is not subtracted there -> `front_missing` warning."""
+    shot, pipe, frames, work = _two_objects(tmp_path, n=6)
+    assert pipe.run_core("puppet", frames).front_missing == []          # nothing in front of the nearest object
+    assert pipe.run_core("tree", frames).front_missing == []            # front core present in every frame
+    pdir = pipe.store.dir("puppet") / "core"
+    for f in frames[1:3]:
+        (pdir / f"c_{f:04d}.png").unlink()
+    fm = pipe.run_core("tree", frames).front_missing
+    assert [(m["object"], m["frames"], m["first"], m["last"]) for m in fm] == [("puppet", 2, frames[1], frames[2])]
+    assert "„puppet”" in fm[0]["message"] and "Policz najpierw" in fm[0]["message"]
+    cj = json.loads((pipe.store.dir("tree") / "core" / "core.json").read_text(encoding="utf-8"))
+    assert cj["front_missing"] == fm
+    for p in pdir.glob("c_*.png"):
+        p.unlink()
+    fm = pipe.run_core("tree", frames).front_missing
+    assert fm[0]["frames"] == len(frames) and "w żadnej klatce" in fm[0]["message"]
+
+
 def test_review_strokes_to_plate_px():
     set_entry = {"id": "horn_v02", "first": 1, "pw": 1000, "ph": 400, "crops": [[100, 200, 1400, 560]] * 3}
     marks = [{"set": "horn_v02", "frame": 2, "strokes": [{"c": "r", "p": [5000, 2000, 5100, 2000]},

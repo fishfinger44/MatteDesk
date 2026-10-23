@@ -48,6 +48,39 @@
     return data;
   }
 
+  // header ladybug: now and then the wing cases open and the wings flutter (random 4-10 s, off with reduced motion)
+  const BUG_SVG = `<svg class="rp-bug" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+      <g class="rp-wing rp-wl"><ellipse cx="8" cy="17" rx="3.6" ry="8.5" transform="rotate(24 8 17)"/></g>
+      <g class="rp-wing rp-wr"><ellipse cx="16" cy="17" rx="3.6" ry="8.5" transform="rotate(-24 16 17)"/></g>
+      <ellipse cx="12" cy="14.8" rx="4.6" ry="6.4" fill="#2a2a2e"/>
+      <path d="M10.6 4.6 8.4 1.8M13.4 4.6l2.2-2.8" stroke="#2a2a2e" stroke-width="1.1" stroke-linecap="round" fill="none"/>
+      <circle cx="12" cy="6.4" r="3" fill="#2a2a2e"/>
+      <g class="rp-case rp-cl"><path d="M12 7.5A7 7 0 0 0 12 21.5Z" fill="#d9443a"/><circle cx="9.2" cy="11.6" r="1.3"/><circle cx="8.6" cy="16.6" r="1.4"/><circle cx="10.7" cy="19.4" r=".9"/></g>
+      <g class="rp-case rp-cr"><path d="M12 7.5A7 7 0 0 1 12 21.5Z" fill="#d9443a"/><circle cx="14.8" cy="11.6" r="1.3"/><circle cx="15.4" cy="16.6" r="1.4"/><circle cx="13.3" cy="19.4" r=".9"/></g>
+      <path d="M12 7.5V21.5" stroke="#2a2a2e" stroke-width=".8"/>
+    </svg>`;
+  const BUG_CSS = `.rp-bug { flex: none; overflow: visible; } .rp-bug .rp-case circle { fill: #2a2a2e; }
+    .rp-bug .rp-wing { fill: rgba(225,225,235,.6); stroke: rgba(255,255,255,.35); stroke-width: .4; opacity: 0; transform-box: view-box; transform-origin: 12px 9px; }
+    .rp-bug .rp-case { transform-box: view-box; transform-origin: 12px 8.5px; }
+    .rp-bug.flap .rp-cl { animation: rpCaseL 1.1s ease-in-out; } .rp-bug.flap .rp-cr { animation: rpCaseR 1.1s ease-in-out; }
+    .rp-bug.flap .rp-wl { animation: rpWingL 1.1s linear; } .rp-bug.flap .rp-wr { animation: rpWingR 1.1s linear; }
+    @keyframes rpCaseL { 0%,100% { transform: none; } 18%,78% { transform: rotate(-32deg); } }
+    @keyframes rpCaseR { 0%,100% { transform: none; } 18%,78% { transform: rotate(32deg); } }
+    @keyframes rpWingL { 0%,10%,90%,100% { opacity: 0; transform: none; } 20% { opacity: 1; transform: rotate(10deg); }
+      30%,50%,70% { opacity: 1; transform: rotate(32deg) scaleX(.6); } 40%,60%,80% { opacity: 1; transform: rotate(8deg); } }
+    @keyframes rpWingR { 0%,10%,90%,100% { opacity: 0; transform: none; } 20% { opacity: 1; transform: rotate(-10deg); }
+      30%,50%,70% { opacity: 1; transform: rotate(-32deg) scaleX(.6); } 40%,60%,80% { opacity: 1; transform: rotate(-8deg); } }
+    @media (prefers-reduced-motion: reduce) { .rp-bug.flap * { animation: none !important; } }`;
+
+  function flapNowAndThen(bg, first = 1500) {
+    setTimeout(() => {
+      if (!bg.isConnected) return;
+      const bug = bg.querySelector('.rp-bug');
+      if (bug) { bug.classList.remove('flap'); void bug.getBoundingClientRect(); bug.classList.add('flap'); }
+      flapNowAndThen(bg, 4000 + Math.random() * 6000);
+    }, first);
+  }
+
   function open(context = {}) {
     if (document.getElementById('mdReport')) return;
     const bg = document.createElement('div');
@@ -57,8 +90,8 @@
     const errBox = context.error_title || context.error_text
       ? `<div class="rp-err" style="margin-bottom:10px;padding:8px 10px;border-left:3px solid #ef4444;background:rgba(239,68,68,.08);font-size:12px;">
            <b>Dołączony błąd:</b> ${esc(context.error_title || '')}<br><span style="color:#a8a8ae;">${esc((context.error_text || '').slice(0, 400))}</span></div>` : '';
-    bg.innerHTML = `<style>#mdReport [hidden] { display: none !important; } #mdReport textarea, #mdReport input[type=email] { background: #101012; color: #dcdcdf; border: 1px solid #3c3c42; border-radius: 4px; padding: 6px 8px; font: inherit; resize: vertical; }</style><div role="dialog" aria-label="Zgłoś problem" style="width:min(720px,94vw);max-height:90vh;display:flex;flex-direction:column;background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-top:4px solid #e8a33d;border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.6);">
-        <div style="padding:14px 18px 4px;font-size:16px;font-weight:700;">🐞 Zgłoś problem</div>
+    bg.innerHTML = `<style>${BUG_CSS}#mdReport [hidden] { display: none !important; } #mdReport textarea, #mdReport input[type=email] { background: #101012; color: #dcdcdf; border: 1px solid #3c3c42; border-radius: 4px; padding: 6px 8px; font: inherit; resize: vertical; }</style><div role="dialog" aria-label="Zgłoś problem" style="width:min(720px,94vw);max-height:90vh;display:flex;flex-direction:column;background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-top:4px solid #e8a33d;border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.6);">
+        <div style="padding:14px 18px 4px;font-size:16px;font-weight:700;display:flex;align-items:center;gap:7px;">${BUG_SVG}<span>Zgłoś problem</span></div>
         <div style="padding:4px 18px 0;font-size:12px;color:#9a9aa0;">Zgłoszenie trafia do autora MatteDesk (prywatne repozytorium na GitHubie). Ścieżki, nazwy ujęć i obiektów, nazwa użytkownika i komputera są zastępowane znacznikami – przed wysłaniem zobaczysz wszystko, co wyjdzie z komputera.</div>
         <div style="padding:10px 18px;overflow:auto;font-size:13px;display:flex;flex-direction:column;gap:8px;">
           ${errBox}
@@ -72,7 +105,7 @@
           <div id="rpShotInfo" style="font-size:12px;color:#9a9aa0;"></div>
           <div id="rpPreview" hidden style="display:flex;flex-direction:column;gap:6px;">
             <b>Tak wygląda całe zgłoszenie:</b>
-            <pre id="rpText" style="max-height:260px;overflow:auto;background:#101012;border:1px solid #2a2a2e;padding:8px;font-size:11px;white-space:pre-wrap;word-break:break-word;margin:0;"></pre>
+            <pre id="rpText" translate="no" style="max-height:260px;overflow:auto;background:#101012;border:1px solid #2a2a2e;padding:8px;font-size:11px;white-space:pre-wrap;word-break:break-word;margin:0;"></pre>
             <img id="rpImg" alt="Zrzut okna" hidden style="max-width:100%;border:1px solid #2a2a2e;">
             <label style="display:flex;gap:6px;align-items:flex-start;"><input id="rpConsent" type="checkbox" style="margin-top:3px;">
               <span>Zgadzam się na wysłanie powyższych danych autorowi MatteDesk w celu naprawienia problemu.</span></label>
@@ -86,6 +119,7 @@
           <button type="button" class="btn btn-primary" id="rpSend" style="background:#e8a33d;border-color:#e8a33d;">Wyślij</button>
         </div></div>`;
     document.body.appendChild(bg);
+    flapNowAndThen(bg);
     const $ = (id) => bg.querySelector('#' + id);
     const msg = (t, tone = '') => { $('rpMsg').innerHTML = t ? `<span style="color:${{ err: '#ef4444', ok: '#10b981' }[tone] || '#9a9aa0'};">${t}</span>` : ''; };
     let shot = null, preview = null, busy = false;

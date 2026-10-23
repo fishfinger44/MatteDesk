@@ -104,10 +104,13 @@ def _interp_closed(n: int, arc: np.ndarray, at: List[Tuple[float, float]], total
     return np.interp(q, s, v).astype(np.float32)
 
 
-def snap_normal(core: np.ndarray, x: float, y: float) -> Optional[Tuple[float, float, float, float]]:
+def snap_normal(core: np.ndarray, x: float, y: float, contours: Optional[List[np.ndarray]] = None
+                ) -> Optional[Tuple[float, float, float, float]]:
     """(sx, sy, nx, ny): the nearest outline pixel and the outward unit normal there (the UI draws the whiskers along
-    it: out = +n, in = -n). None without an outline."""
-    contours = _contours(core)
+    it: out = +n, in = -n). None without an outline. `contours`: _contours(core) computed once for many points (one
+    findContours per frame, not per point – 24 Sapiens2 points took ~2 s a request, 2026-10-23)."""
+    if contours is None:
+        contours = _contours(core)
     if not contours:
         return None
     best = min(((ci, int(np.argmin((c[:, 0] - x) ** 2 + (c[:, 1] - y) ** 2))) for ci, c in enumerate(contours)),

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import zlib
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 import logging
@@ -33,6 +35,37 @@ def _cache_put(k, v):
             _MASK_CACHE.pop(kk, None)
     _MASK_CACHE[k] = v
     return v
+
+
+_CORE_LRU: "OrderedDict[Any, np.ndarray]" = OrderedDict()
+_CORE_LRU_MAX = 12            # ~8 MB each at 4K
+_CORE_LRU_LOCK = threading.Lock()
+_EDGE_CORE_MEMO: "OrderedDict[str, Any]" = OrderedDict()   # edge_preview core_key -> (core, source, band ref)
+
+
+def _read_core_png(fp: Path) -> Optional[np.ndarray]:
+    """bool core mask (> 127) of a PNG as read (no resize), None = no file. The last few reads are kept by (path, mtime,
+    size) – the band previews read the same key / current frame core several times a request (2026-10-23); always a
+    copy, callers may write into it."""
+    try:
+        st = fp.stat()
+    except OSError:
+        return None
+    k = (str(fp), st.st_mtime_ns, st.st_size)
+    with _CORE_LRU_LOCK:
+        m = _CORE_LRU.get(k)
+        if m is not None:
+            _CORE_LRU.move_to_end(k)
+    if m is None:
+        g = cv2.imread(str(fp), cv2.IMREAD_GRAYSCALE)
+        if g is None:
+            return None
+        m = g > 127
+        with _CORE_LRU_LOCK:
+            _CORE_LRU[k] = m
+            while len(_CORE_LRU) > _CORE_LRU_MAX:
+                _CORE_LRU.popitem(last=False)
+    return m.copy()
 
 
 def _read_mask_cached(fp: Path, w: int, h: int) -> Optional[np.ndarray]:
@@ -487,14 +520,18 @@ class ObjectPipeline:
         # objects in front (smaller depth_order): their cores are subtracted (MatteSubtractFront on the core,
         # 5.2 pkt 6); a jump of the tracker onto a front object (IoU > 0.3) is flagged
         res.front_flags = {}
+        # front objects without a core in some frames: nothing is subtracted there -> warning for the UI (2026-10-23)
+        res.front_missing = []
         me = self.store.get(name)
         for o in self.store.list():
             if o["name"] == name or o.get("depth_order", 0) >= me.get("depth_order", 0):
                 continue
             fdir = self.store.dir(o["name"]) / "core"
+            missing = []
             for f in list(res.core):
                 fm = cv2.imread(str(fdir / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
                 if fm is None:
+                    missing.append(int(f))
                     continue
                 fm = fm > 127
                 from engine.segment import iou as _iou
@@ -516,6 +553,14 @@ class ObjectPipeline:
                     res.core[f] = res.core[f] & ~inner
                     if f in res.soft:          # the soft map mirrors the front-object subtraction
                         res.soft[f] = np.where(inner, 0, res.soft[f]).astype(np.uint8)
+            if missing:
+                missing.sort()
+                n = len(missing)
+                where = "w żadnej klatce" if n == len(res.core) else f"w {n} kl. (F{missing[0]}–{missing[-1]})"
+                res.front_missing.append({
+                    "object": o["name"], "frames": n, "first": missing[0], "last": missing[-1],
+                    "message": f"Obiekt z przodu „{o['name']}” nie ma policzonego rdzenia {where} – nie został odjęty, "
+                               f"maska może go objąć. Policz najpierw „{o['name']}”, potem przelicz ten obiekt."})
         # hint: the core gets empty right after touching the frame border (object leaves / enters) -> life range
         st = {f: mask_stats(m) for f, m in res.core.items()}
         res.life_hints = life_hints({f: v[0] for f, v in st.items()}, {f: v[1] for f, v in st.items()}, life)
@@ -564,7 +609,8 @@ class ObjectPipeline:
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals, "keys_sig": keys_sig,
             "mask_plate_denoise": self.use_mplate, "soft_frames": len(res.soft),
             "correction_regions": getattr(res, "region_stats", {}), "coverage": coverage,
-            "frames": [int(frames[0]), int(frames[-1])], "life": life, "life_hints": res.life_hints}, indent=1))
+            "frames": [int(frames[0]), int(frames[-1])], "life": life, "life_hints": res.life_hints,
+            "front_missing": res.front_missing}, indent=1))
         self.store.update(name, tool={"status": "rdzeń gotowy", "final_valid": False})
         return res
 
@@ -572,10 +618,10 @@ class ObjectPipeline:
         cdir = self.store.dir(name) / "core"
         out = {}
         for f in frames:
-            m = cv2.imread(str(cdir / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
+            m = _read_core_png(cdir / f"c_{f:04d}.png")
             if m is None:
                 raise FileNotFoundError(f"brak rdzenia klatki {f} – najpierw policz ujęcie")
-            out[f] = m > 127
+            out[f] = m
         return out
 
     def _region_tracker_fn(self):
@@ -1665,14 +1711,16 @@ class ObjectPipeline:
 
     def edge_preview(self, name: str, f: int, band_scale: Optional[float] = None,
                      shift_px: Optional[float] = None, band_out_px: Optional[float] = None,
-                     band_in_px: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+                     band_in_px: Optional[float] = None, core_key: Optional[str] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Preview of the MatAnyone2 edge before computing (stage 3 palette, user request 2026-10-15): full-frame uint8,
         255 = the mask the edge pass keeps (mask 1+2 + „Przesuń środek konturu”), 128 = the adaptive band where MatAnyone2 decides
         (same `_band_fn` as „Przelicz MatAnyone2”, with the slider values not yet saved), 0 = background.
         The mask is built the way `finalize(stage="matanyone")` builds it (2026-10-16; was: raw core_fix / core PNGs):
         stabilised SAM 3.1 core + brush corrections, a group = the whole of its members (group_core) in the group crops
         (_work_segments), then the shrink / grow shift. The stabilisation votes over +-2 frames, so a window of
-        f-2..f+2 (inside the object's life range) is computed."""
+        f-2..f+2 (inside the object's life range) is computed. `core_key` (app stage_band_lines): a signature of
+        everything the shifted core depends on – NOT the band points – so a band point edit reuses the stabilised core
+        (~2 s of the ~3.7 s, 2026-10-23); the band itself is always recomputed."""
         from engine.crop import paste_crop
         from engine.edge import clamp_band_scale, clamp_shift_px
         obj = dict(self.store.get(name))
@@ -1695,23 +1743,20 @@ class ObjectPipeline:
             raise ValueError(f"obiekt niewidoczny w klatce {f} (zakres życia)")
         if f not in win:
             raise ValueError(f"obiekt niewidoczny w klatce {f} (zakres życia)")
-        keys = self.keys(name)
-        members = self.group_members(name)
-        disk = self._mask12_disk(name, f)
+        hit = _EDGE_CORE_MEMO.get(core_key) if core_key else None
+        if hit is not None:
+            core, src, ref = hit
+            core = core.copy()
+            self._band_ref = (name, {k: v.copy() for k, v in ref.items()})
         try:
-            if disk is not None:   # the mask 1+2 on disk is current: read, not recomputed (2026-10-22, ~0.1 s)
-                self._band_ref = (name, {f: disk})
-                core = self._shifted_core({f: disk}, obj, keys, None)[f]
-                src = "mask12 (core_fix)" + ("+group" if members else "")
-            elif members:   # a group: the whole (members' masks 1+2 joined with the seam), as stage 3 computes it
-                gcore = self.group_core(name, win, only=[f])   # one frame shown: only it is stabilised
-                zres = self.apply_zones(name, win, gcore, keys, kinds=("brush",))
-                self._band_ref = (name, zres.core if zres else gcore)
-                core = self._shifted_core(zres.core if zres else gcore, obj, keys, zres)[f]
-                src = "mask12+group"
-            else:
-                core = self._final_core(name, win, obj, keys, kinds=("brush",), only=[f])[0][f]
-                src = "mask12"
+            if hit is None:
+                core, src = self._edge_preview_core(name, f, win, obj)
+                if core_key:
+                    ref = {k: v.copy() for k, v in (self._band_ref[1] or {}).items() if k == f}
+                    with _CORE_LRU_LOCK:
+                        _EDGE_CORE_MEMO[core_key] = (core.copy(), src, ref)
+                        while len(_EDGE_CORE_MEMO) > 12:
+                            _EDGE_CORE_MEMO.popitem(last=False)
         except FileNotFoundError:
             raise ValueError(f"Brak rdzenia w klatce {f} – „▶▶ Przelicz całość” (etap 1)")
         seg = [s for s in self._work_segments(name, [f]) if s.first <= f <= s.last][0]
@@ -1724,6 +1769,26 @@ class ObjectPipeline:
                      "band_px_mode": band_px_limits(obj),
                      "band_px": int((out == 128).sum()), "crop": list(seg.crop),
                      "outside_crop_px": self._crop_outside([seg], [f], {f: core}), "core": core, "seg": seg}
+
+    def _edge_preview_core(self, name: str, f: int, win: List[int], obj: Dict[str, Any]) -> Tuple[np.ndarray, str]:
+        """The shifted mask 1+2 of edge_preview (sets self._band_ref = the edge before the shift)."""
+        keys = self.keys(name)
+        members = self.group_members(name)
+        disk = self._mask12_disk(name, f)
+        if disk is not None:   # the mask 1+2 on disk is current: read, not recomputed (2026-10-22, ~0.1 s)
+            self._band_ref = (name, {f: disk})
+            core = self._shifted_core({f: disk}, obj, keys, None)[f]
+            src = "mask12 (core_fix)" + ("+group" if members else "")
+        elif members:   # a group: the whole (members' masks 1+2 joined with the seam), as stage 3 computes it
+            gcore = self.group_core(name, win, only=[f])   # one frame shown: only it is stabilised
+            zres = self.apply_zones(name, win, gcore, keys, kinds=("brush",))
+            self._band_ref = (name, zres.core if zres else gcore)
+            core = self._shifted_core(zres.core if zres else gcore, obj, keys, zres)[f]
+            src = "mask12+group"
+        else:
+            core = self._final_core(name, win, obj, keys, kinds=("brush",), only=[f])[0][f]
+            src = "mask12"
+        return core, src
 
     def _band_fn(self, obj, frames: Optional[Sequence[int]] = None):
         """Adaptive band (7.8 pkt 2) on the plate-to-mask crop: focus blur + motion blur along the normal.

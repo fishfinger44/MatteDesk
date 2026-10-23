@@ -1151,9 +1151,15 @@
     Z.undo.push({ band: true, zid: z.zone_id, f, what, prev: JSON.parse(JSON.stringify(p.band_points || [])),
                   ref_out: p.band_ref_out ?? null, ref_in: p.band_ref_in ?? null, shared: z.band_mode === 'shared' });
     try {
+      let r = null;
       if (del != null) await api('DELETE', `/api/object/${obj()}/zones/${z.zone_id}/band${del === '' || del[0] === '?' ? '' : '/'}${del}`);
-      else await api('PUT', `/api/object/${obj()}/zones/${z.zone_id}/band/${f}`, body);
+      else r = await api('PUT', `/api/object/${obj()}/zones/${z.zone_id}/band/${f}`, body);
       bandDirty(z); await load(); if (window.MD_BANDPTS) window.MD_BANDPTS.dirty();   // the shared band: stages 3 / 4 / 7 too
+      // the PUT answers with the band of this frame: no second GET of the same state (2026-10-23, ~2 s with 24 points)
+      if (r && r.band) {
+        (Z.band.data[z.zone_id] = Z.band.data[z.zone_id] || {})[f] = r.band;
+        if (r.band.tracking && !Z.band.tracking) { Z.band.tracking = true; setTimeout(() => bandPoll(z), 2000); }
+      }
       status(`Pas ${z.zone_id} F${f}: ${what} – „👁 Podgląd klatek” / „Zastosuj na ujęcie” policzy strefę z nową grubością`, 'ok');
     } catch (e) { Z.undo.pop(); bandDirty(z); toast(`Punkt pasa: ${e.message || e}`, 6000); }
     onFrame(); renderLane(); V().render();

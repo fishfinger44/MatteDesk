@@ -8,9 +8,9 @@
 
 Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie liczy każdą maskę na całe ujęcie. Ty poprawiasz tylko te klatki, które tego wymagają.
 
-`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
+`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.39/MatteDesk-0.39-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.4/MatteDesk-0.4-setup.exe)
 
 Windows 10 / 11 · karta NVIDIA · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -19,6 +19,8 @@ Windows 10 / 11 · karta NVIDIA · przycisk pobiera instalator – wszystkie wer
 Wersja: plik [`VERSION`](VERSION) (widoczna też w lewym górnym rogu UI) · historia: [CHANGELOG.md](CHANGELOG.md)
 
 </div>
+
+https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
 
 ---
 
@@ -63,16 +65,17 @@ flowchart LR
     S --> B[2 CoTracker<br/>pędzel poprawek, opcjonalnie]
     B --> M[3 MatAnyone<br/>miękka krawędź]
     M --> V[4 VideoMaMa<br/>kosmyki włosów]
-    V --> T[5 ViTMatte<br/>strefy]
+    V --> T[5 BiRefNet / ViTMatte<br/>pas krawędzi]
     T --> X[6 Eksperymenty<br/>bazy · QA · poprawka krawędzi]
     X --> L[7 LTX<br/>alfa generatywna, opcjonalnie]
-    L --> E[8 Eksport<br/>alpha + Nuke]
+    L --> F[8 Final Touch<br/>pędzel · poziomy · motion blur]
+    F --> E[9 Eksport<br/>alpha + Nuke]
     S -.->|zła klatka: klucz| S
 ```
 
-Każdy obiekt przechodzi przez pasek etapów **0 Plate'y · 1 SAM 3.1 · 2 CoTracker3 · 3 MatAnyone2 · 4 VideoMaMa · 5 ViTMatte · 6 Eksperymenty ·
-7 LTX-2.5 · 8 Eksport**. Etapy 2 i 4–7 są opcjonalne; Eksport jest dostępny od razu po rdzeniu SAM 3.1, a źródło wybierasz (rdzeń, MatAnyone2,
-VideoMaMa, ViTMatte, LTX-2.5 albo dowolna wersja). Panel każdego etapu mówi, co robi i do czego jest najlepszy. Pasek pokazuje, co jest gotowe,
+Każdy obiekt przechodzi przez pasek etapów **0 Plate'y · 1 SAM 3.1 · 2 CoTracker3 · 3 MatAnyone2 · 4 VideoMaMa · 5 ViTMatte / BiRefNet · 6 Eksperymenty ·
+7 LTX-2.5 · 8 Final Touch · 9 Eksport**. Etapy 2 i 4–8 są opcjonalne; Eksport jest dostępny od razu po rdzeniu SAM 3.1, a źródło wybierasz (rdzeń, MatAnyone2,
+VideoMaMa, ViTMatte / BiRefNet, LTX-2.5, Final Touch albo dowolna wersja). Panel każdego etapu mówi, co robi i do czego jest najlepszy. Pasek pokazuje, co jest gotowe,
 a co wymaga przeliczenia po Twojej poprawce; cofanie jest zawsze dostępne, a każda zmiana tworzy nową wersję do porównania (A / B / różnica).
 
 ---
@@ -105,20 +108,31 @@ Sekwencja `_fix` to kompletny, naprawiony plate RGB – wczytujesz go wprost w N
 
 ### 🧰 Przygotowanie plate'ów (etap 0)
 - **Wyrównanie** backlitu i clear plate'u do beauty (dopasowanie lokalne CoTracker3 → siatka przesunięć `align/grid_<plate>/`, < 1 MB/kl.; w Nuke'u STMap z siatki, eksport `.nk`),
-- **Deflicker i odszumianie** – migotanie usuwane w przestrzeni liniowej, bez spłaszczania zamierzonych zmian światła,
+- **Deflicker i odszumianie** – migotanie usuwane w przestrzeni liniowej, bez spłaszczania zamierzonych zmian światła; jeden przycisk
+  mierzy plate i ustawia parametry, podgląd 1024 px i kontrola treści (bez duchów) przed pełnym liczeniem, 4K bez braku pamięci,
 - **Ruch kamery 2D** z eksportem `Camera2D` do Nuke,
 - **Mapa głębi** (DepthCrafter) z kontrolą stabilności, podpowiadająca kolejność obiektów.
 
 ### ✂️ Wycinanie
 - **SAM3.1** znajduje obiekt z punktów albo frazy w klatkach kluczowych i propaguje rdzeń na całe ujęcie; kadry jadą za obiektem automatycznie,
 - **poprawki pędzlem z CoTracker3** – kreski dodaj / usuń w kilku klatkach, przenoszone na resztę ujęcia śledzonymi punktami,
+- **jeden pas krawędzi we wszystkich etapach krawędzi** (3 MatAnyone2, 4 VideoMaMa, 5 BiRefNet / ViTMatte, 7 LTX-2.5): suwaki skalują pas,
+  punkty pasa śledzone CoTrackerem3 go kształtują (szeroko na włosach, 0 = brak pasa, np. na skórze), wtopienia wewnętrzne / zewnętrzne,
+  podgląd przerywanymi liniami. Pas należy do obiektu – ustawiasz go raz, korzysta z niego każdy etap („odłącz → własny pas”, gdy jeden
+  etap potrzebuje czegoś innego),
+- **„Zaproponuj pas (Sapiens2)”** (opcjonalnie) – Sapiens2-seg-0.4B rozpoznaje części ciała i ustawia punkty pasa dla ludzi: szeroko na
+  włosach, wąsko na ubraniu, cienko na skórze,
 - **MatAnyone2** liczy miękką, stabilną w czasie krawędź w pasie wokół rdzenia,
 - **VideoMaMa** dokłada kosmyki włosów i detal krawędzi (suwaki zasięgu i ochrony krawędzi na żywo, bez ponownego liczenia modelu),
-- **strefy ViTMatte** dla włosów, futra, dymu i włókien – malowany pas albo cały obrys minus wykluczenia, śledzone z obiektem,
+- **silnik krawędzi etapu 5** dla włosów, futra, dymu i włókien w pasie: **BiRefNet_HR-matting / Lucida** (wagi MIT, także do pracy
+  komercyjnej) albo **ViTMatte** (opcjonalnie, wagi niekomercyjne),
 - **Eksperymenty** – dowolna policzona wersja jako baza, QA i propozycje poprawki krawędzi, przeliczenie z tej bazy,
 - **LTX-2.5 Alpha-Gen** (opcjonalnie) – generatywna alfa dla rzeczy półprzezroczystych i cienkich,
+- **Final Touch** – ręczne poprawki alfy na dowolnej wersji przed eksportem: pędzel (dodaj / usuń / zmaż, klatka po klatce),
+  czerń / biel / gamma, erode, rozmycie i motion blur z ruchu plate'u,
+- **„👁 Podgląd klatek”** w etapach z modelem – kilka klatek wokół bieżącej przed długim liczeniem całego ujęcia,
 - **wiele obiektów** liczonych od przodu do tyłu oraz **części obiektu** (np. suknia jako część postaci) z własną maską i eksportem bez szwu,
-- **lupa** na cienkich elementach, regulacja szerokości i położenia krawędzi, motion blur alfy, wygładzanie w czasie.
+- **lupa** na cienkich elementach, motion blur alfy, wygładzanie w czasie; nakładki masek, kontury, widok Alpha i comp rysowane na GPU.
 
 ### 🔬 Kontrola jakości
 Maska jest oceniana **w całości, na każdej klatce** – nigdy na samym wycinku. Mapa migotania w czasie, flagi na osi, pomiar dokładności
@@ -127,7 +141,12 @@ krawędzi względem gradientu obrazu. Po dwóch nieudanych próbach automatyczny
 ### 🩺 Doktor środowiska
 Przycisk **Doktor** sprawdza ComfyUI, węzły, modele, ffmpeg i GPU. Gdy czegoś brakuje, otwiera się sam przy starcie i przy każdej pozycji
 daje przycisk **Zainstaluj** z paskiem postępu (MB, prędkość, czas do końca) oraz zbiorczy **„Zainstaluj wszystkie brakujące”**.
-Jest też przełącznik między **ComfyUI Desktop** a **ComfyUI z gita**.
+Jest też przełącznik między **ComfyUI Desktop** a **ComfyUI z gita** (folder, folder modeli i port do zmiany w obu; puste = wykrywane
+automatycznie), ostrzeżenie, gdy na porcie odpowiada **inny** ComfyUI (dwie instalacje na jednym komputerze), i licencja każdego
+składnika. **Zainstalowane modele** (LTX-2.5, VideoMaMa, MatAnyone2, ViTMatte, Sapiens2, MiniMax-Remover, LaMa) mają przycisk 🗑, który
+usuwa **tylko ich wagi** po pokazaniu każdego pliku z rozmiarem – etap, który potrzebuje modelu, jest wtedy zablokowany. SAM 3.1,
+CoTracker3 i BiRefNet_HR-matting / Lucida (silnik etapu 5, który zostaje bez ViTMatte) nie mają kosza. Nic nie instaluje się samo –
+tylko po kliknięciu.
 
 ### 🐞 Zgłoś problem
 Przycisk **🐞 Zgłoś problem** (w nagłówku, w oknie „O programie” i w każdym oknie błędu) wysyła autorowi krótki opis z diagnostyką:
@@ -161,8 +180,10 @@ dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej 
 | 🩹 Kontrola i naprawa plate'ów | ✅ w kodzie i w UI (etap 0) |
 | 🧰 Wyrównanie, deflicker, kamera 2D | ✅ w kodzie; testy na prawdziwych ujęciach w toku |
 | ✂️ Etapy 1–3: rdzeń SAM3.1, poprawki pędzlem CoTracker3, krawędź MatAnyone2; klucze, wiele obiektów, części, QA, eksport | ✅ działa |
-| 💇 Etap 4 VideoMaMa (kosmyki włosów, v0.3) · etap 5 strefy ViTMatte · etap 6 Eksperymenty | ✅ działa; testowane na prawdziwych ujęciach, dopracowywane |
+| 💇 Etap 4 VideoMaMa (kosmyki włosów) · etap 5 BiRefNet / ViTMatte · etap 6 Eksperymenty · wspólny pas krawędzi, propozycja pasa Sapiens2 | ✅ działa; testowane na prawdziwych ujęciach, dopracowywane |
 | 🧪 Etap 7 LTX-2.5 Alpha-Gen (opcjonalny, generatywny) | ✅ działa; wymaga 24 GB VRAM |
+| 🖌 Etap 8 Final Touch (ręczne poprawki alfy przed eksportem) | ✅ działa (od v0.35) |
+| 🐞 Zgłoś problem (zanonimizowane, za zgodą) | ✅ działa (od v0.35) |
 | 🌐 **Język interfejsu** | ✅ angielski (domyślnie) / polski, przełącznik w nagłówku |
 | 🌿 Strefa „matting lokalny” | 🚧 w budowie |
 
@@ -177,8 +198,8 @@ dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej 
 | Wagi **SAM3.1** (`sam3.1_multiplex_fp16`) | Hugging Face `Comfy-Org/sam3.1` | 1,7 GB | ✅ |
 | Wagi **MatAnyone2** | GitHub `pq-yang/MatAnyone2` | 135 MB | ✅ |
 | **CoTracker3** (pakiet do Pythona ComfyUI + wagi) | pip `--no-deps` + Hugging Face `facebook/cotracker3` | 100 MB | zalecane |
-| Wagi **ViTMatte** (strefy „włosy” / silnik `vitmatte`; liczy się w Pythonie ComfyUI) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, tylko gdy brak) | 390 MB | ✅ dla stref włosów (wagi **tylko niekomercyjnie** – trenowane na zbiorze Adobe) |
-| Wagi **BiRefNet_HR-matting / Lucida** (opcjonalne modele krawędzi strefy ViTMatte, MIT – do pracy komercyjnej; Python ComfyUI) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, tylko gdy brak) | 444 + 885 MB | ❌ opcjonalne |
+| Wagi **ViTMatte** (strefy „włosy” / silnik `vitmatte`; liczy się w Pythonie ComfyUI) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, tylko gdy brak) | 390 MB | ❌ opcjonalne (wagi **tylko niekomercyjnie** – trenowane na zbiorze Adobe) |
+| Wagi **BiRefNet_HR-matting / Lucida** (silnik krawędzi etapu 5, MIT – także do pracy komercyjnej; Python ComfyUI) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, tylko gdy brak) | 444 + 885 MB | ✅ dla etapu 5 |
 | Wagi **Sapiens2-seg-0.4B** (opcjonalne „Zaproponuj pas” – części ciała → punkty pasa, tylko ludzie; Sapiens2 License, komercyjnie OK; Python ComfyUI z transformers ≥ 5) | Hugging Face `facebook/sapiens2-seg-0.4b` | 1,63 GB | ❌ opcjonalne |
 | **Wyrównanie plate'ów na GPU** (`engine/align_gpu_worker.py` w Pythonie ComfyUI; tylko sprawdzenie – używa torcha i CUDA z ComfyUI) | – | 0 | nie (przyspieszenie; bez tego CPU) |
 | Węzły **VideoHelperSuite** (`VHS_LoadImagesPath` – ujęcia 8-bit PNG/JPG w SAM 3.1, MatAnyone2, strefach) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + jego wymagania (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ dla ujęć 8-bit |
@@ -264,7 +285,8 @@ i otwiera http://127.0.0.1:8765. Zamknięcie okna konsoli zatrzymuje serwer.
 
 - kopiuje nasze węzły (`ComfyUI-PlateMatte`, `ComfyUI-MatAnyone2-Keyframes`) do `custom_nodes`,
 - klonuje węzeł `ComfyUI-MatAnyone2` i instaluje jego wymagania,
-- pobiera wagi **SAM3.1** (1,7 GB) i **MatAnyone2** (135 MB); opcjonalnie LaMa (196 MB) i CoTracker3 (100 MB).
+- pobiera wagi **SAM3.1** (1,7 GB), **MatAnyone2** (135 MB), **CoTracker3** (100 MB) i **BiRefNet_HR-matting / Lucida** (1,3 GB);
+  modele opcjonalne (VideoMaMa, LTX-2.5, ViTMatte, Sapiens2, LaMa) mają własne przyciski „Zainstaluj”.
 
 **5. Zrestartuj ComfyUI** – przyciskiem „🔁 Zrestartuj ComfyUI” w Doktorze – i kliknij „Odśwież test”. Gdy wszystko jest zielone – gotowe.
 
@@ -305,7 +327,7 @@ Po zmianach w interfejsie odśwież przeglądarkę (Ctrl+F5).
 - 🔁 **Wyraźna informacja o restarcie ComfyUI** – po instalacji węzłów duży, stały baner „Zrestartuj ComfyUI, inaczej węzły nie zadziałają”
   (z listą tego, co czeka na restart), znacznik „czeka na restart” przy zainstalowanych pozycjach i wykrycie, kiedy Comfy został już zrestartowany.
 - 🧪 **Pierwszy prawdziwy przebieg na tym komputerze** – instalacja przez Doktora, restart ComfyUI i test na ujęciu.
-- ⚡ **Wydajność i jakość** – szybszy podgląd klatki SAM 3.1, pełna rozdzielczość nakładek, domknięcie testów na prawdziwych ujęciach.
+- ⚡ **Wydajność i jakość** – szybszy podgląd klatki SAM 3.1, domknięcie testów na prawdziwych ujęciach.
 
 **Dalej**
 - 🐧 **Wersje na Linuxa i macOS** – skrypt startowy, instalator i Doktor bez założeń Windowsa.

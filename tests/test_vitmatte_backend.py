@@ -129,9 +129,10 @@ def test_install_vitmatte_pip_only_when_missing():
     assert not bad["success"] and any("BŁĄD" in l for l in bad["log"])
 
 
-@pytest.mark.parametrize("state,status,action", [("ready", "ok", None), ("no_weights", "warning", "install_vitmatte"),
-                                                 ("unavailable", "warning", "install_vitmatte")])
+@pytest.mark.parametrize("state,status,action", [("ready", "ok", None), ("no_weights", "info", "install_vitmatte"),
+                                                 ("unavailable", "info", "install_vitmatte")])
 def test_doctor_vitmatte_item(tmp_path, monkeypatch, state, status, action):
+    """User decision 2026-10-23: ViTMatte is optional in stage 5 (BiRefNet_HR-matting / Lucida is the required engine)."""
     from doctor import EnvironmentDoctor
     monkeypatch.setattr(vm.VitMatteRunner, "available", staticmethod(lambda: (False, "no torch")))
     res = {"ready": (True, "cuda", [vm.DEFAULT_MODEL]), "no_weights": (True, "cuda", []),
@@ -142,4 +143,4 @@ def test_doctor_vitmatte_item(tmp_path, monkeypatch, state, status, action):
     it = {i.name: i for i in doc.run_all_checks().items}["Model: ViTMatte"]
     assert it.status == status and it.action == action
     if status != "ok":
-        assert "Wymagane teraz: TAK" in it.fix_suggestion and it.links
+        assert "Wymagane teraz: NIE" in it.fix_suggestion and it.links

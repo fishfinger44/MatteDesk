@@ -700,3 +700,49 @@ def test_wizard_video_plates_new_shot(client, tmp_path):
     assert plates["beauty"].endswith("source/beauty/beauty_####.png")
     assert plates["backlit"].endswith("source/backlit/backlit_####.png")
     assert len(list((work_dir / "matte_desk" / "source" / "backlit").glob("backlit_*.png"))) == 5
+
+
+def _png_seq(d: Path, name: str, w: int, h: int, n: int = 3) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    for f in range(1, n + 1):
+        cv2.imwrite(str(d / f"{name}_{f:04d}.png"), np.zeros((h, w, 3), dtype=np.uint8))
+    return d
+
+
+def test_open_rejects_aux_plate_from_another_shot(tmp_path):
+    """2026-10-23: form fields left from SH010 were saved into sh060's project.json as added plates."""
+    client = TestClient(app)
+    saved = dict(STATE)
+    try:
+        work = tmp_path / "SHOT_A"
+        beauty = _png_seq(work / "plate_beauty", "SHOT_A_beauty", 80, 48)
+        foreign = _png_seq(tmp_path / "other" / "backlit", "OTHER_backlit", 64, 32)
+        same = _png_seq(work / "plate_backlit", "SHOT_A_backlit", 80, 48)
+
+        # new shot (wizard): a foreign backlit is refused, nothing created
+        r = client.post("/api/project/open_or_create", json={
+            "work_dir": str(work), "shot_name": "SHOT_A",
+            "plates": {"beauty": str(beauty), "backlit": str(foreign)}})
+        assert r.status_code == 400 and "innego ujęcia" in r.text
+        assert not list(work.glob("shot_manifest_*.json"))
+
+        r = client.post("/api/project/open_or_create", json={
+            "work_dir": str(work), "shot_name": "SHOT_A", "plates": {"beauty": str(beauty)}})
+        assert r.status_code == 200, r.text
+        pj = work / "matte_desk" / "project.json"
+
+        # existing shot: a leftover foreign plate is refused and not saved
+        for k in ("backlit", "cleanplate"):
+            r = client.post("/api/project/open_or_create", json={
+                "work_dir": str(work), "plates": {"beauty": str(beauty), k: str(foreign)}})
+            assert r.status_code == 400 and k in r.text
+            assert k not in json.loads(pj.read_text(encoding="utf-8"))["plates_added"]
+
+        # a plate of the same resolution is still accepted
+        r = client.post("/api/project/open_or_create", json={
+            "work_dir": str(work), "plates": {"beauty": str(beauty), "backlit": str(same)}})
+        assert r.status_code == 200, r.text
+        assert "backlit" in json.loads(pj.read_text(encoding="utf-8"))["plates_added"]
+    finally:
+        STATE.clear()
+        STATE.update(saved)

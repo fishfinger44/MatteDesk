@@ -51,6 +51,25 @@ from engine.report import install_log_buffer  # noqa: E402
 install_log_buffer()   # last log lines for "Zgłoś problem" (the start_v*.bat console is not a file)
 
 
+class _QuietPolling(logging.Filter):
+    """Hide successful UI polling (job progress, Comfy health) from the uvicorn access log; errors still show."""
+    PATHS = ("/api/jobs", "/api/comfy/health")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        path = str(args[2]).split("?", 1)[0]
+        try:
+            ok = int(args[4]) < 400
+        except (TypeError, ValueError):
+            ok = False
+        return not (args[1] == "GET" and ok and path in self.PATHS)
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietPolling())
+
+
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
@@ -858,6 +877,8 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
                     v = video_to_sequence(v, proj.work_dir, int(proj.manifest.get("first", 1)))["pattern"]
                 resolved = MediaInspector.resolve_sequence_pattern(v).get("pattern", v)
                 if manifest_plates.get(k) != resolved:
+                    # 2026-10-23: form fields left over from SH010 were saved into the sh060 project
+                    _reject_aux_mismatch(k, resolved, proj.effective_manifest())
                     proj.set_plate(k, resolved)
         data["manifest"] = proj.effective_manifest()
     else:
@@ -923,6 +944,8 @@ def _open_work_dir(req: OpenOrCreateProjectRequest) -> Dict[str, Any]:
         backlit_pat = req.plates.get("backlit", "").strip()
         if backlit_pat:
             backlit_pat = _aux_seq("backlit", backlit_pat)
+        for k, pat in (("cleanplate", cleanplate_pat), ("backlit", backlit_pat)):
+            _reject_aux_mismatch(k, pat, {"plate_w": plate_w, "plate_h": plate_h})
 
         creator.create_manifest(
             shot_name=shot_name,
@@ -1090,6 +1113,15 @@ def _aux_mismatch(name: str, pattern: str, manifest: Dict[str, Any]) -> Optional
         return None
     from engine.pipeline import aux_plate_mismatch
     return aux_plate_mismatch(pattern, int(manifest["plate_w"]), int(manifest["plate_h"]))
+
+
+def _reject_aux_mismatch(name: str, pattern: str, manifest: Dict[str, Any]) -> None:
+    """400 when a backlit / clear plate is not the beauty's resolution (plate from another shot)."""
+    why = _aux_mismatch(name, pattern, manifest) if pattern else None
+    if why:
+        raise HTTPException(status_code=400, detail=(
+            f"{name}: rozdzielczość {why} – to plate z innego ujęcia "
+            "(backlit / clear plate muszą być z tej samej kamery i rozdzielczości)"))
 
 
 @app.get("/api/project/plates")
@@ -2928,7 +2960,7 @@ async def compute_all(name: str):
     return {"success": True, "frames": [frames[0], frames[-1]], "work_area": _work_area(),
             "whole_shot": frames == _shot_frames(), "crops_recomputed": bool(reason), "crops_reason": reason,
             "crop_segments": len(crops["segments"]) if crops else None, "crop_flags": (crops or {}).get("flags") or {},
-            "life_hints": getattr(res, "life_hints", []),
+            "life_hints": getattr(res, "life_hints", []), "front_missing": getattr(res, "front_missing", []),
             "uncertain": res.uncertain, "suggested_keys": res.suggested_keys,
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals}
 
@@ -2965,6 +2997,7 @@ async def run_object_core(name: str):
         raise HTTPException(status_code=409, detail=str(e))
     await _auto_mask12(pipe, name)
     return {"success": True, "frames": [frames[0], frames[-1]], "life_hints": getattr(res, "life_hints", []),
+            "front_missing": getattr(res, "front_missing", []),
             "uncertain": res.uncertain, "suggested_keys": res.suggested_keys,
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals}
 
@@ -4727,12 +4760,14 @@ def _band_state_o(name: str, ow: "_BandOwner", frame: int) -> Dict[str, Any]:
     except FileNotFoundError:
         core = None
     so, si = ow.scales()        # the sliders size the band, the points shape it (2026-10-21)
+    from engine.bandmap import _contours
+    cs = _contours(core) if core is not None else None     # one outline trace for all the points of the frame
     out = []
     for q in pts:
         x, y, vis = pos.get(q["id"], (None, None, False))
         o, i = widths_at(q, frame)
         o, i = o * so, i * si
-        sn = snap_normal(core, x, y) if core is not None and x is not None else None
+        sn = snap_normal(core, x, y, cs) if core is not None and x is not None else None
         out.append({"id": q["id"], "x": x, "y": y, "visible": vis, "out": round(o, 2), "in": round(i, 2),
                     "key": str(frame) in q["keys"], "keys": sorted(int(k) for k in q["keys"]),
                     **({"sx": round(sn[0], 2), "sy": round(sn[1], 2), "nx": round(sn[2], 4), "ny": round(sn[3], 4)} if sn else {})})
@@ -5153,7 +5188,10 @@ def propose_band(name: str, req: BandProposeRequest):
         gp = np.clip(np.asarray(pipe.loader.frame(req.frame - 1), np.float32), 0, 1).mean(axis=2)
         flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST).calc(u8(gp), u8(g), None)
     auto_w = adaptive_band_width(core, g, flow, pipe.shutter, 1.0)
-    pts, stats = propose(core, cls, req.frame, auto_w, (ow.out, ow.inn))
+    # „Wcięcie w rdzeń” at 0 means 0 (user decision 2026-10-23: the proposed points cut 10–14 px into the core): no
+    # inset on any point; the 0 reference keeps them at scale 1, so a whisker dragged on one point is plain px there
+    # (as hand-set points made at 0)
+    pts, stats = propose(core, cls, req.frame, auto_w, (ow.out, ow.inn), inset=ow.inn > 0)
     if not pts:
         raise HTTPException(status_code=422, detail="Brak części ciała na obrysie – pas zostaje stały")
     ow.params = {**ow.params, **ow.refs()}      # the sliders as they are now = scale 1 for these points
@@ -5214,18 +5252,30 @@ def stage_band_lines(name: str, stage: str, frame: int, outer_feather_px: Option
         cores = sorted((p.parent.parent.name, p.stat().st_mtime_ns) for p in root.glob("*/core/core.json"))
         ck = json.dumps([str(root), ow.name, frame, band_scale, shift_px, reach_px, inset_px, feather_px, outer_feather_px,
                          settings_sig(o), mask_sig(_objects(), ow.name), cores, _STATE_PLATE_KEY()], default=str)
+        from engine import bandtrack
         from engine.objband import edge_band
-        if edge_band(o):   # band points: their positions settle when the CoTracker3 tracking ends – never kept
+        from engine.stages import EDGE_KEYS, EDGE_KEYS_OPT
+        # band points: their positions settle when the CoTracker3 tracking ends – kept only when no tracking runs
+        # (before and after this request; settings_sig carries the points, 2026-10-23)
+        if edge_band(o) and bandtrack._RUNNING:
             ck = None
         hit = _LINES_CACHE.get(ck) if ck else None
         if hit is not None:
             _LINES_CACHE.move_to_end(ck)
             return hit
+        # the shifted mask 1+2 (core stabilisation ~2 s) does not depend on the band points: kept across point edits
+        sk = {k: o.get(k) for k in EDGE_KEYS + EDGE_KEYS_OPT if k != "edge_band"}
+        objs = [(x["name"], x.get("depth_order"), x.get("part_of"), x.get("life")) for x in _objects().list()]
+        core_key = json.dumps([str(root), ow.name, frame, band_scale, shift_px, reach_px, inset_px, sk, objs,
+                               mask_sig(_objects(), ow.name), cores, _STATE_PLATE_KEY()], default=str)
         try:
             # adaptive mode (0 / 0): band_scale / shift_px of the palette (2026-10-22: the lines in both modes)
-            m, info = _pipeline().edge_preview(ow.name, frame, band_scale, shift_px, band_out_px=reach_px, band_in_px=inset_px)
+            m, info = _pipeline().edge_preview(ow.name, frame, band_scale, shift_px, band_out_px=reach_px, band_in_px=inset_px,
+                                               core_key=core_key)
         except (FileNotFoundError, ValueError) as e:
             raise HTTPException(status_code=404, detail=str(e))
+        if edge_band(o) and bandtrack._RUNNING:
+            ck = None
         band, core = m == 128, np.asarray(info["core"]).astype(bool)
         fi = float(feather_px if feather_px is not None else (o.get("band_in_feather_px") or 0.0))
         fo = float(outer_feather_px if outer_feather_px is not None else (o.get("band_out_feather_px") or 0.0))

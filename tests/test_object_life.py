@@ -35,6 +35,14 @@ def test_life_helpers():
     assert life_changed_intervals(None, life, shot) == [[1, 9], [41, 79]]
     assert life_changed_intervals([[10, 40]], [[10, 45]], shot) == [[41, 45]]
     assert life_changed_intervals(life, life, shot) == []
+    # bug 2026-10-23: a trim at the start / end without a key keeps the core valid; a key in the hidden frames, a cut in
+    # the middle of a piece or newly shown frames still need a recompute
+    assert life_changed_intervals(None, [[1, 60]], shot, keys=[1]) == []
+    assert life_changed_intervals(None, [[20, 100]], shot, keys=[50]) == []
+    assert life_changed_intervals(None, [[1, 60]], shot, keys=[1, 80]) == [[61, 100]]
+    assert life_changed_intervals(None, [[1, 40], [60, 100]], shot, keys=[1]) == [[41, 59]]
+    assert life_changed_intervals([[1, 60]], [[1, 50]], shot, keys=[1]) == []
+    assert life_changed_intervals([[1, 50]], [[1, 60]], shot, keys=[1]) == [[51, 60]]
 
 
 def test_life_hints_exit_and_entry_at_border():

@@ -116,9 +116,10 @@ def test_install_birefnet_pip_only_missing_never_torch():
 
 
 @pytest.mark.parametrize("res,status,action", [((True, "cuda", list(br.MODELS.values())), "ok", None),
-                                               ((True, "cuda", ["egeorcun/lucida"]), "info", "install_birefnet"),
-                                               ((False, "ModuleNotFoundError: timm", []), "info", "install_birefnet")])
-def test_doctor_birefnet_item_optional_and_commercial(tmp_path, monkeypatch, res, status, action):
+                                               ((True, "cuda", ["egeorcun/lucida"]), "warning", "install_birefnet"),
+                                               ((False, "ModuleNotFoundError: timm", []), "warning", "install_birefnet")])
+def test_doctor_birefnet_item_required_and_commercial(tmp_path, monkeypatch, res, status, action):
+    """User decision 2026-10-23: BiRefNet_HR-matting / Lucida is the REQUIRED stage-5 engine (warning when missing)."""
     from doctor import BIREFNET_LABEL, EnvironmentDoctor
     monkeypatch.setattr(vm, "check_worker_python", lambda *a, **k: res)
     doc = EnvironmentDoctor(simulation={"simulate_comfy_offline": True})
@@ -128,7 +129,7 @@ def test_doctor_birefnet_item_optional_and_commercial(tmp_path, monkeypatch, res
     assert it.status == status and it.action == action
     assert it.license and "MIT" in it.license and not it.license_nc                # commercial OK
     if status != "ok":
-        assert "Wymagane teraz: NIE" in it.fix_suggestion
+        assert "Wymagane teraz: TAK" in it.fix_suggestion
     assert items["Model: ViTMatte"].license_nc                                     # ViTMatte: Adobe-trained weights
 
 

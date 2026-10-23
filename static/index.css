@@ -47,6 +47,89 @@ body, html {
   user-select: none;
 }
 
+/* Sliders everywhere (user request 2026-10-23): thin dark track, amber filled part up to the value (`--fill`, kept by
+   static/range_fill.js), small square-ish amber handle like the buttons; disabled = grey. */
+input[type=range] {
+  -webkit-appearance: none; appearance: none; background: transparent; height: 16px; min-width: 40px;
+  cursor: pointer; vertical-align: middle; --fill: 50%; --rf-on: var(--accent-primary);
+}
+input[type=range]:disabled { cursor: default; --rf-on: #55555c; }
+input[type=range]:focus { outline: none; }
+input[type=range]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px;
+  background: linear-gradient(to right, var(--rf-on) 0 var(--fill), #3a3a40 var(--fill) 100%);
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 10px; height: 14px; margin-top: -5px; border-radius: 2px;
+  background: var(--rf-on); border: 1px solid var(--bg-darkest); box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+  transition: background .12s, transform .12s;
+}
+input[type=range]:not(:disabled):hover::-webkit-slider-thumb { background: #f3b85a; }
+input[type=range]:not(:disabled):active::-webkit-slider-thumb { transform: scaleY(1.15); }
+input[type=range]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 2px rgba(232,163,61,.45); }
+input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: #3a3a40; }
+input[type=range]::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--rf-on); }
+input[type=range]::-moz-range-thumb {
+  width: 10px; height: 14px; border-radius: 2px; background: var(--rf-on); border: 1px solid var(--bg-darkest);
+}
+
+/* Checkboxes everywhere (user request 2026-10-23, same look as the sliders): dark square with a thin border, amber
+   fill + dark tick when checked; disabled = grey. */
+input[type=checkbox] {
+  -webkit-appearance: none; appearance: none; flex: none; width: 14px; height: 14px; margin: 0 2px; vertical-align: middle;
+  border: 1px solid #55555c; border-radius: 2px; background: var(--bg-darkest); cursor: pointer; position: relative;
+  transition: background .12s, border-color .12s;
+}
+input[type=checkbox]:not(:disabled):hover { border-color: var(--accent-primary); }
+input[type=checkbox]:checked { background: var(--accent-primary); border-color: var(--accent-primary); }
+input[type=checkbox]:checked::after {
+  content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px;
+  border: solid var(--on-accent); border-width: 0 2px 2px 0; transform: rotate(45deg);
+}
+input[type=checkbox]:indeterminate { background: var(--accent-primary); border-color: var(--accent-primary); }
+input[type=checkbox]:indeterminate::after {
+  content: ""; position: absolute; left: 2px; top: 5px; width: 8px; height: 2px; background: var(--on-accent);
+}
+input[type=checkbox]:disabled { cursor: default; border-color: #3a3a40; background: #26262a; }
+input[type=checkbox]:disabled:checked { background: #55555c; border-color: #55555c; }
+input[type=checkbox]:focus { outline: none; }
+input[type=checkbox]:focus-visible { box-shadow: 0 0 0 2px rgba(232,163,61,.45); }
+
+/* The rest of the native controls in the app style (user request 2026-10-23). `color-scheme: dark` makes what stays
+   native (dropdown lists, number spinners, date pickers) dark instead of light-grey Windows widgets. */
+:root { color-scheme: dark; }
+input[type=radio] {
+  -webkit-appearance: none; appearance: none; flex: none; width: 14px; height: 14px; margin: 0 2px; vertical-align: middle;
+  border: 1px solid #55555c; border-radius: 50%; background: var(--bg-darkest); cursor: pointer;
+  transition: border-color .12s, box-shadow .12s;
+}
+input[type=radio]:not(:disabled):hover { border-color: var(--accent-primary); }
+input[type=radio]:checked { border-color: var(--accent-primary); box-shadow: inset 0 0 0 3px var(--bg-darkest); background: var(--accent-primary); }
+input[type=radio]:disabled { cursor: default; border-color: #3a3a40; background: #26262a; }
+input[type=radio]:focus { outline: none; }
+input[type=radio]:focus-visible { outline: 2px solid rgba(232,163,61,.45); outline-offset: 1px; }
+/* dropdowns: flat, with a thin chevron instead of the system arrow (:not([multiple]) also outranks single-class rules
+   that use the `background` shorthand, e.g. .plate-select-dropdown) */
+select:not([multiple]) {
+  -webkit-appearance: none; appearance: none; cursor: pointer; padding-right: 20px !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a9aa0' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 6px center; background-size: 10px 6px;
+}
+select:not([multiple]):not(:disabled):hover { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23e8a33d' stroke-width='1.5'/%3E%3C/svg%3E"); }
+select:disabled { cursor: default; opacity: .55; }
+select option, select optgroup { background-color: var(--bg-dark); color: var(--text-main); }
+input[type=file]::file-selector-button {
+  margin-right: 8px; padding: 4px 10px; border: 1px solid var(--border-subtle); border-radius: 2px; cursor: pointer;
+  background: var(--bg-card); color: var(--text-main); font: 500 12px var(--font-sans); transition: border-color .12s;
+}
+input[type=file]::file-selector-button:hover { border-color: var(--accent-primary); }
+/* scrollbars: thin, dark, amber on drag (Chromium / Edge app window) */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3c3c42; border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: #55555c; }
+::-webkit-scrollbar-thumb:active { background-color: var(--accent-primary); }
+
 /* App Layout */
 .app-container {
   display: flex;
@@ -1535,6 +1618,10 @@ canvas.edge-hot { cursor: pointer !important; }
 /* linked objects (parent + parts) = one layer: inherited colour swatch, seam slider under the group */
 .other-layers .ol-swatch { width: 14px; height: 14px; border-radius: 2px; border: 1px solid var(--border-subtle); justify-self: center; }
 .other-layers .ol-row.grp:not(.cur) { background: rgba(148,163,184,.05); }
+.other-layers .ol-row.grp-main .ol-name { font-weight: 600; }
+.other-layers .ol-row.grp-part { margin-left: 18px; position: relative; }
+.other-layers .ol-row.grp-part::before { content: ""; position: absolute; left: -10px; top: -2px; bottom: -2px; border-left: 1px solid var(--border-subtle); }
+.other-layers .ol-seam { margin-left: 18px; padding-left: 4px !important; border-left: 1px solid var(--border-subtle); }
 .other-layers .ol-seam { display: grid; grid-template-columns: 1fr 96px 36px; align-items: center; gap: 6px; padding: 1px 4px 4px 18px; color: var(--text-muted); }
 .other-layers .ol-seam-l { display: flex; align-items: center; gap: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .other-layers .ol-seam-l i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }

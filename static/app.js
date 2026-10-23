@@ -820,13 +820,13 @@ class MatteDeskViewer {
           this.workDirStatusHint.textContent = `✓ Znaleziono manifest: shot_manifest_${shot}.json. Pola płyt uzupełnione automatycznie.`;
           this.workDirStatusHint.className = 'field-hint success';
 
+          // every field = this manifest's value or empty: a value left from the previous shot would be saved
+          // into this project as an added plate (2026-10-23: SH010 backlit / clear plate landed in sh060)
           const plates = info.plates || {};
-          if (plates.beauty && this.inputBeautyPlate) this.inputBeautyPlate.value = plates.beauty;
-          if ((plates.cleanplate || plates.clean_plate) && this.inputCleanPlate) {
-            this.inputCleanPlate.value = plates.cleanplate || plates.clean_plate;
-          }
-          if (plates.backlit && this.inputBacklitPlate) this.inputBacklitPlate.value = plates.backlit;
-          if (plates.depth && this.inputDepthPlate) this.inputDepthPlate.value = plates.depth;
+          if (this.inputBeautyPlate) this.inputBeautyPlate.value = plates.beauty || '';
+          if (this.inputCleanPlate) this.inputCleanPlate.value = plates.cleanplate || plates.clean_plate || '';
+          if (this.inputBacklitPlate) this.inputBacklitPlate.value = plates.backlit || '';
+          if (this.inputDepthPlate) this.inputDepthPlate.value = plates.depth || '';
           if (this.frameNumberingGroup) this.frameNumberingGroup.style.display = 'none';   // numbering = the manifest's
           if (this.beautyRangeHint) this.beautyRangeHint.textContent = `Klatki ${info.first}–${info.last} (manifest)`;
         } else {
@@ -1600,7 +1600,9 @@ class MatteDeskViewer {
       for (let y = 0; y < H; y += 16) for (let x = 0; x < W; x += 16) { g.fillStyle = ((x + y) / 16) % 2 ? '#999' : '#666'; g.fillRect(x, y, 16, 16); }
     } else if (bgSpec === 'bg') g.drawImage(bgImg, 0, 0, W, H);
     else { g.fillStyle = bgSpec; g.fillRect(0, 0, W, H); }
-    if (m) {
+    const gc = m && window.mdGpu ? mdGpu.comp(beauty, m.img, c, W, H) : null;   // same pixels on the GPU (gpu_overlay.js)
+    if (gc) { g.drawImage(gc, 0, 0); }
+    else if (m) {
       const b = g.getImageData(0, 0, W, H);
       const t = document.createElement('canvas'); t.width = W; t.height = H;
       const tg = t.getContext('2d');

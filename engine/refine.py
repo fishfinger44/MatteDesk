@@ -46,7 +46,7 @@ VRAM_LIMIT_GB = 11.0
 SPILL_LIMIT_GB = 0.5   # GPU memory moved to system RAM during the probe (Windows WDDM) above this = scale too big
 TEST_BATCH = 9
 PROBE_SCALES = (1.0, 0.75, 0.5)
-# auto probe start by crop side (beatch 2026-10-18: a 2784 px crop probed at 1.0 aborted the whole Comfy process)
+# auto probe start by crop side (sh060 2026-10-18: a 2784 px crop probed at 1.0 aborted the whole Comfy process)
 PROBE_START_BY_SIDE = ((2600, 0.5), (2048, 0.75))
 MA_SCALE_MODES = ("auto", "1.0", "0.75", "0.5")
 MA_NODE_DEFAULTS = {"vram_release_frac": 0.85, "max_mem_frames": 0,   # defaults.json "matanyone" overrides

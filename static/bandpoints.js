@@ -15,7 +15,7 @@
   let H = null;
   const S = () => H.S;
   const obj = () => H.S.obj;
-  const B = { data: {}, lines: {}, lastLines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false };
+  const B = { data: {}, lines: {}, lastLines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false, keep: null };
   // the stage whose band is edited: 4 VideoMaMa, 3 MatAnyone2 (px mode of the edge band)
   const STAGE_OF = () => (!H ? null : S().stage === H.ST.VIDEOMAMA ? 'videomama' : S().stage === H.ST.MATANYONE ? 'matanyone'
     : S().stage === H.ST.LTX ? 'ltx' : null);
@@ -43,7 +43,7 @@
     } catch (e) { /* no core in this frame: asked again on the next draw */ }
     finally { delete B.busy[k]; }
   }
-  function dirty() { B.data = {}; dirtyLines(); B.live = null; }
+  function dirty() { B.data = B.keep ? { [B.keep.k]: B.keep.d } : {}; dirtyLines(); B.live = null; }
   function dirtyLines() { B.lines = {}; B.lastLines = {}; }
   // preview lines of the band: the palette's slider values (live while dragging = the whiskers scale, lines after release)
   async function loadLines(f, params, prefetch) {
@@ -77,9 +77,16 @@
   async function save(f, body, what, del) {
     await snap(f, what);
     try {
+      let r = null;
       if (del != null) await H.api('DELETE', `${base()}${del === '' || del[0] === '?' ? '' : '/'}${del}`);
-      else await H.api('PUT', `${base()}/${f}`, body);
-      dirty(); await reloadStage(); renderMode();
+      else r = await H.api('PUT', `${base()}/${f}`, body);
+      // the PUT answers with the band of this frame: kept through the dirty() of the stage reload, so the same state is
+      // not asked again (2026-10-23, ~2 s with 24 points)
+      B.keep = r && r.band ? { k: key(f), d: r.band } : null;
+      dirty();
+      if (B.keep && B.keep.d.tracking && !B.tracking) { B.tracking = true; setTimeout(() => { delete B.data[key(V().currentFrame)]; load(V().currentFrame); }, 2000); }
+      try { await reloadStage(); } finally { B.keep = null; }
+      renderMode();
       H.status(`Pas ${STAGE_OF()} F${f}: ${what}`, 'ok');
     } catch (e) { B.undo.pop(); dirty(); H.toast(`Punkt pasa: ${e.message || e}`, 6000); }
     renderLane(); V().render();

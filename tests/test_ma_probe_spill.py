@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""MatAnyone2 auto scale probe (2026-10-21, beatch crash 2026-10-18): the start scale follows the crop size, GPU memory
+"""MatAnyone2 auto scale probe (2026-10-21, sh060 crash 2026-10-18): the start scale follows the crop size, GPU memory
 spilled to system RAM (Windows counter) pushes the scale down, and Comfy down / OOM on a crop names the scale to set."""
 
 import types
@@ -53,7 +53,7 @@ def test_probe_start_scale_by_crop(side, start):
 
 def test_big_crop_never_probes_full_scale():
     calls = []
-    scale, rep = _probe(_fin(calls), 2784)                 # beatch Woman_01: 2784 px crop
+    scale, rep = _probe(_fin(calls), 2784)                 # sh060 Woman_01: 2784 px crop
     assert calls == [0.5] and scale == 0.5
     assert rep.vram_log[0] == "kadr 2784 px: próba od ma_scale 0.5"
     calls = []

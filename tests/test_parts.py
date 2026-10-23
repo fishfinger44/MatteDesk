@@ -136,3 +136,33 @@ def test_single_export_equals_full_export(tmp_path):
     assert np.abs(whole["R"] - full_whole["R"]).max() < 1e-3
     out = json.loads((work / "outputs.json").read_text(encoding="utf-8"))
     assert {e["name"] for e in out["objects"]} == {"figure", "suknia"}     # earlier entries kept
+
+
+def test_three_objects_seam_fills_every_gap(tmp_path, monkeypatch):
+    """Group of 3 objects (main + 2 parts, user check 2026-10-23): the main object's part_seam_px fills the gap at BOTH
+    contacts of the whole; seam 0 leaves them open. Also via the API: two parts can be attached to one main object."""
+    from fastapi.testclient import TestClient
+    import app as app_module
+    from engine.stages import group_parts
+    yy, xx = np.mgrid[0:H, 0:W]
+    top = (abs(xx - 100) <= 25) & (yy >= 10) & (yy < 30)
+    mid = (abs(xx - 100) <= 25) & (yy >= 34) & (yy < 80)       # 4 px gap to top
+    low = (abs(xx - 100) <= 25) & (yy >= 84) & (yy < 140)      # 4 px gap to mid
+    gaps = [(slice(30, 34), slice(80, 121)), (slice(80, 84), slice(80, 121))]
+    for seam, filled in ((4, True), (0, False)):
+        work = tmp_path / f"s{seam}" / "matte_desk"
+        store = ObjectStore(work)
+        _object(store, "a", top, 0)                  # main = head: touches only the torso (b), never the legs (c)
+        _object(store, "b", mid, 1, part_of="a")
+        _object(store, "c", low, 2)                  # legs: touch only the torso – seams are filled between ANY two members
+        monkeypatch.setitem(app_module.STATE, "work_dir", str(work))
+        api = TestClient(app_module.app)
+        assert api.put("/api/object/c/settings", json={"part_of": "a"}).status_code == 200   # 2nd part of the same main
+        assert api.put("/api/object/a/settings", json={"part_seam_px": seam}).status_code == 200
+        assert group_parts(store, "a") == ["b", "c"]
+        export_objects(work, "shot", store.list(), [1], W, H)
+        ch, _ = read_exr(work / "export" / "mattes" / "all" / "shot_mattes_0001.exr")
+        full = ch["a_full.alpha"]
+        for g in gaps:
+            assert (full[g].min() >= 0.99) == filled, (seam, g)
+        assert np.abs(ch["a.alpha"] + ch["b.alpha"] + ch["c.alpha"] - full).max() < 3e-3   # parts still sum to the whole

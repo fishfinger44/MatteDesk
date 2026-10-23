@@ -401,3 +401,17 @@ def test_overlay_cache_keeps_newest_2026_10_23():
         assert not re.search(r"compCache = \{ \[\w+\]: c, \.\.\.", js)
     assert "function putComp(ck, c)" in obj and "slice(-(COMP_KEEP - 1))), [ck]: c }" in obj
     assert "tintCanvas, putComp," in obj and "H.putComp(key, c)" in zon
+
+
+def test_gpu_overlays_with_cpu_fallback():
+    """Viewport overlays on the GPU (2026-10-23): static/gpu_overlay.js loaded before app.js / objects.js; tint / bw /
+    comp try mdGpu first and keep the CPU loop as the fallback (no WebGL, context lost, md_gpu_overlay = '0')."""
+    assert HTML.index('<script src="/static/gpu_overlay.js"></script>') < HTML.index('<script src="/static/app.js"></script>')
+    js = (STATIC / "gpu_overlay.js").read_text(encoding="utf-8")
+    assert "window.mdGpu" in js and "webglcontextlost" in js and "md_gpu_overlay" in js
+    assert "premultipliedAlpha: true" in js and "floor(rgb * a / 255. + .5)" in js   # same stored values as putImageData
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    assert "mdGpu.line(ov, rgb) : mdGpu.tint(ov, rgb)" in obj and "mdGpu.bw(ov)" in obj and "mdGpu.comp(img, ov, c" in obj
+    assert obj.count("getImageData(0, 0, c.width, c.height)") >= 3   # the CPU paths are still there
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "mdGpu.comp(beauty, m.img, c, W, H)" in app

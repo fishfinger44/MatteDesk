@@ -8,9 +8,9 @@
 
 Repair the plates once. Generate alpha mattes for multiple objects – the tool computes each mask for the whole shot. You fix only the frames that need it.
 
-`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `ViTMatte` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
+`SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
-[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.39/MatteDesk-0.39-setup.exe)
+[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.4/MatteDesk-0.4-setup.exe)
 
 Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all versions: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -19,6 +19,8 @@ Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all vers
 Version: file [`VERSION`](VERSION) (also shown in the top-left corner of the UI) · history: [CHANGELOG.md](CHANGELOG.md)
 
 </div>
+
+https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
 
 ---
 
@@ -64,16 +66,17 @@ flowchart LR
     S --> B[2 CoTracker<br/>brush fixes, optional]
     B --> M[3 MatAnyone<br/>soft edge]
     M --> V[4 VideoMaMa<br/>hair strands]
-    V --> T[5 ViTMatte<br/>zones]
+    V --> T[5 BiRefNet / ViTMatte<br/>edge band]
     T --> X[6 Experiments<br/>bases · QA · edge fix]
     X --> L[7 LTX<br/>generative alpha, optional]
-    L --> E[8 Export<br/>alpha + Nuke]
+    L --> F[8 Final Touch<br/>brush · levels · motion blur]
+    F --> E[9 Export<br/>alpha + Nuke]
     S -.->|bad frame: key| S
 ```
 
-Every object goes through the stage bar **0 Plates · 1 SAM 3.1 · 2 CoTracker3 · 3 MatAnyone2 · 4 VideoMaMa · 5 ViTMatte · 6 Experiments ·
-7 LTX-2.5 · 8 Export**. Stages 2, 4–7 are optional; Export is available as soon as the SAM 3.1 core exists, and you choose its source
-(core, MatAnyone2, VideoMaMa, ViTMatte, LTX-2.5 or any version). Each stage panel says what it does and what it is best for. The stage bar
+Every object goes through the stage bar **0 Plates · 1 SAM 3.1 · 2 CoTracker3 · 3 MatAnyone2 · 4 VideoMaMa · 5 ViTMatte / BiRefNet · 6 Experiments ·
+7 LTX-2.5 · 8 Final Touch · 9 Export**. Stages 2, 4–8 are optional; Export is available as soon as the SAM 3.1 core exists, and you choose its source
+(core, MatAnyone2, VideoMaMa, ViTMatte / BiRefNet, LTX-2.5, Final Touch or any version). Each stage panel says what it does and what it is best for. The stage bar
 shows what is ready and what needs recomputing after your correction; undo is always available, and every change creates a new version
 you can compare with the previous one (A / B / difference).
 
@@ -107,20 +110,30 @@ The `_fix` sequence is a complete, repaired RGB plate – read it directly in Nu
 
 ### 🧰 Plate preparation (stage 0)
 - **Alignment** of the backlit and clear plate to the beauty (local CoTracker3 matching → displacement grid `align/grid_<plate>/`, < 1 MB/frame; STMap from the grid in Nuke, `.nk` export),
-- **Deflicker and denoise** – flicker removed in linear space, without flattening intended lighting changes,
+- **Deflicker and denoise** – flicker removed in linear space, without flattening intended lighting changes; one button measures the
+  plate and sets the parameters, a 1024 px preview and a content check (no ghosting) before the full run, 4K without running out of RAM,
 - **2D camera motion** with `Camera2D` export to Nuke,
 - **Depth map** (DepthCrafter) with a stability check, suggesting the object order.
 
 ### ✂️ Cutting out
 - **SAM3.1** finds the object from points or a text prompt in keyframes and propagates the core through the shot; crops follow the object automatically,
 - **CoTracker3 brush fixes** – add / remove strokes in a few frames, carried to the rest of the shot by tracked points,
+- **one edge band for every edge stage** (3 MatAnyone2, 4 VideoMaMa, 5 BiRefNet / ViTMatte, 7 LTX-2.5): sliders scale the band, band
+  points tracked with CoTracker3 shape it (wide on hair, 0 = no band, e.g. on skin), inner / outer feathers, preview as dashed lines.
+  The band belongs to the object – set it once, every stage uses it ("detach → own band" when one stage needs something else),
+- **"Propose band (Sapiens2)"** (optional) – Sapiens2-seg-0.4B recognises body parts and sets the band points for people:
+  wide on hair, narrow on clothes, thin on skin,
 - **MatAnyone2** computes the soft, temporally stable edge in a band around the core,
 - **VideoMaMa** adds hair strands and fine edge detail (live sliders for reach and edge protection, no model rerun),
-- **ViTMatte zones** for hair, fur, smoke and fibres – painted bands or the whole outline minus exclusions, tracked with the object,
+- **stage 5 edge engine** for hair, fur, smoke and fibres in the band: **BiRefNet_HR-matting / Lucida** (MIT weights, also for
+  commercial work) or **ViTMatte** (optional, non-commercial weights),
 - **Experiments** – any computed version as a base, QA and edge-fix proposals on it, recompute from that base,
 - **LTX-2.5 Alpha-Gen** (optional) – generative alpha for semi-transparent and thin things,
+- **Final Touch** – manual alpha fixes on any version before export: brush (add / remove / erase, frame by frame), black / white /
+  gamma, erode, blur and motion blur measured from the plate motion,
+- **"👁 Preview frames"** in the model stages – a few frames around the current one before the long run on the whole shot,
 - **multiple objects** computed front to back, and **object parts** (e.g. a dress as part of a character) with their own mask and seamless export,
-- **loupe** for thin elements, edge width / position controls, alpha motion blur, temporal smoothing.
+- **loupe** for thin elements, alpha motion blur, temporal smoothing; mask overlays, outlines, Alpha view and comp drawn on the GPU.
 
 ### 🔬 Quality control
 The mask is judged **as a whole, on every frame** – never on the crop alone. Temporal flicker map, flags on the timeline, edge accuracy
@@ -169,8 +182,10 @@ whether an edge is good) stay with the artist in the UI. Exports and other write
 | 🩹 Plate check and repair | ✅ in the code and in the UI (stage 0) |
 | 🧰 Alignment, deflicker, 2D camera | ✅ in the code; tests on real shots in progress |
 | ✂️ Stages 1–3: SAM3.1 core, CoTracker3 brush fixes, MatAnyone2 edge; keys, multiple objects, parts, QA, export | ✅ works |
-| 💇 Stage 4 VideoMaMa (hair strands, v0.3) · stage 5 ViTMatte zones · stage 6 Experiments | ✅ works; tested on real shots, being refined |
+| 💇 Stage 4 VideoMaMa (hair strands) · stage 5 BiRefNet / ViTMatte · stage 6 Experiments · shared edge band, Sapiens2 band proposal | ✅ works; tested on real shots, being refined |
 | 🧪 Stage 7 LTX-2.5 Alpha-Gen (optional, generative) | ✅ works; needs 24 GB VRAM |
+| 🖌 Stage 8 Final Touch (manual alpha fixes before export) | ✅ works (since v0.35) |
+| 🐞 Report a problem (anonymised, with consent) | ✅ works (since v0.35) |
 | 🌿 "Local matting" zone | 🚧 in progress |
 
 ### What the Doctor installs (one click)
@@ -184,8 +199,8 @@ whether an edge is good) stay with the artist in the UI. Exports and other write
 | **SAM3.1** weights (`sam3.1_multiplex_fp16`) | Hugging Face `Comfy-Org/sam3.1` | 1.7 GB | ✅ |
 | **MatAnyone2** weights | GitHub `pq-yang/MatAnyone2` | 135 MB | ✅ |
 | **CoTracker3** (package for ComfyUI's Python + weights) | pip `--no-deps` + Hugging Face `facebook/cotracker3` | 100 MB | recommended |
-| **ViTMatte** weights ("hair" zones / `vitmatte` engine; runs in ComfyUI's Python) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, only if missing) | 390 MB | ✅ for hair zones (weights **non-commercial only** – Adobe-trained) |
-| **BiRefNet_HR-matting / Lucida** weights (optional edge models of the ViTMatte zone, MIT – for commercial work; ComfyUI's Python) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, only if missing) | 444 + 885 MB | ❌ optional |
+| **ViTMatte** weights ("hair" zones / `vitmatte` engine; runs in ComfyUI's Python) | Hugging Face `hustvl/vitmatte-base-composition-1k` (+ `transformers`, only if missing) | 390 MB | ❌ optional (weights **non-commercial only** – Adobe-trained) |
+| **BiRefNet_HR-matting / Lucida** weights (stage 5 edge engine, MIT – also for commercial work; ComfyUI's Python) | Hugging Face `ZhengPeng7/BiRefNet_HR-matting`, `egeorcun/lucida` (+ `timm`, only if missing) | 444 + 885 MB | ✅ for stage 5 |
 | **Sapiens2-seg-0.4B** weights (optional „Propose band” – body parts → band points, people only; Sapiens2 License, commercial use allowed; ComfyUI's Python with transformers ≥ 5) | Hugging Face `facebook/sapiens2-seg-0.4b` | 1.63 GB | ❌ optional |
 | **Plate alignment on the GPU** (`engine/align_gpu_worker.py` in ComfyUI's Python; check only – uses ComfyUI's torch and CUDA) | – | 0 | no (speed-up; CPU otherwise) |
 | **VideoHelperSuite** nodes (`VHS_LoadImagesPath` – 8-bit PNG/JPG shots in SAM 3.1, MatAnyone2, zones) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + its requirements (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ for 8-bit shots |
@@ -271,7 +286,8 @@ and opens http://127.0.0.1:8765. Closing the console window stops the server.
 
 - copies our nodes (`ComfyUI-PlateMatte`, `ComfyUI-MatAnyone2-Keyframes`) to `custom_nodes`,
 - clones the `ComfyUI-MatAnyone2` node and installs its requirements,
-- downloads the **SAM3.1** (1.7 GB) and **MatAnyone2** (135 MB) weights; optionally LaMa (196 MB) and CoTracker3 (100 MB).
+- downloads the **SAM3.1** (1.7 GB), **MatAnyone2** (135 MB), **CoTracker3** (100 MB) and **BiRefNet_HR-matting / Lucida** (1.3 GB) weights;
+  optional models (VideoMaMa, LTX-2.5, ViTMatte, Sapiens2, LaMa) have their own Install buttons.
 
 Check the licence shown next to each component – some models are for non-commercial use only (see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)).
 
@@ -313,7 +329,7 @@ After UI changes refresh the browser (Ctrl+F5).
   the result of each step (✅ / ❌) and a readable error; installing several things as a list of steps with progress.
 - 🔁 **Clear ComfyUI restart notice** – after installing nodes a large, persistent banner "Restart ComfyUI, otherwise the nodes will not work"
   (with a list of what waits for the restart), a "waiting for restart" tag on installed items and detection that Comfy has been restarted.
-- ⚡ **Performance and quality** – faster SAM 3.1 frame preview, full-resolution overlays, finishing the tests on real shots.
+- ⚡ **Performance and quality** – faster SAM 3.1 frame preview, finishing the tests on real shots.
 
 **Later**
 - 🐧 **Linux and macOS versions** – start script, installer and Doctor without Windows assumptions.

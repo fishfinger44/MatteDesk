@@ -61,16 +61,20 @@ TRACK_INSET_PX = (6.0, 60.0)
 
 def inset_queries(qs: Sequence[Tuple[str, int, float, float]], core_at: Callable[[int], Optional[np.ndarray]]
                   ) -> List[Tuple[str, int, float, float]]:
-    from engine.bandmap import snap_normal
+    from engine.bandmap import _contours, snap_normal
     out = []
+    per: Dict[int, Any] = {}     # key frame -> (core, contours, area): read + traced once, not once per point
     for pid, k, x, y in qs:
-        c = core_at(k)
-        sn = snap_normal(c, x, y) if c is not None and c.any() else None
+        if k not in per:
+            c = core_at(k)
+            per[k] = (c, _contours(c), float(c.sum())) if c is not None and c.any() else (c, None, 0.0)
+        c, cs, area = per[k]
+        sn = snap_normal(c, x, y, cs) if cs is not None else None
         if sn is None:
             out.append((pid, k, x, y))
             continue
         sx, sy, nx, ny = sn
-        d = float(np.clip(TRACK_INSET_FRAC * np.sqrt(float(c.sum())), *TRACK_INSET_PX))
+        d = float(np.clip(TRACK_INSET_FRAC * np.sqrt(area), *TRACK_INSET_PX))
         qx, qy = sx - nx * d, sy - ny * d
         h, w = c.shape
         inside = 0 <= int(round(qx)) < w and 0 <= int(round(qy)) < h and c[int(round(qy)), int(round(qx))]

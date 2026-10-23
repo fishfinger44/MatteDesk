@@ -301,7 +301,10 @@ class EnvironmentDoctor:
                      "MiniMax-Remover (wideo)": "minimax_remover", "Model: MiniMax-Remover": "minimax_remover",
                      "Model: LTX-2.5 Alpha-Gen": "ltx", "Model: VideoMaMa": "videomama", VHS_LABEL: "vhs"}
         for item in items:
-            if item.status in ("error", "warning") and item.name in link_keys and not item.links:
+            # an optional model not installed yet (info + „Zainstaluj”) keeps its „where to get it” too (2026-10-23:
+            # ViTMatte became optional and lost its link)
+            missing = item.status in ("error", "warning") or (item.status == "info" and item.action)
+            if missing and item.name in link_keys and not item.links:
                 item.links = list(LINKS[link_keys[item.name]])
             lic = LICENSES.get(link_keys.get(item.name, ""))
             if lic and not item.license:

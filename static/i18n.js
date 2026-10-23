@@ -35,6 +35,7 @@
   let patterns = [];        // {re (anchored), reG (unanchored, global), en}
   let subRe = null;          // alternation of exact sources for the substring pass
   const memo = new Map();
+  const MAX_TR = 1000;       // pattern / substring passes only up to this length (longest pattern source ~500 chars)
   let ready = false;
 
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -96,6 +97,9 @@
     const trail = s.length > lead.length ? s.match(/\s*$/)[0] : '';
     const core = s.trim().replace(/\s+/g, ' ');
     let out = exact.get(core);
+    // MAX_TR: a long text (report preview with the log) through thousands of catalog regexes froze the page for minutes
+    // (user report 2026-10-23, ~7 s already for 4000 chars) -> long texts get the exact lookup only
+    if (out === undefined && core.length > MAX_TR) return s;
     if (out === undefined) {
       for (const p of patterns) {
         const m = core.match(p.re);
@@ -120,7 +124,7 @@
   function trNode(node) {
     if (node.nodeType === 3) {
       const p = node.parentNode;
-      if (p && (p.nodeName === 'SCRIPT' || p.nodeName === 'STYLE' || p.nodeName === 'TEXTAREA')) return;
+      if (p && (p.nodeName === 'SCRIPT' || p.nodeName === 'STYLE' || p.nodeName === 'TEXTAREA' || (p.closest && p.closest('[translate="no"]')))) return;
       const t = tr(node.data);
       if (t !== node.data) node.data = t;
       return;

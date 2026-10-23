@@ -224,12 +224,22 @@ def need_missing(rng: Sequence[int], coverage: Optional[Sequence[Sequence[int]]]
 
 
 def life_changed_intervals(old: Optional[Sequence[Sequence[int]]], new: Optional[Sequence[Sequence[int]]],
-                           shot: Sequence[int]) -> List[Interval]:
-    """Frames whose visibility differs between two life ranges (None = the whole shot)."""
+                           shot: Sequence[int], keys: Optional[Iterable[int]] = None) -> List[Interval]:
+    """Frames whose visibility differs between two life ranges (None = the whole shot).
+    With `keys` (the object's key frames) a trim is left out (bug 2026-10-23: accepting the "object leaves the frame"
+    hint blocked every later stage until a recompute): frames hidden at the start / end of a visible piece without a key
+    in them change nothing in the still visible frames (no key beyond them, propagation never came back through them),
+    so the core stays valid – the hidden frames are skipped by every stage and black in the export."""
     whole = [[int(shot[0]), int(shot[1])]]
     o = union(old) if old else whole
     n = union(new) if new else whole
-    return union(intersect(missing(whole[0], o), n), intersect(missing(whole[0], n), o))
+    shown = intersect(missing(whole[0], o), n)
+    hidden = intersect(missing(whole[0], n), o)
+    if keys is not None:
+        ks = [int(k) for k in keys]
+        hidden = [[a, b] for a, b in hidden
+                  if any(a <= k <= b for k in ks) or (is_visible(a - 1, n) and is_visible(b + 1, n))]
+    return union(shown, hidden)
 
 
 # hint: the object leaves / enters the frame (core gets empty after touching the frame border)

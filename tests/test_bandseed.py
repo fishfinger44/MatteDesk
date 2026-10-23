@@ -31,7 +31,7 @@ def _halves(core, top=4, bottom=3):
     return cls
 
 
-def test_hair_wide_skin_thin_points_at_the_class_boundary():
+def test_hair_wide_skin_thin_points_ramp_across_the_class_boundary():
     core = _disc()
     pts, st = bandseed.propose(core, _halves(core), 7)
     assert st["edge_share"]["hair"] == pytest.approx(0.5, abs=0.05) and st["edge_share"]["skin"] == pytest.approx(0.5, abs=0.05)
@@ -42,8 +42,29 @@ def test_hair_wide_skin_thin_points_at_the_class_boundary():
         assert (k["out"], k["in"]) in ((48.0, 8.0), (4.0, 2.0))
         hair = k["y"] < 150
         assert (k["out"] == 48.0) == hair                           # hair above, skin below
-        assert abs(k["y"] - 150) < 12                               # the points sit at the hair / skin boundary
+        # hair keeps its width up to the hair / skin boundary (y 150); the skin point is set back by the ramp
+        # 2 x |48 - 4| = 88 px along the outline (~77 px in y on this disc), so the width ramps smoothly on the skin
+        # side instead of a step between two points 6 px apart (user report 2026-10-23)
+        if hair:
+            assert abs(k["y"] - 150) < 12
+        else:
+            assert 60 < k["y"] - 150 < 95
     assert len({p["id"] for p in pts}) == 4
+    xy = np.array([[p["keys"]["7"]["x"], p["keys"]["7"]["y"]] for p in pts])
+    d = np.sqrt(((xy[:, None] - xy[None]) ** 2).sum(-1)) + np.eye(len(xy)) * 1e9
+    assert d.min() > 2 * bandseed.RAMP_HALF[0]                      # no two points next to each other
+
+
+def test_one_group_contour_one_point_and_short_run_one_point():
+    core = _disc()
+    cls = np.where(core, 4, 0).astype(np.uint8)                    # all hair: one point (was two, 6 px apart)
+    pts, _ = bandseed.propose(core, cls, 2)
+    assert len(pts) == 1 and pts[0]["keys"]["2"]["out"] == 48.0
+    cls = _halves(core)
+    ys, xs = np.where(core)
+    cls[ys[(np.abs(ys - 150) < 16) & (xs > 240)], xs[(np.abs(ys - 150) < 16) & (xs > 240)]] = 1   # ~32 px of clothing
+    pts, _ = bandseed.propose(core, cls, 2)
+    assert sum(p["keys"]["2"]["out"] == 12.0 for p in pts) == 1   # too short for two points apart: one in the middle
 
 
 def test_auto_width_is_a_floor():
@@ -141,3 +162,32 @@ def test_propose_endpoint_writes_the_shared_band(tmp_path, monkeypatch):
     monkeypatch.setattr(sapiens2, "get_runner", lambda *a, **k: NoPerson())
     r4 = api.post("/api/object/obj/band/propose", json={"frame": start, "stage": "videomama", "replace": True})
     assert r4.status_code == 422
+
+
+def test_propose_with_inset_slider_at_zero_has_no_inset_and_px_whiskers(tmp_path, monkeypatch):
+    """User decisions 2026-10-23: „Wcięcie w rdzeń” 0 means 0 – the proposed points cut 10–14 px into the core; with the
+    slider at 0 a blue whisker dragged on one point is plain px there (scale 1, as hand-set points made at 0)."""
+    from engine.pipeline import ObjectPipeline
+    from test_zone_matte import _api_project
+    monkeypatch.setattr(ObjectPipeline, "_zone_tracker", lambda self: None)
+    app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
+
+    class Seg:
+        def classes(self, img):
+            c = np.full(img.shape[:2], 3, np.uint8)
+            c[: img.shape[0] // 2] = 4
+            return c
+    monkeypatch.setattr(sapiens2, "get_runner", lambda *a, **k: Seg())
+    assert api.put("/api/object/obj/videomama", json={"reach_px": 12, "inset_px": 0}).status_code == 200
+    assert api.post("/api/object/obj/band/propose", json={"frame": start, "stage": "videomama"}).status_code == 200
+    band = pipe.store.get("obj")["band"]
+    assert all(p["keys"][str(start)]["in"] == 0 for p in band["band_points"])
+    assert max(p["keys"][str(start)]["out"] for p in band["band_points"]) == 48.0     # outer widths as proposed
+    st = api.get(f"/api/object/obj/stage_band/videomama/{start}").json()
+    assert st["scale"]["in"] == 1 and all(p["in"] == 0 for p in st["points"])
+    pid = st["points"][0]["id"]
+    r = api.put(f"/api/object/obj/stage_band/videomama/{start}", json={"id": pid, "in": 6})
+    assert r.status_code == 200, r.text
+    st = api.get(f"/api/object/obj/stage_band/videomama/{start}").json()
+    by = {p["id"]: p["in"] for p in st["points"]}
+    assert by[pid] == 6 and all(v == 0 for k, v in by.items() if k != pid)       # one point cuts in, the rest not
