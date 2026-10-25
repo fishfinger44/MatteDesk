@@ -12,8 +12,10 @@ dughogan/nuke-alphagen-ofx (MIT) does ("isolate then matte"):
   guide "steer"   – isolate + everything outside the (grown) object defocused – for objects that are not the
                     foreground of the crop (the model mattes the sharp, near thing).
 The grey matte comes back as 16-bit PNG (SaveImageAdvanced, downloaded over /view – also works with a remote Comfy),
-is limited to the object's region (mask 1+2 grown by `region_px`, soft edge `region_soft_px`) and optionally joined
-with the eroded mask 1+2 (`combine: max_core` – holes of the generated matte inside the object filled).
+is put over the mask 1+2 through the one band of every stage (`combine: band`, engine/bandsys.py – `region_px` outside /
+`core_erode_px` inside the edge, feathers `feather_px` / `region_soft_px`, band points), or kept as the model made it
+(`combine: raw` – the model alone decides what it cuts out). User decision 2026-10-24: the former modes „region” and
+„+ wnętrze” (max_core) are gone, objects that had them read „pas”.
 
 Graph = the OFX `addAlphaGen` recipe on core nodes (Comfy >= 0.39): UNETLoader (distilled int8) -> LoraLoaderModelOnly
 (Alpha-Gen 1.0) -> GetICLoRAParameters; CLIPLoader ltxv, prompt "" / negative " "; LTXVConditioning 24 fps;
@@ -58,7 +60,8 @@ LTX_NODES = ("UNETLoader", "LoraLoaderModelOnly", "GetICLoRAParameters", "CLIPLo
              "SaveImageAdvanced", "PlateLoadEXR")
 SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 GUIDES = ("plain", "isolate", "steer")
-COMBINES = ("region", "max_core", "raw", "band")   # band = the one band system (engine/bandsys.py, 2026-10-22)
+COMBINES = ("band", "raw")   # band = the one band of every stage (engine/bandsys.py); raw = no band (user decision 2026-10-24)
+LEGACY_COMBINES = ("region", "max_core")   # read as "band" (2026-10-24)
 # which mask limits / guides LTX (user request 2026-10-16): the mask 1+2 (default), or the result of stage 3 / 4 (> 0.5)
 MASK_SOURCES = ("core", "matanyone", "vitmatte")
 LTX_DEFAULTS: Dict[str, Any] = {
@@ -67,30 +70,38 @@ LTX_DEFAULTS: Dict[str, Any] = {
     "max_frames": 97,         # batch length (8k+1, <= 145 – model card); 97 x 1280x736 = 22.5 GB VRAM peak on a 4090 (dynamic loading)
     "overlap": 16,            # batch overlap, linear crossfade (8 left a visible seam, CLIP2_A 2026-10-16)
     "seed": 1234,
-    "region_px": 24,          # the matte is kept inside the mask 1+2 grown by this (plate px) ...
-    "region_soft_px": 12,     # ... with this soft edge
-    "combine": "region",      # region | max_core (+ eroded mask 1+2: holes filled) | raw (no limit – diagnostics)
-    "core_erode_px": 4,
+    "region_px": 40,          # the band outside the mask 1+2 edge – engine/bandsys.BAND_DEFAULTS (set below)
+    "region_soft_px": 8,      # the outer feather (from the outer band edge inwards) – BAND_DEFAULTS
+    "combine": "band",        # band (the one band of every stage) | raw (the model's matte as it is)
+    "core_erode_px": 2,       # the band inside the edge – BAND_DEFAULTS
     "mask_source": "core",    # core = mask 1+2 | matanyone = stage 3 result | vitmatte = stage 4 result (alpha > 0.5)
     # combine "band" (one band system, user decision 2026-10-22): the band region_px outside .. core_erode_px inside the
     # mask edge; the matte blends into the core over feather_px from the inner edge and region_soft_px from the outer
     # one; band points shape it (the sliders' reference band_ref_out / _in)
-    "feather_px": 0.0,
+    "feather_px": 8.0,        # the inset feather – BAND_DEFAULTS
     "band_points": [],
     "band_ref_out": None,
     "band_ref_in": None,
 }
+from engine.bandsys import BAND_DEFAULTS as _BD  # noqa: E402
+LTX_DEFAULTS.update(region_px=_BD["out_px"], core_erode_px=int(_BD["in_px"]), feather_px=_BD["inset_feather_px"],
+                    region_soft_px=_BD["outer_feather_px"])
 SETTING_KEYS = tuple(LTX_DEFAULTS)
 BAND_KEYS = ("feather_px", "band_points", "band_ref_out", "band_ref_in")   # in the signature only in the band mode
 
 
-def ltx_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """LTX_DEFAULTS <- defaults.json "ltx" <- object field `ltx` (only known keys, validated)."""
+def ltx_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[str, Any]] = None,
+                 overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """LTX_DEFAULTS <- defaults.json "ltx" <- object field `ltx` (only known keys, validated). The band: `s["band"]` =
+    engine/objband.band_for(obj, "ltx", own=the validated stage fields, overrides) – the shared object band unless the
+    stage is detached, `active` only in the band mode („surowy” = no band); the legacy keys region_px / core_erode_px /
+    feather_px / region_soft_px / band_points / band_ref_* / band_owner are its thin mapping for old readers.
+    `overrides` = palette values not saved yet (canonical or legacy names)."""
     s = dict(LTX_DEFAULTS)
     for src in (defaults or {}, (obj or {}).get("ltx") or {}):
         s.update({k: v for k, v in src.items() if k in LTX_DEFAULTS and v is not None})
     s["guide"] = s["guide"] if s["guide"] in GUIDES else "plain"
-    s["combine"] = s["combine"] if s["combine"] in COMBINES else "region"
+    s["combine"] = s["combine"] if s["combine"] in COMBINES else "band"
     ms = str(s["mask_source"])
     # a stage name, or a version of stage Eksperymenty ("v###", 2026-10-16 – origin kept in run.json)
     s["mask_source"] = ms if (ms in MASK_SOURCES or re.fullmatch(r"v\d{3,}", ms)) else "core"
@@ -102,19 +113,21 @@ def ltx_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[s
     for k in ("region_px", "region_soft_px"):
         s[k] = float(s[k])
     s["feather_px"] = float(min(200.0, max(0.0, float(s.get("feather_px") or 0.0))))
-    from engine.bandmap import band_points
-    s["band_points"] = band_points({"band_points": s.get("band_points")}) if s.get("band_points") else []
-    from engine.objband import apply   # the shared object band unless the stage is detached (2026-10-22)
-    return apply(obj, "ltx", s)
+    from engine.objband import band_for   # the one band settings model (2026-10-24)
+    b = band_for(obj, "ltx", own=s, overrides=overrides)
+    b.active = s["combine"] == "band"
+    s.update(b.legacy())
+    s["band"] = b
+    return s
 
 
-def object_settings(obj: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def object_settings(obj: Optional[Dict[str, Any]] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """ltx_settings with defaults.json "ltx" (the project-wide defaults) under the object's own `ltx`."""
     try:
         d = json.loads((Path(__file__).resolve().parent.parent / "defaults.json").read_text(encoding="utf-8")).get("ltx")
     except (OSError, ValueError):
         d = None
-    return ltx_settings(obj, d or {})
+    return ltx_settings(obj, d or {}, overrides)
 
 
 def settings_sig(s: Dict[str, Any]) -> str:
@@ -125,21 +138,16 @@ def settings_sig(s: Dict[str, Any]) -> str:
 
 
 def band_u8(mask: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
-    """Band preview of the LTX-2.5 palette: 128 = where the LTX-2.5 matte is kept (the mask grown by region_px), 255 = forced 1
-    (combine max_core: the mask eroded by core_erode_px); raw = the whole frame 128."""
+    """Band preview of the LTX-2.5 palette: 128 = the band (the LTX-2.5 matte), 255 = the core inside it (forced 1);
+    raw = the whole frame 128 (no band)."""
     if s["combine"] == "raw":
         return np.full(mask.shape, 128, np.uint8)
+    from engine.bandsys import band_area, band_widths
     d = sdf_px(mask)
+    o, i = band_widths(mask, s["region_px"], s["core_erode_px"], pts)
     out = np.zeros(mask.shape, np.uint8)
-    if s["combine"] == "band":
-        from engine.bandsys import band_widths
-        o, i = band_widths(mask, s["region_px"], s["core_erode_px"], pts)
-        out[(d >= -o) & (d <= i)] = 128
-        out[d > i] = 255
-        return out
-    out[d >= -s["region_px"]] = 128
-    if s["combine"] == "max_core":
-        out[d >= s["core_erode_px"]] = 255
+    out[band_area(d, o, i)] = 128
+    out[d > np.asarray(i, np.float32)] = 255
     return out
 
 
@@ -262,23 +270,15 @@ def sdf_px(core: np.ndarray) -> np.ndarray:
 
 
 def finish(alpha: np.ndarray, core: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
-    """LTX-2.5 matte (crop) -> the object's alpha: limited to the grown mask 1+2 (`region`), optionally joined with the
-    eroded mask 1+2 (`max_core`); `raw` = untouched; `band` = the one band system (engine/bandsys.py; band points (x, y,
-    out, in) in the crop's pixels shape it)."""
+    """LTX-2.5 matte (crop) -> the object's alpha: `band` = the one band of every stage (engine/bandsys.py; band points
+    (x, y, out, in) in the crop's pixels shape it); `raw` = untouched (the model decides)."""
     a = np.clip(alpha.astype(np.float32), 0, 1)
     if s["combine"] == "raw":
         return a
-    d = sdf_px(core)
-    if s["combine"] == "band":
-        from engine.bandsys import band_widths, compose
-        c = (np.asarray(core) > 0.5).astype(np.float32)
-        o, i = band_widths(c, s["region_px"], s["core_erode_px"], pts)
-        return compose(c, a, d, o, i, s.get("feather_px", 0.0), s["region_soft_px"])
-    reg = np.clip((d + s["region_px"]) / max(s["region_soft_px"], 1e-3) + 0.5, 0.0, 1.0)
-    a = a * reg
-    if s["combine"] == "max_core":
-        a = np.maximum(a, (d >= s["core_erode_px"]).astype(np.float32))
-    return a.astype(np.float32)
+    from engine.bandsys import band_widths, compose
+    c = (np.asarray(core) > 0.5).astype(np.float32)
+    o, i = band_widths(c, s["region_px"], s["core_erode_px"], pts)
+    return compose(c, a, sdf_px(core), o, i, s.get("feather_px", 0.0), s["region_soft_px"])
 
 
 # ----------------------------------------------------------------------------- Comfy graph

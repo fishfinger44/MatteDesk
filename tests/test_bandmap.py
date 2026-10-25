@@ -104,7 +104,9 @@ def test_api_band_points_shape_the_outline_zone(tmp_path, monkeypatch):
     other = next(f for f in frames if f != start)
     r = api.put(f"/api/object/obj/zones/{zid}/band/{other}", json={"id": pid, "out": 0, "in": 0})   # key: gap
     assert r.status_code == 200 and r.json()["band"]["points"][0]["keys"] == sorted([start, other])
-    assert api.get(f"/api/object/obj/zones/{zid}/region/{other}").json()["area_px"] == 0
+    # the gap: the band of the point's contour is gone; the preview now builds the band on the stabilised mask 1+2 (as
+    # the runs, 2026-10-24) – a speck of it may form a contour of its own without points (zone defaults), so: ~nothing left
+    assert api.get(f"/api/object/obj/zones/{zid}/region/{other}").json()["area_px"] < 0.05 * reg0["area_px"]
     assert api.delete(f"/api/object/obj/zones/{zid}/band/{pid}?frame={other}").status_code == 200
     assert api.delete(f"/api/object/obj/zones/{zid}/band/{pid}").status_code == 200
     z = api.get("/api/object/obj/zones").json()["zones"][0]
@@ -347,7 +349,7 @@ def test_region_returns_the_whole_band_ring(tmp_path, monkeypatch):
 def test_feathers_meet_inside_a_narrow_band():
     """User rule 2026-10-22: the outer feather (from the outer band edge inwards) never passes the end of the inset
     feather (from the inner band edge outwards) – they touch at most; the inset feather keeps its length."""
-    from engine.zones import feather_weight
+    from engine.bandsys import area_weight as feather_weight
     core = _disk(r=50)
     band = (cv2.distanceTransform((~core).astype(np.uint8), cv2.DIST_L2, 5) <= 17) & ~core
     w = feather_weight(band, core, inner_px=11, outer_px=51)
@@ -386,7 +388,7 @@ def test_inset_feather_line_inside_the_core(tmp_path, monkeypatch):
 def test_outer_feather_weight_and_region_line(tmp_path, monkeypatch):
     """User request 2026-10-21: a separate feather at the OUTER band edge (towards the background), shown as a thinner
     dashed line. Weight ramps over outer_px from the background side and over inner_px from the core side."""
-    from engine.zones import feather_weight
+    from engine.bandsys import area_weight as feather_weight
     core = _disk(r=50)
     band = (cv2.distanceTransform((~core).astype(np.uint8), cv2.DIST_L2, 5) <= 30) & ~core   # 30 px outside the core
     w = feather_weight(band, core, inner_px=4, outer_px=20)
@@ -410,3 +412,54 @@ def test_outer_feather_weight_and_region_line(tmp_path, monkeypatch):
     api.patch(f"/api/object/obj/zones/{zid}", json={"params": {**body["params"], "outer_feather_px": 10}})
     reg = api.get(f"/api/object/obj/zones/{zid}/region/{start}").json()
     assert reg["feather_contours"] and reg["band_contours"] and reg["feather_contours"] != reg0["feather_contours"]
+
+
+def test_tilted_whiskers_shift_the_band_along_the_outline_2026_10_26():
+    """A whisker pair turned round its point: the band edge goes through the whisker END (cos(a)·L away from the outline,
+    sin(a)·L along it); tilt 0 = bit-identical to the 4-tuple points; keys without "ang" read as 0."""
+    core = _disk()
+    base = [(160.0, 100.0, 30.0, 4.0), (40.0, 100.0, 2.0, 4.0)]
+    o0, i0 = B.width_maps(core, base, 10, 4)
+    o1, i1 = B.width_maps(core, [base[0] + (0.0,), base[1]], 10, 4)
+    assert np.array_equal(o0, o1) and np.array_equal(i0, i1)
+    o2, _ = B.width_maps(core, [(160.0, 100.0, 30.0, 4.0, 60.0), base[1]], 10, 4)
+    band0, band2 = B.variable_band(core, o0, i0), B.variable_band(core, o2, i0)
+    assert _band_width_at(band2, core, 160, 100, (1, 0)) < _band_width_at(band0, core, 160, 100, (1, 0))   # cos 60° = ½
+    assert 13 <= _band_width_at(band2, core, 160, 100, (1, 0)) <= 17
+    # the outer band edge goes through the whisker END (within ~2 px), also on a curved outline
+    sx, sy, nx, ny, tx, ty = B.snap_frame(core, 160.0, 100.0)[:6]
+    ex, ey = sx + 30.0 * (nx * np.cos(np.radians(60)) + tx * np.sin(np.radians(60))), sy + 30.0 * (ny * np.cos(np.radians(60)) + ty * np.sin(np.radians(60)))
+    edge = band2 & ~core
+    ys, xs = np.nonzero(edge & ~cv2.erode(edge.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool))
+    assert float(np.sqrt((xs - ex) ** 2 + (ys - ey) ** 2).min()) < 3.0
+    assert not np.array_equal(band0, band2)
+    p = {"id": "a", "keys": {"5": {"x": 1, "y": 1, "out": 1, "in": 1, "ang": 40}, "15": {"x": 1, "y": 1, "out": 1, "in": 1}}}
+    assert B.angle_at(p, 5) == 40 and B.angle_at(p, 10) == 20 and B.angle_at(p, 99) == 0
+    assert B.points_at([p], 5, {"a": (1, 1, True)})[0][4] == 40
+    sn = B.snap_frame(core, 160.0, 100.0)
+    assert B.snap_normal(core, 160.0, 100.0) == sn[:4] and abs(sn[2] * sn[4] + sn[3] * sn[5]) < 1e-6
+
+
+def test_tilted_whisker_crossing_a_thin_part_makes_no_hole_2026_10_26():
+    """An inner whisker longer than a thin limb: its end is past the outline – the band must not pinch to 0 there
+    (user report 2026-10-26: holes in the band), and the band edge stays smooth (no jagged steps)."""
+    core = np.zeros((200, 300), bool)
+    core[80:120, 20:280] = True                                           # a 40 px thick limb
+    pts = [(150.0, 80.0, 30.0, 88.0, 29.0)]                               # 88 px inside crosses the limb
+    o, i = B.width_maps(core, pts, 10, 4)
+    band = B.variable_band(core, o, i)
+    assert band[100, 150] and band[100, 120] and band[100, 180]           # the limb under the point is covered, no hole
+    top = o[78, 20:280]
+    assert float(np.abs(np.diff(top)).max()) < 3.0                       # no jump along the outline
+
+
+def test_speck_next_to_a_pointed_contour_takes_its_widths_2026_10_26():
+    """A split-off speck of the mask has no point of its own: it must not keep the default band (wedges of 62 px on a
+    24 px edge, user report 2026-10-26) – it takes the widths of the nearest pointed outline; a far contour keeps the default."""
+    core = np.zeros((300, 600), bool)
+    core[100:200, 50:250] = True                                   # the object, one point: 10 px out / 4 in
+    core[140:150, 262:270] = True                                  # a speck 12 px from the object
+    core[140:150, 560:568] = True                                  # a far speck (another object): the default
+    o, _ = B.width_maps(core, [(150.0, 100.0, 10.0, 4.0)], 60, 4)
+    assert abs(float(o[145, 266]) - 10.0) < 1e-3                  # the near speck = the object's width
+    assert abs(float(o[145, 564]) - 60.0) < 1e-3                  # the far one keeps the constant band

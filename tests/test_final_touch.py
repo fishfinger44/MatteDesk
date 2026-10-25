@@ -218,3 +218,23 @@ def test_finish_api_preview_export_and_stale(proj):
     assert api.put("/api/object/obj/final_touch/finish", json={"erode_px": 0}).status_code == 200
     assert api.get("/api/object/obj/stages").json()["steps"][-1]["state"] == "stale"
     assert api.put("/api/object/obj/final_touch/finish", json={"black": "x"}).status_code == 422
+
+
+def test_layer_box_roi_equals_full_frame_arithmetic():
+    """layer() works per stroke box; it must equal the full-frame arithmetic bit for bit, and C is 0 outside the box."""
+    import numpy as np
+    from engine.final_touch import layer_box, stroke_mask
+    w, h = 200, 120
+    st = [{"mode": "add", "radius_px": 14, "hardness": 0.3, "p": [[20, 20], [60, 40]]},
+          {"mode": "remove", "radius_px": 9, "hardness": 1.0, "p": [[50, 30], [190, 110]]},
+          {"mode": "erase", "radius_px": 12, "hardness": 0.0, "p": [[30, 25], [40, 30]]},
+          {"mode": "add", "radius_px": 6, "hardness": 1.0, "p": [[-30, -30], [-20, -25]]}]
+    c = np.zeros((h, w), np.float32)
+    for s in st:
+        m = stroke_mask(s, w, h)
+        c = c + m * (1 - c) if s["mode"] == "add" else (c - m * (1 + c) if s["mode"] == "remove" else c * (1 - m))
+    got, box = layer_box(st, w, h)
+    assert np.array_equal(got, c)
+    x0, y0, x1, y1 = box
+    out = got.copy(); out[y0:y1, x0:x1] = 0
+    assert not out.any()

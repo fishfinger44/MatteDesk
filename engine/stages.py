@@ -4,7 +4,7 @@
 
 Fine-grained stages (`stages`, what the backend checks before an action):
   detect    – instance chosen / a key saved (points, prompt, candidate)
-  crops     – crop segments -> crops.json (automatic in „▶▶ Przelicz całość”)
+  crops     – crop segments -> crops.json (automatic in „▶▶ Przelicz nieaktualne”)
   core      – SAM 3.1 core over the shot -> core/core.json, newer than the keys and crops
   cotracker – brush corrections of the mask (zones `params.source = brush`, propagated by CoTracker3) applied on the
               shot -> core_fix/ (mask 1+2); optional: without corrections it is done
@@ -144,10 +144,21 @@ EDGE_KEYS_OPT = ("band_out_px", "band_in_px", "band_in_feather_px", "band_out_fe
 
 
 def settings_sig(obj: Dict[str, Any]) -> str:
-    from engine.objband import edge_band
-    obj = {**obj, "edge_band": edge_band(obj)}   # the band points stage 3 works with (shared object band or its own)
+    # the band stage 3 works with (edge.edge_settings: the shared object band or its own, 2026-10-24): its points and
+    # its sliders; a slider at its default is left out – an object that never had the field keeps the signature it had
+    from engine.bandsys import BAND_DEFAULTS
+    from engine.edge import edge_settings
+    s = edge_settings(obj)
+    eb = {k: s[k] for k in ("band_points", "band_ref_out", "band_ref_in")} if s["band_points"] else None
+    obj = {**obj, "edge_band": eb}
     d = {k: obj.get(k) for k in EDGE_KEYS}
     d.update({k: obj[k] for k in EDGE_KEYS_OPT if obj.get(k) is not None})
+    for k, dk in (("band_out_px", "out_px"), ("band_in_px", "in_px"), ("band_in_feather_px", "inset_feather_px"),
+                  ("band_out_feather_px", "outer_feather_px")):
+        if s[k] != BAND_DEFAULTS[dk]:
+            d[k] = s[k]
+        else:
+            d.pop(k, None)
     return _sha(d)
 
 
@@ -452,7 +463,7 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
                        f"zakres życia obiektu zmieniony po ostatnim liczeniu ({fmt_intervals(life_diff)}) – „Przelicz zmienione "
                        "przedziały”" if life_diff else
                        "klucze lub kadry zmienione po ostatnim liczeniu – „Przelicz zmienione przedziały”" if not core_ok else
-                       f"rdzeń nie obejmuje zakresu pracy – brak {fmt_intervals(core_miss)}: „▶▶ Przelicz całość”")
+                       f"rdzeń nie obejmuje zakresu pracy – brak {fmt_intervals(core_miss)}: „▶▶ Przelicz nieaktualne”")
     run_cov = run_coverage(od, run) if run else None
     final_miss = need_missing(need, run_cov, life) if (need and run_cov is not None) else []
     final_ok = bool(run and run_t and tool.get("final_valid") and core_t and run_t >= core_t)
@@ -545,7 +556,7 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
         if r is not None:
             st[s] = "locked"      # also a "done" optional stage (CoTracker without corrections) before the core
             # the lock reason wins over the stage's own note (e.g. "etap opcjonalny" of CoTracker before the core)
-            why[s] = ("najpierw: „▶▶ Przelicz całość” w etapie 1 SAM 3.1" if r in ("crops", "core") and st[r] != "stale"
+            why[s] = ("najpierw: „▶▶ Przelicz nieaktualne” w etapie 1 SAM 3.1" if r in ("crops", "core") and st[r] != "stale"
                       else f"najpierw: {LABEL[r]}" + (f" – {why[r]}" if why.get(r) and st[r] == "stale" else ""))
     nxt = next((s for s in NEXT_CHAIN if st[s] != "done"), None)
     stale = stale_intervals(store, name, need, mplate) if keys else []
@@ -567,6 +578,8 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
             # results that exist on disk (possibly outdated) – the UI may still show them (view tabs Rdzeń / Alpha)
             "has": {"core": core_t is not None, "final": bool(run and run_t), "core_fix": fix_exists},
             "stage_runs": {"matanyone": ma_run, "videomama": vv_run, "vitmatte": vm_run, "ltx": lx_run, "active": run,
+                           # mask 1+2 written as a version (base picker of stage 6; the UI reads it as `core_base`)
+                           "core_base": stage_run(store, name, "core_base")[0],
                            # both ViTMatte results (one per base) for the comparison in stage 4
                            **{f"vitmatte@{b}": stage_run(store, name, "vitmatte", b)[0] for b in VITMATTE_BASES}},
             "vitmatte_base": vbase,

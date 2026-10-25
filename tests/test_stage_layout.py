@@ -240,11 +240,13 @@ def test_group_is_computed_as_a_whole_with_its_seam(proj):
     (cd / "core.json").write_text(json.dumps({"coverage": [[frames[0], frames[-1]]]}))
     # the band preview (palette „Krawędź”): 255 = mask kept, 128 = band
     r = api.get(f"/api/object/obj/edge_preview/{start}?band_scale=1.5&shift_px=1")
-    assert r.status_code == 200 and r.headers["X-MD-Source"] == "mask12+group" and int(r.headers["X-MD-Band-Px"]) > 0
+    # the whole of the group; until the work-area batch is ready the fast stand-in (2026-10-24) – both „mask12+group”
+    assert r.status_code == 200 and r.headers["X-MD-Source"].startswith("mask12+group") and int(r.headers["X-MD-Band-Px"]) > 0
     pv = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_GRAYSCALE)
     assert (pv == 128).any() and (pv == 255).any()
-    wide = int(api.get(f"/api/object/obj/edge_preview/{start}?band_scale=2").headers["X-MD-Band-Px"])
-    narrow = int(api.get(f"/api/object/obj/edge_preview/{start}?band_scale=0.5").headers["X-MD-Band-Px"])
+    # the band is sized by the px sliders like every stage (2026-10-24: band_scale / the adaptive band are gone)
+    wide = int(api.get(f"/api/object/obj/edge_preview/{start}?band_out_px=30&band_in_px=8").headers["X-MD-Band-Px"])
+    narrow = int(api.get(f"/api/object/obj/edge_preview/{start}?band_out_px=6&band_in_px=2").headers["X-MD-Band-Px"])
     assert wide > narrow
     # stage 3 asked on the part: computed on the parent as the whole
     r = api.post("/api/object/hand/finalize", json={"stage": "matanyone"})
@@ -287,3 +289,16 @@ def test_group_is_computed_as_a_whole_with_its_seam(proj):
                                                       "polygon": [[1, 1], [9, 1], [9, 9]], "strokes": [], "params": {"source": "brush"}})
     r = api.post(f"/api/object/hand/zones/{z.json()['zone']['zone_id']}/apply?stage=vitmatte")
     assert r.status_code == 409 and "obiekcie głównym" in r.json()["detail"]
+
+
+def test_experiments_core_base_made_on_pick(proj):
+    """Stage 6 offers the computed mask 1+2 as a base before any MatAnyone2 / ViTMatte run: POST core_base writes it as a
+    version (reused while current) and the analysis accepts its id."""
+    app_module, api, shot, pipe, frames, start = proj
+    r = api.post("/api/object/obj/core_base")
+    assert r.status_code == 200, r.text
+    run = r.json()["run"]
+    assert api.post("/api/object/obj/core_base").json()["run"] == run          # reused, not duplicated
+    runs = {x["run"]: x for x in api.get("/api/object/obj/runs").json()["runs"]}
+    assert runs[run]["stage"] == "core"
+    assert api.get("/api/object/obj/stages").json()["stage_runs"]["core_base"] == run

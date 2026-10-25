@@ -330,7 +330,7 @@ def frame_segments(segs: Sequence[CropSegment], frame: int) -> List[CropSegment]
 def crops_cover_keys(segs: Sequence[CropSegment], key_boxes: Dict[int, Tuple[int, int, int, int]],
                      margin: float = 0.02) -> Optional[str]:
     """None when every user key's mask box (x0, y0, x1, y1, plate px) lies inside the crop of a segment of its frame
-    (with `margin` × side), else why the crops must be recomputed („Przelicz całość”, 2026-10-15). Crops are only
+    (with `margin` × side), else why the crops must be recomputed („Przelicz nieaktualne”, 2026-10-15). Crops are only
     redone when needed: new crops change the core inputs, so the interval cache would be lost."""
     for f, (x0, y0, x1, y1) in sorted(key_boxes.items()):
         segs_f = frame_segments(segs, f)

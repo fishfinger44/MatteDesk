@@ -176,7 +176,7 @@ def test_api_object_detect_choose_crops(tmp_path, monkeypatch):
 
 
 def test_crops_cover_keys_rule():
-    """„Przelicz całość” (2026-10-15) redoes the crops only when a user key no longer fits its segment's crop."""
+    """„Przelicz nieaktualne” (2026-10-15) redoes the crops only when a user key no longer fits its segment's crop."""
     from engine.crop import CropSegment, crops_cover_keys
     seg = CropSegment("s00", 1, 10, 0, 0, [100, 100, 400, 400], [0, 0, 0, 0], 2.52)
     assert crops_cover_keys([seg], {5: (150, 150, 300, 300)}) is None
@@ -186,7 +186,7 @@ def test_crops_cover_keys_rule():
 
 
 def test_api_compute_all_crops_then_core_then_cache(tmp_path, monkeypatch):
-    """„▶▶ Przelicz całość”: crops computed automatically (none yet), core on the whole shot; the second call keeps the
+    """„▶▶ Przelicz nieaktualne”: crops computed automatically (none yet), core on the whole shot; the second call keeps the
     crops and takes every interval from the cache."""
     from fastapi.testclient import TestClient
     import app as app_module

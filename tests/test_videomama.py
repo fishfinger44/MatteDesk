@@ -20,17 +20,21 @@ from engine import videomama as V   # noqa: E402
 
 
 # ----------------------------------------------------------------------------- pure helpers
-def test_settings_validation_and_protect_auto():
+def test_settings_validation_and_band_defaults():
+    """2026-10-24: VideoMaMa composes through the one band of every stage – no protect mode; unset band sliders =
+    engine/bandsys.BAND_DEFAULTS."""
+    from engine.bandsys import BAND_DEFAULTS as BD
     s = V.vmm_settings()
-    assert s["base"] == "core" and s["protect"] == 0.0 and s["reach_px"] == 40.0 and s["batch"] == 24 and s["overlap"] == 8
-    s = V.vmm_settings({"videomama": {"base": "matanyone"}})
-    assert s["protect"] == 3.0 and s["protect_px"] is None                     # auto by base
+    assert s["base"] == "core" and s["reach_px"] == BD["out_px"] and s["inset_px"] == BD["in_px"]
+    assert s["feather_px"] == BD["inset_feather_px"] and s["outer_feather_px"] == BD["outer_feather_px"]
+    assert s["batch"] == 24 and s["overlap"] == 8 and "protect" not in s and "protect_px" not in s
     s = V.vmm_settings({"videomama": {"base": "x", "protect_px": 5, "max_side": 1283, "batch": 2, "overlap": 99,
-                                      "offload": "?", "reach_px": -4}})
-    assert s["base"] == "core" and s["protect"] == 5.0 and s["max_side"] == 1280 and s["batch"] == 4
-    assert s["overlap"] == 2 and s["offload"] == "auto" and s["reach_px"] == 0.0
+                                      "offload": "?", "reach_px": -4, "inset_px": None}})
+    assert s["base"] == "core" and s["max_side"] == 1280 and s["batch"] == 4 and "protect_px" not in s
+    assert s["overlap"] == 2 and s["offload"] == "auto" and s["reach_px"] == 0.0 and s["inset_px"] == BD["in_px"]
     a, b = V.vmm_settings(), V.vmm_settings({"videomama": {"reach_px": 20}})
     assert V.settings_sig(a) != V.settings_sig(b) and V.model_sig(a) == V.model_sig(b)   # slider = no model run
+    assert V.settings_sig(a) != V.settings_sig(V.vmm_settings({"videomama": {"outer_feather_px": 3}}))
     assert V.model_sig(a) != V.model_sig(V.vmm_settings({"videomama": {"overlap": 4}}))
 
 
@@ -40,20 +44,20 @@ def _disc(h=120, w=120, r=30):
     return m
 
 
-def test_compose_reach_and_protect():
+def test_compose_is_the_one_band():
+    """The VideoMaMa composition = engine/bandsys.compose on the base (the same as stages 3 / 5 / 7)."""
+    from engine.bandsys import band_widths, compose
     base = _disc()
     d = V.sdf_px(base)
-    vmm = np.full(base.shape, 0.4, np.float32)                 # a uniform "strand" everywhere
-    a = V.compose(base, vmm, protect=0.0, reach=10.0)
-    assert np.allclose(a[d > 0.5], 1.0)                        # inside the base untouched
-    assert np.allclose(a[(d < -1) & (d >= -10)], 0.4)           # within reach: max(base, vmm)
-    assert np.allclose(a[d < -10.5], 0.0)                      # beyond reach: base (strays cut off)
-    a3 = V.compose(base, vmm, protect=3.0, reach=10.0)
-    ring = (d < -0.5) & (d > -2.5)
-    assert (a3[ring] < 0.4).all() and (a3[ring] >= 0).all()    # protect band: ramp from the base
-    assert np.allclose(a3[(d < -3.5) & (d >= -10)], 0.4)
-    band = V.band_u8(base, V.vmm_settings({"videomama": {"protect_px": 3, "reach_px": 10}}))
-    assert (band[(d < -4) & (d > -9)] == 128).all() and (band[np.abs(d) < 2] == 255).all() and (band[d < -12] == 0).all()
+    rng = np.random.default_rng(3)
+    vmm = rng.random(base.shape).astype(np.float32)
+    for reach, inset, fi, fo in ((10.0, 0.0, 0.0, 0.0), (10.0, 6.0, 4.0, 0.0), (20.0, 4.0, 8.0, 8.0)):
+        o, i = band_widths(base, reach, inset)
+        assert np.array_equal(V.compose(base, vmm, reach, inset, fi, fo), compose(base, vmm, d, o, i, fi, fo))
+    a = V.compose(base, vmm, 10.0, 0.0)
+    assert np.allclose(a[d > 0.5], 1.0) and np.allclose(a[d < -10.5], 0.0)      # inside the base / beyond the band
+    band = V.band_u8(base, V.vmm_settings({"videomama": {"reach_px": 10, "inset_px": 0, "feather_px": 0, "outer_feather_px": 0}}))
+    assert (band[(d < -1) & (d > -9)] == 128).all() and (band[d > 1] == 255).all() and (band[d < -12] == 0).all()
 
 
 def test_compose_unified_inset_and_feather():
@@ -62,17 +66,15 @@ def test_compose_unified_inset_and_feather():
     base = _disc()
     d = V.sdf_px(base)
     vmm = np.full(base.shape, 0.4, np.float32)
-    a = V.compose(base, vmm, protect=0.0, reach=10.0, inset=6.0, feather=0.0)
+    a = V.compose(base, vmm, reach=10.0, inset=6.0, feather=0.0)
     assert np.allclose(a[(d > 0.5) & (d < 5.5)], 0.4)          # inside the base, within the inset: VideoMaMa replaces it
     assert np.allclose(a[d > 6.5], 1.0) and np.allclose(a[d < -10.5], 0.0)
-    af = V.compose(base, vmm, protect=0.0, reach=10.0, inset=6.0, feather=4.0)
+    af = V.compose(base, vmm, reach=10.0, inset=6.0, feather=4.0)
     near = (d > 4.5) & (d < 5.5)                                # ~1 px from the deep base: mostly the base
-    assert (af[near] > 0.7).all() and np.allclose(af[(d < -1) & (d >= -10)], 0.4)
-    # inset 0 on the mask 1+2 base = the former composition exactly
-    assert np.allclose(V.compose(base, vmm, 0.0, 10.0, inset=0.0), V.compose(base, vmm, 0.0, 10.0))
+    assert (af[near] > 0.6).all() and af[near].mean() > 0.7 and np.allclose(af[(d < -1) & (d >= -10)], 0.4)
     s_old = V.vmm_settings({"videomama": {"reach_px": 10}})
     s_new = V.vmm_settings({"videomama": {"reach_px": 10, "inset_px": 0}})
-    assert s_old["inset_px"] is None                            # never touched: the former signature (results stay current)
+    assert s_old["inset_px"] == 2.0 and s_new["inset_px"] == 0.0   # unset = BAND_DEFAULTS (2026-10-24)
     assert V.settings_sig(s_old) != V.settings_sig(s_new)       # the unified sliders are part of the result
     band = V.band_u8(base, V.vmm_settings({"videomama": {"reach_px": 10, "inset_px": 6}}))
     assert (band[(d > 1) & (d < 5)] == 128).all() and (band[d > 7] == 255).all() and (band[d < -12] == 0).all()
@@ -193,7 +195,9 @@ def test_stage_videomama_api_base_export(proj, tmp_path, monkeypatch):
     assert stg["state"] == "todo" and "MatAnyone" in stg["why"]
     r = api.post("/api/object/obj/videomama")
     assert r.status_code == 409 and "MatAnyone" in r.json()["detail"]
-    assert api.put("/api/object/obj/videomama", json={"base": "core", "batch": 4, "overlap": 2}).status_code == 200
+    # a hard band outside only (the halo assertion below): the defaults are 2 px inside with 8 px feathers (2026-10-24)
+    assert api.put("/api/object/obj/videomama", json={"base": "core", "batch": 4, "overlap": 2, "inset_px": 0, "feather_px": 0,
+                                                       "outer_feather_px": 0}).status_code == 200
     info = api.get("/api/object/obj/videomama").json()
     assert info["settings"]["base"] == "core" and info["settings"]["batch"] == 4 and info["run"] is None
     r = api.post("/api/object/obj/videomama")

@@ -22,7 +22,7 @@ from engine import ltx_alpha as L   # noqa: E402
 # ----------------------------------------------------------------------------- pure helpers
 def test_settings_validation():
     s = L.ltx_settings({"ltx": {"guide": "nope", "max_side": 5000, "max_frames": 300, "combine": "x", "overlap": 99}})
-    assert s["guide"] == "plain" and s["combine"] == "region"
+    assert s["guide"] == "plain" and s["combine"] == "band"                     # one band (2026-10-24): unknown -> band
     assert s["max_side"] == 1920 and s["max_frames"] == 145 and (s["max_frames"] - 1) % 8 == 0
     assert s["overlap"] <= s["max_frames"] // 2
     assert L.ltx_settings({"ltx": {"max_frames": 30}})["max_frames"] == 25        # down to 8k+1
@@ -99,18 +99,20 @@ def test_isolate_guide_paints_others_not_target():
     assert far.std() < img[5:30, 290:315].std()                         # outside defocused
 
 
-def test_finish_region_and_max_core():
+def test_finish_band_and_raw_and_legacy_modes():
+    """2026-10-24: the result modes are „pas” (the one band of every stage) and „surowy” (no band, the model decides);
+    the former „region” / „+ wnętrze” (max_core) read as „pas”."""
     core = np.zeros((100, 100), np.float32)
     core[30:70, 30:70] = 1
     a = np.zeros_like(core)
     a[30:70, 30:70] = 0.6                                                # a "hole" inside (generative matte too soft)
     a[0:10, 0:10] = 1.0                                                  # another object far away
     a[30:70, 71:80] = 0.5                                                # soft edge just outside (hair)
-    s = L.ltx_settings({"ltx": {"region_px": 12, "region_soft_px": 4, "combine": "region"}})
+    for legacy in ("region", "max_core"):
+        assert L.ltx_settings({"ltx": {"combine": legacy}})["combine"] == "band"
+    s = L.ltx_settings({"ltx": {"region_px": 12, "core_erode_px": 4, "region_soft_px": 0, "combine": "band"}})
     r = L.finish(a, core, s)
-    assert r[5, 5] == 0 and r[50, 75] > 0.4 and abs(r[50, 50] - 0.6) < 1e-6
-    m = L.finish(a, core, {**s, "combine": "max_core"})
-    assert m[50, 50] == 1.0 and m[50, 75] > 0.4
+    assert r[5, 5] == 0 and abs(r[50, 75] - 0.5) < 1e-6 and r[50, 50] == 1.0         # far away 0, band = LTX, core = 1
     assert np.array_equal(L.finish(a, core, {**s, "combine": "raw"}), a)
 
 

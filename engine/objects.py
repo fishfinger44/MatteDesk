@@ -79,6 +79,11 @@ class ObjectStore:
             from engine.objband import migrate
             migrate(self.root, name)
             obj = json.loads(p.read_text(encoding="utf-8"))
+        root = obj if not obj.get("part_of") else None
+        if root is not None and "out_px" not in (obj.get("band") or {}):   # the sliders join the band (2026-10-24)
+            from engine.objband import migrate_sliders
+            migrate_sliders(self.root, name)
+            obj = json.loads(p.read_text(encoding="utf-8"))
         return obj
 
     def update(self, name: str, **fields: Any) -> Dict[str, Any]:
@@ -196,6 +201,14 @@ class ObjectStore:
 
     @staticmethod
     def _write(p: Path, data: Dict[str, Any]) -> None:
+        import time
         tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(p)
+        for i in range(8):   # Windows: the replace fails (WinError 5) while another process reads the file – a second
+            try:             # server, a viewer, an antivirus (seen 2026-10-24: a slider save lost with a 500)
+                tmp.replace(p)
+                return
+            except PermissionError:
+                if i == 7:
+                    raise
+                time.sleep(0.05 * (i + 1))

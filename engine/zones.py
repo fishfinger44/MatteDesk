@@ -28,7 +28,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-ZONE_SCHEMA = "matte_desk/zone@1.1"
+ZONE_SCHEMA = "matte_desk/zone@1.2"
+# zone@1.2 (2026-10-24): params.outer_feather_px is literal like in every stage – 0 = a hard outer band edge; absent = as
+# the inset feather. In zone@1.1 an explicit 0 meant „jak wcięcie”: load_zones writes the inset value there (same look)
 CRITERIA = ("dark", "bright", "color", "all", "matte")
 
 
@@ -85,11 +87,37 @@ def save_zone(obj_dir: Path, z: Zone) -> Path:
 
 
 def load_zones(obj_dir: Path) -> List[Zone]:
+    """The zones of an object; a whole-outline zone on the shared object band carries the band's points AND sliders
+    (engine/objband.zone_params, 2026-10-24) – everything downstream reads the effective params."""
+    from engine.objband import zone_params
     d = obj_dir / "zones"
+    try:
+        obj = json.loads((obj_dir / "object.json").read_text(encoding="utf-8"))
+        root = (json.loads((obj_dir.parent / obj["part_of"] / "object.json").read_text(encoding="utf-8"))
+                if obj.get("part_of") else obj)
+    except (OSError, ValueError, KeyError):
+        obj, root = None, None
     out = []
     for p in sorted(d.glob("z_*.json")) if d.exists() else []:
-        out.append(Zone(**json.loads(p.read_text(encoding="utf-8"))))
+        zd = json.loads(p.read_text(encoding="utf-8"))
+        if obj is not None and isinstance(obj.get("band"), dict) and zd.get("criterion") == "matte" \
+                and (zd.get("params") or {}).get("region") == "outline":
+            zd = {**zd, "params": zone_params(zd, obj, root or {})}
+        out.append(_migrated(Zone(**zd)))
     return out
+
+
+def _migrated(z: "Zone") -> "Zone":
+    """zone@1.1 -> 1.2: an outer feather of 0 meant „as the inset feather” – it gets that value, so the zone looks the
+    same while 0 now means a hard edge (one meaning in every stage, user decision 2026-10-24). Read-time; saved with the
+    next edit of the zone."""
+    if z.schema != ZONE_SCHEMA:
+        p = dict(z.params or {})
+        if not float(p.get("outer_feather_px") or 0.0):
+            p["outer_feather_px"] = zone_feather_px(z)
+        z.params = p
+        z.schema = ZONE_SCHEMA
+    return z
 
 
 def next_zone_id(obj_dir: Path) -> str:
@@ -312,46 +340,31 @@ def zone_keys(z: Zone) -> Dict[int, Dict[str, Any]]:
 
 def zone_outer_feather_px(z: "Zone") -> float:
     """Feather (px) of a whole-outline zone at its OUTER band edge (towards the background), separate from the inset
-    feather on the core side (user request 2026-10-21); 0 / absent = the inset feather everywhere, as before."""
+    feather on the core side (user request 2026-10-21). Literal like every stage (2026-10-24): 0 = a hard outer edge;
+    absent = the inset feather (the default of a new zone; zone@1.1 zones are migrated in load_zones)."""
+    v = (z.params or {}).get("outer_feather_px")
+    if v is None:
+        return zone_feather_px(z)
     try:
-        return max(0.0, float((z.params or {}).get("outer_feather_px") or 0.0))
+        return max(0.0, float(v))
     except (TypeError, ValueError):
-        return 0.0
+        return zone_feather_px(z)
 
 
-def feather_maps(area: np.ndarray, core: np.ndarray, inner_px: float, outer_px: float):
-    """Distances to the inner / outer band edge and the local length of both feathers (user rule 2026-10-22): the inner
-    feather runs from the INNER band edge (the core outside the area) outwards, the outer feather from the OUTER band edge
-    inwards; they never overlap – at most they touch. The inner one keeps its length (up to the band width), the outer
-    one gets what is left of the band. -> (d_in, d_out, li, lo), all float32 maps."""
-    a = area.astype(bool)
-    c = core.astype(bool)
-    d_in = cv2.distanceTransform((~(c & ~a)).astype(np.uint8), cv2.DIST_L2, 5)
-    d_out = cv2.distanceTransform((~(~c & ~a)).astype(np.uint8), cv2.DIST_L2, 5)
-    width = d_in + d_out                                       # local band width across this pixel
-    li = np.minimum(max(0.5, float(inner_px)), width)
-    lo = np.minimum(max(0.5, float(outer_px)), np.maximum(0.0, width - li))
-    return d_in, d_out, np.maximum(0.5, li), np.maximum(0.5, lo)
-
-
-def feather_weight(area: np.ndarray, core: np.ndarray, inner_px: float, outer_px: float) -> np.ndarray:
-    """Blend weight (0..1) of a zone over its base inside `area`: ramps over the inner feather from the inner band edge
-    and over the outer feather from the outer band edge, never overlapping (feather_maps; user report 2026-10-22: a 51 px
-    outer feather on a 17 px band ran across the band into the core – the zone never reached full weight)."""
-    d_in, d_out, li, lo = feather_maps(area, core, inner_px, outer_px)
-    w = np.minimum(np.clip(d_in / li, 0, 1), np.clip(d_out / lo, 0, 1))
-    return np.where(area.astype(bool), w, 0.0).astype(np.float32)
+# the feathers of a band (inner from the inner edge, outer from the outer edge, never overlapping; user rule 2026-10-22)
+# are the one band system: engine/bandsys.py (area_dists / lengths / weight – the former feather_maps / feather_weight
+# of this module moved there on 2026-10-24, so stages 3 / 4 / 5 / 7 share one rule)
 
 
 def zone_feather_px(z: "Zone") -> float:
     """Feather (px) of a matte zone over its base inside its area – the core inset blends into the core over this many px
     instead of a hard step (user request 2026-10-17); default = the former fixed value."""
-    from engine.refine import ZONE_FEATHER_PX
+    from engine.bandsys import BAND_DEFAULTS
     v = (z.params or {}).get("inset_feather_px")
     try:
-        return max(0.5, float(v)) if v is not None else float(ZONE_FEATHER_PX)
+        return max(0.5, float(v)) if v is not None else BAND_DEFAULTS["inset_feather_px"]
     except (TypeError, ValueError):
-        return float(ZONE_FEATHER_PX)
+        return BAND_DEFAULTS["inset_feather_px"]
 
 
 def outline_without_drawing(z: Zone) -> bool:
@@ -632,11 +645,31 @@ def zone_crop_segment(regions: Dict[int, np.ndarray], frames: Sequence[int], zon
 # (polygon / "+" strokes) plus the chosen objects (params.exclude_objects) are EXCLUDED from it: the user marks where
 # ViTMatte must not work (skin, face, a hand in front), not where the hair is. The band follows the object by definition.
 REGION_MODES = ("draw", "outline")
-OUTLINE_OUT_PX = 40          # band outside the core edge (px)
-OUTLINE_IN_MARGIN_PX = 4     # band inside the core edge = the trimap / forcing inset + this margin
+OUTLINE_OUT_PX = 40          # band outside the core edge (px) = engine/bandsys.BAND_DEFAULTS["out_px"] (one set of defaults)
 EXCLUDE_GROW_PX = 6          # excluded objects grown by this many px (their soft edge stays outside ViTMatte)
 OUTLINE_TILE_PX = 448        # outline mode: ViTMatte on tiles of this side (plate px) – the whole outline in one crop
 #                              would be scaled down (CLIP2_A: 815 px union -> x1.24 instead of x2.25)
+
+
+def band_is_unknown(z: "Zone") -> bool:
+    """Whole-outline (band) zones, user decision 2026-10-25: the band IS the unknown of the ViTMatte trimap – inside it
+    the model replaces the core (sure FG = the core outside the band, nothing forced back to 1), the feathers blend at
+    its edges only (engine/bandsys). Until then the sure FG was the core eroded by the inset slider and the result was
+    forced to 1 there, so band points whose inner whisker reached deeper than the inset (background between the strands
+    that SAM 3.1 took for hair) stayed 1 whatever the model said."""
+    return z.criterion == "matte" and region_mode(z) == "outline"
+
+
+def zone_force_core(z: "Zone", core: np.ndarray, region: np.ndarray, force_px: int) -> np.ndarray:
+    """Where a ViTMatte zone result is forced to 1 (full run and frame preview alike): the core outside the band for a
+    whole-outline zone (`band_is_unknown`), else the core eroded by `force_px` (0 = the whole core, as before)."""
+    c = np.asarray(core).astype(bool)
+    if band_is_unknown(z):
+        return c & ~np.asarray(region).astype(bool)
+    if force_px > 0:
+        kf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * force_px + 1, 2 * force_px + 1))
+        return cv2.erode(c.astype(np.uint8), kf).astype(bool)
+    return c
 
 
 def region_mode(z: "Zone") -> str:
@@ -647,24 +680,24 @@ def region_mode(z: "Zone") -> str:
 
 
 def outline_in_px(params: Optional[Dict[str, Any]]) -> int:
-    """Band inside the core edge: explicit outline_in_px, else the inset (fg_erode_px / force_core_erode_px) + margin."""
+    """Band inside the core edge: explicit outline_in_px, else the inset slider „Wcięcie w rdzeń” (fg_erode_px /
+    force_core_erode_px) – the slider IS the band inside, as in stages 3 / 4 / 7 (user decision 2026-10-24; until then
+    a hidden +4 px margin was added, so 0 still put the band 4 px into the core)."""
     p = params or {}
     if p.get("outline_in_px") is not None:
         return max(0, int(p["outline_in_px"]))
-    return max(int(p.get("fg_erode_px", 2) or 0), int(p.get("force_core_erode_px", 0) or 0)) + OUTLINE_IN_MARGIN_PX
+    from engine.bandsys import BAND_DEFAULTS
+    return max(int(p.get("fg_erode_px", BAND_DEFAULTS["in_px"]) or 0), int(p.get("force_core_erode_px", 0) or 0))
 
 
 def band_scales(params: Optional[Dict[str, Any]]) -> Tuple[float, float]:
     """(outer, inner) scale of the band points' widths (user decision 2026-10-21: the sliders „Pas na zewnątrz” /
     „Wcięcie w rdzeń” keep sizing the whole band, the points only shape it): the slider values now over their values
-    when the first point was set (params band_ref_out / band_ref_in); no reference = 1."""
+    when the first point was set (params band_ref_out, band_ref_in; engine/objband.scales); no reference = 1."""
+    from engine.objband import BandSettings, scales
     p = params or {}
-    out_now = float(p.get("outline_out_px", OUTLINE_OUT_PX))
-    in_now = float(outline_in_px(p))
-    ro, ri = p.get("band_ref_out"), p.get("band_ref_in")
-    so = out_now / float(ro) if ro else 1.0
-    si = in_now / float(ri) if ri else 1.0
-    return so, si
+    return scales(BandSettings(float(p.get("outline_out_px", OUTLINE_OUT_PX)), float(outline_in_px(p)), 0.0, 0.0,
+                               band_ref_out=p.get("band_ref_out"), band_ref_in=p.get("band_ref_in")))
 
 
 def band_refs(params: Optional[Dict[str, Any]]) -> Dict[str, float]:
@@ -905,7 +938,7 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
                   only: Optional[Sequence[int]] = None, fg_erode_px: int = 2, model_px: int = MA_ZONE_TARGET_PX,
                   unknown_value: float = 0.5, probs: Optional[Dict[int, np.ndarray]] = None,
                   force_core: Optional[Dict[int, np.ndarray]] = None, tile_px: int = 0,
-                  fg_sure: Optional[Dict[int, np.ndarray]] = None
+                  fg_sure: Optional[Dict[int, np.ndarray]] = None, band_unknown: bool = False
                   ) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[str, Any]]:
     """ViTMatte per frame on the SAME crop as the `matanyone` engine (square union crop of the zone over the shot,
     scaled up to ~1008 px, <= 3x; experiment 2026-10-13). Trimap per frame = engine/localmatte.build_trimap on the crop
@@ -918,7 +951,9 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
     `tile_px` > 0 (outline mode, 2026-10-15): per frame, square tiles of that side over the region's bbox (overlap 1/6,
     linear blend), each scaled up like the one crop (model_px / tile_px, <= 3x); tiles without unknown pixels skipped.
     `fg_sure` (frame -> mask; parts of the object, e.g. a hand that is one matte with the head): sure foreground of the
-    trimap AFTER the FG erosion – the hair right next to the part is never left half-transparent."""
+    trimap AFTER the FG erosion – the hair right next to the part is never left half-transparent.
+    `band_unknown` (whole-outline zones, 2026-10-25): the region is the trimap's unknown and nothing in it is forced
+    to 1 (build_trimap band_unknown; the default forcing = the core outside the region)."""
     from engine.crop import extract_crop, paste_crop
     from engine.localmatte import build_trimap
     frames = list(frames)
@@ -948,6 +983,14 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
     n_tiles = 0
     run_model = lambda img_, tri_: (runner.run(img_, tri_, unknown_value) if abs(unknown_value - 0.5) > 1e-6
                                     else runner.run(img_, tri_))
+
+    def run_tiles(imgs_: list, tris_: list) -> list:
+        """All tiles of a frame: one worker request when the runner has `run_many` (same forward per tile, batch 1 –
+        the alphas are those of `run`), else one by one (mocks, in-process runners without it)."""
+        many = getattr(runner, "run_many", None)
+        if many is not None and len(imgs_) > 1:
+            return list(many(imgs_, tris_, unknown_value))
+        return [run_model(im_, tr_) for im_, tr_ in zip(imgs_, tris_)]
     for i, f in enumerate(todo):
         if progress is not None:
             progress(i, len(todo))
@@ -962,6 +1005,7 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
             acc = np.zeros((H, W), np.float32)
             wsum = np.zeros((H, W), np.float32)
             ys_, xs_ = np.where(reg)
+            tiles: list = []          # (slice, tx, ty, image tile, trimap u8) – the tiles with unknown pixels, in grid order
             for ty in _tile_starts(int(ys_.min()), int(ys_.max()) + 1, H, T, T - ov):
                 for tx in _tile_starts(int(xs_.min()), int(xs_.max()) + 1, W, T, T - ov):
                     sl = (slice(ty, ty + T), slice(tx, tx + T))
@@ -969,7 +1013,8 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
                         continue
                     rt = lambda m: cv2.resize(m[sl].astype(np.float32), (ss, ss), interpolation=cv2.INTER_LINEAR) > 0.5
                     pt = cv2.resize(pff[sl], (ss, ss), interpolation=cv2.INTER_LINEAR) if pff is not None else None
-                    tm = build_trimap(rt(core[f]), rt(reg), rt(forced), max(1, int(round(fg_erode_px * scale))), prob=pt)
+                    tm = build_trimap(rt(core[f]), rt(reg), rt(forced), max(1, int(round(fg_erode_px * scale))), prob=pt,
+                                      band_unknown=band_unknown)
                     if fg_sure is not None and f in fg_sure:
                         fs = rt(fg_sure[f])
                         tm.fg |= fs
@@ -977,22 +1022,24 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
                     if not tm.unknown.any():
                         continue
                     img = cv2.resize(img_f[sl], (ss, ss), interpolation=cv2.INTER_LINEAR if ss > T else cv2.INTER_AREA)
-                    t0 = time.time()
-                    a_t = run_model(img, tm.as_u8())
-                    secs += time.time() - t0
-                    n_tiles += 1
-                    a_t = cv2.resize(a_t.astype(np.float32), (T, T), interpolation=cv2.INTER_AREA if ss > T else cv2.INTER_LINEAR)
-                    wt = _tile_weight(T, ov, tx, ty, W, H)
-                    acc[sl] += a_t * wt
-                    wsum[sl] += wt
+                    tiles.append((sl, tx, ty, img, tm.as_u8()))
+            t0 = time.time()
+            outs = run_tiles([t_[3] for t_ in tiles], [t_[4] for t_ in tiles]) if tiles else []
+            secs += time.time() - t0
+            n_tiles += len(tiles)
+            for (sl, tx, ty, _img, _tri), a_t in zip(tiles, outs):   # grid order: the same sums as tile by tile
+                a_t = cv2.resize(a_t.astype(np.float32), (T, T), interpolation=cv2.INTER_AREA if ss > T else cv2.INTER_LINEAR)
+                wt = _tile_weight(T, ov, tx, ty, W, H)
+                acc[sl] += a_t * wt
+                wsum[sl] += wt
             a = np.where(wsum > 0, acc / np.maximum(wsum, 1e-6), 0.0)
             a = np.where(reg, a, 0.0).astype(np.float32)
-            a[reg & (force_core[f] if force_core is not None else core[f])] = 1.0
+            a[reg & (force_core[f] if force_core is not None else (core[f] & ~reg if band_unknown else core[f]))] = 1.0
             a[reg & bgm & ~core[f]] = 0.0
             if hm is not None:
                 a[reg & hm & ~core[f]] = 0.0
             out[f] = a
-            tfull = build_trimap(core[f], reg, forced, max(1, int(fg_erode_px)), prob=pff)
+            tfull = build_trimap(core[f], reg, forced, max(1, int(fg_erode_px)), prob=pff, band_unknown=band_unknown)
             if fg_sure is not None and f in fg_sure:
                 tfull.fg |= fg_sure[f]
                 tfull.unknown &= ~fg_sure[f]
@@ -1000,7 +1047,8 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
             continue
         pf = rp(probs[f]) if probs and f in probs else None
         n_soft += pf is not None
-        tm = build_trimap(rs(core[f]), rs(reg), rs(forced), max(1, int(round(fg_erode_px * scale))), prob=pf)
+        tm = build_trimap(rs(core[f]), rs(reg), rs(forced), max(1, int(round(fg_erode_px * scale))), prob=pf,
+                          band_unknown=band_unknown)
         if fg_sure is not None and f in fg_sure:
             fs = rs(fg_sure[f])
             tm.fg |= fs
@@ -1013,7 +1061,7 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
         secs += time.time() - t0
         a = paste_crop(a_crop, seg, W, H)
         a = np.where(reg, a, 0.0).astype(np.float32)
-        a[reg & (force_core[f] if force_core is not None else core[f])] = 1.0
+        a[reg & (force_core[f] if force_core is not None else (core[f] & ~reg if band_unknown else core[f]))] = 1.0
         a[reg & bgm & ~core[f]] = 0.0
         if hm is not None:
             a[reg & hm & ~core[f]] = 0.0
@@ -1032,6 +1080,88 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
     return out, tris, stats
 
 
+def smooth_zone_alphas(alphas: Dict[int, np.ndarray], fl: Sequence[int], bbox: Tuple[int, int, int, int],
+                       regions: Dict[int, np.ndarray], force: Dict[int, np.ndarray], temporal: str, t_radius: int,
+                       t_scale: float, t_conf: Dict[str, Any], fin: Dict[str, Any], images: Callable[[int], np.ndarray],
+                       fg_sure: Optional[Dict[int, np.ndarray]] = None,
+                       progress: Optional[Callable[[int, int], None]] = None) -> None:
+    """Temporal smoothing of a ViTMatte zone IN PLACE (alphas[f] replaced for f in `fl`): the crops of the union bbox
+    (y0, y1, x0, x1) – parts of the object forced to 1 (`fg_sure`), flow_mean: levels first – smoothed by
+    refine.temporal_median / temporal_median_flow / temporal_mean_flow (`temporal`), on the bbox stack up-scaled
+    `t_scale` x when > 1 (user decision 2026-10-13: strands wider, flow holds), of which only the smoothing DELTA comes
+    back down (INTER_AREA: unchanged frames stay bit-identical); outside the region 0, the forced core 1.
+    Since 2026-10-25 (plan A1) the frames are sources, not stacks: each crop / gray / up-scale is made when the
+    smoother's window first asks for it and dropped once the window has moved on – four full stacks (41 GB on a 4K
+    shot) became ~2 r + 1 frames; the smoother hands the frames back one by one (`emit`) and reports `progress` per
+    frame (cancel). Every value is computed by the same calls on the same inputs as the former stack code, so the
+    result is bit-identical (tests/test_zone_smooth_window.py)."""
+    if temporal == "none" or len(fl) < 3:
+        return
+    from engine.refine import temporal_mean_flow, temporal_median, temporal_median_flow
+    y0, y1, x0, x1 = bbox
+    bh, bw = y1 - y0, x1 - x0
+    up = t_scale > 1.0
+    up_size = (int(round(bw * t_scale)), int(round(bh * t_scale)))
+    levels = temporal == "flow_mean" and ("alpha_black" in fin or "alpha_white" in fin)
+    base: Dict[int, np.ndarray] = {}        # i -> the 1x crop the smoothing starts from (window only)
+
+    def base_i(i: int) -> np.ndarray:
+        b = base.get(i)
+        if b is None:
+            f = fl[i]
+            b = alphas[f][y0:y1, x0:x1]
+            if fg_sure and f in fg_sure:
+                # parts of the object are foreground (1) for the smoothing: a hand moving over the hair must not pull
+                # the aligned neighbours' hair alpha down to 0 at its edge (they are cut out of the result again below)
+                b = b.copy()
+                b[fg_sure[f][y0:y1, x0:x1]] = 1.0
+            if levels:   # garbage clipped in its own frame first: a zeroed speck is never averaged onto the neighbours
+                b = levels_alpha(b, fin.get("alpha_black"), fin.get("alpha_white"))
+            base[i] = b
+        return b
+
+    def up_i(i: int) -> np.ndarray:
+        b = base_i(i)
+        return cv2.resize(b, up_size, interpolation=cv2.INTER_LINEAR) if up else b
+
+    class _Src:
+        def __init__(self, get: Callable[[int], np.ndarray]):
+            self.get = get
+
+        def __len__(self) -> int:
+            return len(fl)
+
+        def __getitem__(self, i: int) -> np.ndarray:
+            return self.get(i)
+
+    def gray_i(i: int) -> np.ndarray:
+        g = cv2.cvtColor(np.clip(images(fl[i])[y0:y1, x0:x1], 0, 1).astype(np.float32), cv2.COLOR_BGR2GRAY)
+        return cv2.resize(g, up_size, interpolation=cv2.INTER_LINEAR) if up else g
+
+    def emit(i: int, sm: np.ndarray) -> None:
+        f = fl[i]
+        if up:
+            # only the smoothing DELTA comes back down (no resampling blur of the full-res alpha: unchanged frames stay
+            # bit-identical): INTER_AREA = box mean of the 2x delta
+            delta = cv2.resize(sm - up_i(i), (bw, bh), interpolation=cv2.INTER_AREA)
+            sm = np.clip(base_i(i) + delta, 0.0, 1.0).astype(np.float32)
+        a = alphas[f].copy()
+        a[y0:y1, x0:x1] = sm
+        a[~regions[f]] = 0.0
+        a[regions[f] & force[f]] = 1.0
+        alphas[f] = a
+        for k in [k for k in base if k < i - t_radius]:
+            del base[k]
+
+    src = _Src(up_i)
+    if temporal == "median":
+        temporal_median(src, t_radius, 0.35, progress=progress, emit=emit)
+    elif temporal == "flow_mean":
+        temporal_mean_flow(src, _Src(gray_i), t_radius, progress=progress, emit=emit, **t_conf)
+    else:
+        temporal_median_flow(src, _Src(gray_i), t_radius, progress=progress, emit=emit)
+
+
 def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], images: Callable[[int], np.ndarray],
                        regions: Dict[int, np.ndarray], bgm: Callable[[int], np.ndarray],
                        holdout: Optional[Callable[[int], Optional[np.ndarray]]], runner: Any,
@@ -1039,7 +1169,8 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
                        probs: Optional[Dict[int, np.ndarray]] = None,
                        base_alpha: Optional[Callable[[int], np.ndarray]] = None,
                        hybrid_base: Optional[Dict[int, np.ndarray]] = None,
-                       fg_extra: Optional[Callable[[int], Optional[np.ndarray]]] = None
+                       fg_extra: Optional[Callable[[int], Optional[np.ndarray]]] = None,
+                       progress_smooth: Optional[Callable[[int, int], None]] = None
                        ) -> Tuple[Dict[int, np.ndarray], Dict[int, List[str]], Dict[str, Any]]:
     """`matting=vitmatte` inside _matte_zone: per-frame cache of the RAW model result (hash without the temporal
     option, so none / median / flow share the cached frames), then the temporal smoothing chosen in
@@ -1101,12 +1232,12 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     # edge – the core was forced back to 1 after the model): the result is forced to 1 only on the core eroded by this
     # many px, the rim is left to ViTMatte. 0 = the whole core (as before, bit-identical).
     force_px = int(params.get("force_core_erode_px", 0))
-    if force_px > 0:
-        kf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * force_px + 1, 2 * force_px + 1))
-        force = {f: cv2.erode(core[f].astype(np.uint8), kf).astype(bool) for f in frames}
-    else:
-        force = core
-    zsig = zone_signature({**z.to_dict(), "params": params, "vitmatte_model": getattr(runner, "model_id", "mock")})
+    # a whole-outline zone (2026-10-25): the band is the unknown, forced = the core outside it (zone_force_core); the
+    # signature token invalidates the per-frame cache computed with the old (eroded-core) trimap once
+    band_unk = band_is_unknown(z)
+    force = {f: zone_force_core(z, core[f], regions[f], force_px) for f in frames}
+    zsig = zone_signature({**z.to_dict(), "params": params, "vitmatte_model": getattr(runner, "model_id", "mock"),
+                           **({"band_unknown": 1} if band_unk else {})})
     seg = zone_crop_segment(regions, frames, z.zone_id)
     if seg is None:
         return {}, {}, {"frames": 0, "engine": "vitmatte"}
@@ -1133,8 +1264,8 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     if todo:
         new, _, st = vitmatte_zone(z, frames, core, regions, images, runner, holdout, bgm, progress, only=todo,
                                    fg_erode_px=fg_erode_px, model_px=model_px, unknown_value=unknown_value, probs=probs,
-                                   force_core=force if force_px > 0 else None, tile_px=vitmatte_tile_px(params),
-                                   fg_sure=fg_sure)
+                                   force_core=force if (force_px > 0 or band_unk) else None, tile_px=vitmatte_tile_px(params),
+                                   fg_sure=fg_sure, band_unknown=band_unk)
         for f, a in new.items():
             if cache is not None:
                 cache.put(hashes[f], f, a, regions[f])
@@ -1150,44 +1281,8 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     ys, xs = np.where(np.any(np.stack([regions[f] for f in fl]), axis=0))
     y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
     t0 = time.time()
-    if temporal != "none" and len(fl) >= 3:
-        from engine.refine import temporal_mean_flow, temporal_median, temporal_median_flow
-        stack = np.stack([alphas[f][y0:y1, x0:x1] for f in fl])
-        if fg_sure:
-            # parts of the object are foreground (1) for the smoothing: a hand moving over the hair must not pull the
-            # aligned neighbours' hair alpha down to 0 at its edge (they are cut out of the result again below)
-            for i, f in enumerate(fl):
-                if f in fg_sure:
-                    stack[i][fg_sure[f][y0:y1, x0:x1]] = 1.0
-        bh, bw = stack.shape[1:]
-        if temporal == "flow_mean" and ("alpha_black" in fin or "alpha_white" in fin):
-            # garbage clipped in its own frame first: a zeroed speck is never averaged onto the neighbours
-            stack = levels_alpha(stack, fin.get("alpha_black"), fin.get("alpha_white"))
-        stack0 = stack
-        if t_scale > 1.0:
-            stack = np.stack([cv2.resize(a, (int(round(bw * t_scale)), int(round(bh * t_scale))), interpolation=cv2.INTER_LINEAR)
-                              for a in stack])
-            up0 = stack.copy()
-        if temporal == "median":
-            stack = temporal_median(stack, t_radius, 0.35)
-        else:
-            grays = np.stack([cv2.cvtColor(np.clip(images(f)[y0:y1, x0:x1], 0, 1).astype(np.float32), cv2.COLOR_BGR2GRAY)
-                              for f in fl])
-            if t_scale > 1.0:
-                grays = np.stack([cv2.resize(g, (stack.shape[2], stack.shape[1]), interpolation=cv2.INTER_LINEAR) for g in grays])
-            stack = (temporal_mean_flow(stack, grays, t_radius, **t_conf) if temporal == "flow_mean"
-                     else temporal_median_flow(stack, grays, t_radius))
-        if t_scale > 1.0:
-            # only the smoothing DELTA comes back down (no resampling blur of the full-res alpha: unchanged frames stay
-            # bit-identical); INTER_AREA = box mean of the 2x delta
-            delta = np.stack([cv2.resize(a - u, (bw, bh), interpolation=cv2.INTER_AREA) for a, u in zip(stack, up0)])
-            stack = np.clip(stack0 + delta, 0.0, 1.0).astype(np.float32)
-        for i, f in enumerate(fl):
-            a = alphas[f].copy()
-            a[y0:y1, x0:x1] = stack[i]
-            a[~regions[f]] = 0.0
-            a[regions[f] & force[f]] = 1.0
-            alphas[f] = a
+    smooth_zone_alphas(alphas, fl, (y0, y1, x0, x1), regions, force, temporal, t_radius, t_scale, t_conf, fin, images,
+                       fg_sure=fg_sure, progress=progress_smooth)
     # flow_mean applied the levels before the smoothing: only the blur is left for the finish
     levels_done = temporal == "flow_mean" and len(fl) >= 3
     fin_after = ({k: v for k, v in fin.items() if k not in ("alpha_black", "alpha_white")} if levels_done else dict(fin))
@@ -1301,7 +1396,8 @@ def _matte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], ima
                 bg_masks: Optional[Dict[int, np.ndarray]] = None, cache: Any = None,
                 plate_sig: Optional[Callable[[int], Any]] = None, probs: Optional[Dict[int, np.ndarray]] = None,
                 base_alpha: Optional[Callable[[int], np.ndarray]] = None,
-                fg_extra: Optional[Callable[[int], Optional[np.ndarray]]] = None
+                fg_extra: Optional[Callable[[int], Optional[np.ndarray]]] = None,
+                progress_smooth: Optional[Callable[[int, int], None]] = None
                 ) -> Tuple[Dict[int, np.ndarray], Dict[int, List[str]], Dict[str, Any]]:
     """Per-frame local matting on the propagated region (step 3 mode); one temporal stabilization on the stacked
     alphas inside the union bbox of the regions (memory: crops, not full frames). `matting=matanyone`: one MatAnyone2
@@ -1328,7 +1424,7 @@ def _matte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], ima
         alphas, flags, st = _vitmatte_sequence(z, frames, core, images, regions, bgm, holdout,
                                                edge_model_runner((z.params or {}).get("vitmatte_model")), progress,
                                                cache, psig, probs=probs, base_alpha=base_alpha, hybrid_base=hyb_base,
-                                               fg_extra=fg_extra)
+                                               fg_extra=fg_extra, progress_smooth=progress_smooth)
         return alphas, flags, {**st, "cleanplate": clean is not None}
     if z.matting == "matanyone":
         return _matanyone_sequence(z, frames, core, images, regions, bgm, holdout, progress, clean, ma_run, cache, psig, zsig)
@@ -1436,13 +1532,15 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
             if z.mode != "add":
                 raise ValueError(f"strefa {z.zone_id}: tryb Usuń dla kryterium „matte” jeszcze nieobsługiwany")
             cb = (lambda d, t: progress(f"Strefa {z.zone_id} ({z.preset}): matting", d, t)) if progress else None
+            cb2 = (lambda d, t: progress(f"Strefa {z.zone_id} ({z.preset}): wygładzanie czasowe", d, t)) if progress else None
             alphas, zflags, zstats = _matte_zone(z, frames, core, images, regions, transforms.get(z.zone_id, {}),
                                                  removed, holdout, cb, clean, ma_run,
                                                  bg_masks=(bg_by_zone or {}).get(z.zone_id),
                                                  cache=cache_for(z.zone_id) if cache_for else None, plate_sig=plate_sig,
                                                  probs=({f: p for f, p in probs.items() if f in core and np.array_equal(core[f], cores[f])}
                                                         if probs else None),
-                                                 base_alpha=base_alpha, fg_extra=(fg_by_zone or {}).get(z.zone_id))
+                                                 base_alpha=base_alpha, fg_extra=(fg_by_zone or {}).get(z.zone_id),
+                                                 progress_smooth=cb2)
             fo = zone_outer_feather_px(z) if region_mode(z) == "outline" else 0.0
             for f, a in alphas.items():       # never skipped in user-key frames (plan section 12)
                 area = regions[f]
@@ -1494,17 +1592,16 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                 # white where the core is (the inner side, and an outer edge that lies on the core), the stage base
                 # where it is not (user decision 2026-10-22, later that day: the outer edge stays continuous with a soft
                 # base such as MatAnyone2 / VideoMaMa – with the mask 1+2 as base this is black, as before); the area
-                # then wins outright
-                d_in, d_out, li, lo = feather_maps(area, cores[f], fi, fo if fo > 0 else fi)
-                w_in, w_out = np.clip(d_in / li, 0, 1), np.clip(d_out / lo, 0, 1)
-                zw = np.minimum(w_in, w_out)
+                # then wins outright; the feathers = the one band system (engine/bandsys.compose_area, 2026-10-24)
+                from engine.bandsys import compose_area
                 partner = cores[f].astype(np.float32)
                 if base_alpha is not None:
                     partner = np.maximum(partner, np.clip(base_alpha(f), 0.0, 1.0).astype(np.float32))
-                sa = np.where(area, zw * sa + (1.0 - zw) * partner, sa).astype(np.float32)
+                sa = compose_area(cores[f], sa, area, fi, fo, outside=sa, partner=partner)   # fo literal (2026-10-24)
                 w = np.where(area, 1.0, w)
                 continue
-            zw = (feather_weight(area, cores[f], fi, fo) if fo > 0 else
+            from engine.bandsys import area_weight
+            zw = (area_weight(area, cores[f], fi, fo) if fo > 0 else
                   np.clip(cv2.distanceTransform(area.astype(np.uint8), cv2.DIST_L2, 5) / max(0.5, fi), 0, 1))
             w = np.where(area, zw, w)
         soft[f] = (sa, soft[f][1])

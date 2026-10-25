@@ -39,7 +39,10 @@ def _setup_all(api, start):
     return api.post("/api/object/obj/zones/new", json={**ZONE, "frame": start}).json()["zone"]["zone_id"]
 
 
-def test_shared_band_is_read_by_every_stage_with_its_own_scale(tmp_path, monkeypatch):
+def test_shared_band_is_read_by_every_stage_with_the_shared_sliders(tmp_path, monkeypatch):
+    """2026-10-24: the sliders are shared too – _setup_all moves the one band four times (the last: the zone's 6 px),
+    the point is set against that reference and every stage shows the same widths; a slider moved in one stage scales
+    the whiskers in every stage."""
     app_module, api, shot, pipe, frames, start = _proj(tmp_path, monkeypatch)
     zid = _setup_all(api, start)
     ys, xs = np.where(pipe.load_core("obj", [start])[start])
@@ -47,10 +50,9 @@ def test_shared_band_is_read_by_every_stage_with_its_own_scale(tmp_path, monkeyp
                 json={"x": float(xs.max()), "y": float(np.median(ys)), "out": 40})
     assert r.status_code == 200, r.text
     ob = api.get("/api/object/obj/band").json()
-    assert ob["points"] == 1 and ob["keys"] == [start] and ob["band_ref_out"] == 20
+    assert ob["points"] == 1 and ob["keys"] == [start] and ob["band_ref_out"] == 6 and ob["sliders"]["out_px"] == 6
     assert {o["key"]: o["mode"] for o in ob["owners"]} == {"matanyone": "shared", "videomama": "shared", "ltx": "shared",
                                                           f"zone:{zid}": "shared"}
-    # the same point everywhere, widths scaled by each stage's slider / the reference (20 px)
     outs = {}
     for st in ("matanyone", "videomama", "ltx", f"zone:{zid}"):
         url = (f"/api/object/obj/zones/{zid}/band/{start}" if st.startswith("zone:")
@@ -58,10 +60,14 @@ def test_shared_band_is_read_by_every_stage_with_its_own_scale(tmp_path, monkeyp
         pts = api.get(url).json()["points"]
         assert [p["id"] for p in pts] == ["p1"], st
         outs[st] = pts[0]["out"]
-    assert outs == {"videomama": 40, "matanyone": 20, "ltx": 60, f"zone:{zid}": 12}
+    assert outs == {"videomama": 40, "matanyone": 40, "ltx": 40, f"zone:{zid}": 40}
     # an edit from another stage (stage 5 zone) changes the shared band – seen by stage 4
     api.put(f"/api/object/obj/zones/{zid}/band/{start}", json={"id": "p1", "out": 24})
-    assert api.get(f"/api/object/obj/stage_band/videomama/{start}").json()["points"][0]["out"] == 80
+    assert api.get(f"/api/object/obj/stage_band/videomama/{start}").json()["points"][0]["out"] == 24
+    # the shared slider doubled in stage 3: the whiskers double everywhere (reference 6 -> 12)
+    assert api.put("/api/object/obj/settings", json={"band_out_px": 12}).status_code == 200
+    assert api.get(f"/api/object/obj/stage_band/ltx/{start}").json()["points"][0]["out"] == 48
+    assert api.get(f"/api/object/obj/zones/{zid}/band/{start}").json()["points"][0]["out"] == 48
 
 
 def test_shared_band_change_invalidates_every_shared_stage_but_not_a_detached_one(tmp_path, monkeypatch):
@@ -102,7 +108,10 @@ def test_shared_band_change_invalidates_every_shared_stage_but_not_a_detached_on
     r = api.post("/api/object/obj/band/from", json={"source": "videomama"})
     assert r.status_code == 200, r.text
     assert store.get("obj")["band_modes"] == {} and not store.get("obj")["videomama"]["band_points"]
-    assert api.get(f"/api/object/obj/stage_band/matanyone/{start}").json()["points"][0]["out"] == round(77 * 10 / 20, 2)
+    # ... with its sliders (2026-10-24): the detached copy kept 6 / 4 (the shared value at the detach: the zone's 6 px)
+    # -> stage 3 reads the same 6 / 4 now and shows the point as stage 4 did
+    assert store.get("obj")["band"]["out_px"] == 6
+    assert api.get(f"/api/object/obj/stage_band/matanyone/{start}").json()["points"][0]["out"] == 77
     # back to shared from own drops the own copy
     api.put("/api/object/obj/stage_band/ltx/mode", json={"mode": "own"})
     api.put("/api/object/obj/stage_band/ltx/mode", json={"mode": "shared"})
@@ -148,11 +157,14 @@ def test_migration_one_owner_becomes_the_object_band_and_results_stay_current(tm
     raw = json.loads((store.dir("a") / "object.json").read_text(encoding="utf-8"))
     sig_before = videomama.settings_sig(videomama.object_settings(raw))      # not migrated = its own points
     mig_before = settings_sig(raw)
-    o = store.get("a")                                                      # the first read migrates
-    assert o["band"] == {"band_points": PTS, "band_ref_out": 20, "band_ref_in": 4} and o["band_modes"] == {}
-    assert o["videomama"]["band_points"] == []
+    o = store.get("a")                                                      # the first read migrates (points + sliders)
+    assert {k: o["band"][k] for k in ("band_points", "band_ref_out", "band_ref_in")} == {"band_points": PTS, "band_ref_out": 20, "band_ref_in": 4}
+    # the sliders (2026-10-24): VideoMaMa's own 20 / 4 lead (the only owner with sliders of its own); stages 3 / 7 had
+    # the defaults -> detached with a copy of the points, nothing changes in their results
+    assert (o["band"]["out_px"], o["band"]["in_px"]) == (20, 4) and o["band_modes"] == {"matanyone": "own", "ltx": "own"}
+    assert o["videomama"]["band_points"] == [] and o["edge_band"]["band_points"] == PTS
     assert videomama.settings_sig(videomama.object_settings(o)) == sig_before   # the computed result stays current
-    assert settings_sig(o) == mig_before            # stage 3 (adaptive mode) does not read the points
+    assert settings_sig(o) != mig_before            # stage 3 reads band points since 2026-10-24: its copy is in its signature
     assert store.get("a") == o                      # idempotent
 
 
@@ -193,7 +205,11 @@ def test_migration_of_a_group_with_the_same_points_and_new_objects(tmp_path):
     (zd / "z_02.json").write_text(json.dumps(zone), encoding="utf-8")
     sig = matte_sig(store.dir("a"))
     a = store.get("a")
-    assert a["band"]["band_points"] == PTS and a["band_modes"] == {} and a["edge_band"] is None
-    assert "band_points" not in json.loads((zd / "z_02.json").read_text(encoding="utf-8"))["params"]
-    assert matte_sig(store.dir("a")) == sig         # the shared zone carries the same band: still current
+    # the points: one band; the sliders (2026-10-24): stage 3's own 10 / 4 lead, the zone (defaults) is detached with a
+    # copy of the points – its band (and its signature) exactly as before
+    assert a["band"]["band_points"] == PTS and a["edge_band"] is None
+    assert a["band_modes"] == {"zone:z_02": "own", "videomama": "own", "ltx": "own"}   # every owner with other sliders
+    assert (a["band"]["out_px"], a["band"]["in_px"]) == (10, 4)
+    assert json.loads((zd / "z_02.json").read_text(encoding="utf-8"))["params"]["band_points"] == PTS
+    assert matte_sig(store.dir("a")) == sig         # the detached zone carries the same band: still current
     assert store.create("c")["band"] == {"band_points": [], "band_ref_out": None, "band_ref_in": None}

@@ -1,5 +1,27 @@
 # MatteDesk – changelog
 
+## 0.41 – 2026-10-25
+- **One edge band in every stage:** MatAnyone2 (stage 3), VideoMaMa (4), ViTMatte (5) and LTX-2.5 (7) use the same band –
+  the same sliders (outer band, core inset, both feathers), the same band points and the same defaults (40 / 2 px, feathers
+  8 / 8); at equal values the band is identical in every stage. Sliders and points are shared by the object with one
+  "detach" for a stage that needs its own. VideoMaMa composes only through the band; LTX-2.5 "raw" stays the only mode
+  without a band.
+- **Band points:** tilt the whisker pair round the point, grab the whole whisker line, Shift = symmetric whiskers; the points
+  hide with the band preview; tracking runs in one long-lived CoTracker3 process (weights loaded once) and an edit cancels
+  the tracking of the previous point set – a 5-frame preview right after editing points went from ~6 min to ~1–2 min; the
+  job bar says "Tracking band points (CoTracker3)" while it waits.
+- **Whole-outline zone (stage 5):** the band is the trimap's unknown area – the model replaces the core in the whole band,
+  so inward whiskers cut out background the core had taken for hair.
+- **Faster, lighter edge stages:** temporal smoothing streams a sliding window with parallel optical flow (a 4K hair zone
+  needed ~41 GB of RAM, now a few GB; ~1.7x faster; results bit-identical), "Abort" works during the smoothing, all
+  ViTMatte tiles of a frame go to the model in one request, stage 3 is finished frame by frame.
+- **Hair preset default:** ViTMatte at 1/2 resolution (504 px), fine tune 0.5, no temporal smoothing (flow_mean r3 x2 when
+  switched on).
+- **Final Touch:** corrections drawn on the Core overlay, no black frame between strokes, faster stroke preview; it is now the
+  only motion blur (the per-stage alpha motion blur was removed).
+- **Experiments:** the mask 1+2 can be the base once the core is computed.
+- **UI:** "REPAIR" button (wrench) for plate cleanup, "Update changes" instead of "Recompute all", the logo badge opens About.
+
 ## 0.40 – 2026-10-24
 - **Viewport overlays on the GPU:** mask tint, outlines, the Alpha view and the comp are drawn on the graphics card (the CPU path
   stays as a fallback) – smoother scrubbing and zoom on 4K shots.

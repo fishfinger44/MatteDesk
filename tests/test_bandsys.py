@@ -16,8 +16,9 @@ def _disk(h=240, w=240, r=60, c=(120, 120)):
     return m
 
 
-def test_videomama_without_points_is_the_former_composition():
-    """No points, no outer feather = the unified-slider composition of 2026-10-17, bit for bit."""
+def test_videomama_without_points_is_close_to_the_former_composition():
+    """No points, no outer feather: the unified-slider composition of 2026-10-17 up to the one measure of the band
+    (2026-10-24: the distances come from the band area, ~1 px on the ramp); without feathers bit for bit."""
     base = _disk()
     rng = np.random.default_rng(1)
     vmm = rng.random(base.shape).astype(np.float32)
@@ -26,9 +27,10 @@ def test_videomama_without_points_is_the_former_composition():
     band = (d >= -reach) & (d <= inset)
     w = np.clip((inset - d) / feather, 0.0, 1.0)
     old = np.where(band, w * vmm + (1.0 - w) * base, base).astype(np.float32)
-    assert np.array_equal(vmm_compose(base, vmm, 0.0, reach, inset, feather), old)
+    new = vmm_compose(base, vmm, reach, inset, feather)
+    assert np.abs(new - old).max() <= 1.0 / feather + 1e-6 and np.abs(new - old).mean() < 0.01
     hard = np.where(band, vmm, base).astype(np.float32)                    # feather 0 = hard on both sides
-    assert np.array_equal(vmm_compose(base, vmm, 0.0, reach, inset, 0.0), hard)
+    assert np.array_equal(vmm_compose(base, vmm, reach, inset, 0.0), hard)
 
 
 def test_feathers_blend_into_the_core_and_never_overlap():
@@ -39,7 +41,7 @@ def test_feathers_blend_into_the_core_and_never_overlap():
     y = 120
     at = lambda px: a[y, int(np.argmin(np.abs(-d[y, 150:220] - px))) + 150]  # alpha px outside the core edge
     assert at(-7) == 1.0 and at(21) == 0.0                                  # beyond the band: the core (1 / 0)
-    assert at(-6.2) > 0.97 and at(20) < 0.03                               # band edges: still the core
+    assert at(-6.2) > 0.97 and at(20) < 0.11                               # band edges: the core (first px: 1 / 10)
     assert abs(at(-1) - 0.5) < 1e-6 and abs(at(10) - 0.5) < 1e-6           # full model weight between the feathers
     assert 0.5 < at(-4) < 1.0 and 0.0 < at(15) < 0.5                       # the ramps
     _, w = band_weight(d, 3.0, 3.0, 4.0, 10.0)                             # band 6 px: inset 4 keeps, outer gets 2

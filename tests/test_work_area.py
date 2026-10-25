@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Work area (zakres pracy, user request 2026-10-15): project.json work_area, „▶▶ Przelicz całość” / „Przelicz finalnie” /
+"""Work area (zakres pracy, user request 2026-10-15): project.json work_area, „▶▶ Przelicz nieaktualne” / „Przelicz finalnie” /
 export respect it; a core / final result computed only on the work area never passes for the whole shot (409 with the
 missing frame intervals); SAM3 needs at least one key inside the work area."""
 
@@ -117,7 +117,7 @@ def test_api_work_area_core_final_export(tmp_path, monkeypatch):
     assert st["stale_intervals"]
     r = api.post("/api/object/puppet/finalize", json={"edge_mode": "core"})
     assert r.status_code == 409 and r.json()["detail"]["code"] == "range_missing", r.text
-    # „▶▶ Przelicz całość” on the whole shot: the core covers everything (a single key -> both intervals are open-ended,
+    # „▶▶ Przelicz nieaktualne” on the whole shot: the core covers everything (a single key -> both intervals are open-ended,
     # their span changed with the range, so they are recomputed; intervals between two keys would come from the cache)
     d = api.post("/api/object/puppet/compute_all").json()
     assert d["whole_shot"] and d["frames"] == [shot.first, shot.last]

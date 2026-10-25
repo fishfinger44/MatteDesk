@@ -157,7 +157,8 @@ def _videomama(pipe: Any, name: str, frames: List[int], models_dir: Optional[Pat
             guides = [extract_crop(core2[f].astype(np.float32), seg) for f in chunk]
             mattes = gen.run(f"pv_{name}_{seg.seg_id}_{chunk[0]}", imgs, guides)
             for f, m in zip(chunk, mattes):
-                res[f] = compose(extract_crop(base[f], seg), m, s["protect"], s["reach_px"], s.get("inset_px"), s.get("feather_px", 0.0))
+                res[f] = compose(extract_crop(base[f], seg), m, s["reach_px"], s["inset_px"], s.get("feather_px", 0.0),
+                                 s.get("outer_feather_px", 0.0))
         per_seg[seg.seg_id] = res
     return assemble_full(per_seg, segs, frames, pipe.w, pipe.h)
 

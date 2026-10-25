@@ -75,10 +75,7 @@
     "max_frames": 97,
     "overlap": 16,
     "seed": 1234,
-    "region_px": 24,
-    "region_soft_px": 12,
-    "combine": "region",
-    "core_erode_px": 4
+    "combine": "band"
   },
   "localmatte": {
     "max_side": 1280,
@@ -102,9 +99,11 @@
         },
         "matting": "vitmatte",
         "params": {
-          "temporal": "flow_mean",
-          "temporal_radius": 5,
+          "temporal": "none",
+          "temporal_radius": 3,
           "temporal_scale": 2,
+          "model_px": 504,
+          "unknown_value": 0.5,
           "alpha_black": 0.1,
           "alpha_white": 0.9,
           "soft_trimap": false

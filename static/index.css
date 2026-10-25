@@ -170,6 +170,10 @@ input[type=file]::file-selector-button:hover { border-color: var(--accent-primar
   font-size: 18px;
 }
 
+/* logo + name + version = one button that opens "O programie" */
+.logo-badge.about-open { cursor: pointer; padding: 3px 6px; margin: -3px -6px; border-radius: 4px; transition: background-color 0.15s ease; }
+.logo-badge.about-open:hover, .logo-badge.about-open:focus-visible { background-color: var(--bg-hover); outline: none; }
+
 /* logo = the favicon (static/favicon.svg) */
 .logo-img {
   width: 22px;
@@ -357,6 +361,38 @@ input[type=file]::file-selector-button:hover { border-color: var(--accent-primar
 
 .btn-secondary:hover {
   background-color: var(--bg-hover);
+}
+
+.btn-repair {
+  width: 100%;
+  justify-content: center;
+  padding: 8px 12px;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-primary);
+  background: linear-gradient(180deg, rgba(232, 163, 61, 0.16), rgba(232, 163, 61, 0.06));
+  border-color: var(--accent-primary);
+}
+
+.btn-repair svg { flex: none; }
+
+/* modal title wrench: every ~7 s a short tilt + the sparks flicker (like the ladybug in "Zgłoś problem") */
+.repair-title { display: flex; align-items: center; gap: 8px; }
+.repair-ico { flex: none; overflow: visible; color: var(--accent-primary); }
+.repair-ico .repair-wrench { transform-box: view-box; transform-origin: 6px 19px; animation: repairTilt 7s ease-in-out infinite; }
+.repair-ico .repair-spark { animation: repairSpark 7s ease-in-out infinite; }
+@keyframes repairTilt {
+  0%, 12%, 100% { transform: none; }
+  3% { transform: rotate(-16deg); } 6% { transform: rotate(8deg); } 9% { transform: rotate(-8deg); }
+}
+@keyframes repairSpark { 0%, 2%, 14%, 100% { opacity: 1; } 5%, 9% { opacity: .15; } 7%, 11% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .repair-ico * { animation: none !important; } }
+
+.btn-repair:hover {
+  background: var(--accent-primary);
+  color: var(--on-accent);
+  box-shadow: 0 0 10px rgba(232, 163, 61, 0.35);
 }
 
 .btn-ghost {
@@ -1530,8 +1566,6 @@ canvas.edge-hot { cursor: pointer !important; }
 .pts-palette .pp-tools .tool-btn { flex: 1; flex-direction: row; gap: 6px; justify-content: center; padding: 4px 6px; min-height: 0; height: auto; }
 .pts-palette .pp-tools .tool-btn .tool-label { font-size: 11px; }
 .pts-palette > .form-input { font-size: 11px; padding: 4px 6px; }
-/* motion blur palette: under the edge palette by default (both in stage 3) */
-.pts-palette.mb-palette { top: auto; bottom: 46px; }
 /* edge palette: typed value next to the slider (any value, the slider is a shortcut) */
 .pts-palette .pp-sec .form-input.edge-num { width: 58px; display: inline-block; padding: 1px 4px; margin: 0 2px; }
 .pts-palette .edge-px { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
@@ -1645,8 +1679,23 @@ canvas.edge-hot { cursor: pointer !important; }
 
 .about-body p { margin: 0 0 10px; line-height: 1.5; }
 .about-body code { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-.about-links { margin: 6px 0 0; padding-left: 18px; }
-.about-links a { color: var(--accent-primary); }
+.about-title { display: flex; align-items: center; gap: 10px; }
+.about-logo { width: 28px; height: 28px; flex: none; display: block; }
+.about-links { margin: 12px 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 8px; }
+.about-links li { display: block; }
+.about-link { padding: 7px 12px; text-decoration: none; }
+.about-link svg { flex: none; }
+.about-link:hover { border-color: var(--accent-primary); color: var(--accent-primary); }
+.about-support { color: var(--accent-primary); border-color: var(--accent-primary); background: linear-gradient(180deg, rgba(232, 163, 61, 0.16), rgba(232, 163, 61, 0.06)); }
+.about-support:hover { background: var(--accent-primary); color: var(--on-accent); box-shadow: 0 0 10px rgba(232, 163, 61, 0.35); }
+/* beating red heart: double thump, then a pause */
+.about-support svg { color: #ef4444; fill: rgba(239, 68, 68, 0.35); transform-origin: center; animation: heartBeat 1.6s ease-in-out infinite; }
+.about-support:hover svg { color: #dc2626; fill: #dc2626; animation-duration: 0.9s; }
+@keyframes heartBeat {
+  0%, 40%, 100% { transform: scale(1); }
+  10% { transform: scale(1.22); } 20% { transform: scale(1); } 30% { transform: scale(1.14); }
+}
+@media (prefers-reduced-motion: reduce) { .about-support svg { animation: none; } }
 .ol-rename { padding: 1px 4px; font-size: 12px; height: auto; width: 140px; }
 
 /* which mask the preview shows (user request 2026-10-17): always visible, stands out */

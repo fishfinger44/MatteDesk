@@ -1,8 +1,8 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""„Motion blur alfy” (user decision 2026-10-16, engine/motionblur.py): a vector blur of the alpha along the object's own
-motion (plate flow x shutter / 360 x strength), only where it moves; applied on a version -> a new version, a stage's
-result stays that stage's result. Engine on a synthetic moving square, API on the synthetic shot of test_stage_layout."""
+"""Motion blur of the alpha (engine/motionblur.py): a vector blur of the alpha along the object's own motion (plate flow
+x shutter / 360 x strength), only where it moves. Used only by Final Touch (the stage-version „Motion blur alfy” was
+removed 2026-10-24). Engine on a synthetic moving square."""
 
 import json
 import sys
@@ -80,60 +80,6 @@ def test_background_motion_is_not_used():
     assert _soft(out[120, 60:220]) <= 2 and st["max_px"] < 1.5
 
 
-@pytest.fixture
-def proj(tmp_path, monkeypatch):
-    from engine.pipeline import ObjectPipeline
-    from test_zone_matte import _api_project
-    monkeypatch.setattr(ObjectPipeline, "_zone_tracker", lambda self: None)
-    return _api_project(tmp_path, monkeypatch)
-
-
-def test_api_preview_and_apply_on_the_stage_3_result(proj):
-    app_module, api, shot, pipe, frames, start = proj
-    od = pipe.store.dir("obj")
-    assert api.post("/api/object/obj/motion_blur", json={"strength": 1}).status_code == 409   # no version yet
-    r = api.post("/api/object/obj/finalize", json={"stage": "matanyone"})
-    assert r.status_code == 200, r.text
-    base = r.json()["run"]
-    f = frames[len(frames) // 2]
-    pv = api.get(f"/api/object/obj/motion_blur/{f}?v={base}&strength=1&shutter=360")
-    assert pv.status_code == 200 and pv.headers["X-MD-MB-Run"] == base
-    assert float(pv.headers["X-MD-MB-Max-Px"]) > 1.0        # the synthetic object moves
-    assert api.post("/api/object/obj/motion_blur", json={"run": base, "strength": 0}).status_code == 409
-
-    r = api.post("/api/object/obj/motion_blur", json={"run": base, "strength": 1.5, "shutter_deg": 270})
-    assert r.status_code == 200, r.text
-    new, mb = r.json()["run"], r.json()["motion_blur"]
-    assert mb["strength"] == 1.5 and mb["shutter_deg"] == 270.0 and mb["base_run"] == base and mb["stages"] == ["matanyone"]
-    rj = json.loads((od / "runs" / new / "run.json").read_text(encoding="utf-8"))
-    assert rj["stage"] == "matanyone" and rj["motion_blur"]["strength"] == 1.5     # still the stage-3 result
-    obj = pipe.store.get("obj")
-    assert obj["tool"]["stage_runs"]["matanyone"] == new and obj["tool"]["active_run"] == new
-    d = api.get("/api/object/obj/stages").json()
-    assert {s["id"]: s["state"] for s in d["steps"]}["matanyone"] == "done"         # valid: ViTMatte can use it as base
-    runs = {x["run"]: x for x in api.get("/api/object/obj/runs").json()["runs"]}
-    assert runs[new]["motion_blur"]["base_run"] == base and runs[base]["motion_blur"] is None
-
-    from engine.export import run_alpha_loader
-    a0 = run_alpha_loader(od, base, shot.w, shot.h)(f)
-    a1 = run_alpha_loader(od, new, shot.w, shot.h)(f)
-    ab = run_alpha_loader(od, new, shot.w, shot.h, sub="alpha_base")(f)
-    assert _soft(a1) > _soft(a0)                              # more soft edge where it moves
-    assert np.array_equal(a1, ab)                             # no zones: the blurred alpha is the base too
-    assert abs(float(a1.sum()) - float(a0.sum())) < 0.05 * a0.sum()
-
-
-def test_apply_on_a_plain_version_is_a_plain_version(proj):
-    app_module, api, shot, pipe, frames, start = proj
-    r = api.post("/api/object/obj/finalize", json={"stage": "matanyone"})
-    base = r.json()["run"]
-    pipe.store.update("obj", tool={"stage_runs": {}})         # not a stage's result any more
-    r = api.post("/api/object/obj/motion_blur", json={"run": base})
-    assert r.status_code == 200, r.text
-    rj = json.loads((pipe.store.dir("obj") / "runs" / r.json()["run"] / "run.json").read_text(encoding="utf-8"))
-    assert rj["applied_from"] == base and "stage" not in rj and r.json()["motion_blur"]["stages"] == []
-
-
 # ------------------------------------------------------------------ GPU (the alignment worker in ComfyUI's Python)
 def _gpu_ready():
     from engine import align_gpu
@@ -160,17 +106,3 @@ def test_gpu_equals_cpu(speed, shutter, strength):
     d = np.abs(gg - cpu)
     assert float(d.max()) < 0.02 and float(d.mean()) < 1e-3, (float(d.max()), float(d.mean()))
     assert sg["samples"] == sc["samples"] and abs(sg["max_px"] - sc["max_px"]) < 0.05
-
-
-def test_apply_falls_back_to_the_cpu_when_the_gpu_worker_dies(proj, monkeypatch):
-    """auto: a GPU worker that dies -> the rest on the CPU (fake worker in this .venv's Python, no torch)."""
-    import os
-    from engine import align_gpu, motionblur
-    app_module, api, shot, pipe, frames, start = proj
-    base = api.post("/api/object/obj/finalize", json={"stage": "matanyone"}).json()["run"]
-    env = {**os.environ, "MD_ALIGN_GPU_FAKE": "1", "MD_ALIGN_GPU_FAKE_CRASH": "1"}
-    monkeypatch.setattr(motionblur, "mb_device", lambda requested=None: ("gpu", "fake"))
-    monkeypatch.setattr(align_gpu, "open_aligner", lambda *a, **k: align_gpu.GpuAligner(sys.executable, env, timeout_s=60))
-    new_dir, mb = pipe.apply_motion_blur("obj", frames, base, 1.0)
-    assert mb["device"] == "cpu" and "GPU przerwane" in mb["device_note"]
-    assert (new_dir / "run.json").exists()

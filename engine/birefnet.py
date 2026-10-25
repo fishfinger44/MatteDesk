@@ -52,6 +52,10 @@ class ComfyBirefnetRunner(vitmatte.ComfyVitMatteRunner):
     doctor_item = "Model: BiRefNet_HR-matting / Lucida"
     worker = WORKER
     tmp_prefix = "md_birefnet_"
+    batched = False                    # its worker takes one (H, W, 3) image per request
+
+    def run_many(self, imgs, tris, unknown_value: float = 0.5):
+        return [self.run(i, t, unknown_value) for i, t in zip(imgs, tris)]
 
     def __init__(self, model_id: str = DEFAULT_MODEL, **kw: Any):
         super().__init__(model_id, **kw)

@@ -9,8 +9,10 @@ numpy, torch and transformers – nothing from MatteDesk (run with `python -I`).
     <py> vitmatte_worker.py --serve <model_id>       -> request loop, one JSON line per request on stdin:
         {"x": "<in.npy>", "out": "<out.npy>"}  ->  {"ok": true, "device": "cuda", "load_seconds": 1.2}
                                                    {"ok": false, "error": "..."}
-        in.npy : (H, W, 4) float32 – normalised RGB + trimap channel, already padded to a multiple of 32
-        out.npy: (H, W) float32 alpha clamped to 0..1 (FG / BG forcing and the crop are done by the caller)
+        in.npy : (H, W, 4) float32 – normalised RGB + trimap channel, already padded to a multiple of 32,
+                 or an (N, H, W, 4) stack = the tiles of one frame (2026-10-25): each tile its own forward
+        out.npy: (H, W) float32 alpha clamped to 0..1 (FG / BG forcing and the crop are done by the caller),
+                 (N, H, W) for a stack
 
 MD_VITMATTE_FAKE=1: no torch / transformers, alpha = trimap channel (protocol tests in MatteDesk's .venv).
 """
@@ -100,7 +102,8 @@ def _serve(model_id):
             req = json.loads(line)
             if req.get("op") == "quit":
                 break
-            a = m.forward(np.load(req["x"]))
+            x = np.load(req["x"])
+            a = np.stack([m.forward(xi) for xi in x]) if x.ndim == 4 else m.forward(x)
             np.save(req["out"], a)
             resp = {"ok": True, "device": m.device, "load_seconds": round(m.load_seconds, 3)}
         except Exception as e:

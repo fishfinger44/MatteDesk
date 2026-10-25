@@ -91,14 +91,15 @@ def test_apply_zones_matte_holdout_and_remove_mode_refused():
                     {"z_03": {f: np.eye(2, 3, dtype=np.float32) for f in frames}})
 
 
-def test_zone_schema_1_1_roundtrip_and_old_files(tmp_path):
+def test_zone_schema_roundtrip_and_old_files(tmp_path):
     d = tmp_path / "obj"
     z = Zone("z_01", "add", "matte", 7, polygon=[[0, 0], [10, 0], [10, 10]], preset="smoke", matting="hybrid",
              prompt="wytnij dym", bg_strokes=[{"p": [[1, 1], [2, 2]], "radius_px": 2}], engine_hints={"chroma": 1.5},
              params={"chroma_lo": 3.0})
     save_zone(d, z)
     back = load_zones(d)[0]
-    assert back.schema == "matte_desk/zone@1.1" and back.preset == "smoke" and back.params == {"chroma_lo": 3.0}
+    # zone@1.2 (2026-10-24): saved with the current schema; params as saved
+    assert back.schema == "matte_desk/zone@1.2" and back.preset == "smoke" and back.params == {"chroma_lo": 3.0}
     assert back.bg_strokes == z.bg_strokes and back.engine_hints == {"chroma": 1.5} and back.holdout is True
     # a zone@1.0 file (no new fields) still loads with the defaults
     (d / "zones" / "z_02.json").write_text(json.dumps({"zone_id": "z_02", "mode": "remove", "criterion": "all", "frame": 1,

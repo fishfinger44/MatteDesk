@@ -243,7 +243,9 @@ def test_cotracker_runs_in_comfy_python_through_the_worker(tmp_path, monkeypatch
     monkeypatch.setitem(tracking._CHECK_CACHE, sys.executable, (True, "cpu"))
     ckpt = tmp_path / "scaled_offline.pth"
     ckpt.write_bytes(b"w")
-    t = tracking.CoTracker3Tracker(ckpt, python=sys.executable, max_side=100)
+    # persistent=False: this fake worker speaks the one-shot argv protocol (the served loop is tested with the real
+    # worker in MD_COTRACKER_FAKE mode, tests/test_cotracker_worker_serve.py)
+    t = tracking.CoTracker3Tracker(ckpt, python=sys.executable, max_side=100, persistent=False)
     frames = [np.zeros((200, 400, 3), np.uint8)] * 3            # downscaled x0.25 for the worker
     res = t.track(frames, np.array([[0, 40.0, 20.0]], np.float32))
     assert res.engine == "cotracker3" and res.tracks.shape == (3, 1, 2)

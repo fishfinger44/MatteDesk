@@ -256,7 +256,11 @@
     // (user report 2026-10-22)
     const key = `${obj()}_ftlayer_${F.info.sig || '0'}_${F.rev[f] || 0}_${f}`;
     const ov = H.loadOverlay ? H.loadOverlay(key, `/api/object/${obj()}/final_touch/layer/${f}?c=${F.info.sig || '0'}.${F.rev[f] || 0}`) : null;
-    if (ov && ov !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = pa * F.strokesOpacity / 100; ctx.drawImage(ov, 0, 0, img.width, img.height); ctx.globalAlpha = pa; }
+    F.lastLayer = F.lastLayer || {};
+    const lk = `${obj()}_${f}`;
+    if (ov && ov !== 'missing') F.lastLayer[lk] = ov;
+    const show = ov === 'missing' ? null : (ov || F.lastLayer[lk]);   // the previous layer stays until the new one arrives
+    if (show) { const pa = ctx.globalAlpha; ctx.globalAlpha = pa * F.strokesOpacity / 100; ctx.drawImage(show, 0, 0, img.width, img.height); ctx.globalAlpha = pa; }
   }
 
   // ------------------------------------------------------------------------------------------------ timeline lane

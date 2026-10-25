@@ -148,6 +148,21 @@ def track_positions(points: Sequence[Dict[str, Any]], frames: Sequence[int], tra
 _LOCK = threading.Lock()
 _RUNNING: Dict[str, threading.Event] = {}
 _RUN_GUARD = threading.Lock()
+# Background (not awaited) trackings supersede each other per (cache dir, frame span): adding or moving a band point
+# makes a new query set, and the tracking of the previous set is worthless the moment it starts – it is skipped if it
+# has not started, and cancelled (the worker killed) if it is running (sh060 2026-10-25: six edits = six full-shot
+# trackings of ~1 min queued in front of a 5-frame preview). Awaited trackings are never superseded.
+_LATEST: Dict[Tuple[str, int, int, int], str] = {}
+
+
+class Superseded(RuntimeError):
+    """A background band tracking whose query set is no longer the latest (a newer edit replaced it)."""
+
+
+def _span_key(path: Optional[Path], frames: Sequence[int]) -> Optional[Tuple[str, int, int, int]]:
+    if path is None:
+        return None
+    return (str(path.parent), int(frames[0]), int(frames[-1]), len(frames))
 
 
 def _load(path: Optional[Path]):
@@ -164,15 +179,29 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
     got = _load(path)
     if got is not None:
         return got
+    span = _span_key(path, frames)
     with _RUN_GUARD:
+        if span is not None and not wait:
+            _LATEST[span] = h             # this query set is now the one worth tracking in this span
         ev = _RUNNING.get(h)
         owner = ev is None
         if owner:
             ev = _RUNNING[h] = threading.Event()
 
+    def stale() -> bool:
+        return span is not None and _LATEST.get(span, h) != h
+
+    def check_cancel() -> None:
+        if stale():
+            raise Superseded(h)
+
     def compute():
         try:
+            if stale():
+                return                     # replaced before it started: nothing to compute
             with _LOCK:
+                if stale():
+                    return
                 if _load(path) is None:
                     got_frames = tracker_frames(frames)
                     imgs, scale = got_frames[0], got_frames[1]
@@ -183,7 +212,7 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
                     t_of = {f: i for i, f in enumerate(frames)}
                     q = np.array([[t_of[k], (x - offs[t_of[k], 0]) * scale, (y - offs[t_of[k], 1]) * scale]
                                   for _pid, k, x, y in qs], np.float32)
-                    res = tracker.track(imgs, q)
+                    res = tracker.track(imgs, q, check_cancel) if _accepts_cancel(tracker) else tracker.track(imgs, q)
                     tr = np.asarray(res.tracks, np.float32) / scale + offs[:, None, :]
                     vs = np.asarray(res.visible, bool)
                     if path is None:
@@ -194,6 +223,8 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
                         with open(tmp, "wb") as fh:
                             np.savez_compressed(fh, tracks=tr, vis=vs)
                         tmp.replace(path)
+        except Superseded:
+            pass                           # a newer edit's tracking takes over; nothing cached for this set
         finally:
             with _RUN_GUARD:
                 _RUNNING.pop(h, None)
@@ -201,6 +232,9 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
 
     if owner:
         if wait:
+            if span is not None:
+                with _RUN_GUARD:
+                    _LATEST[span] = h      # an awaited run is the latest by definition (never superseded)
             compute()
         else:
             threading.Thread(target=compute, name=f"bandtrack-{h}", daemon=True).start()
@@ -209,10 +243,22 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
         return None
     else:
         ev.wait()
+        if path is not None and _load(path) is None:
+            # the run we joined was a background one that a newer edit superseded: an awaited caller needs its set
+            # nonetheless – compute it now (it becomes the latest of the span)
+            return _tracks(h, path, qs, frames, tracker, tracker_frames, wait)
     return _load(path) if path is not None else _MEM.get(h)
 
 
 _MEM: Dict[str, Any] = {}          # tracks without a cache dir (tests)
+
+
+def _accepts_cancel(tracker: Any) -> bool:
+    import inspect
+    try:
+        return "cancel_check" in inspect.signature(tracker.track).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 # a tracked point farther than this from the object (fraction of sqrt(area), px clamp) is lost, not occluded

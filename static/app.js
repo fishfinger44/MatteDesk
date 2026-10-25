@@ -1164,6 +1164,16 @@ class MatteDeskViewer {
     const gen = this.projectGen || 0;
     img.crossOrigin = 'anonymous';
     img.src = `/api/frame/${frameNum}?plate=${encodeURIComponent(plate)}${aligned ? '&aligned=1' : ''}&g=${gen}`;
+    // a request that never answers (the server restarted under an open page, user report 2026-10-24: „Wczytywanie
+    // klatki 78…” for ever) must not keep the frame locked: after 20 s it is asked again (once per load call)
+    const watchdog = setTimeout(() => {
+      if (gen !== (this.projectGen || 0) || this.frameCache.has(cacheKey) || !this.loadingFrames.has(cacheKey)) return;
+      img.onload = img.onerror = null; img.src = '';
+      this.loadingFrames.delete(cacheKey);
+      this.loadFrame(frameNum, callback, plateName, alignedFlag);
+    }, 20000);
+    img.addEventListener('load', () => clearTimeout(watchdog));
+    img.addEventListener('error', () => clearTimeout(watchdog));
     img.onload = () => {
       if (gen !== (this.projectGen || 0)) return;   // a frame of the previous project – never cache / show it
       this.frameCache.set(cacheKey, img);

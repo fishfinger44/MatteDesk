@@ -334,9 +334,9 @@ def test_przelicz_klatke_with_the_prompt_alone(tmp_path, monkeypatch):
 
 
 def test_przelicz_klatke_ignores_the_object_crops(tmp_path, monkeypatch):
-    """Bug 2026-10-15 (CLIP2_A): with crops from „Przelicz całość”, a + point on the wall outside the object's crop gave
+    """Bug 2026-10-15 (CLIP2_A): with crops from „Przelicz nieaktualne”, a + point on the wall outside the object's crop gave
     the hair (SAM3 got the point outside its image). User decision: in stage Wykryj „Przelicz klatkę” never uses the
-    object's crops (they come from „Przelicz całość”) – a square around the points, or the whole frame for a prompt."""
+    object's crops (they come from „Przelicz nieaktualne”) – a square around the points, or the whole frame for a prompt."""
     import app as app_module
     from engine.crop import CropSegment, save_crops
     api, shot, mf = _open(tmp_path, monkeypatch)

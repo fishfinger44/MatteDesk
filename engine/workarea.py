@@ -3,7 +3,7 @@
 """engine/workarea.py - Work area (frame range of the shot, like the AE / Nuke work area; user request 2026-10-15).
 
 The work area is stored per shot in `<work>/matte_desk/project.json` -> `work_area: [first, last]` (absent = the whole
-shot; the shot manifest is never written). „▶▶ Przelicz całość”, „Przelicz finalnie” and the export (scope
+shot; the shot manifest is never written). „▶▶ Przelicz nieaktualne”, „Przelicz finalnie” and the export (scope
 "work_area") compute only its frames.
 
 Coverage = which frames a result was computed on, with the current inputs:

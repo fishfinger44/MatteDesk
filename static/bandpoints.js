@@ -16,13 +16,25 @@
   const S = () => H.S;
   const obj = () => H.S.obj;
   const B = { data: {}, lines: {}, lastLines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false, keep: null };
-  // the stage whose band is edited: 4 VideoMaMa, 3 MatAnyone2 (px mode of the edge band)
+  // the band being edited: a stage (3 MatAnyone2 / 4 VideoMaMa / 7 LTX-2.5) or, in stage 5, the active whole-outline zone
+  // („zone:<id>” – one editor for every band, user decision 2026-10-24; the server's stage_band endpoints take both)
   const STAGE_OF = () => (!H ? null : S().stage === H.ST.VIDEOMAMA ? 'videomama' : S().stage === H.ST.MATANYONE ? 'matanyone'
-    : S().stage === H.ST.LTX ? 'ltx' : null);
-  const PFX = () => ({ matanyone: 'ep', videomama: 'vm', ltx: 'lx' }[STAGE_OF()] || 'vm');   // palette ids: epBandInfo …
+    : S().stage === H.ST.LTX ? 'ltx' : S().stage === H.ST.VITMATTE && H.zoneBand ? H.zoneBand() : null);
+  const isZone = () => (STAGE_OF() || '').startsWith('zone:');
+  const PFX = () => (isZone() ? 'z4' : ({ matanyone: 'ep', videomama: 'vm', ltx: 'lx' }[STAGE_OF()] || 'vm'));   // palette ids: epBandInfo …
   const on = () => !!(H && obj() && !S().auxMode && STAGE_OF());
   const base = () => `/api/object/${obj()}/stage_band/${STAGE_OF()}`;
   const key = (f) => `${obj()}|${STAGE_OF()}|${f}`;
+  // the band preview checkbox of the stage hides the band points with it (user report 2026-10-24); same sources as the palettes
+  const ls = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : v === '1'; } catch (e) { return d; } };
+  const pvShown = () => {
+    const s = STAGE_OF();
+    if (s === 'matanyone') return S().edgePv == null ? true : !!S().edgePv;
+    if (s === 'videomama') return ls('md_vmm_band', true);
+    if (s === 'ltx') return ls('md_ltx_band', true);
+    if (isZone()) return (() => { try { return localStorage.getItem('md_zone_bandpv') !== '0'; } catch (e) { return true; } })();
+    return true;
+  };
   const tr = (t) => (window.mdT ? window.mdT(t) : t);
   const MIN_WHISKER_SCREEN = 14;
 
@@ -40,7 +52,11 @@
       if (d.tracking) { B.tracking = true; setTimeout(() => { delete B.data[key(V().currentFrame)]; load(V().currentFrame); }, 2000); }
       else if (B.tracking) { B.tracking = false; dirtyLines(); }
       info(); renderLane(); V().render();
-    } catch (e) { /* no core in this frame: asked again on the next draw */ }
+    } catch (e) {
+      // no core in this frame: asked again on the next draw; a refusal (409: the stage reads no points in this mode –
+      // stage 3 adaptive) is kept per frame, every render asked again before (50 requests in 50 ms, 2026-10-24)
+      if (e.status === 409) B.data[k] = { frame: f, points: [], defaults: {}, refused: e.message };
+    }
     finally { delete B.busy[k]; }
   }
   function dirty() { B.data = B.keep ? { [B.keep.k]: B.keep.d } : {}; dirtyLines(); B.live = null; }
@@ -53,8 +69,15 @@
     if (Object.keys(B.lines).length > 240) B.lines = {};
     B.busy[k] = true;
     const url = `${base()}/${f}/lines?${q}`;
-    try { B.lines[k] = await H.api('GET', url); if (!prefetch) V().render(); }
-    catch (e) { if (!prefetch) B.lines[k] = { band_contours: [] }; }
+    try {
+      B.lines[k] = await H.api('GET', url); if (!prefetch) V().render();
+      // the mask 1+2 of this frame was the quick stand-in (the exact one is computed in the background, 2026-10-24):
+      // shown now; asked again ONCE, when the cheap status says the exact mask is ready (no re-asking every few seconds)
+      if (B.lines[k] && B.lines[k].approx) watchMask12(() => { for (const kk of Object.keys(B.lines)) if (B.lines[kk] && B.lines[kk].approx) delete B.lines[kk]; if (V()) V().render(); });
+    }
+    catch (e) {   // the reason stays with the frame (lineNote) until the band changes – not „ładuję…” for ever (2026-10-24)
+      if (!prefetch) { B.lines[k] = { band_contours: [], error: e.message || String(e) }; V().render(); }
+    }
     finally { delete B.busy[k]; }
     // the neighbours in the background (user report 2026-10-22: the band showed late after a frame step): the next
     // step finds its lines here / in the server cache – one at a time, only while the frame stays put and not playing
@@ -73,6 +96,8 @@
     try { const d = await H.api('GET', `${base()}/params`); prev = { band_points: d.band_points || [], band_ref_out: d.band_ref_out ?? null, band_ref_in: d.band_ref_in ?? null }; }
     catch (e) { /* no band yet (px mode off): nothing to restore */ }
     B.undo.push({ stage: STAGE_OF(), url: base(), f, what, prev });
+    // a zone band edit goes on the zone's own undo stack too (drawing and band edits in one order, Ctrl+Z in stage 5)
+    if (isZone() && window.MD_ZONES && window.MD_ZONES.pushBandUndo) window.MD_ZONES.pushBandUndo();
   }
   async function save(f, body, what, del) {
     await snap(f, what);
@@ -92,6 +117,12 @@
     renderLane(); V().render();
   }
   async function reloadStage() {   // the stage palette reads its settings again (objects.js loadVmm via the reload hook)
+    if (isZone()) {   // stage 5: the zone list again, AND the palettes of stages 3 / 4 / 7 – „odłącz” / „ustaw jako wspólny” / a
+      // band edit of a zone changes the band they show (user report 2026-10-24: stage 3 kept the old sliders)
+      if (window.MD_ZONES && window.MD_ZONES.reloadBand) await window.MD_ZONES.reloadBand();
+      if (H.reloadBandPalettes) await H.reloadBandPalettes({ zones: false });
+      return;
+    }
     if (H.reloadStageBand) await H.reloadStageBand();
   }
   async function undo() {
@@ -135,13 +166,13 @@
     const keys = (d.keys || []).map((k) => 'F' + k).join(' ');
     const pk = (n) => tr(n === 1 ? 'punkt' : 'pkt');
     const idle = me.active === false   // the stage does not read points in its current mode
-      ? ` <span class="muted" title="Etap czyta punkty pasa tylko w trybie px (MatAnyone2: „Pas na zewnątrz” / „Wcięcie” > 0) albo w wyniku „pas” (LTX-2.5)">· ${tr('nieużywany w tym trybie')}</span>` : '';
+      ? ` <span class="muted" title="Wynik LTX-2.5 „surowy” nie ma pasa – model sam decyduje, co wycina; punkty pasa działają w wyniku „pas”">· ${tr('nieużywany w tym trybie')}</span>` : '';
     el.innerHTML = own
-      ? `<span class="muted" title="Ten etap ma własną kopię punktów pasa – zmiany wspólnego pasa obiektu go nie dotyczą">✂ ${tr('własny pas')} · ${me.points} ${pk(me.points)}</span>${idle}
-         <button type="button" class="btn btn-ghost btn-xs" data-bm="shared" title="Wróć do wspólnego pasa obiektu – własne punkty tego etapu zostaną usunięte">🔗 ${tr('wróć do wspólnego')}</button>
+      ? `<span class="muted" title="Ten etap ma własną kopię pasa – suwaków i punktów; zmiany wspólnego pasa obiektu go nie dotyczą">✂ ${tr('własny pas')} · ${me.points} ${pk(me.points)}</span>${idle}
+         <button type="button" class="btn btn-ghost btn-xs" data-bm="shared" title="Wróć do wspólnego pasa obiektu – ten etap znów czyta wspólne suwaki i punkty; własne punkty tego etapu zostaną usunięte">🔗 ${tr('wróć do wspólnego')}</button>
          ${me.points ? `<button type="button" class="btn btn-ghost btn-xs" data-bm="from" title="Punkty tego etapu stają się wspólnym pasem obiektu – zmienią się wszystkie etapy na wspólnym pasie (↻)">⇧ ${tr('ustaw jako wspólny')}</button>` : ''}`
-      : `<span class="muted" title="Jedne punkty pasa dla etapów 3 / 4 / 5 / 7 – każdy etap skaluje je własnymi suwakami; zmiana punktu = ↻ we wszystkich etapach na wspólnym pasie">🔗 ${tr('pas obiektu (wspólny)')} · ${d.points} ${pk(d.points)}${keys ? ` · ${tr('klucze')} ${keys}` : ''}</span>${idle}
-         <button type="button" class="btn btn-ghost btn-xs" data-bm="own" title="Odłącz → własny pas: ten etap dostaje kopię punktów i dalej zmiany wspólnego pasa go nie dotyczą">⛓ ${tr('odłącz')}</button>`;
+      : `<span class="muted" title="Jeden pas dla etapów 3 / 4 / 5 / 7 – te same suwaki (pas, wcięcie, wtopienia) i punkty; zmiana suwaka lub punktu = ↻ we wszystkich etapach na wspólnym pasie">🔗 ${tr('pas obiektu (wspólny)')} · ${d.points} ${pk(d.points)}${keys ? ` · ${tr('klucze')} ${keys}` : ''}</span>${idle}
+         <button type="button" class="btn btn-ghost btn-xs" data-bm="own" title="Odłącz → własny pas: ten etap dostaje kopię suwaków i punktów i dalej zmiany wspólnego pasa go nie dotyczą">⛓ ${tr('odłącz')}</button>`;
     renderSeed(document.getElementById(el.id.replace(/BandMode$/, 'BandSeed')), bkey, own, after);
     for (const c of copyEls || []) if (c) c.style.display = own ? '' : 'none';
     el.querySelectorAll('[data-bm]').forEach((b) => b.addEventListener('click', () => setMode(bkey, b.dataset.bm, after)));
@@ -214,20 +245,25 @@
   function geom(p) {
     if (!p.visible || p.sx == null) return null;
     const d = B.drag && B.drag.p.id === p.id ? B.drag : null;
-    const g = { sx: p.sx, sy: p.sy, nx: p.nx, ny: p.ny, out: p.out, in: p.in };
+    const g = { sx: p.sx, sy: p.sy, nx: p.nx, ny: p.ny, tx: p.tx == null ? -p.ny : p.tx, ty: p.ty == null ? p.nx : p.ty,
+                out: p.out, in: p.in, ang: p.ang || 0 };
     if (B.live) { g.out *= B.live.out; g.in *= B.live.in; }
     if (d && d.kind === 'move') { g.sx = d.x; g.sy = d.y; }
-    if (d && d.kind === 'out') g.out = d.val;
-    if (d && d.kind === 'in') g.in = d.val;
+    if (d && d.kind === 'out') { g.out = d.val; g.ang = d.ang; if (d.sym) g.in = d.val; }
+    if (d && d.kind === 'in') { g.in = d.val; g.ang = d.ang; if (d.sym) g.out = d.val; }
     return g;
   }
+  // the whisker pair's direction: the outline's normal turned by `ang` degrees toward the contour's tangent (2026-10-26);
+  // the yellow whisker always stays outside, the blue one inside – the pair only turns round the point, never swaps
+  const wdir = (g) => { const a = (g.ang || 0) * Math.PI / 180; const c = Math.cos(a), s = Math.sin(a);
+                        return [g.nx * c + g.tx * s, g.ny * c + g.ty * s]; };
   function ends(g) {
     const m = MIN_WHISKER_SCREEN / (V().zoom * plateScale());
-    const lo = Math.max(g.out, m), li = Math.max(g.in, m);
-    return { o: [g.sx + g.nx * lo, g.sy + g.ny * lo], i: [g.sx - g.nx * li, g.sy - g.ny * li] };
+    const lo = Math.max(g.out, m), li = Math.max(g.in, m); const [dx, dy] = wdir(g);
+    return { o: [g.sx + dx * lo, g.sy + dy * lo], i: [g.sx - dx * li, g.sy - dy * li] };
   }
   function hit(f, p) {
-    const s = st(f); if (!s) return null;
+    const s = st(f); if (!s || !pvShown()) return null;
     const tol = 9 / (V().zoom * plateScale());
     const near = (q) => Math.hypot(q[0] - p[0], q[1] - p[1]) <= tol;
     for (const pt of s.points) {
@@ -236,6 +272,15 @@
       if (near(e.o)) return { kind: 'out', p: pt };
       if (near(e.i)) return { kind: 'in', p: pt };
       if (near([g.sx, g.sy])) return { kind: 'move', p: pt };
+    }
+    // the whisker line itself (2026-10-26): grabbing anywhere along it moves the point, like grabbing the point
+    for (const pt of s.points) {
+      const g = geom(pt); if (!g) continue;
+      const e = ends(g);
+      const ax = e.i[0], ay = e.i[1], bx = e.o[0], by = e.o[1];
+      const l2 = (bx - ax) ** 2 + (by - ay) ** 2; if (l2 <= 0) continue;
+      const t = Math.max(0, Math.min(1, ((p[0] - ax) * (bx - ax) + (p[1] - ay) * (by - ay)) / l2));
+      if (Math.hypot(p[0] - (ax + t * (bx - ax)), p[1] - (ay + t * (by - ay))) <= tol) return { kind: 'move', p: pt };
     }
     return null;
   }
@@ -249,6 +294,7 @@
     const q = Object.entries(params || {}).map(([kk, v]) => `${kk}=${encodeURIComponent(v)}`).join('&');
     let L = B.lines[`${key(f)}|${q}`];
     let dim = false;
+    if (L && L.error) return false;   // the server refused: nothing to draw, lineNote(f, params) says why
     if (!L) {
       const pre = `${key(f)}|`;
       if (!(opts.live && Object.keys(B.busy).some((b) => b.startsWith(pre)))) loadLines(f, params);
@@ -257,19 +303,51 @@
       dim = true;
     }
     B.lastLines[key(f)] = L;
+    strokeLines(ctx, k, L, { alpha: dim ? 0.5 : null });
+    return true;
+  }
+  // ONE drawing of a band preview (stages 3 / 4 / 5 / 7, 2026-10-24): `L` = a lines dict of the server (band_contours /
+  // inset_feather_contours / feather_contours in plate px, engine/bandsys.preview_lines), `k` = plate -> image scale:
+  // dashed band edges + thin dashes where the feathers end, no fill (user decision 2026-10-21)
+  function strokeLines(ctx, k, L, opts = {}) {
     const v = V();
     ctx.save();
-    if (dim) ctx.globalAlpha = 0.5;
+    if (opts.alpha != null) ctx.globalAlpha = opts.alpha;
     try {
       ctx.strokeStyle = 'rgba(255,212,0,0.95)'; ctx.lineWidth = 1.6 / v.zoom; ctx.setLineDash([6 / v.zoom, 4 / v.zoom]);
       for (const c of L.band_contours || []) { poly(ctx, k, c); ctx.stroke(); }
       ctx.strokeStyle = 'rgba(255,212,0,0.8)'; ctx.lineWidth = 0.8 / v.zoom; ctx.setLineDash([3 / v.zoom, 3 / v.zoom]);
       for (const c of [...(L.inset_feather_contours || []), ...(L.feather_contours || [])]) { poly(ctx, k, c); ctx.stroke(); }
     } finally { ctx.restore(); }
-    return true;
+  }
+  // the exact mask 1+2 of the work area is computed once in the background (pipeline.mask12_warm); the previews shown
+  // on the stand-in mask register here and are refreshed once, when GET …/mask12_status says ready (one poll, 5 s)
+  const W = { timer: null, cbs: [], obj: null };
+  function watchMask12(cb) {
+    if (!obj()) return;
+    if (W.obj !== obj()) { W.cbs = []; W.obj = obj(); }
+    if (cb && !W.cbs.includes(cb)) W.cbs.push(cb);
+    if (W.timer) return;
+    const tick = async () => {
+      W.timer = null;
+      if (!obj()) { W.cbs = []; return; }
+      let st = null;
+      try { st = await H.api('GET', `/api/object/${obj()}/mask12_status`); } catch (e) { st = null; }
+      if (st && st.ready) { const cbs = W.cbs; W.cbs = []; cbs.forEach((c) => { try { c(); } catch (e) { /* a stale view */ } }); return; }
+      if (st && !st.running && !st.ready) { W.cbs = []; return; }   // nothing is being computed (an error was logged): stop
+      W.timer = setTimeout(tick, 5000);
+    };
+    W.timer = setTimeout(tick, 5000);
+  }
+  // why drawLines(f, params) drew nothing: the server's refusal of the lines ('' = still loading)
+  function lineNote(f, params) {
+    const q = Object.entries(params || {}).map(([kk, v]) => `${kk}=${encodeURIComponent(v)}`).join('&');
+    const L = B.lines[`${key(f)}|${q}`];
+    if (L && L.error) return `Podgląd pasa F${f}: ${L.error}`;
+    return L && L.approx ? `Podgląd pasa F${f}: przybliżony – liczę dokładną maskę 1+2 obszaru roboczego (raz, w tle)…` : '';
   }
   function draw(ctx, img, k, f) {
-    if (!on()) return;
+    if (!on() || !pvShown()) return;
     const s = st(f);
     if (!s) { load(f); return; }
     const v = V(); const lw = 2 / v.zoom; const r = 5 / v.zoom; const h = 4 / v.zoom;
@@ -301,7 +379,13 @@
 
   // ---- tools (left rail) and pointer
   const tool = () => (on() && ['band_add', 'band_remove'].includes(S().tool) ? S().tool : null);
-  function onTool() { V().canvas.style.cursor = tool() ? 'crosshair' : ''; info(); V().render(); }
+  // a band-point tool picked while the stage's band preview is off switches the preview on (user request 2026-10-24)
+  function onTool() {
+    if (tool() && !pvShown()) {
+      const cb = $(isZone() ? 'zpBandPv' : { matanyone: 'ePv', videomama: 'vmPvBand', ltx: 'lxPvBand' }[STAGE_OF()]);
+      if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+    V().canvas.style.cursor = tool() ? 'crosshair' : ''; info(); V().render(); }
   function wire(cv) {
     cv.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.altKey || !on()) return;
@@ -316,13 +400,23 @@
       e.preventDefault(); e.stopPropagation(); e.mdHandled = true;
       if (!ht) { save(f, { x: p[0], y: p[1] }, 'nowy punkt'); return; }
       try { cv.setPointerCapture(e.pointerId); } catch (er) { /* not capturable */ }
-      B.drag = { ...ht, pid: e.pointerId, f, x0: p[0], y0: p[1], x: p[0], y: p[1], val: ht.kind === 'out' ? ht.p.out : ht.kind === 'in' ? ht.p.in : 0 };
+      B.drag = { ...ht, pid: e.pointerId, f, x0: p[0], y0: p[1], x: p[0], y: p[1], val: ht.kind === 'out' ? ht.p.out : ht.kind === 'in' ? ht.p.in : 0, ang: ht.p.ang || 0 };
     }, true);
     cv.addEventListener('pointermove', (e) => {
       const d = B.drag; if (!d || e.pointerId !== d.pid) return;
       const p = H.canvasToPlate(e); if (!p) return;
-      if (d.kind === 'move') { d.x = p[0]; d.y = p[1]; }
-      else { const sg = d.kind === 'out' ? 1 : -1; d.val = Math.max(0, Math.round(sg * ((p[0] - d.p.sx) * d.p.nx + (p[1] - d.p.sy) * d.p.ny))); }
+      if (d.kind === 'move') { d.x = d.p.sx + (p[0] - d.x0); d.y = d.p.sy + (p[1] - d.y0); }
+      else {
+        // polar drag (2026-10-26): the end follows the cursor – distance = the whisker's length, direction = the tilt of the
+        // whole pair round the point (the other whisker stays collinear); within 4° of the normal it snaps back to 0
+        d.sym = !!e.shiftKey; const sg = d.kind === 'out' ? 1 : -1;
+        const vx = sg * (p[0] - d.p.sx), vy = sg * (p[1] - d.p.sy);
+        const tx = d.p.tx == null ? -d.p.ny : d.p.tx, ty = d.p.ty == null ? d.p.nx : d.p.ty;
+        let a = Math.atan2(vx * tx + vy * ty, vx * d.p.nx + vy * d.p.ny) * 180 / Math.PI;
+        a = Math.max(-80, Math.min(80, a)); if (Math.abs(a) < 4) a = 0;
+        d.ang = Math.round(a * 10) / 10;
+        d.val = Math.max(0, Math.round(Math.hypot(vx, vy)));
+      }
       V().render();
     }, true);
     const up = (e) => {
@@ -333,7 +427,9 @@
         save(d.f, { id: d.p.id, x: d.x, y: d.y }, `punkt ${d.p.id} przesunięty (klucz)`);
       } else {
         const side = d.kind === 'out' ? 'na zewnątrz' : 'do środka';
-        save(d.f, { id: d.p.id, [d.kind]: d.val }, `${d.p.id}: ${tr(side)} ${d.val} px (klucz)`);
+        const an = d.ang ? `, kąt ${d.ang}°` : '';
+        if (d.sym) save(d.f, { id: d.p.id, out: d.val, in: d.val, ang: d.ang }, `${d.p.id}: oba wąsy ${d.val} px (symetrycznie${an}, klucz)`);
+        else save(d.f, { id: d.p.id, [d.kind]: d.val, ang: d.ang }, `${d.p.id}: ${tr(side)} ${d.val} px${an} (klucz)`);
       }
     };
     cv.addEventListener('pointerup', up, true);
@@ -369,6 +465,9 @@
       m.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); v.goToFrame(f); deleteKeyAt(f); });
       lane.appendChild(m);
     }
+    // the band keys of a frame arrive asynchronously (load): 🔑✕ / Delete must follow them (user report 2026-10-26: the key of
+    // F40 could not be deleted – the button was computed before the points were loaded and stayed disabled)
+    if (H && H.updateDelKey) H.updateDelKey();
   }
   function info() {
     const el = $(`${PFX()}BandInfo`); if (!el || !on()) return;
@@ -390,6 +489,25 @@
     window.addEventListener('md-frame', onFrame);
     window.MD_BANDPTS.ready = true;
   }
-  window.MD_BANDPTS = { init, draw, drawLines, onTool, onFrame, reset, dirty, undo, hasKeyAt, deleteKeyAt, copyFrom, setLive,
+
+  // ---- ONE band palette (user decision 2026-10-24): every band stage (3 / 4 / 7; the stage-5 zone keeps its own
+  // rows with the same ranges) shows the same four sliders in the same order, range and wording; a stage keeps only
+  // its element ids and its model name. `slider(kind, model)` = the attribute strings for the stage's own <input id=…>
+  const SLIDER_ORDER = ['out', 'in', 'feather', 'outFeather'];
+  const SLIDERS = {
+    out: [120, 400, 'Pas na zewnątrz', (m) => `Jak daleko poza krawędź maski bazowej sięga pas (zewnętrzna przerywana linia), w którym ${m} decyduje o alfie (kosmyki, rozmycie). Punkty pasa kształtują go wzdłuż obrysu, suwak skaluje cały pas – tak samo w etapach 3 / 4 / 5 / 7. Suwak 0–120 px, w polu do 400`],
+    in: [40, 200, 'Wcięcie w rdzeń', (m) => `Ile px w głąb maski bazowej oddajemy ${m} (wewnętrzna przerywana linia pasa); dalej w środku alfa = 1. Punkty pasa kształtują je wzdłuż obrysu – tak samo w etapach 3 / 4 / 5 / 7. Suwak 0–40 px, w polu do 200`],
+    feather: [40, 200, 'Wtopienie wcięcia', (m) => `Na ilu px od wewnętrznej krawędzi pasa rdzeń przechodzi w wynik ${m} (cieńsza przerywana linia); nie nachodzi na wtopienie krawędzi zewnętrznej. 0 = twarde przejście`],
+    outFeather: [80, 200, 'Wtopienie krawędzi zewn.', (m) => `Na ilu px od ZEWNĘTRZNEJ krawędzi pasa wynik ${m} przechodzi w rdzeń (zwykle czerń) – cieńsza przerywana linia. Nie nachodzi na wtopienie wcięcia. 0 = twarde cięcie`],
+  };
+  function slider(kind, model) {
+    const [smax, nmax, label, tip] = SLIDERS[kind];
+    const rt = `${label} (px) – podgląd na żywo, zapis po puszczeniu`;
+    const nt = `${label} (px) – wpisz i Enter`;
+    return { label, title: tip(model),
+             range: `type="range" min="0" max="${smax}" step="1" title="${rt}"`,
+             num: `type="number" min="0" max="${nmax}" step="1" class="form-input edge-num" title="${nt}"` };
+  }
+  window.MD_BANDPTS = { init, draw, drawLines, strokeLines, lineNote, onTool, slider, SLIDER_ORDER, pointsAt: (f) => pts(f), watchMask12, onFrame, reset, dirty, undo, hasKeyAt, deleteKeyAt, copyFrom, setLive,
                         renderLane, info, stage: STAGE_OF, renderMode, renderModeInto, ready: false };
 })();

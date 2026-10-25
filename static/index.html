@@ -23,7 +23,7 @@
         <div class="logo-badge">
           <img class="logo-img" src="/static/favicon.svg" alt="" width="22" height="22">
           <span class="logo-text">MatteDesk</span>
-          <span class="version-tag" id="appVersion" title="Wersja MatteDesk – kliknij: O programie (autor, licencja)">v…</span>
+          <span class="version-tag" id="appVersion" title="Wersja MatteDesk – kliknij logo lub numer: O programie (autor, licencja)">v…</span>
         </div>
         <button class="btn btn-primary" id="openProjectModalBtn" title="Otwórz / skonfiguruj projekt ujęcia">📁 Projekt</button>
       </div>
@@ -42,7 +42,7 @@
         </div>
         <div class="view-mode-tabs" id="viewModeTabs">
           <button class="tab-btn active" data-view="none" title="Sam obraz plate'u">Plate</button>
-          <button class="tab-btn" data-view="core" title="Rdzeń SAM 3.1 wybranego obiektu (niebieska nakładka) – po „▶▶ Przelicz całość”; w etapie 2 maska 1+2 (rdzeń + poprawki pędzlem)">Rdzeń</button>
+          <button class="tab-btn" data-view="core" title="Rdzeń SAM 3.1 wybranego obiektu (niebieska nakładka) – po „▶▶ Przelicz nieaktualne”; w etapie 2 maska 1+2 (rdzeń + poprawki pędzlem)">Rdzeń</button>
           <button class="tab-btn" data-view="alpha" title="Kanał alpha wybranego obiektu: czarno-biały (biały = obiekt, szarość = półprzezroczystość; aktywna wersja) – od etapu 3 MatAnyone2">Alpha</button>
           <button class="tab-btn" data-view="comp" title="Podgląd compu: obiekt na tle BG (tło docelowe, gdy jest w projekcie), inaczej na zielonym [V = zmiana tła: BG / zielone / czarne / białe / 18 % / szachownica / kolor] – od etapu 3 MatAnyone2">Comp</button>
         </div>
@@ -194,7 +194,7 @@
             <option value="30">30 fps</option>
             <option value="60">60 fps</option>
           </select>
-          <span class="wa-label" id="waLabel" title="Zakres pracy (work area): znaczniki [ ] na osi czasu (przeciągnij; dwuklik = całe ujęcie). Shift+B = początek w bieżącej klatce, Shift+N = koniec, Alt+X = całe ujęcie. „▶▶ Przelicz całość”, „Przelicz finalnie” i eksport „work area” liczą tylko te klatki (zapis w project.json)">Zakres: całe ujęcie</span>
+          <span class="wa-label" id="waLabel" title="Zakres pracy (work area): znaczniki [ ] na osi czasu (przeciągnij; dwuklik = całe ujęcie). Shift+B = początek w bieżącej klatce, Shift+N = koniec, Alt+X = całe ujęcie. „▶▶ Przelicz nieaktualne”, „Przelicz finalnie” i eksport „work area” liczą tylko te klatki (zapis w project.json)">Zakres: całe ujęcie</span>
           <button class="btn btn-ghost btn-sm" id="btnHelpShortcuts" title="Skróty klawiszowe">⌨️ Skróty</button>
         </div>
       </div>
@@ -312,7 +312,7 @@
       <div class="modal-card modal-large">
         <div class="modal-header">
           <div class="modal-title-group">
-            <h3>✨ Czyszczenie plate'u: deflicker i odszumianie</h3>
+            <h3 class="repair-title"><svg class="repair-ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="repair-wrench" d="M14.7 6.3a4 4 0 0 0-5.4 5.1L3 17.7 6.3 21l6.3-6.3a4 4 0 0 0 5.1-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/><path class="repair-spark" d="M19 3v3M17.5 4.5h3M5 3v2M4 4h2" stroke-width="1.6"/></svg><span>Czyszczenie plate'u: deflicker i odszumianie</span></h3>
             <span class="modal-subtitle">Łańcuch deflickera v10 + odszumianie z kompensacją ruchu. Działa na każdym plate'cie (beauty, clear plate, backlit).</span>
           </div>
           <button class="modal-close-btn" id="closeCleanModalBtn">✕</button>
@@ -557,7 +557,7 @@
       <div class="modal-card">
         <div class="modal-header">
           <div class="modal-title-group">
-            <h3>MatteDesk <span id="aboutVersion"></span></h3>
+            <h3 class="about-title"><img class="about-logo" src="/static/favicon.svg" alt="" width="28" height="28"><span>MatteDesk <span id="aboutVersion"></span></span></h3>
             <span class="modal-subtitle">Interaktywne narzędzie do wycinania obiektów z ujęć – alpha, matte, roto.</span>
           </div>
           <button class="modal-close-btn" id="closeAboutModalBtn" title="Zamknij (Esc)">✕</button>
@@ -567,8 +567,8 @@
           <p><b>Licencja:</b> GNU GPL-3.0-or-later – wolno używać (także komercyjnie), zmieniać i rozpowszechniać, ale zmienione wersje muszą zostać otwarte na tej samej licencji. Pełny tekst: plik <code>LICENSE</code>.</p>
           <p><b>Modele zewnętrzne</b> (SAM 3.1, MatAnyone2, CoTracker3, ViTMatte, DepthCrafter…) nie są częścią MatteDesk. Pobierasz je sam przez Doktora i obowiązują ich własne licencje – część z nich jest tylko do użytku niekomercyjnego. Lista: <code>THIRD_PARTY_LICENSES.md</code>.</p>
           <ul class="about-links">
-            <li><a id="aboutLink_repo" target="_blank" rel="noopener">Kod źródłowy i zgłaszanie błędów</a></li>
-            <li><a id="aboutLink_support" target="_blank" rel="noopener">☕ Wesprzyj projekt (dobrowolnie)</a></li>
+            <li><a id="aboutLink_repo" class="btn btn-secondary about-link" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Kod źródłowy i zgłaszanie błędów</span></a></li>
+            <li><a id="aboutLink_support" class="btn about-link about-support" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20.5s-8-4.6-8-10.5a4.5 4.5 0 0 1 8-2.8A4.5 4.5 0 0 1 20 10c0 5.9-8 10.5-8 10.5z"/></svg><span>Wesprzyj projekt (dobrowolnie)</span></a></li>
           </ul>
         </div>
         <div class="modal-footer">

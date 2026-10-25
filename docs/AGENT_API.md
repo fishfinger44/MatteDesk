@@ -75,7 +75,7 @@ edge band preview before computing `GET /api/object/{o}/edge_preview/{f}?band_sc
 
 ## Typical flow (new shot → export)
 1. `open <katalog>` (or the wizard in the UI) → stage 0 in the UI (plates, proxies, alignment of the backlit / clear plate).
-2. Object: UI (name, prompt) → points / candidate (user) → "▶▶ Recompute whole" („▶▶ Przelicz całość”) (`POST /api/object/{o}/compute_all`: crops + core).
+2. Object: UI (name, prompt) → points / candidate (user) → "▶▶ Recompute whole" („▶▶ Przelicz nieaktualne”) (`POST /api/object/{o}/compute_all`: crops + core).
 3. Core review (user: SAM 3.1 keys) → `rerun <obj> --wait`; persistent errors → brush corrections in the UI (stage 2) → `core-fix <obj> --wait`.
 4. `finalize <obj> --stage matanyone --wait` (stage 3) → ViTMatte zones in the UI → `zone-apply <obj> <zone> --stage vitmatte --wait` (stage 4);
    experiments: `finalize <obj> --wait` → `qa <obj>` → optionally `edge-fix <obj> --skip …` → `versions <obj>`.
@@ -145,12 +145,12 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/object/{name}/points/{frame}` | long_job (quiet), object_edit | Stage 1 (Wykryj): the points of a frame ARE its key |
 | GET | `/api/object/{name}/edge_modes` | – | 'Krawędź' list (SPEC 5.5): Backlit only when a backlit plate exists |
 | PUT | `/api/object/{name}/edge_mode` | object_edit |  |
-| GET | `/api/project/work_area` | – | Work area (AE / Nuke style, user request 2026-10-15): `range` = [first, last] or None (whole shot), `shot`, `effective` = the frames „▶▶ Przelicz całość”, „Prze |
+| GET | `/api/project/work_area` | – | Work area (AE / Nuke style, user request 2026-10-15): `range` = [first, last] or None (whole shot), `shot`, `effective` = the frames „▶▶ Przelicz nieaktualne”,  |
 | PUT | `/api/project/work_area` | – | Stored in project.json -> work_area (the shot manifest is never written) |
 | GET | `/api/object/{name}/life` | – | Object life range (zakres życia, user request 2026-10-15): `life` = visible intervals [[a, b], ...] or None (the whole shot), `shot`, `hints` = suggestions from |
 | PUT | `/api/object/{name}/life` | object_edit | Stored in objects/<name>/object.json -> life (the shot manifest is never written) |
 | GET | `/api/object/{name}/stages` | – | Stage strip of the objects panel: done / stale / todo / locked + the next action. |
-| POST | `/api/object/{name}/compute_all` | long_job | „▶▶ Przelicz całość” (user decision 2026-10-15): crops only when missing or when a user key no longer fits its crop, then the core on the whole shot (unchanged  |
+| POST | `/api/object/{name}/compute_all` | long_job | „▶▶ Przelicz nieaktualne” (user decision 2026-10-15): crops only when missing or when a user key no longer fits its crop, then the core on the whole shot (uncha |
 | POST | `/api/object/{name}/run` | long_job | Core SAM 3.1 on the whole shot from the keys (7.2); intervals with unchanged inputs come from cache. |
 | POST | `/api/object/{name}/core_fix` | long_job | Stage 2 „▶▶ Zastosuj poprawki” (2026-10-15): the mask 1+2 (SAM 3.1 core + brush corrections propagated by CoTracker3) on every frame the core covers -> core_fix |
 | POST | `/api/object/{name}/finalize` | long_job | 'Przelicz finalnie' (7.3a) -> runs/v### on the work area (whole shot without one); the core must cover it |
@@ -160,16 +160,15 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/object/{name}/ltx/refinish` | long_job (quiet) | „Zastosuj suwaki na wynik” (2026-10-16): the current LTX-2.5 version's raw mattes limited again with the saved region / mask settings -> a new version (no model |
 | POST | `/api/object/{name}/ltx` | long_job | Stage „LTX-2.5 Alpha-Gen” (user decision 2026-10-16): LTX-2.5 IC-LoRA Alpha-Gen on the work area, guided by the mask 1+2 (other objects painted out of the guide |
 | GET | `/api/object/{name}/videomama` | – | Stage „VideoMaMa” (2026-10-16): the object's settings (defaults.json "videomama" <- object `videomama`), the stage result, weights / nodes. |
-| PUT | `/api/object/{name}/videomama` | object_edit | Stage VideoMaMa settings of the object (base, reach / protect px, resolution, batch / overlap); protect_auto = the protect band by base again. |
-| GET | `/api/object/{name}/videomama_preview/{frame}` | – | VideoMaMa palette, live: what=band – 128 = where VideoMaMa adds, 255 = protect band (proxy PNG); what=alpha – the current VideoMaMa version's raw matte put over |
-| POST | `/api/object/{name}/videomama/refinish` | long_job (quiet) | „✚ Suwaki na wynik”: the current VideoMaMa version's raw mattes put over the base again with the saved base / reach / protect -> a new version (no model run). |
+| PUT | `/api/object/{name}/videomama` | object_edit | Stage VideoMaMa settings of the object (base, the band sliders, resolution, batch / overlap). |
+| GET | `/api/object/{name}/videomama_preview/{frame}` | – | VideoMaMa palette, live: what=band – 128 = the band, 255 = the base deeper inside (proxy PNG); what=alpha – the current VideoMaMa version's raw matte put over t |
+| POST | `/api/object/{name}/videomama/refinish` | long_job (quiet) | „✚ Suwaki na wynik”: the current VideoMaMa version's raw mattes put over the base again with the saved base and band sliders -> a new version (no model run). |
 | POST | `/api/object/{name}/videomama` | long_job | Stage „VideoMaMa” (user decision 2026-10-16): VideoMaMa on the work area guided by the mask 1+2, put over the base (mask 1+2 or the stage-3 result) -> runs/v### |
+| POST | `/api/object/{name}/core_base` | long_job | Stage Eksperymenty: the mask 1+2 written as a version (reused while current), so it can be picked as a base like any stage result |
 | POST | `/api/object/{name}/analyze` | long_job | Stage Eksperymenty (2026-10-16): QA + edge-correction proposals of the chosen base version (measured once). |
 | GET | `/api/object/{name}/edge_recount` | – | Live count of the proposals with other thresholds (saved measurements only; nothing written). |
 | POST | `/api/object/{name}/experiment` | long_job | Stage Eksperymenty (2026-10-16): „Przelicz z tej bazy” – the base version's mask -> threshold zones -> optional edge correction of the base -> edge engine -> a  |
 | POST | `/api/object/{name}/edge_fix` | long_job | 'Zastosuj poprawkę krawędzi' (Z27 pkt 1): the former automatic second round, as a new runs/v###. |
-| GET | `/api/object/{name}/motion_blur/{frame}` | – | Stage Eksperymenty „Motion blur alfy” (2026-10-16): preview of one frame – the version `v` (default the active one) with the object's motion blur at `strength`  |
-| POST | `/api/object/{name}/motion_blur` | long_job, object_edit | „Zastosuj motion blur” (stage Eksperymenty, 2026-10-16): new runs/v### = the base version with the object's motion blur in every frame (alpha only). |
 | GET | `/api/object/{name}/edge_preview/{frame}` | – | Stage 3 palette: preview of the MatAnyone2 edge before computing – proxy PNG, 255 = mask kept (mask 1+2 + shrink / grow), 128 = adaptive band where MatAnyone2 d |
 | POST | `/api/object/{name}/stage_preview/{frame}` | long_job (quiet) | Stage 5: the preview is computed with the object's current engine and kept per engine (slot "vitmatte" / "vitmatte@birefnet", 2026-10-22) – the other engine's p |
 | GET | `/api/object/{name}/stage_preview/{stage}` | – | {exists, stage, center, frames, stale, seconds} of the last preview of this stage (stage 5: of `engine`, default the object's current engine). |
@@ -213,7 +212,8 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | DELETE | `/api/object/{name}/band` | object_edit | Keys of the shared band in `frame` (?frame=N), or the whole shared band (every stage on it = constant band). |
 | POST | `/api/object/{name}/band/from` | object_edit | „Ustaw jako wspólny”: the points of a detached stage / zone become the shared band of the object (as stored, with their reference – the source's result does not |
 | POST | `/api/object/{name}/band/propose` | long_job (quiet), object_edit | „Zaproponuj pas” (plan docs/PLAN_SAPIENS2.md point 1, user decisions 2026-10-22): Sapiens2-seg-0.4B body parts of the person in `frame` -> band points of the ba |
-| GET | `/api/object/{name}/stage_band/{stage}/{frame}/lines` | – | Preview lines of a stage band in `frame` (plate px): band edges (dashed), where the inset / outer feather end (thin dashes) – the same drawing as the stage-5 zo |
+| GET | `/api/object/{name}/mask12_status` | – | Is the exact mask 1+2 of the work area ready (the band previews stop being „przybliżony” then)? A cheap poll – nothing is computed here (the batch runs once in  |
+| GET | `/api/object/{name}/stage_band/{stage}/{frame}/lines` | – | Preview lines of a stage band in `frame` (plate px): band edges (dashed), where the inset / outer feather end (thin dashes) – one lines function for every band  |
 | POST | `/api/object/{name}/zones/{zone_id}/apply` | long_job | „Zastosuj” (plan step 4): only the zones are recomputed (cache) on the base alpha of the active version -> a new version runs/v### (QA + edge report); 409 with  |
 | GET | `/api/object/{name}/color_lab/{frame}` | – | Pipette of the "color" zone criterion (Z24): median Lab of 5 x 5 px of the plate-to-mask display image (the image the zone key is computed on) around (x, y) in  |
 | DELETE | `/api/object/{name}/zones/{zone_id}` | object_edit |  |

@@ -102,7 +102,9 @@ def test_group_zone_sure_fg_per_member_and_whole_core(tmp_path, monkeypatch):
     whole = pipe.preview_core("obj", [start])[start]
     own = pipe.load_core("obj", [start])[start]
     assert whole[10, 10] and (whole | own).sum() == whole.sum() and whole.sum() > own.sum()
-    assert np.array_equal(pipe.preview_core("head", [start])[start], m > 127)   # a part alone: its own core
+    # a part alone: its own core in the fast stand-in (preview_core of ONE frame is the mask 1+2 since 2026-10-24 and
+    # needs the crops of a real run; the joining of a group is what this test checks)
+    assert np.array_equal(pipe._fast_core("head", [start])[start], m > 127)
 
 
 def test_band_px_mode_minimum_out_and_in_no_shift():
@@ -121,8 +123,11 @@ def test_band_px_mode_minimum_out_and_in_no_shift():
     assert np.array_equal(b0, edge.adaptive_band(core, wmap))          # 0 / 0 = the adaptive band alone
     wide = np.full((h, w), 12.0, np.float32)
     assert d[edge.band_px(core, wide, 5.0, 2.0)].max() >= 11.5          # adaptive wider than the px -> adaptive
-    assert edge.band_px_limits({"band_scale": 2}) is None
-    assert edge.band_px_limits({"band_out_px": 10}) == (10.0, 0.0)
+    # 2026-10-24 (user decision, CLAUDE.md "ten sam pas w każdym etapie"): no automatic 0 / 0 mode any more – unset
+    # fields take the one band defaults (bandsys.BAND_DEFAULTS), a set field keeps its value
+    from engine.bandsys import BAND_DEFAULTS
+    assert edge.band_px_limits({"band_scale": 2}) == (BAND_DEFAULTS["out_px"], BAND_DEFAULTS["in_px"])
+    assert edge.band_px_limits({"band_out_px": 10}) == (10.0, BAND_DEFAULTS["in_px"])
     old = {"band_scale": 1.0, "shift_px": 0.0, "temporal_smoothing": "normal"}
     assert settings_sig(old) == settings_sig({**old, "band_out_px": None, "band_in_px": None})
     assert settings_sig(old) != settings_sig({**old, "band_out_px": 24.0})

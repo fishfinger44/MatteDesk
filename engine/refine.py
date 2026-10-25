@@ -25,7 +25,10 @@ SaveImage (8-bit alpha PNG, downloaded). Backlit (scene-linear plate) and LTX-2.
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -155,7 +158,8 @@ def antialiased_core(core: np.ndarray, soft_px: float = 1.0) -> np.ndarray:
 def _median_odd(win: np.ndarray) -> np.ndarray:
     """Element-wise median of an odd number of frames (axis 0) – the middle element of the sorted values, which is
     exactly what np.median returns for an odd count (bit-identical), via min/max sorting networks for 3 and 5
-    (no partition along the slow axis: 4x faster on 279 x 704^2); other counts -> np.median."""
+    (no partition along the slow axis: 4x faster on 279 x 704^2); other odd counts -> the middle row of np.sort
+    along axis 0 (the same selected value as np.median, ~20 % faster on 11 x 6 Mpx, 2026-10-25)."""
     n = win.shape[0]
     mn, mx = np.minimum, np.maximum
     if n == 3:
@@ -170,27 +174,193 @@ def _median_odd(win: np.ndarray) -> np.ndarray:
         m1, m2 = mx(f, h), mn(g, i)          # the two middle candidates of {a, b, c, d}
         p, q = mn(m1, m2), mx(m1, m2)
         return mx(p, mn(q, e))               # median of {p, q, e} with p <= q
+    if n % 2 == 1:
+        return np.sort(win, axis=0)[n // 2]
     return np.median(win, axis=0)
 
 
-def temporal_median(alphas: np.ndarray, radius: int, motion_limit: float, band: Optional[np.ndarray] = None,
-                    progress: Optional[Callable[[int, int], None]] = None) -> np.ndarray:
+# ----------------------------------------------------------------------------- temporal smoothing (sliding window)
+# The three smoothers below (plan docs/PLAN_EDGE_SPEED.md A1-A3, 2026-10-25) take their frames from any sequence –
+# an (n, h, w) stack as before, or a lazy `Sequence` / list-like whose __getitem__ computes a frame on demand – and
+# keep in RAM only the window a frame needs (+-radius), so a 4K zone no longer holds four full stacks (41 GB on
+# sh060). With `emit(i, frame)` the result is handed out frame by frame instead of a returned stack; `progress(i, n)`
+# is called once per frame (the job's cancel check lives there). The per-pixel maths is unchanged: every value is
+# computed by the same calls on the same inputs, so the results are bit-identical to the former stack versions
+# (tests/test_temporal_window_identity.py against the frozen copy tests/_ref_temporal_old.py).
+
+
+def flow_workers() -> int:
+    """Threads for the DIS flows / warps of the flow smoothers: config `flow_workers`, else min(8, half the CPUs).
+    DIS runs on one thread per call and gives identical bits for any thread count (measured 2026-10-25), so the
+    pairs of a window are computed side by side; 0 / 1 = sequential (tests, small machines)."""
+    try:
+        from engine.config import load_config
+        n = int(load_config().get("flow_workers") or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        n = max(1, min(8, (os.cpu_count() or 2) // 2))
+    return n
+
+
+class _FrameCache:
+    """Frames of a source computed once and kept until `drop_below` says no later output needs them. The getter is
+    called at most once per index (a race between two workers only wastes one computation of the same value)."""
+
+    def __init__(self, get: Callable[[int], np.ndarray]):
+        self._get = get
+        self._d: Dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
+
+    def __call__(self, i: int) -> np.ndarray:
+        with self._lock:
+            v = self._d.get(i)
+        if v is None:
+            v = self._get(i)
+            with self._lock:
+                v = self._d.setdefault(i, v)
+        return v
+
+    def drop_below(self, lo: int) -> None:
+        with self._lock:
+            for k in [k for k in self._d if k < lo]:
+                del self._d[k]
+
+
+class _FlowPool:
+    """DIS flows between frame pairs, computed ahead in a thread pool (one DIS instance per thread) and cached until
+    `drop_below`: pair (i, j) with a frame below the window of the current centre is never used again. Sequential
+    with workers <= 1 (identical values: DIS is deterministic for any thread count)."""
+
+    def __init__(self, u8: Callable[[int], np.ndarray], preset: int, workers: int):
+        self.u8 = u8
+        self.preset = preset
+        self.workers = int(workers)
+        self.ex = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+        self._f: Dict[Tuple[int, int], Any] = {}
+        self._local = threading.local()
+
+    def dis(self, shape: Tuple[int, ...]) -> Any:
+        """One DIS instance per thread AND per image size: OpenCV's DIS keeps buffers between calls, and a call after
+        one at another size returns a different flow (0.27 px on the test scene, 2026-10-25) – per-size instances make
+        every flow equal to a fresh instance's, whatever ran before."""
+        d = getattr(self._local, "dis", None)
+        if d is None:
+            d = self._local.dis = {}
+        k = tuple(shape[:2])
+        if k not in d:
+            d[k] = cv2.DISOpticalFlow_create(self.preset)
+        return d[k]
+
+    def _calc(self, i: int, j: int) -> np.ndarray:
+        a = self.u8(i)
+        return self.dis(a.shape).calc(a, self.u8(j), None)
+
+    def request(self, pairs: Sequence[Tuple[int, int]]) -> None:
+        if self.ex is None:
+            return
+        for k in pairs:
+            if k not in self._f:
+                self._f[k] = self.ex.submit(self._calc, *k)
+
+    def get(self, i: int, j: int) -> np.ndarray:
+        v = self._f.get((i, j))
+        if v is None:
+            v = self._calc(i, j)
+        elif not isinstance(v, np.ndarray):
+            v = v.result()
+        self._f[(i, j)] = v
+        return v
+
+    def drop_below(self, lo: int) -> None:
+        for k in [k for k in self._f if min(k) < lo]:
+            v = self._f.pop(k)
+            if not isinstance(v, np.ndarray):
+                v.cancel()
+
+    def map(self, fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
+        """`fn` over `items`, in the pool when there is one (warps release the GIL), else in order."""
+        if self.ex is None:
+            return [fn(x) for x in items]
+        return list(self.ex.map(fn, items))
+
+    def close(self) -> None:
+        if self.ex is not None:
+            self.ex.shutdown(wait=True, cancel_futures=True)
+            self.ex = None
+        self._f.clear()
+
+
+def _window(i: int, n: int, radius: int) -> List[int]:
+    return [min(n - 1, max(0, j)) for j in range(i - radius, i + radius + 1)]
+
+
+def _pairs(i: int, n: int, radius: int) -> List[Tuple[int, int]]:
+    out = []
+    for j in _window(i, n, radius):
+        if j != i:
+            out += [(i, j), (j, i)]
+    return out
+
+
+def _by_rows(fn: Callable[[int, int], np.ndarray], n_rows: int, pool: Optional["_FlowPool"]) -> np.ndarray:
+    """`fn(y0, y1)` = the per-pixel maths of one frame on the rows y0..y1 (median, gate, weights: every output pixel
+    depends only on its own column of the window), run on row chunks in the pool's threads (numpy releases the GIL
+    on large arrays) and concatenated – the same operations in the same per-pixel order, so identical to one call
+    over all rows (11 x 13 Mpx: 3.5 s -> 1.1 s, 2026-10-25). Sequential without a pool."""
+    k = pool.workers if pool is not None and pool.ex is not None else 1
+    if k <= 1 or n_rows < 2 * k:
+        return fn(0, n_rows)
+    b = np.linspace(0, n_rows, k + 1).astype(int)
+    return np.concatenate(pool.map(lambda c: fn(int(b[c]), int(b[c + 1])), range(k)), axis=0)
+
+
+def _u8_cache(grays: Sequence[np.ndarray]) -> _FrameCache:
+    return _FrameCache(lambda i: cv2.normalize(np.asarray(grays[i]).astype(np.float32), None, 0, 255,
+                                               cv2.NORM_MINMAX).astype(np.uint8))
+
+
+def temporal_median(alphas: Sequence[np.ndarray], radius: int, motion_limit: float,
+                    band: Optional[Sequence[np.ndarray]] = None,
+                    progress: Optional[Callable[[int, int], None]] = None,
+                    emit: Optional[Callable[[int, np.ndarray], None]] = None,
+                    workers: Optional[int] = None) -> Optional[np.ndarray]:
     """Per-pixel median over +-radius frames, skipped where the alpha range in the window is large (real
-    motion -> no ghosts, lesson MBA) – soft gate like CoreCombine's motion_limit. Only inside `band` if given."""
-    n = alphas.shape[0]
-    out = alphas.copy()
-    for i in range(n):
-        if progress is not None:
-            progress(i + 1, n)
-        idx = [min(n - 1, max(0, j)) for j in range(i - radius, i + radius + 1)]
-        win = alphas[idx]
-        med = _median_odd(win)
-        # range over the window incl. frame i (as MatAnyone2CoreCombine): thin parts moving faster than their
-        # width must not be mistaken for glitches. Large one-frame jumps are a core problem -> key, not smoothing.
-        rng = win.max(axis=0) - win.min(axis=0)
-        calm = 1.0 - np.clip((rng - motion_limit * 0.6) / (motion_limit * 0.4), 0.0, 1.0)
-        sm = alphas[i] + (med - alphas[i]) * calm
-        out[i] = sm if band is None else np.where(band[i], sm, alphas[i])
+    motion -> no ghosts, lesson MBA) – soft gate like CoreCombine's motion_limit. Only inside `band` if given.
+    `alphas` / `band`: (n, h, w) stacks or lazy sequences; returns the (n, h, w) result, or None when `emit` takes the
+    frames one by one (only the window +-radius is held then). The per-pixel maths runs on row chunks in `workers`
+    threads (default flow_workers(); identical values)."""
+    n = len(alphas)
+    A = _FrameCache(lambda i: np.asarray(alphas[i]))
+    P = _FlowPool(lambda i: A(i), 0, flow_workers() if workers is None else int(workers))   # threads only (no flows)
+    out = None
+    try:
+        for i in range(n):
+            A.drop_below(i - radius)
+            if progress is not None:
+                progress(i + 1, n)
+            win = np.stack([A(j) for j in _window(i, n, radius)])
+            ai = A(i)
+            bi = None if band is None else np.asarray(band[i])
+
+            def maths(y0: int, y1: int) -> np.ndarray:
+                w_, a_ = win[:, y0:y1], ai[y0:y1]
+                med = _median_odd(w_)
+                # range over the window incl. frame i (as MatAnyone2CoreCombine): thin parts moving faster than their
+                # width must not be mistaken for glitches. Large one-frame jumps are a core problem -> key, not smoothing.
+                rng = w_.max(axis=0) - w_.min(axis=0)
+                calm = 1.0 - np.clip((rng - motion_limit * 0.6) / (motion_limit * 0.4), 0.0, 1.0)
+                sm = a_ + (med - a_) * calm
+                return sm if bi is None else np.where(bi[y0:y1], sm, a_)
+            res = _by_rows(maths, ai.shape[0], P)
+            if emit is not None:
+                emit(i, res)
+                continue
+            if out is None:
+                out = np.empty((n,) + res.shape, res.dtype)
+            out[i] = res
+    finally:
+        P.close()
     return out
 
 
@@ -201,9 +371,13 @@ def _drop_flows(cache: Dict[Tuple[int, int], Any], lo: int) -> None:
         del cache[k]
 
 
-def temporal_median_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 2, band: Optional[np.ndarray] = None,
+def temporal_median_flow(alphas: Sequence[np.ndarray], grays: Sequence[np.ndarray], radius: int = 2,
+                         band: Optional[Sequence[np.ndarray]] = None,
                          occl_px: float = 1.0, motion_limit: float = 0.35,
-                         preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM) -> np.ndarray:
+                         preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
+                         progress: Optional[Callable[[int, int], None]] = None,
+                         emit: Optional[Callable[[int, np.ndarray], None]] = None,
+                         workers: Optional[int] = None) -> Optional[np.ndarray]:
     """Motion-compensated temporal median (experiment 2026-10-13, ViTMatte zone engine): for frame i the alphas of
     frames i±1..i±radius are warped INTO frame i by DIS optical flow measured on `grays` (same crop as `alphas`,
     float 0..1 or uint8) and the per-pixel median of the ALIGNED window is taken, with the same soft motion gate as
@@ -211,43 +385,61 @@ def temporal_median_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 2,
     smooth background, or a real one-frame change, is never "repaired" into a ghost; motion_limit <= 0 = plain
     median). A neighbour whose flow fails the forward/backward check (|f_ij + f_ji(warped)| > occl_px: occlusion /
     unreliable) contributes the centre value instead, so it never votes. Only inside `band` if given. Frames at the
-    ends use the available neighbours (window clamped as in temporal_median)."""
-    n, h, w = alphas.shape
+    ends use the available neighbours (window clamped as in temporal_median). Sliding window, flows and warps in a
+    thread pool (`workers`, default flow_workers()), `progress` / `emit` as temporal_median."""
+    n = len(alphas)
     if n < 3:
-        return alphas.copy()
-    dis = cv2.DISOpticalFlow_create(preset)
-    u8 = [cv2.normalize(g.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) for g in grays]
-    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    flows: Dict[Tuple[int, int], np.ndarray] = {}
+        return np.stack([np.asarray(alphas[i]).copy() for i in range(n)]) if emit is None else None
+    A = _FrameCache(lambda i: np.asarray(alphas[i]))
+    U = _u8_cache(grays)
+    F = _FlowPool(U, preset, flow_workers() if workers is None else int(workers))
+    out = None
+    gx = gy = None
+    try:
+        for i in range(n):
+            lo = i - radius
+            A.drop_below(lo)
+            U.drop_below(lo)
+            F.drop_below(lo)   # pairs no later frame needs (RAM: 4K x2 flows, user report 2026-10-22)
+            if progress is not None:
+                progress(i + 1, n)
+            for j in _window(min(i + 1, n - 1), n, radius):   # grays decoded here (the plate loader is not thread-safe)
+                U(j)
+            F.request(_pairs(i, n, radius) + (_pairs(i + 1, n, radius) if i + 1 < n else []))
+            ai = A(i)
+            if gx is None:
+                h, w = ai.shape
+                gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
 
-    def flow(i: int, j: int) -> np.ndarray:        # for every pixel of frame i: where it is in frame j
-        k = (i, j)
-        if k not in flows:
-            flows[k] = dis.calc(u8[i], u8[j], None)
-        return flows[k]
+            def sample(j: int, i: int = i, ai: np.ndarray = ai) -> np.ndarray:
+                if j == i:
+                    return ai
+                fij, fji = F.get(i, j), F.get(j, i)
+                mx, my = gx + fij[..., 0], gy + fij[..., 1]
+                warped = cv2.remap(A(j), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                back = cv2.remap(fji, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                occl = np.linalg.norm(fij + back, axis=2) > occl_px
+                return np.where(occl, ai, warped).astype(np.float32)
+            win = np.stack(F.map(sample, _window(i, n, radius)))
+            bi = None if band is None else np.asarray(band[i])
 
-    out = alphas.copy()
-    for i in range(n):
-        _drop_flows(flows, i - radius)   # pairs no later frame needs (RAM: 4K x2 flows, user report 2026-10-22)
-        samples = []
-        for d in range(-radius, radius + 1):
-            j = min(n - 1, max(0, i + d))
-            if j == i:
-                samples.append(alphas[i])
+            def maths(y0: int, y1: int) -> np.ndarray:
+                w_, a_ = win[:, y0:y1], ai[y0:y1]
+                med = _median_odd(w_)
+                if motion_limit > 0:
+                    rng = w_.max(axis=0) - w_.min(axis=0)
+                    calm = 1.0 - np.clip((rng - motion_limit * 0.6) / (motion_limit * 0.4), 0.0, 1.0)
+                    med = a_ + (med - a_) * calm
+                return med if bi is None else np.where(bi[y0:y1], med, a_)
+            res = _by_rows(maths, ai.shape[0], F)
+            if emit is not None:
+                emit(i, res)
                 continue
-            fij, fji = flow(i, j), flow(j, i)
-            mx, my = gx + fij[..., 0], gy + fij[..., 1]
-            warped = cv2.remap(alphas[j], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            back = cv2.remap(fji, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            occl = np.linalg.norm(fij + back, axis=2) > occl_px
-            samples.append(np.where(occl, alphas[i], warped).astype(np.float32))
-        win = np.stack(samples)
-        med = _median_odd(win)
-        if motion_limit > 0:
-            rng = win.max(axis=0) - win.min(axis=0)
-            calm = 1.0 - np.clip((rng - motion_limit * 0.6) / (motion_limit * 0.4), 0.0, 1.0)
-            med = alphas[i] + (med - alphas[i]) * calm
-        out[i] = med if band is None else np.where(band[i], med, alphas[i])
+            if out is None:
+                out = np.empty((n,) + res.shape, res.dtype)
+            out[i] = res
+    finally:
+        F.close()
     return out
 
 
@@ -266,11 +458,15 @@ def _min_eig(g: np.ndarray, sigma: float = 1.5) -> np.ndarray:
     return np.maximum(0.5 * (jxx + jyy - np.sqrt((jxx - jyy) ** 2 + 4 * jxy ** 2)), 0.0).astype(np.float32)
 
 
-def temporal_mean_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 3, sigma_t: Optional[float] = None,
+def temporal_mean_flow(alphas: Sequence[np.ndarray], grays: Sequence[np.ndarray], radius: int = 3,
+                       sigma_t: Optional[float] = None,
                        tol: float = 0.25, occl_px: float = 1.0,
                        preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
                        fb_sigma: float = 0.0, photo_sigma: float = 0.0, tex_k: float = 0.0, conf_mode: str = "drop",
-                       multiscale: int = 1) -> np.ndarray:
+                       multiscale: int = 1,
+                       progress: Optional[Callable[[int, int], None]] = None,
+                       emit: Optional[Callable[[int, np.ndarray], None]] = None,
+                       workers: Optional[int] = None) -> Optional[np.ndarray]:
     """Motion-compensated, median-anchored weighted MEAN (user decision 2026-10-15: stronger temporal stabilisation of the
     ViTMatte zone alpha). As temporal_median_flow the frames i±1..i±radius are warped into frame i by DIS flow (a
     neighbour failing the forward/backward check contributes the centre value); then each aligned sample gets the weight
@@ -286,41 +482,38 @@ def temporal_mean_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 3, s
     structure tensor of gray_i (a smooth background, where DIS only interpolates, does not vote). conf_mode "drop" =
     the lost weight is dropped (the other samples decide), "centre" = it goes to the frame's own value. multiscale 2 =
     the flow is also measured on the half-size grays (3: also quarter ...), per pixel the one with the smaller fwd/bwd
-    error is used (also a
-    confidence mode: with nothing else on, c = the binary fwd/bwd test)."""
-    n, h, w = alphas.shape
+    error is used (also a confidence mode: with nothing else on, c = the binary fwd/bwd test).
+    Sliding window, flows and warps in a thread pool, `progress` / `emit` as temporal_median (2026-10-25)."""
+    n = len(alphas)
     if n < 3:
-        return alphas.copy()
+        return np.stack([np.asarray(alphas[i]).copy() for i in range(n)]) if emit is None else None
     if conf_mode not in TEMPORAL_CONF_MODES:
         raise ValueError(f"conf_mode musi być jednym z {TEMPORAL_CONF_MODES}, jest {conf_mode!r}")
     conf = fb_sigma > 0 or photo_sigma > 0 or tex_k > 0 or multiscale > 1
     st = float(sigma_t) if sigma_t else max(0.5, float(radius))     # near-flat window: ~1.5x the median's efficiency
-    dis = cv2.DISOpticalFlow_create(preset)
-    u8 = [cv2.normalize(g.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) for g in grays]
-    pyr = [[cv2.resize(u, (max(8, w >> k), max(8, h >> k)), interpolation=cv2.INTER_AREA) for u in u8]
-           for k in range(1, max(1, int(multiscale)))]          # half, quarter ... size grays
+    A = _FrameCache(lambda i: np.asarray(alphas[i]))
+    U = _u8_cache(grays)
+    F = _FlowPool(U, preset, flow_workers() if workers is None else int(workers))
+    h, w = np.asarray(alphas[0]).shape
+    # half, quarter ... size grays (multiscale), per level a window cache
+    pyr = [_FrameCache(lambda i, k=k: cv2.resize(U(i), (max(8, w >> k), max(8, h >> k)), interpolation=cv2.INTER_AREA))
+           for k in range(1, max(1, int(multiscale)))]
     gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    flows: Dict[Tuple[int, int], np.ndarray] = {}
-    fbs: Dict[Tuple[int, int], np.ndarray] = {}
+    fbs: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
 
     def fb_err(fij: np.ndarray, fji: np.ndarray) -> np.ndarray:
         back = cv2.remap(fji, gx + fij[..., 0], gy + fij[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         return np.linalg.norm(fij + back, axis=2)
 
-    def flow(i: int, j: int) -> np.ndarray:        # for every pixel of frame i: where it is in frame j
-        k = (i, j)
-        if k not in flows:
-            flows[k] = dis.calc(u8[i], u8[j], None)
-        return flows[k]
-
     def flow_ms(i: int, j: int) -> Tuple[np.ndarray, np.ndarray]:   # (flow i->j, its fwd/bwd error), best of 2 scales
         k = (i, j)
         if k not in fbs:
-            f1, b1 = flow(i, j), flow(j, i)
+            f1, b1 = F.get(i, j), F.get(j, i)
             e1 = fb_err(f1, b1)
             for lv in pyr:
-                sc = np.array([w / lv[0].shape[1], h / lv[0].shape[0]], np.float32)
-                hs = lambda a, b: cv2.resize(dis.calc(lv[a], lv[b], None), (w, h), interpolation=cv2.INTER_LINEAR) * sc
+                sc = np.array([w / lv(0).shape[1], h / lv(0).shape[0]], np.float32)
+                hs = lambda a, b: cv2.resize(F.dis(lv(a).shape).calc(lv(a), lv(b), None), (w, h),
+                                             interpolation=cv2.INTER_LINEAR) * sc
                 f2, b2 = hs(i, j), hs(j, i)
                 e2 = fb_err(f2, b2)
                 pick = e2 < e1
@@ -329,68 +522,95 @@ def temporal_mean_flow(alphas: np.ndarray, grays: np.ndarray, radius: int = 3, s
             fbs[k] = (f1, e1)
         return fbs[k]
 
-    tex = None
-    out = alphas.copy()
-    for i in range(n):
-        _drop_flows(flows, i - radius)   # pairs no later frame needs (RAM: 4K x2 flows, user report 2026-10-22)
-        _drop_flows(fbs, i - radius)
-        samples, tw, conf_w, raw = [], [], [], []
-        if conf and tex_k > 0:
-            t = _min_eig(u8[i].astype(np.float32) / 255.0)
-            tex = t / (t + float(tex_k))
-        for d in range(-radius, radius + 1):
-            j = min(n - 1, max(0, i + d))
-            tw.append(float(np.exp(-0.5 * (d / st) ** 2)))
-            if j == i:
-                samples.append(alphas[i])
-                if conf:
-                    raw.append(alphas[i])
-                    conf_w.append(np.ones((h, w), np.float32))
-                continue
+    out = None
+    try:
+        for i in range(n):
+            lo = i - radius
+            A.drop_below(lo)
+            U.drop_below(lo)
+            F.drop_below(lo)   # pairs no later frame needs (RAM: 4K x2 flows, user report 2026-10-22)
+            _drop_flows(fbs, lo)
+            for lv in pyr:
+                lv.drop_below(lo)
+            if progress is not None:
+                progress(i + 1, n)
+            for j in _window(min(i + 1, n - 1), n, radius):   # grays decoded here (the plate loader is not thread-safe)
+                U(j)
+            F.request(_pairs(i, n, radius) + (_pairs(i + 1, n, radius) if i + 1 < n else []))
+            ai = A(i)
+            tw = [float(np.exp(-0.5 * (d / st) ** 2)) for d in range(-radius, radius + 1)]
+            tex = None
+            if conf and tex_k > 0:
+                t = _min_eig(U(i).astype(np.float32) / 255.0)
+                tex = t / (t + float(tex_k))
             if conf:
-                fij, err = flow_ms(i, j)
-                mx, my = gx + fij[..., 0], gy + fij[..., 1]
-                warped = cv2.remap(alphas[j], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                occl = err > occl_px
-                c = (np.exp(-0.5 * (err / fb_sigma) ** 2) if fb_sigma > 0 else (~occl).astype(np.float32))
-                if photo_sigma > 0:
-                    gw = cv2.remap(u8[j].astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                    c = c * np.exp(-0.5 * ((gw - u8[i].astype(np.float32)) / (255.0 * photo_sigma)) ** 2)
-                if tex is not None:
-                    c = c * tex
-                conf_w.append(c.astype(np.float32))
-                raw.append(warped.astype(np.float32))
-                samples.append(np.where(occl, alphas[i], warped).astype(np.float32))
+                samples, conf_w, raw = [], [], []
+                for j in _window(i, n, radius):
+                    if j == i:
+                        samples.append(ai)
+                        raw.append(ai)
+                        conf_w.append(np.ones((h, w), np.float32))
+                        continue
+                    fij, err = flow_ms(i, j)
+                    mx, my = gx + fij[..., 0], gy + fij[..., 1]
+                    warped = cv2.remap(A(j), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                    occl = err > occl_px
+                    c = (np.exp(-0.5 * (err / fb_sigma) ** 2) if fb_sigma > 0 else (~occl).astype(np.float32))
+                    if photo_sigma > 0:
+                        gw = cv2.remap(U(j).astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                        c = c * np.exp(-0.5 * ((gw - U(i).astype(np.float32)) / (255.0 * photo_sigma)) ** 2)
+                    if tex is not None:
+                        c = c * tex
+                    conf_w.append(c.astype(np.float32))
+                    raw.append(warped.astype(np.float32))
+                    samples.append(np.where(occl, ai, warped).astype(np.float32))
+                win = np.stack(samples)
+                rw = np.stack(raw)
+                cw = np.stack(conf_w)
+                twa = np.asarray(tw, np.float32)[:, None, None]
+
+                def maths(y0: int, y1: int) -> np.ndarray:
+                    w_, r_, c_ = win[:, y0:y1], rw[:, y0:y1], cw[:, y0:y1]
+                    med = _median_odd(w_)
+                    close = np.clip(1.0 - np.abs(r_ - med[None]) / max(tol, 1e-3), 0.0, 1.0)
+                    wgt = close * twa * c_
+                    if conf_mode == "centre":   # the weight a doubtful neighbour loses goes to the frame's own value
+                        ci = radius
+                        lost = (twa * (1.0 - c_)).sum(axis=0)
+                        wgt[ci] = wgt[ci] + lost * close[ci]
+                    s_ = wgt.sum(axis=0)
+                    mean = np.where(s_ > 1e-6, (wgt * r_).sum(axis=0) / np.maximum(s_, 1e-6), med)
+                    return np.clip(mean, 0.0, 1.0).astype(np.float32)
+                res = _by_rows(maths, h, F)
+            else:
+                def sample(j: int, i: int = i, ai: np.ndarray = ai) -> np.ndarray:
+                    if j == i:
+                        return ai
+                    fij, fji = F.get(i, j), F.get(j, i)
+                    mx, my = gx + fij[..., 0], gy + fij[..., 1]
+                    warped = cv2.remap(A(j), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                    back = cv2.remap(fji, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                    occl = np.linalg.norm(fij + back, axis=2) > occl_px
+                    return np.where(occl, ai, warped).astype(np.float32)
+                win = np.stack(F.map(sample, _window(i, n, radius)))
+                twa = np.asarray(tw, np.float32)[:, None, None]
+
+                def maths(y0: int, y1: int) -> np.ndarray:
+                    w_ = win[:, y0:y1]
+                    med = _median_odd(w_)
+                    wgt = np.clip(1.0 - np.abs(w_ - med[None]) / max(tol, 1e-3), 0.0, 1.0) * twa
+                    s_ = wgt.sum(axis=0)
+                    mean = np.where(s_ > 1e-6, (wgt * w_).sum(axis=0) / np.maximum(s_, 1e-6), med)
+                    return np.clip(mean, 0.0, 1.0).astype(np.float32)
+                res = _by_rows(maths, h, F)
+            if emit is not None:
+                emit(i, res)
                 continue
-            fij, fji = flow(i, j), flow(j, i)
-            mx, my = gx + fij[..., 0], gy + fij[..., 1]
-            warped = cv2.remap(alphas[j], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            back = cv2.remap(fji, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            occl = np.linalg.norm(fij + back, axis=2) > occl_px
-            samples.append(np.where(occl, alphas[i], warped).astype(np.float32))
-        win = np.stack(samples)
-        med = _median_odd(win)
-        if conf:
-            rw = np.stack(raw)
-            cw = np.stack(conf_w)
-            twa = np.asarray(tw, np.float32)[:, None, None]
-            close = np.clip(1.0 - np.abs(rw - med[None]) / max(tol, 1e-3), 0.0, 1.0)
-            wgt = close * twa * cw
-            if conf_mode == "centre":       # the weight a doubtful neighbour loses goes to the frame's own value
-                ci = radius
-                lost = (twa * (1.0 - cw)).sum(axis=0)
-                wgt[ci] = wgt[ci] + lost * close[ci]
-            s = wgt.sum(axis=0)
-            mean = np.where(s > 1e-6, (wgt * rw).sum(axis=0) / np.maximum(s, 1e-6), med)
-        else:
-            wgt = np.clip(1.0 - np.abs(win - med[None]) / max(tol, 1e-3), 0.0, 1.0) * np.asarray(tw, np.float32)[:, None, None]
-            s = wgt.sum(axis=0)
-            mean = np.where(s > 1e-6, (wgt * win).sum(axis=0) / np.maximum(s, 1e-6), med)
-        out[i] = np.clip(mean, 0.0, 1.0).astype(np.float32)
-        for k_ in [k_ for k_ in flows if min(k_) < i - radius]:
-            flows.pop(k_, None)
-        for k_ in [k_ for k_ in fbs if min(k_) < i - radius]:
-            fbs.pop(k_, None)
+            if out is None:
+                out = np.empty((n,) + res.shape, res.dtype)
+            out[i] = res
+    finally:
+        F.close()
     return out
 
 
@@ -976,48 +1196,53 @@ class Finalizer:
             # spec's +-3 px on keys made the edge jump hard for one frame at every key – CLIP2_A F50 had half the soft
             # pixels of its neighbours); key_band_same=False = the spec rule (+-3 px, no adaptive band)
             key_same = key_band_same_on(obj)
-            res, bands = {}, []
-            for fi, f in enumerate(sf):
-                job_progress("Pas krawędzi", fi + 1, len(sf))
+            # Band, temporal median, hygiene, soft zones and the EXR write run per frame through a sliding window
+            # (docs/PLAN_EDGE_SPEED.md A1, 2026-10-25): the band composite of a frame is made when the median's window
+            # first needs it (the engine's crop is freed then), the finished frame is written at once – no per-segment
+            # stacks (3 x 55 MB x frames on a 3728 px crop). Same per-frame calls as before and temporal_median streams
+            # bit-identically, so the alphas are unchanged.
+            from engine.bandsys import compose_area
+            from engine.edge import band_feathers, hygiene
+            fe, fo = band_feathers(obj)   # unset = the one defaults of every stage (2026-10-24)
+            bands: Dict[int, np.ndarray] = {}
+            done: Dict[int, np.ndarray] = {}
+
+            def band_of(f: int) -> np.ndarray:
+                b = bands.get(f)
+                if b is None:
+                    c = extract_crop(core[f].astype(np.float32), seg) > 0.5
+                    narrow = f in keys and not key_same
+                    bw = min(band_px, 3.0) if narrow else band_px
+                    # adaptive band (7.8 pkt 2) for matanyone / core; backlit and LTX are limited by the core region
+                    adaptive = band_fn is not None and not narrow and edge_mode in ("matanyone", "core")
+                    b = band_fn(f, seg, c, bw) if adaptive else edge_band(c, bw)
+                    if exclude and f in exclude:
+                        b &= ~(extract_crop(exclude[f].astype(np.float32), seg) > 0.5)
+                    bands[f] = b
+                return b
+
+            def res_i(i: int) -> np.ndarray:
+                f = sf[i]
                 c = extract_crop(core[f].astype(np.float32), seg) > 0.5
-                narrow = f in keys and not key_same
-                bw = min(band_px, 3.0) if narrow else band_px
-                # adaptive band (7.8 pkt 2) for matanyone / core; backlit and LTX are limited by the core region
-                adaptive = band_fn is not None and not narrow and edge_mode in ("matanyone", "core")
-                band = band_fn(f, seg, c, bw) if adaptive else edge_band(c, bw)
-                if exclude and f in exclude:
-                    band &= ~(extract_crop(exclude[f].astype(np.float32), seg) > 0.5)
-                fe = float(obj.get("band_in_feather_px") or 0.0)
-                fo = float(obj.get("band_out_feather_px") or 0.0)
-                if fo > 0:
-                    # one band system (2026-10-22): the outer feather blends the edge result into the core (0 there) from
-                    # the outer band edge, the inset feather from the inner edge; they never overlap (zones.feather_maps)
-                    from engine.zones import feather_maps
-                    d_in, d_out, li, lo = feather_maps(band, c, fe, fo)
-                    w_in = np.clip(d_in / li, 0.0, 1.0) if fe > 0 else 1.0
-                    w = np.minimum(w_in, np.clip(d_out / lo, 0.0, 1.0))
-                    res[f] = np.where(band, w * soft[f] + (1.0 - w) * c.astype(np.float32), c.astype(np.float32))
-                elif fe > 0:
-                    # feather of the core inset (user request 2026-10-17): near the deep core the edge result fades into
-                    # the core over `fe` px instead of a hard switch (a visible line at the inner band edge)
-                    deep = c & ~band
-                    w = np.clip(cv2.distanceTransform((~deep).astype(np.uint8), cv2.DIST_L2, 5) / fe, 0.0, 1.0)
-                    res[f] = np.where(band, w * soft[f] + (1.0 - w) * c.astype(np.float32), c.astype(np.float32))
-                else:
-                    res[f] = np.where(band, soft[f], c.astype(np.float32))
-                bands.append(band)
-            arr = np.stack([res[f] for f in sf])
-            arr = temporal_median(arr, radius, mlimit, np.stack(bands),
-                                  progress=lambda d, t: job_progress("Mediana czasowa", d, t))
-            # (6) alpha hygiene (7.8 pkt 4)
-            from engine.edge import hygiene
-            for i, f in enumerate(sf):
-                job_progress("Higiena alphy", i + 1, len(sf))
+                band = band_of(f)
+                sf_ = soft.pop(f)
+                if fe > 0 or fo > 0:
+                    # one band system (engine/bandsys.py, 2026-10-22 / one implementation 2026-10-24): the inset feather
+                    # from the inner band edge blends the core (1) into the edge result (user request 2026-10-17: no
+                    # visible line at the inner band edge), the outer feather from the outer edge blends it into the
+                    # core (0 there); they never overlap, the inset one keeps its length up to the band width
+                    return compose_area(c, sf_, band, fe, fo)
+                return np.where(band, sf_, c.astype(np.float32))
+
+            def emit(i: int, a: np.ndarray) -> None:
+                f = sf[i]
+                job_progress("Higiena i zapis alphy (EXR)", i + 1, len(sf))
+                # (6) alpha hygiene (7.8 pkt 4)
                 c = extract_crop(core[f].astype(np.float32), seg) > 0.5
                 keep = None
                 if keep_holes and f in keep_holes:
                     keep = extract_crop(keep_holes[f].astype(np.float32), seg) > 0.5
-                arr[i], hrep = hygiene(arr[i], c, bands[i], keep)
+                a, hrep = hygiene(a, c, bands.pop(f), keep)
                 for k, v in hrep.items():
                     rep.hygiene[k] = rep.hygiene.get(k, 0) + v
                 # Soft zones LAST (PLAN_HAIR_TOOL 2 / 12, real test SH020 2026-10-13): the base alpha is computed exactly
@@ -1028,19 +1253,29 @@ class Finalizer:
                     # the base alpha (no zones) is kept per version: "Zastosuj" (step 4) re-applies changed zones on it.
                     # The override blends on the HALF-precision base (what alpha_base holds), so "Zastosuj" reproduces
                     # "Przelicz finalnie" bit for bit (SH020 2026-10-13: float32 base gave 113 px / frame of rounding).
-                    write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", arr[i])
-                    arr[i] = np.clip(arr[i], 0, 1).astype(np.float16).astype(np.float32)
+                    write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
+                    a = np.clip(a, 0, 1).astype(np.float16).astype(np.float32)
                     sa, sarea = soft_override[f]
                     area = extract_crop(sarea.astype(np.float32), seg) > 0.5
                     sw = (extract_crop(soft_weights[f], seg) if soft_weights and f in soft_weights else None)
-                    arr[i] = apply_soft_override(arr[i], extract_crop(sa.astype(np.float32), seg), area, soft_feather, sw)
-            per_seg[seg.seg_id] = {f: arr[i] for i, f in enumerate(sf)}
-            # write crop-only alpha + core (runs/v###/alpha/<seg>/a_####.exr)
-            for i, f in enumerate(sf):
-                job_progress("Zapis alphy (EXR)", i + 1, len(sf))
-                write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", arr[i])
-                cv2.imwrite(str(_mk(run_dir / "core" / seg.seg_id) / f"c_{f:04d}.png"),
-                            (extract_crop(core[f].astype(np.float32), seg) > 0.5).astype(np.uint8) * 255)
+                    a = apply_soft_override(a, extract_crop(sa.astype(np.float32), seg), area, soft_feather, sw)
+                done[f] = a
+                # write crop-only alpha + core (runs/v###/alpha/<seg>/a_####.exr)
+                write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+                cv2.imwrite(str(_mk(run_dir / "core" / seg.seg_id) / f"c_{f:04d}.png"), c.astype(np.uint8) * 255)
+
+            class _Seq:
+                def __init__(self, get):
+                    self.get = get
+
+                def __len__(self):
+                    return len(sf)
+
+                def __getitem__(self, i):
+                    return self.get(i)
+            temporal_median(_Seq(res_i), radius, mlimit, _Seq(lambda i: band_of(sf[i])),
+                            progress=lambda d, t: job_progress("Mediana czasowa", d, t), emit=emit)
+            per_seg[seg.seg_id] = {f: done[f] for f in sf}
             if progress_cb:
                 progress_cb("Przelicz finalnie", n + 1, len(segs))
 

@@ -34,9 +34,9 @@
     st1Create: 'Dodaj nowy obiekt do ujęcia',
     st1PtsClear: 'Usuń wszystkie punkty tej klatki (usuwa też jej klucz z punktów; Ctrl+Z cofa)',
     st1Detect: 'SAM 3.1 szuka obiektu z promptu na całej klatce i pokazuje kandydatów do wyboru',
-    st1All: 'Kadry (gdy trzeba) + rdzeń SAM 3.1 na całym ujęciu od kluczy – maska w każdej klatce; po zmianie kluczy liczy tylko zmienione przedziały',
+    st1All: 'Liczy tylko to, co nieaktualne po ostatnim przeliczeniu: odcinki ze zmienionymi kluczami (reszta z cache). Za pierwszym razem – całe ujęcie (kadry automatycznie, gdy trzeba + rdzeń SAM 3.1)',
     st3Rerun: 'Przelicz rdzeń SAM 3.1 tylko w przedziałach zmienionych przez klucze (reszta z cache)',
-    st2Crops: 'Policz kwadratowe kadry wokół obiektu dla SAM 3.1 od nowa (zwykle robi to samo „▶▶ Przelicz całość”)',
+    st2Crops: 'Policz kwadratowe kadry wokół obiektu dla SAM 3.1 od nowa (zwykle robi to samo „▶▶ Przelicz nieaktualne”)',
     st3KeySave: 'Zapisz bieżące kreski / wielokąty jako klucz tej klatki (zwykle zapisuje się samo)',
     // stage 2 CoTracker – brush corrections (static/brush.js)
     b2Track: 'Poprawki przenoszone lokalnie punktami CoTracker3 (nadążają za ruchem i odkształceniem); wyłączone = sztywny kształt jadący za obiektem',
@@ -45,9 +45,6 @@
     b2Apply: 'Policz maskę 1+2 (rdzeń SAM 3.1 + poprawki) na całym ujęciu; widok Rdzeń pokaże wynik, ta sama maska idzie do MatAnyone2 i do eksportu „rdzeń (1+2)”',
     // stage 3 MatAnyone (edge settings shared with stage 5)
     st3Ma: 'MatAnyone2 na masce 1+2 bez stref ViTMatte → nowa wersja = baza etapu 4; najlepsze do naturalnej miękkiej krawędzi (ruch, nieostrość)',
-    mbPv: 'Podgląd tej klatki: wersja etapu z dodanym rozmyciem ruchu (na żywo, nic nie zapisuje)',
-    mbStr: 'Siła motion blura: mnożnik długości rozmycia (1 = fizycznie z ruchu i shuttera, 0 = bez zmian); w polu obok dowolna wartość do 10×',
-    mbShut: 'Shutter (kąt migawki, °): 180 = pół klatki naświetla ruch, 360 = cała klatka; domyślnie z manifestu; w polu obok 0–720',
     o4Out: 'Pas na zewnątrz: minimum px poza krawędzią maski 1+2, które liczy MatAnyone2 (przy rozmyciu automat daje więcej); w polu obok dowolna wartość',
     o4In: 'Wcięcie w rdzeń: minimum px w głąb maski 1+2 oddane MatAnyone2; dalej alfa = 1; w polu obok dowolna wartość',
     o4Smooth: 'Wygładzanie w czasie: mocne = mniej migotania, ale ryzyko smug przy szybkim ruchu',

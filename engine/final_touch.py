@@ -225,9 +225,10 @@ def corrections_sig(d: Dict[str, Any]) -> str:
                                                               for k, v in fin.items()}}, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def stroke_mask(s: Dict[str, Any], w: int, h: int) -> np.ndarray:
-    """Soft opacity of one stroke (float32 h x w, 0..1): the hard stroke (engine/keys.draw_variable_stroke, the same
-    capsules the viewer draws) faded inwards from its edge over (1 - hardness) of the radius."""
+def stroke_mask_roi(s: Dict[str, Any], w: int, h: int):
+    """(x0, y0, m): the soft opacity of one stroke (float32, 0..1) inside its bounding box only; outside it is 0.
+    The hard stroke (engine/keys.draw_variable_stroke, the same capsules the viewer draws) is faded inwards from its
+    edge over (1 - hardness) of the radius. None when the box is empty."""
     from engine.keys import draw_variable_stroke
     r_def = float(s.get("radius_px") or 8)
     pts = s["p"]
@@ -235,9 +236,8 @@ def stroke_mask(s: Dict[str, Any], w: int, h: int) -> np.ndarray:
     xs, ys = [float(q[0]) for q in pts], [float(q[1]) for q in pts]
     x0, y0 = max(0, int(np.floor(min(xs) - rmax - 2))), max(0, int(np.floor(min(ys) - rmax - 2)))
     x1, y1 = min(w, int(np.ceil(max(xs) + rmax + 3))), min(h, int(np.ceil(max(ys) + rmax + 3)))
-    out = np.zeros((h, w), np.float32)
     if x1 <= x0 or y1 <= y0:
-        return out
+        return None
     roi = np.zeros((y1 - y0, x1 - x0), np.uint8)
     draw_variable_stroke(roi, [[q[0] - x0, q[1] - y0] + ([q[2]] if len(q) >= 3 else []) for q in pts], r_def, 255)
     feather = rmax * (1.0 - float(s.get("hardness", HARDNESS_DEFAULT)))
@@ -247,22 +247,45 @@ def stroke_mask(s: Dict[str, Any], w: int, h: int) -> np.ndarray:
         dist = cv2.distanceTransform((roi > 0).astype(np.uint8), cv2.DIST_L2, 5)
         t = np.clip(dist / feather, 0.0, 1.0)
         m = (t * t * (3.0 - 2.0 * t)).astype(np.float32)      # smoothstep: soft, no visible ring
-    out[y0:y1, x0:x1] = m
+    return x0, y0, m
+
+
+def stroke_mask(s: Dict[str, Any], w: int, h: int) -> np.ndarray:
+    """Soft opacity of one stroke as a full frame (float32 h x w, 0..1)."""
+    out = np.zeros((h, w), np.float32)
+    r = stroke_mask_roi(s, w, h)
+    if r is not None:
+        x0, y0, m = r
+        out[y0:y0 + m.shape[0], x0:x0 + m.shape[1]] = m
     return out
 
 
-def layer(strokes: Sequence[Dict[str, Any]], w: int, h: int) -> np.ndarray:
-    """Correction layer C (float32, -1..1) of one frame's strokes, in order."""
+def layer_box(strokes: Sequence[Dict[str, Any]], w: int, h: int):
+    """(C, box): the correction layer of `layer` and the union (x0, y0, x1, y1) of the strokes' boxes – C is exactly 0
+    outside it (None = no stroke touched the frame)."""
     c = np.zeros((h, w), np.float32)
+    box = None
     for s in strokes:
-        m = stroke_mask(s, w, h)
+        r = stroke_mask_roi(s, w, h)
+        if r is None:
+            continue
+        x0, y0, m = r
+        x1, y1 = x0 + m.shape[1], y0 + m.shape[0]
+        v = c[y0:y1, x0:x1]
         if s["mode"] == "add":
-            c += m * (1.0 - c)
+            v += m * (1.0 - v)
         elif s["mode"] == "remove":
-            c -= m * (1.0 + c)
+            v -= m * (1.0 + v)
         else:
-            c *= 1.0 - m
-    return c
+            v *= 1.0 - m
+        box = (x0, y0, x1, y1) if box is None else (min(box[0], x0), min(box[1], y0), max(box[2], x1), max(box[3], y1))
+    return c, box
+
+
+def layer(strokes: Sequence[Dict[str, Any]], w: int, h: int) -> np.ndarray:
+    """Correction layer C (float32, -1..1) of one frame's strokes, in order. Each stroke only touches its own box
+    (outside it the stroke is 0, i.e. C stays) – same result as the full-frame arithmetic, far less work."""
+    return layer_box(strokes, w, h)[0]
 
 
 def compose(base: np.ndarray, c: np.ndarray) -> np.ndarray:

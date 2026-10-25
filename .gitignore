@@ -40,3 +40,4 @@ bin/
 build/
 dist/
 logs/
+.testmondata*

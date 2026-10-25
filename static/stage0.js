@@ -55,7 +55,7 @@
     <div class="pane-section">
       <div class="sec-title">Czyszczenie plate'u <span class="muted">(deflicker / odszumianie – każdy plate)</span></div>
       <div id="p0Clean"></div>
-      <button class="btn btn-secondary btn-sm" id="p0CleanOpen">✨ Czyszczenie…</button>
+      <button class="btn btn-repair" id="p0CleanOpen"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.1L3 17.7 6.3 21l6.3-6.3a4 4 0 0 0 5.1-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/><path d="M19 3v3M17.5 4.5h3M5 3v2M4 4h2" stroke-width="1.6"/></svg><span>Napraw</span></button>
     </div>
     <div class="pane-section">
       <div class="sec-title">Plate do maskowania <span class="muted">(wejście SAM 3.1 / MatAnyone2 – projekt)</span></div>

@@ -153,7 +153,7 @@
     // newer stage buttons and the floating palettes (2026-10-16: "Run MatAnyone" on the palette did nothing visible during VideoMaMa)
     '#st1All', '#ppAll', '#st3Ma', '#epCompute', '#vmRun', '#lx6Run', '#exAnalyze', '#exCompute', '#zpApply', '#b2Apply',
     // frame previews, SAM3 of one frame, motion blur, the Nuke script (user request 2026-10-22: everything that computes waits)
-    '#zpStagePv', '#epStagePv', '#vmStagePv', '#ppCompute', '#z4PvFrame', '#mbApply', '#e5NkOnly'].join(',');
+    '#zpStagePv', '#epStagePv', '#vmStagePv', '#ppCompute', '#z4PvFrame', '#e5NkOnly'].join(',');
   document.addEventListener('click', (e) => {
     const b = busy && e.target.closest && e.target.closest(HEAVY);
     if (!b) return;

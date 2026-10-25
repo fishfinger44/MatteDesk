@@ -13,11 +13,17 @@
   if (!modal || !tag) return;
 
   const show = (on) => { modal.style.display = on ? 'flex' : 'none'; };
-  tag.style.cursor = 'pointer';
-  tag.addEventListener('click', () => {
+  // the whole badge (logo + name + version) opens the window, not just the version tag
+  const badge = tag.closest('.logo-badge') || tag;
+  badge.classList.add('about-open');
+  badge.setAttribute('role', 'button');
+  badge.tabIndex = 0;
+  const openAbout = () => {
     document.getElementById('aboutVersion').textContent = tag.textContent;
     show(true);
-  });
+  };
+  badge.addEventListener('click', openAbout);
+  badge.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openAbout(); } });
   document.getElementById('closeAboutModalBtn').addEventListener('click', () => show(false));
   document.getElementById('confirmAboutBtn').addEventListener('click', () => show(false));
   modal.addEventListener('click', (e) => { if (e.target === modal) show(false); });

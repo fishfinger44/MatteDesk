@@ -1,0 +1,4 @@
+# Development only (not installed by start_v*.bat / the Windows installer): test selection by coverage.
+# pytest --testmon --testmon-forceselect -m "not real"  -> only the tests whose executed code changed (user decision 2026-10-24)
+-r requirements.txt
+pytest-testmon>=2.2.0

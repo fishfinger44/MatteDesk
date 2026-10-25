@@ -9,10 +9,11 @@ VideoMaMaPipelineLoader + VideoMaMaSampler); the guide is ALWAYS the mask 1+2 (S
 its whole), the image the plate-to-mask crop.
 Its matte is then put over a BASE chosen by the user (setting `base`):
   "core"      – the mask 1+2 (default; with it VideoMaMa makes the whole edge – on CLIP2_A the calmest hard edge),
-  "matanyone" – the stage-3 result (its hard edge is kept inside the protect band).
-Composition per frame, distances in plate px from the base edge (alpha 0.5):
-  inside the base, deeper than `protect` -> base; protect band (both sides) -> linear ramp base -> max(base, vmm);
-  outside, protect < d <= reach -> max(base, vmm) (the strands); beyond `reach` -> base (strays / islands cut off).
+  "matanyone" – the stage-3 result.
+Composition = the one band of every stage (engine/bandsys.py, user decision 2026-10-24): VideoMaMa decides in the band
+`reach_px` outside .. `inset_px` inside the base edge (band points shape it), blended into the base over `feather_px`
+from the inner edge and `outer_feather_px` from the outer one; beyond the band = the base (strays / islands cut off).
+(The former „protect” composition – max(base, matte) outside the base with a protect ramp – is gone.)
 The node runs every frame it gets in ONE UNet pass, so frames go in batches (separate prompts); batches overlap and are
 crossfaded – without the overlap every batch start jumps (CLIP2_A: hard-edge flicker x1.9, hair x2.8 on the boundaries;
 24 / overlap 8 -> +4 %).
@@ -57,16 +58,13 @@ BASES = ("core", "matanyone")
 OFFLOADS = ("auto", "on", "off")
 VMM_DEFAULTS: Dict[str, Any] = {
     "base": "core",           # core = mask 1+2 | matanyone = stage-3 result (CLIP2_A: the MA base keeps MA's boiling edge)
-    "reach_px": 40.0,         # how far out of the base edge VideoMaMa may add (strands); beyond = base
-    "protect_px": None,       # band around the base edge where the base wins (ramp); None = auto: 0 core / 3 matanyone
-    # the sliders of the other edge stages (user decision 2026-10-17): VideoMaMa REPLACES the base from reach_px outside
-    # to inset_px inside its edge, blended into the deeper base over feather_px. None = the former composition
-    # (VideoMaMa only adds outside the base, protect band) – objects saved before keep their results
-    "inset_px": None,
-    "feather_px": 0.0,
-    # one band system (user decision 2026-10-22, engine/bandsys.py): outer-edge feather (0 = hard, as before) and band
-    # control points shaping the band (engine/bandmap.py; [] = constant band), the sliders' reference for scaling them
-    "outer_feather_px": 0.0,
+    # the band (engine/bandsys.py BAND_DEFAULTS – one set of defaults for every stage, 2026-10-24): VideoMaMa REPLACES
+    # the base from reach_px outside to inset_px inside its edge, blended over the two feathers; band control points
+    # shape the band (engine/bandmap.py; [] = constant band), the sliders' reference scales them
+    "reach_px": 40.0,
+    "inset_px": 2.0,
+    "feather_px": 8.0,
+    "outer_feather_px": 8.0,
     "band_points": [],
     "band_ref_out": None,
     "band_ref_in": None,
@@ -79,17 +77,20 @@ VMM_DEFAULTS: Dict[str, Any] = {
 SETTING_KEYS = tuple(VMM_DEFAULTS)
 
 
-def vmm_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """VMM_DEFAULTS <- defaults.json "videomama" <- object field `videomama` (known keys, validated); `protect`
-    = the effective protect band (auto by base)."""
+def vmm_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[str, Any]] = None,
+                 overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """VMM_DEFAULTS <- defaults.json "videomama" <- object field `videomama` (known keys, validated). The band:
+    `s["band"]` = engine/objband.band_for(obj, "videomama", own=the validated stage fields, overrides) – the shared
+    object band unless the stage is detached; the legacy keys reach_px / inset_px / feather_px / outer_feather_px /
+    band_points / band_ref_* / band_owner are its thin mapping for old readers. `overrides` = palette values not saved
+    yet (canonical or legacy names)."""
     s = dict(VMM_DEFAULTS)
     for src in (defaults or {}, (obj or {}).get("videomama") or {}):
-        s.update({k: v for k, v in src.items() if k in VMM_DEFAULTS and (v is not None or k in ("protect_px", "inset_px", "band_ref_out", "band_ref_in"))})
+        s.update({k: v for k, v in src.items() if k in VMM_DEFAULTS and (v is not None or k in ("band_ref_out", "band_ref_in"))})
     s["base"] = s["base"] if s["base"] in BASES else "core"
     s["offload"] = s["offload"] if s["offload"] in OFFLOADS else "auto"
     s["reach_px"] = float(min(400.0, max(0.0, float(s["reach_px"]))))
-    s["protect_px"] = None if s["protect_px"] in (None, "", "auto") else float(min(40.0, max(0.0, float(s["protect_px"]))))
-    s["inset_px"] = None if s["inset_px"] in (None, "", "auto") else float(min(200.0, max(0.0, float(s["inset_px"]))))
+    s["inset_px"] = float(min(200.0, max(0.0, float(s["inset_px"]))))
     s["feather_px"] = float(min(64.0, max(0.0, float(s["feather_px"] or 0.0))))
     s["outer_feather_px"] = float(min(200.0, max(0.0, float(s["outer_feather_px"] or 0.0))))
     from engine.bandmap import band_points
@@ -98,18 +99,20 @@ def vmm_settings(obj: Optional[Dict[str, Any]] = None, defaults: Optional[Dict[s
     s["batch"] = int(min(64, max(4, int(s["batch"]))))
     s["overlap"] = int(max(0, min(int(s["overlap"]), s["batch"] // 2)))
     s["seed"] = int(s["seed"])
-    s["protect"] = s["protect_px"] if s["protect_px"] is not None else (3.0 if s["base"] == "matanyone" else 0.0)
-    from engine.objband import apply   # the shared object band unless the stage is detached (2026-10-22)
-    return apply(obj, "videomama", s)
+    from engine.objband import band_for   # the one band settings model (2026-10-24)
+    b = band_for(obj, "videomama", own=s, overrides=overrides)
+    s.update(b.legacy())
+    s["band"] = b
+    return s
 
 
-def object_settings(obj: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def object_settings(obj: Optional[Dict[str, Any]] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """vmm_settings with defaults.json "videomama" (project-wide defaults) under the object's own `videomama`."""
     try:
         d = json.loads((Path(__file__).resolve().parent.parent / "defaults.json").read_text(encoding="utf-8")).get("videomama")
     except (OSError, ValueError):
         d = None
-    return vmm_settings(obj, d or {})
+    return vmm_settings(obj, d or {}, overrides)
 
 
 def model_sig(s: Dict[str, Any]) -> str:
@@ -119,13 +122,11 @@ def model_sig(s: Dict[str, Any]) -> str:
 
 
 def settings_sig(s: Dict[str, Any]) -> str:
-    """The whole stage result: the model run + the composition (base, reach, protect)."""
-    d = {k: s.get(k) for k in ("base", "reach_px", "protect", "max_side", "batch", "overlap", "seed")}
-    if s.get("inset_px") is not None:   # the unified sliders (absent = the former signature: old results stay current)
-        d.update(inset_px=s["inset_px"], feather_px=s.get("feather_px", 0.0))
-    if s.get("outer_feather_px") or s.get("band_points"):   # the band system (absent = the signature above)
-        d.update(outer_feather_px=s.get("outer_feather_px", 0.0), band_points=s.get("band_points") or [],
-                 band_ref=[s.get("band_ref_out"), s.get("band_ref_in")])
+    """The whole stage result: the model run + the band composition (2026-10-24: one signature, the band always in it –
+    versions computed before that day show „↻ do przeliczenia” once)."""
+    d = {k: s.get(k) for k in ("base", "reach_px", "inset_px", "feather_px", "outer_feather_px", "max_side", "batch",
+                               "overlap", "seed")}
+    d.update(band_points=s.get("band_points") or [], band_ref=[s.get("band_ref_out"), s.get("band_ref_in")])
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -165,46 +166,30 @@ def work_side(w: int, h: int, max_side: int) -> int:
 
 
 # ----------------------------------------------------------------------------- composition
-def compose(base: np.ndarray, vmm: np.ndarray, protect: float, reach: float, inset: Optional[float] = None,
-            feather: float = 0.0, outer_feather: float = 0.0, pts=None) -> np.ndarray:
-    """Base (0..1, the mask 1+2 or the stage-3 alpha) + VideoMaMa matte -> the stage alpha (see the module doc).
-    `inset` given (the unified sliders, 2026-10-17; the band system since 2026-10-22, engine/bandsys.py): VideoMaMa in
-    the band reach px outside .. inset px inside the base edge, blended into the base (the stage's core) over `feather` px
-    from the inner band edge and `outer_feather` px from the outer one; band points (x, y, out, in in the crop's pixels)
-    shape the band; beyond the band = the base."""
+def compose(base: np.ndarray, vmm: np.ndarray, reach: float, inset: float, feather: float = 0.0,
+            outer_feather: float = 0.0, pts=None) -> np.ndarray:
+    """Base (0..1, the mask 1+2 or the stage-3 alpha) + VideoMaMa matte -> the stage alpha through the one band of every
+    stage (engine/bandsys.compose): VideoMaMa in the band `reach` px outside .. `inset` px inside the base edge, blended
+    into the base over `feather` px from the inner band edge and `outer_feather` px from the outer one; band points
+    (x, y, out, in in the crop's pixels) shape the band; beyond the band = the base."""
+    from engine.bandsys import band_widths
+    from engine.bandsys import compose as band_compose
     b = np.clip(base.astype(np.float32), 0, 1)
     v = np.clip(vmm.astype(np.float32), 0, 1)
-    d = sdf_px(b)                       # > 0 inside the base
-    if inset is not None:
-        from engine.bandsys import band_widths
-        from engine.bandsys import compose as band_compose
-        o, i = band_widths(b, reach, inset, pts)
-        return band_compose(b, v, d, o, i, feather, outer_feather)
-    mx = np.maximum(b, v)
-    a = b.copy()
-    add = (d < -protect) & (d >= -reach)
-    a[add] = mx[add]
-    if protect > 0:
-        band = np.abs(d) <= protect
-        t = np.clip(np.abs(d) / protect, 0, 1)
-        a[band] = b[band] + t[band] * (mx[band] - b[band])
-    return a.astype(np.float32)
+    o, i = band_widths(b, reach, inset, pts)
+    return band_compose(b, v, sdf_px(b), o, i, feather, outer_feather)
 
 
 def band_u8(base: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
-    """Band preview of the palette: 128 = where VideoMaMa adds (max), 255 = the protect band (base wins at the edge)."""
+    """Band preview of the palette (PNG fallback of an old page): 128 = the band (VideoMaMa decides), 255 = the base
+    deeper inside."""
+    from engine.bandsys import band_area, band_widths
     b = np.clip(base.astype(np.float32), 0, 1)
     d = sdf_px(b)
+    o, i = band_widths(b, s["reach_px"], s["inset_px"], pts)
     out = np.zeros(d.shape, np.uint8)
-    if s.get("inset_px") is not None:   # unified sliders: 128 = VideoMaMa decides, 255 = the base stays (deeper inside)
-        from engine.bandsys import band_widths
-        o, i = band_widths(b, s["reach_px"], s["inset_px"], pts)
-        out[(d >= -o) & (d <= i)] = 128
-        out[d > i] = 255
-        return out
-    out[(d < -s["protect"]) & (d >= -s["reach_px"])] = 128
-    if s["protect"] > 0:
-        out[np.abs(d) <= s["protect"]] = 255
+    out[band_area(d, o, i)] = 128
+    out[d > np.asarray(i, np.float32)] = 255
     return out
 
 

@@ -106,6 +106,8 @@ def _defined_ids(html: str, js_sources):
     for src in js_sources:
         ids |= set(re.findall(r'\bid="([\w-]+)"', src))
         ids |= set(re.findall(r"\.id\s*=\s*'([\w-]+)'", src))
+        for m in re.finditer(r"bandRow\('\w+', '[^']*', '([\w-]+)', '([\w-]+)'", src):   # the shared band rows (2026-10-24)
+            ids |= {m.group(1), m.group(2)}
     return ids
 
 
@@ -241,7 +243,7 @@ def test_new_and_delete_object_dialogs_wired():
 
 def test_kadruj_is_automatic_przelicz_calosc():
     """2026-10-15: Kadruj is automatic – no stage of its own (the crops live in a collapsed box of stage SAM3),
-    „▶▶ Przelicz całość” in stage SAM3 (panel + palette) calls POST /compute_all; nothing crops by itself."""
+    „▶▶ Przelicz nieaktualne” in stage SAM3 (panel + palette) calls POST /compute_all; nothing crops by itself."""
     src = (STATIC / "objects.js").read_text(encoding="utf-8")
     assert "autoCrop" not in src and "id: 'crops'" not in src and 'id="st1CropsBox"' in src
     assert "compute_all" in src and src.count("run('st1All', computeAll)") == 1 and "run('ppAll', computeAll)" in src
@@ -415,3 +417,44 @@ def test_gpu_overlays_with_cpu_fallback():
     assert obj.count("getImageData(0, 0, c.width, c.height)") >= 3   # the CPU paths are still there
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     assert "mdGpu.comp(beauty, m.img, c, W, H)" in app
+
+
+def test_one_band_drawing_2026_10_24():
+    """One band path (user request 2026-10-24): every band preview is drawn by MD_BANDPTS.strokeLines (dashed band
+    edges + thin feather-end lines) – stage 5 zones.js no longer strokes its own yellow lines; stage 3 shows a refused
+    lines request (lineNote) instead of „ładuję linie pasa…” for ever."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    zon = (STATIC / "zones.js").read_text(encoding="utf-8")
+    bp = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
+    assert "function strokeLines(ctx, k, L, opts = {})" in bp and "strokeLines(ctx, k, L, { alpha: dim ? 0.5 : null })" in bp
+    assert "rgba(255,212,0" not in zon and "window.MD_BANDPTS.strokeLines(ctx, k, reg)" in zon
+    assert bp.count("rgba(255,212,0") == 2                       # the band edge and the feather ends, once
+    assert "function lineNote(f, params)" in bp and "if (L && L.error) return false;" in bp
+    assert "window.MD_BANDPTS.lineNote(f, lp) ||" in obj
+    assert "if (e.status === 409) B.data[k] = { frame: f, points: [], defaults: {}, refused: e.message };" in bp   # no request storm
+
+
+def test_one_band_palette_2026_10_24():
+    """One band palette (user decision 2026-10-24): stages 3 / 4 / 7 build their four band sliders from
+    MD_BANDPTS.slider (one label / range / wording) in the one order out, in, feather, outFeather; the stage-5 zone rows
+    follow the same order and ranges; the zone's own band-point editor is gone (static/bandpoints.js edits every band)."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    zon = (STATIC / "zones.js").read_text(encoding="utf-8")
+    bp = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
+    assert "SLIDER_ORDER = ['out', 'in', 'feather', 'outFeather']" in bp and "function slider(kind, model)" in bp
+    rows = re.findall(r"bandRow\('(\w+)', '([^']*)', '([\w-]+)', '([\w-]+)'", obj)
+    by_model = {}
+    for kind, model, rid, nid in rows:
+        by_model.setdefault(model, []).append(kind)
+    assert set(by_model) == {"MatAnyone2", "VideoMaMa", "LTX-2.5"}
+    assert all(v == ["out", "in", "feather", "outFeather"] for v in by_model.values()), by_model
+    # the zone palette: the same order and ranges (its sliders also drive the trimap, so they stay its own rows)
+    zi = [zon.index(f'id="{i}"') for i in ("z4Out", "z4Inset", "z4Feather", "z4OutFeather")]
+    assert zi == sorted(zi)
+    assert 'id="z4Out" min="0" max="120"' in zon and 'id="z4Inset" min="0" max="40"' in zon
+    assert 'id="z4Feather" min="0" max="40"' in zon and 'id="z4OutFeather" min="0" max="80"' in zon
+    # one band-point editor
+    for gone in ("function drawBand(", "function bandHit(", "function wireBand(", "async function bandSave(", "function bandGeom("):
+        assert gone not in zon, gone
+    assert "zoneBand: () =>" in obj and "activeBandKey, pushBandUndo, reloadBand" in zon
+    assert "S().stage === H.ST.VITMATTE && H.zoneBand ? H.zoneBand() : null" in bp

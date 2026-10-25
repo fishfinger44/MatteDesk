@@ -13,7 +13,7 @@
   // key = name in code (ST.key), id = engine/stages.py step id; desc = what it does / what it is best for (panel top)
   const STAGES = [
     { key: 'PLATES', id: 'plates', label: "Plate'y", hint: "Plate'y ujęcia, zgodność clear plate / backlit z beauty, czyszczenie, kamera, głębia" },
-    { key: 'SAM3', id: 'sam3', label: 'SAM 3.1', hint: 'Wskaż obiekt (punkty / prompt), „▶▶ Przelicz całość” = maska w każdej klatce; poprawiaj klucze SAM 3.1 i przeliczaj',
+    { key: 'SAM3', id: 'sam3', label: 'SAM 3.1', hint: 'Wskaż obiekt (punkty / prompt), „▶▶ Przelicz nieaktualne” = maska w każdej klatce; poprawiaj klucze SAM 3.1 i przeliczaj',
       desc: '<b>Co robi:</b> SAM 3.1 znajduje obiekt z punktów / promptu w klatkach kluczowych i propaguje maskę (rdzeń, ostra krawędź) na całe ujęcie; kadry pod obiekt liczą się same. <b>Najlepsze do:</b> wyznaczenia CO jest obiektem – sylwetka, części, zasłonięcia. Złą klatkę poprawiasz tu kluczem SAM 3.1 (punkty, Korekta + / −, pędzel / wielokąt klucza).' },
     { key: 'BRUSH', id: 'cotracker', label: 'CoTracker3', hint: 'Pędzel poprawek maski (dodaj / usuń) w klatkach kluczowych, propagowany punktami CoTracker3',
       desc: '<b>Co robi:</b> poprawki maski pędzlem (dodaj / usuń) w kilku klatkach – CoTracker3 przenosi je punktami na resztę ujęcia (bez SAM 3.1). Maska 1+2 = rdzeń SAM 3.1 ± poprawki. <b>Najlepsze do:</b> stałych błędów SAM 3.1, których kluczami nie da się dobić (cienki fragment, dziura, wyciek na tło), na obiektach, które się przesuwają / odkształcają. Etap opcjonalny; zmiany SAM 3.1 = powrót do etapu 1.' },
@@ -195,7 +195,6 @@
     updateViewTabs();   // Alpha / Comp availability depends on the stage (its own mask, 2026-10-22)
     renderPointsPalette();
     renderEdgePalette();
-    renderMbPalette();
     renderLtxPalette();
     renderVmmPalette();
     window.dispatchEvent(new CustomEvent('md-stage', { detail: { stage: n } }));   // stage0.js: its floating palette
@@ -225,7 +224,7 @@
       b.disabled = !ok;
       b.classList.toggle('disabled', !ok);
       if (!ok && b.dataset.view !== 'none') b.title = S.auxMode ? 'Widoki wyniku tylko na beauty' : (!S.obj ? 'Wybierz obiekt' :
-        (b.dataset.view === 'core' ? `Rdzeń jeszcze nie policzony – „▶▶ Przelicz całość” (etap ${ST.SAM3})`
+        (b.dataset.view === 'core' ? `Rdzeń jeszcze nie policzony – „▶▶ Przelicz nieaktualne” (etap ${ST.SAM3})`
           : `Brak wyniku z krawędzią – „▶ Przelicz MatAnyone2” (etap ${ST.MATANYONE}) albo „Przelicz finalnie” (etap ${ST.EXPERIMENTS})`));
       else if (ok && b.dataset.view !== 'none') {
         const stale = b.dataset.view === 'core' ? stageState('core').state !== 'done' : stageState('final').state !== 'done';
@@ -310,6 +309,15 @@
     return null;
   }
 
+  // Final Touch: every stroke bumps the frame's revision = a new overlay key; until the new image arrives the previous
+  // one of that frame stays on screen (no black frame between strokes, user report 2026-10-24). Returns Image | 'missing' | null.
+  function ftLoad(ref, f) {   // -> { img, key } of the image really shown (its own key: the tint / comp caches are keyed by it) | 'missing' | null
+    const al = loadOverlay(ref.key, ref.url);
+    S.ftLast = S.ftLast || {};
+    const lk = `${S.obj}_${f}`;
+    if (al && al !== 'missing') return (S.ftLast[lk] = { img: al, key: ref.key });
+    return al === 'missing' ? al : (S.ftLast[lk] || null);
+  }
   // Live server previews (edge band, VideoMaMa, LTX, motion blur) take seconds per frame and the browser runs 6 requests
   // at a time, so scrubbing queued a request for every frame passed and the frame you stop on waited behind them – the
   // preview "disappeared" (bug 2026-10-17). A frame is requested only once the playhead rests on it (~0.2 s).
@@ -908,15 +916,7 @@
       const stageMask = S.obj && !S.auxMode && !S.viewRun && (S.view === 'alpha' || S.view === 'comp')
         && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH].includes(S.stage);
       const sw = S.obj && !S.auxMode && (S.view === 'core' || (S.view === 'alpha' && !stageMask)) ? selGroup() : null;
-      if (mbPreviewOn() && (S.view === 'alpha' || S.view === 'comp')) {   // „Motion blur alfy” preview of this frame
-        const ov = mbOverlay(f), base = mbBase(), s = `${mbStrength()}s${mbShutter()}`;
-        if (ov === 'missing') noteTxt = `Podgląd motion blura F${f}: brak wyniku wersji ${base} w tej klatce`;
-        else if (ov) {
-          if (S.view === 'comp') ctx.drawImage(compCanvas(img, ov, `${S.obj}@mb${base}x${s}_${f}`, f), 0, 0);
-          else drawTinted(ctx, ov, 'alpha', `${S.obj}_mb@${base}x${s}_${f}`, img.width, img.height);
-        }
-        noteTxt = noteTxt || `Podgląd: ${base} + motion blur ×${mbStrength()}, shutter ${mbShutter()}° (wyłącz „👁 podgląd” w palecie Motion blur, żeby zobaczyć bez)`;
-      } else if (S.hideSel && S.obj && !S.auxMode) {   // 👁 off in the Objects palette: no mask of the selected object
+      if (S.hideSel && S.obj && !S.auxMode) {   // 👁 off in the Objects palette: no mask of the selected object
         noteTxt = noteTxt || 'Maska wybranego obiektu ukryta – 👁 w palecie Obiekty';
       } else if (stageMask) {
         const m = matteFor(f);
@@ -939,9 +939,13 @@
         } else if (S.view === 'core') {
           const kf = keyOf(f);   // in a key frame the result IS the key – show it, not the old core
           const ck = coreKind(f);  // stage 2: the mask 1+2 when „Zastosuj poprawki” made it
-          const ov = overlayFor(ck, f);
+          // Final Touch: the core overlay shows base + this frame's hand corrections, like Alpha / Comp (user report 2026-10-24)
+          const ftRef = S.stage === ST.FINAL_TOUCH && window.MD_FT && window.MD_FT.ready ? window.MD_FT.matteRef(f) : null;
+          const ftOv = ftRef ? ftLoad(ftRef, f) : null;
+          if (ftOv && ftOv !== 'missing') drawTinted(ctx, ftOv.img, 'core', `core_${ftOv.key}`, img.width, img.height);
+          const ov = ftOv && ftOv !== 'missing' ? null : overlayFor(ck, f);
           if (ov === 'missing') noteTxt = ck === 'core_fix' ? `Brak maski 1+2 w klatce ${f} – „▶▶ Zastosuj poprawki” (etap ${ST.BRUSH})`
-            : `Brak rdzenia w klatce ${f} – „▶▶ Przelicz całość” (etap ${ST.SAM3})`;
+            : `Brak rdzenia w klatce ${f} – „▶▶ Przelicz nieaktualne” (etap ${ST.SAM3})`;
           else if (ov) drawLayer(ctx, ck, ov, 'core', f, img);
           if (ck === 'core_fix' && !noteTxt && stageState('cotracker').state !== 'done') noteTxt = 'Maska 1+2 nieaktualna (poprawki zmienione) – „▶▶ Zastosuj poprawki”';
           if (S.stage === ST.SAM3 && kf && kf.kind === 'correction') {
@@ -1089,8 +1093,8 @@
     let info = null;
     if (o) { try { info = await api('GET', `/api/object/${o}/stages`); } catch (e) { info = null; } }
     if (S.obj === o) { S.info = info; S.infoObj = o; }
-    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderMbPalette(); renderLtxPalette(); renderVmmPalette();
-    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderMbPalette(); renderLtxPalette(); renderExpPalette();
+    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderVmmPalette();
+    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderExpPalette();
     if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.onStages();
     if (window.MD_FT && window.MD_FT.ready) window.MD_FT.onStages();
     updateDelKeyBtn();   // every stage module calls loadStages after a key change
@@ -1204,8 +1208,8 @@
     if (S.stage === ST.FINAL_TOUCH) {   // base + hand corrections of this frame (= the export source „Final Touch”)
       const ref = window.MD_FT && window.MD_FT.ready ? window.MD_FT.matteRef(f) : null;
       if (!ref) return coreMatte(has12 ? 'core_fix' : 'core');
-      const al = loadOverlay(ref.key, ref.url);
-      if (al && al !== 'missing') { S.matteNote = ''; return { img: al, key: ref.key, kind: 'alpha', run: `Final Touch (${ref.run})` }; }
+      const al = ftLoad(ref, f);
+      if (al && al !== 'missing') { S.matteNote = ''; return { img: al.img, key: al.key, kind: 'alpha', run: `Final Touch (${ref.run})` }; }
       if (!al) return 'loading';
       S.matteNote = `Baza Final Touch (${ref.run}) nie obejmuje klatki ${f} – wybierz inną bazę albo przejdź do policzonych klatek`;
       return null;
@@ -1435,12 +1439,12 @@
     $('delObjOk').addEventListener('click', go);
     $('delObjCancel').focus();
   }
-  // „▶▶ Przelicz całość” (user decision 2026-10-15): points -> keys, crops when needed, core on the whole shot; again after
+  // „▶▶ Przelicz nieaktualne” (user decision 2026-10-15): points -> keys, crops when needed, core on the whole shot; again after
   // adding / removing keys = only the changed intervals (server cache). The mask is then visible in every frame.
   async function computeAll() {
     if (!S.obj) return;
     await ensurePointsSaved();
-    status(`Przelicz całość: kadry (gdy trzeba) + rdzeń SAM 3.1 – ${window.MD_WA && window.MD_WA.range ? `zakres pracy ${window.MD_WA.label()}` : 'całe ujęcie'}…`);
+    status(`Przelicz nieaktualne: kadry (gdy trzeba) + rdzeń SAM 3.1 – ${window.MD_WA && window.MD_WA.range ? `zakres pracy ${window.MD_WA.label()}` : 'całe ujęcie'}…`);
     const d = await api('POST', `/api/object/${S.obj}/compute_all`);
     if (d.crops_recomputed) { clearOverlays(); await loadCrops(); } else invalidateIntervals(d.recomputed);
     await loadStages(); setView('core');
@@ -1452,7 +1456,7 @@
       (d.uncertain.length ? `\nNiepewne klatki: ${d.uncertain.slice(0, 12).join(', ')}` : '') +
       (d.suggested_keys.length ? `\nSugerowane klucze: ${d.suggested_keys.slice(0, 8).join(', ')}` : '') +
       frontMissingText(d) +
-      '\nObejrzyj klatki (←/→); złą klatkę popraw punktami (klucz) i „▶ Przelicz klatkę”, potem „▶▶ Przelicz zmiany”.', frontMissingKind(d));
+      '\nObejrzyj klatki (←/→); złą klatkę popraw punktami (klucz) i „▶ Przelicz klatkę”, potem „▶▶ Przelicz nieaktualne”.', frontMissingKind(d));
     toast(`Maska ${d.whole_shot ? 'w każdej klatce' : `w F${d.frames[0]}–${d.frames[1]}`} gotowa${d.uncertain.length ? ` – niepewnych: ${d.uncertain.length}` : ''}` +
       ((d.front_missing || []).length ? ` · ⚠ obiekt z przodu bez rdzenia: ${d.front_missing.map((m) => m.object).join(', ')}` : ''), 5000);
     renderPointsPalette();
@@ -1748,14 +1752,16 @@
     $('st4Edge').value = d.current;
     $('st4EdgeWhy').textContent = d.reason || '';
     const o = S.objects.find((x) => x.name === S.obj) || {};
-    S.edgeLegacy = (o.band_out_px == null && o.band_in_px == null) ? { b: o.band_scale ?? 1, s: o.shift_px ?? 0 } : null;
-    S.edgePxTouched = false;
-    for (const [id, k] of [['o4Out', 'band_out_px'], ['o4In', 'band_in_px'], ['o4Feather', 'band_in_feather_px'], ['o4OutFeather', 'band_out_feather_px']]) { $(id).value = o[k] ?? 0; $(`${id}V`).value = o[k] ?? 0; }
+    // one band like the stage-5 zone (user decision 2026-10-24): the server's band (unset = the zone defaults), no automat
+    const bp = d.band_px || [o.band_out_px ?? 0, o.band_in_px ?? 0];
+    const bf = d.band_feather_px || [o.band_in_feather_px ?? 0, o.band_out_feather_px ?? 0];
+    const eff = { band_out_px: bp[0], band_in_px: bp[1], band_in_feather_px: bf[0], band_out_feather_px: bf[1] };
+    for (const [id, k] of [['o4Out', 'band_out_px'], ['o4In', 'band_in_px'], ['o4Feather', 'band_in_feather_px'], ['o4OutFeather', 'band_out_feather_px']]) { $(id).value = eff[k] ?? 0; $(`${id}V`).value = eff[k] ?? 0; }
+    o.band_out_px = bp[0]; o.band_in_px = bp[1];   // the effective (shared) band: the whiskers' live scale (setLive) reads them
+    S.epvParams = null;                             // the band preview asks with the palette as filled now, never a stale copy
+    if (o.band_in_feather_px == null) { o.band_in_feather_px = bf[0]; o.band_out_feather_px = bf[1]; }
     fillBandSources('ep').catch(() => {});
     if (window.MD_BANDPTS && window.MD_BANDPTS.ready) { window.MD_BANDPTS.dirty(); window.MD_BANDPTS.onFrame(); }
-    const lg = S.edgeLegacy && (+S.edgeLegacy.b !== 1 || +S.edgeLegacy.s !== 0);
-    $('o4PxHint').textContent = lg ? `Obiekt ma stare ustawienie (szerokość ×${S.edgeLegacy.b}, środek ${S.edgeLegacy.s} px) – ruszenie suwaka przełącza na px`
-      : '0 / 0 = sam automat (pas wg rozmycia, 3–24 px w każdą stronę)';
     $('o4Smooth').value = o.temporal_smoothing || 'normal'; $('o4Lupa').value = o.thin_lens || 'auto';
     $('o4MaScale').value = o.ma_scale_mode || 'auto';
     $('o4MaScaleL').style.display = d.modes.some((m) => m.mode === 'matanyone' && m.enabled) ? '' : 'none';
@@ -2007,7 +2013,7 @@
           <button type="button" class="btn btn-primary btn-sm" id="ppCompute" title="Policz maskę tej klatki: prompt (baza) + punkty + (dodaj) − punkty − (odejmij); zapis jako klucz (Enter)">▶ Przelicz klatkę</button>
           <button type="button" class="btn btn-secondary btn-sm" id="ppClear" title="Usuń wszystkie punkty tej klatki (klucz zniknie po „Przelicz klatkę”)">✕ Wyczyść punkty</button>
         </div>
-        <button type="button" class="btn btn-primary btn-sm" id="ppAll" title="Kadry (automatycznie, gdy trzeba) + rdzeń SAM 3.1 na całym ujęciu – maska w każdej klatce. Po zmianie kluczy liczy tylko zmienione przedziały">▶▶ Przelicz całość</button>
+        <button type="button" class="btn btn-primary btn-sm" id="ppAll" title="Liczy tylko to, co nieaktualne po ostatnim przeliczeniu: odcinki ze zmienionymi kluczami (reszta z cache). Za pierwszym razem – całe ujęcie (kadry automatycznie, gdy trzeba + rdzeń SAM 3.1)">▶▶ Przelicz nieaktualne</button>
         <div class="pp-hint muted">Klik = punkt + · PPM = punkt − · Alt = łapka · klik na punkt = usuń · Delete = ostatni</div>
       </div>`);
       w.appendChild(box);
@@ -2047,7 +2053,7 @@
       const b = $(id); if (!b) continue;
       b.disabled = !canAll || document.body.classList.contains('job-busy');
       b.classList.toggle('btn-cta', canAll && core !== 'done');
-      b.textContent = core === 'done' || core === 'stale' ? (core === 'stale' ? '▶▶ Przelicz zmiany' : '▶▶ Przelicz całość') : '▶▶ Przelicz całość';
+      b.textContent = '▶▶ Przelicz nieaktualne';
     }
     placeFloating(box, w, ptsPos.get());
   }
@@ -2247,24 +2253,29 @@
   // what the stage does / what it is best for – at the top of every stage pane (user request 2026-10-15)
   const descHtml = (key) => `<div class="stage-desc" title="Opis etapu">${STAGES[ST[key]].desc}</div>`;
   const paneTitle = (key, sub) => `<div class="pane-title">${ST[key]} · ${STAGES[ST[key]].label}${sub ? ` <span class="muted">(${sub})</span>` : ''}</div>`;
+  // ONE band palette (static/bandpoints.js slider, user decision 2026-10-24): the four band sliders of stages 3 / 4 / 7
+  // share label, range and wording; a stage passes its element ids (kept: the wiring and the tests know them) and its model
+  const bandRow = (kind, model, rangeId, numId, cls = '') => {
+    const sl = window.MD_BANDPTS.slider(kind, model);
+    return `<label class="edge-px${cls ? ' ' + cls : ''}" title="${sl.title}">${sl.label} <input id="${rangeId}" ${sl.range}><input id="${numId}" ${sl.num}> px</label>`;
+  };
   // edge settings shared by stage MatAnyone and Eksperymenty: a floating palette over the view, left, like „Punkty SAM3”
   // (user request 2026-10-15), with a preview of the band before computing (GET edge_preview) that can be switched off
   function edgeSettingsHtml() {
     return `<div class="pts-palette edge-palette" id="edgePalette" style="display:none">
       <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> Krawędź (MatAnyone2)</div>
-      <label class="chk" title="Podgląd przed liczeniem: przerywane linie = krawędzie pasa, w którym MatAnyone2 decyduje o alfie (adaptacyjny – szerszy przy rozmyciu / ruchu), cienkie przerywane = koniec wtopień; w środku zostaje maska 1+2. Wyłącz, gdy oglądasz policzony wynik"><input type="checkbox" id="ePv" title="Podgląd pasa krawędzi na obrazie (wł. / wył.)"> 👁 podgląd pasa krawędzi</label>
+      <label class="chk" title="Podgląd przed liczeniem: przerywane linie = krawędzie pasa, w którym MatAnyone2 decyduje o alfie (ten sam pas co w etapach 4 / 5 / 7: suwaki + punkty pasa), cienkie przerywane = koniec wtopień; w środku zostaje maska 1+2. Wyłącz, gdy oglądasz policzony wynik"><input type="checkbox" id="ePv" title="Podgląd pasa krawędzi na obrazie (wł. / wył.)"> 👁 podgląd pasa krawędzi</label>
       <div class="band-seed" id="epBandSeed"></div>
       <div class="muted pp-hint" id="ePvInfo"></div>
       <div class="pp-sec edge-settings" id="edgeSettings">
-      <label class="edge-px" title="Jak daleko poza krawędź maski 1+2 sięga pas (zewnętrzna przerywana linia), w którym MatAnyone2 liczy miękką alfę (kosmyki, rozmycie). To minimum: tam, gdzie automat mierzy większe rozmycie ostrości / ruchu, pas sam jest szerszy. Maska się nie przesuwa. Suwak 0–60 px, w polu dowolna wartość (do 200 px)">Pas na zewnątrz <input id="o4Out" type="range" min="0" max="60" step="1" value="0"><input id="o4OutV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
-      <label class="edge-px" title="Ile px w głąb maski 1+2 oddajemy MatAnyone2 (wewnętrzna przerywana linia pasa); dalej w środku alfa = 1. Minimum jak wyżej – automat może dać więcej przy rozmyciu. 0 = sam automat (3–24 px). Suwak 0–30 px, w polu do 200 px">Wcięcie w rdzeń <input id="o4In" type="range" min="0" max="30" step="1" value="0"><input id="o4InV" type="number" class="form-input edge-num" min="0" step="1" value="0" title="Dowolna wartość (0–200 px) – wpisz i Enter"> px</label>
-      <label class="edge-px" title="Na ilu px wynik MatAnyone2 przenika się z wnętrzem rdzenia na wewnętrznym brzegu pasa (wcięcia). 0 = twarde przejście (jak dotąd) – może zostać widoczna linia na granicy wcięcia; kilka px = miękkie wtopienie">Wtopienie wcięcia <input id="o4Feather" type="range" min="0" max="24" step="1" value="0" title="Wtopienie wcięcia (px)"><input id="o4FeatherV" type="number" class="form-input edge-num" min="0" max="64" step="1" value="0" title="Wtopienie wcięcia (px, 0–64)"> px</label>
-      <label class="edge-px" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa wynik MatAnyone2 przechodzi w rdzeń (zwykle czerń) – cieńsza przerywana linia na podglądzie. Nie nachodzi na wtopienie wcięcia. 0 = twarde cięcie (jak dotąd)">Wtopienie krawędzi zewn. <input id="o4OutFeather" type="range" min="0" max="80" step="1" value="0" title="Wtopienie krawędzi zewnętrznej (px)"><input id="o4OutFeatherV" type="number" class="form-input edge-num" min="0" max="200" step="1" value="0" title="Wtopienie krawędzi zewnętrznej (px, 0–200)"> px</label>
+      ${bandRow('out', 'MatAnyone2', 'o4Out', 'o4OutV')}
+      ${bandRow('in', 'MatAnyone2', 'o4In', 'o4InV')}
+      ${bandRow('feather', 'MatAnyone2', 'o4Feather', 'o4FeatherV')}
+      ${bandRow('outFeather', 'MatAnyone2', 'o4OutFeather', 'o4OutFeatherV')}
       <div class="pp-sec vm-band-pts"><div class="band-mode" id="epBandMode"></div><span class="muted pp-hint" id="epBandInfo"></span>
         <button type="button" class="btn btn-ghost btn-xs" id="epBandClear" title="Usuń wszystkie punkty bieżącej klatki kluczowej pasa (= usuń klatkę kluczową)">🗑 Usuń wszystkie punkty (ta klatka)</button>
         <label title="Punkty pasa z innego etapu (np. strefy „cały obrys” etapu 5) zastępują punkty tego pasa – szerokości takie, jak tam widać">Kopiuj punkty pasa z <select id="epBandSrc" class="form-input" title="Skąd skopiować punkty pasa"></select></label>
         <button type="button" class="btn btn-secondary btn-xs" id="epBandCopy" title="Skopiuj punkty pasa (z kluczami) z wybranego miejsca">⇩ Kopiuj</button></div>
-      <div class="muted pp-hint" id="o4PxHint">0 / 0 = sam automat (pas wg rozmycia, 3–24 px w każdą stronę)</div>
       <div class="row">
         <label title="Migotanie vs duchy przy ruchu">Wygładzanie<select id="o4Smooth" class="form-input"><option value="weak">słabe</option><option value="normal">normalne</option><option value="strong">mocne</option></select></label>
         <label title="Lupa na cienkich częściach (czułki, rogi, druty)">Lupa<select id="o4Lupa" class="form-input"><option value="auto">auto</option><option value="off">wył.</option><option value="box">ramka (ostatni wielokąt)</option></select></label>
@@ -2282,7 +2293,6 @@
   // preview params: the slider values (also while dragging, before they are saved); debounced so a drag is one request
   // px mode (2026-10-16): once the object has band_out_px / band_in_px or a px slider moved; else its old ×scale / shift
   function edgePvParams() {
-    if (S.edgeLegacy && !S.edgePxTouched) return { px: false, b: +S.edgeLegacy.b || 1, s: +S.edgeLegacy.s || 0 };
     return { px: true, o: Math.max(0, +$('o4OutV').value || 0), i: Math.max(0, +$('o4InV').value || 0) };
   }
   function renderEdgePalette() {
@@ -2377,11 +2387,11 @@
     if (!((S.edgePv || S.pvDrag === 'edge') && edgeStage() && S.obj && !S.auxMode)) return '';
     const dragging = S.pvDrag === 'edge';
     const p = dragging ? edgePvParams() : (S.epvParams || edgePvParams());
-    const q = p.px ? `band_out_px=${p.o}&band_in_px=${p.i}` : `band_scale=${p.b}&shift_px=${p.s}`;
+    const q = `band_out_px=${p.o}&band_in_px=${p.i}`;
     // instant band edges from the mask 1+2 in the browser (fixed px, no adaptive widening, dashed lines – no fill):
     // while the slider is dragged until the server's exact lines are loaded (user reports 2026-10-17 / 2026-10-23)
     const live = () => {
-      if (!p.px || !(window.MD_ZONES && window.MD_ZONES.liveBand)) return null;
+      if (!(window.MD_ZONES && window.MD_ZONES.liveBand)) return null;
       const kind = S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core';
       const m = overlayFor(kind, f);
       return m && m !== 'missing' ? window.MD_ZONES.liveBand(m, `${S.obj}_${kind}_${f}`, p.i, p.o) : null;
@@ -2390,7 +2400,7 @@
     // automatic (adaptive) mode too (user report 2026-10-22: stage 3 still showed the old filled preview at 0 / 0);
     // the adaptive band comes from the saved settings (no reach / inset in the request)
     const lp = { feather_px: +$('o4FeatherV').value || 0, outer_feather_px: +$('o4OutFeatherV').value || 0,
-                 ...(p.px ? { reach_px: p.o, inset_px: p.i } : { band_scale: p.b, shift_px: p.s }) };
+                 reach_px: p.o, inset_px: p.i };
     if (dragging) {   // a slider held (user report 2026-10-23: the old filled band came back while dragging)
       if (!(window.MD_BANDPTS && window.MD_BANDPTS.ready && window.MD_BANDPTS.drawLines(ctx, img, f, lp, { live: true }))) {
         const c = live(); if (c) ctx.drawImage(c, 0, 0, img.width, img.height);
@@ -2399,7 +2409,8 @@
       if (window.MD_BANDPTS && window.MD_BANDPTS.ready) {
         // while the lines load nothing is drawn (user report 2026-10-22: the old filled band flashed on every stage
         // change before the lines replaced it)
-        if (!window.MD_BANDPTS.drawLines(ctx, img, f, lp)) return `Podgląd pasa krawędzi F${f}: ładuję linie pasa…`;
+        if (!window.MD_BANDPTS.drawLines(ctx, img, f, lp)) return window.MD_BANDPTS.lineNote(f, lp) || `Podgląd pasa krawędzi F${f}: ładuję linie pasa…`;
+        const ap = window.MD_BANDPTS.lineNote(f, lp); if (ap) return ap;   // drawn, but on the stand-in mask
       } else {   // no band-points module (older page): the filled preview as before
         const key = `${S.obj}_epv_${q}_${f}`;
         const ov = settledOverlay(key, `/api/object/${S.obj}/edge_preview/${f}?${q}`, f);
@@ -2409,7 +2420,7 @@
       }
     }
     const info = $('ePvInfo');
-    const desc = p.px ? `na zewnątrz ≥ ${p.o} px, w rdzeń ≥ ${p.i} px (więcej, gdzie rozmycie)` : `pas automatyczny z rozmycia ×${p.b}, środek ${p.s} px`;
+    const desc = `na zewnątrz ${p.o} px, w rdzeń ${p.i} px (punkty pasa kształtują go wzdłuż obrysu)`;
     if (info) info.textContent = `F${f}: ${desc} – przerywane = krawędzie pasa (między nimi decyduje MatAnyone2), cienkie = koniec wtopień`;
     return '';   // no banner: the lines say it (one band system, 2026-10-22)
   }
@@ -2466,8 +2477,10 @@
     const cur = keep != null ? keep : sel.value;
     let html = placeholder ? `<option value="">${esc(placeholder)}</option>` : '';
     for (const m of maskSources().filter((x) => keys.includes(x.k))) {
-      const has = avail ? avail(m.k) : (m.k === 'core' && value === 'stage') || !!m.run;
-      const v = value === 'run' ? m.run : m.k;
+      // Eksperymenty: the computed mask 1+2 is pickable before it exists as a version (made on pick, POST core_base)
+      const coreLazy = value === 'run' && m.k === 'core' && !m.run && !avail && stageState('core').state === 'done';
+      const has = avail ? avail(m.k) : (m.k === 'core' && value === 'stage') || !!m.run || coreLazy;
+      const v = value === 'run' ? (m.run || (coreLazy ? 'core_base' : '')) : m.k;
       const off = !has || !v;
       const dis = off && !(v && v === cur);
       html += `<option value="${esc(v || `none:${m.k}`)}"${dis ? ' disabled' : ''}${off ? ` title="${esc(mm[m.k] || m.todo)}"` : ''}>`
@@ -2544,10 +2557,10 @@
         <option value="steer">Izoluj + rozmyj tło</option></select></label>
       <label title="Dłuższy bok obrazu dla LTX-2.5 (tylko w dół; potem dopełnienie do wielokrotności 32, krótszy bok ≤ 1088). Więcej = więcej detalu, więcej VRAM / czasu">Rozdzielczość LTX-2.5<select id="lx6Side" class="form-input" title="Dłuższy bok obrazu dla LTX-2.5"><option value="768">768 px</option><option value="1024">1024 px</option><option value="1280">1280 px</option><option value="1536">1536 px</option><option value="1920">1920 px</option></select></label>
       <label title="Klatki w jednej paczce modelu (8k+1, maks. 145 – dłuższe paczki: model wpuszcza RGB do maski). Paczki zachodzą na siebie 8 klatek z przenikaniem. Dłuższa = stabilniej w czasie, więcej pamięci">Długość paczki<select id="lx6Frames" class="form-input" title="Klatki w jednej paczce modelu (8k+1)"><option value="25">25 kl.</option><option value="49">49 kl.</option><option value="73">73 kl.</option><option value="97">97 kl.</option><option value="121">121 kl.</option></select></label>
-      <label title="Jak wynik modelu staje się alfą obiektu. Region = tylko w masce 1+2 poszerzonej o margines (inne rzeczy, które model uznał za pierwszy plan, odpadają). + wnętrze = dodatkowo pełne wnętrze z maski 1+2 (dziury modelu w obiekcie zamknięte). Surowy = wynik modelu bez zmian (diagnostyka)">Wynik<select id="lx6Combine" class="form-input" title="Jak wynik modelu staje się alfą obiektu"><option value="region">region maski 1+2</option><option value="max_core">region + wnętrze z maski 1+2</option><option value="raw">surowy (bez ograniczenia)</option><option value="band">pas (jeden system: wtopienia w rdzeń, punkty)</option></select></label>        <label class="edge-px" title="O ile px poza maskę alfa LTX-2.5 może wyjść (włosy, rozmycie ruchu); dalej = 0. Suwak 0–120, w polu do 400">Pas na zewnątrz <input id="lx6RegionS" type="range" min="0" max="120" step="1" title="Pas na zewnątrz maski (px) – podgląd na żywo, zapis po puszczeniu"><input id="lx6Region" type="number" min="0" max="400" step="1" class="form-input edge-num" title="Pas na zewnątrz maski (px)"> px</label>
-        <label class="edge-px" title="Miękkie przejście na końcu pasa na zewnątrz (px)">Miękkość <input id="lx6SoftS" type="range" min="0" max="40" step="1" title="Miękkość końca pasa (px)"><input id="lx6Soft" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Miękkość końca pasa (px)"> px</label>
-        <label class="edge-px" title="Wynik „+ wnętrze”: maska zwężona o tyle px jest wymuszona na 1 (dziury LTX-2.5 w obiekcie zamknięte); bliżej krawędzi decyduje LTX-2.5">Wcięcie w rdzeń <input id="lx6ErodeS" type="range" min="0" max="40" step="1" title="Wcięcie w rdzeń (px), wynik „+ wnętrze”"><input id="lx6Erode" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wcięcie w rdzeń (px)"> px</label>
-        <label class="edge-px lx-band-only" title="Wynik „pas”: na ilu px od wewnętrznej krawędzi pasa rdzeń przechodzi w wynik LTX-2.5 (cieńsza przerywana linia). „Miękkość” = wtopienie od zewnętrznej krawędzi w rdzeń (czerń); nie nachodzą na siebie">Wtopienie wcięcia <input id="lx6FeatherS" type="range" min="0" max="40" step="1" title="Wtopienie wcięcia (px)"><input id="lx6Feather" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wtopienie wcięcia (px)"> px</label>
+      <label title="Jak wynik modelu staje się alfą obiektu. Pas = ten sam pas co w etapach 3 / 4 / 5 (suwaki, punkty pasa, wtopienia w rdzeń): LTX-2.5 decyduje tylko w pasie, środek = maska 1+2. Surowy = bez pasa – model sam decyduje, co wycina">Wynik<select id="lx6Combine" class="form-input" title="Jak wynik modelu staje się alfą obiektu"><option value="band">pas (jak w etapach 3 / 4 / 5)</option><option value="raw">surowy (bez pasa – decyduje model)</option></select></label>        ${bandRow('out', 'LTX-2.5', 'lx6RegionS', 'lx6Region', 'lx-band-only')}
+        ${bandRow('in', 'LTX-2.5', 'lx6ErodeS', 'lx6Erode', 'lx-band-only')}
+        ${bandRow('feather', 'LTX-2.5', 'lx6FeatherS', 'lx6Feather', 'lx-band-only')}
+        ${bandRow('outFeather', 'LTX-2.5', 'lx6SoftS', 'lx6Soft', 'lx-band-only')}
         <div class="vm-band-pts lx-band-only"><div class="band-mode" id="lxBandMode"></div><span class="muted pp-hint" id="lxBandInfo"></span>
           <button type="button" class="btn btn-ghost btn-xs" id="lxBandClear" title="Usuń wszystkie punkty bieżącej klatki kluczowej pasa (= usuń klatkę kluczową)">🗑 Usuń wszystkie punkty (ta klatka)</button>
           <label title="Punkty pasa z innego etapu (np. strefy „cały obrys” etapu 5) zastępują punkty tego pasa – szerokości takie, jak tam widać">Kopiuj punkty pasa z <select id="lxBandSrc" class="form-input" title="Skąd skopiować punkty pasa"></select></label>
@@ -2580,8 +2593,8 @@
   // the palette values (also while dragging, before they are saved)
   function ltxPvParams() {
     const n = (id, d) => { const v = +$(id).value; return isFinite(v) && $(id).value !== '' ? Math.max(0, v) : d; };
-    return { region_px: n('lx6Region', 24), region_soft_px: n('lx6Soft', 12), core_erode_px: Math.round(n('lx6Erode', 4)),
-             combine: $('lx6Combine').value, mask_source: $('lx6Mask').value, feather_px: n('lx6Feather', 0) };
+    return { region_px: n('lx6Region', 40), region_soft_px: n('lx6Soft', 8), core_erode_px: Math.round(n('lx6Erode', 2)),
+             combine: $('lx6Combine').value, mask_source: $('lx6Mask').value, feather_px: n('lx6Feather', 8) };
   }
   const ltxQuery = (p) => Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
   function ltxAlphaOverlay(f) {   // the live re-limited LTX matte of frame f (Image), 'missing' or null (loading)
@@ -2596,20 +2609,19 @@
     const al = bandsOnly || selMaskHidden() ? null : ltxAlphaOverlay(f);
     if (al && al !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.75; ctx.drawImage(tintCanvas(al, [60, 255, 90], `${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`), 0, 0, img.width, img.height); ctx.globalAlpha = pa; note = `Wynik LTX-2.5 ${S.ltx.run} z bieżącymi suwakami (zielone)`; }
     if (ltxPvGet('band', true) || S.pvDrag === 'ltx') {
-      // band mode = the one band system (2026-10-22): dashed band edges + thin feather-end lines, no fill
-      // the other result modes (region / + interior / raw): the edges of the server's result area, dashed too (2026-10-23)
+      // the one band of every stage (2026-10-24): dashed band edges + thin feather-end lines, no fill, nothing while
+      // the lines load (as stages 3 / 4 / 5); „surowy” (raw) has no band – nothing to draw (the model decides)
       const lp = { reach_px: p.region_px, inset_px: p.core_erode_px, feather_px: p.feather_px, outer_feather_px: p.region_soft_px };
-      if (!(p.combine === 'band' && window.MD_BANDPTS && window.MD_BANDPTS.ready && window.MD_BANDPTS.drawLines(ctx, img, f, lp, { live: S.pvDrag === 'ltx' }))) {
-        const key = `${S.obj}_ltxb_${q}_${f}`;
-        const ov = settledOverlay(key, `/api/object/${S.obj}/ltx_preview/${f}?what=band&${q}`, f);
-        drawBand(ctx, img, 'ltx', q, ov, key);
+      if (p.combine !== 'raw' && window.MD_BANDPTS && window.MD_BANDPTS.ready
+          && !window.MD_BANDPTS.drawLines(ctx, img, f, lp, { live: S.pvDrag === 'ltx' })) {
+        note = note || window.MD_BANDPTS.lineNote(f, lp) || `Podgląd pasa F${f}: ładuję linie pasa…`;
       }
     }
     const info = $('lxPvInfo');
     if (info) info.textContent = `F${f}: pas na zewnątrz ${p.region_px} px, wcięcie ${p.core_erode_px} px, maska: ${{ core: '1+2', matanyone: 'MatAnyone2', vitmatte: 'ViTMatte' }[p.mask_source]}`;
     return note;
   }
-  // ---- palette „VideoMaMa” (stage between MatAnyone and ViTMatte, 2026-10-16): base, reach / protect in px with a live
+  // ---- palette „VideoMaMa” (stage between MatAnyone and ViTMatte, 2026-10-16): base, the band sliders with a live
   // band preview and – when a VideoMaMa version exists – its raw matte put over the base live (no model run)
   function vmmPaletteHtml() {
     return `<div class="pts-palette vmm-palette" id="vmmPalette" style="display:none">
@@ -2621,10 +2633,10 @@
       <div class="band-seed" id="vmBandSeed"></div>
       <div class="muted pp-hint" id="vmPvInfo"></div>
       <div class="pp-sec">
-        <label class="edge-px" title="Jak daleko od krawędzi bazy VideoMaMa może dokładać (kosmyki, odstające włosy); dalej zostaje baza – wysepki w tle odcięte. Suwak 0–120, w polu do 400">Pas na zewnątrz <input id="vmReachS" type="range" min="0" max="120" step="1" title="Zasięg od krawędzi bazy (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmReach" type="number" min="0" max="400" step="1" class="form-input edge-num" title="Zasięg od krawędzi bazy (px)"> px</label>
-        <label class="edge-px" title="Ile px w głąb bazy VideoMaMa ZASTĘPUJE bazę (wewnętrzna przerywana linia pasa); dalej w środku zostaje baza. 0 = VideoMaMa tylko od krawędzi bazy na zewnątrz. Suwak 0–30, w polu do 200">Wcięcie w rdzeń <input id="vmInsetS" type="range" min="0" max="30" step="1" title="Wcięcie w rdzeń (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmInset" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wcięcie w rdzeń (px)"> px</label>
-        <label class="edge-px" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa wynik VideoMaMa przechodzi w rdzeń (bazę; zwykle czerń) – cieńsza przerywana linia na podglądzie. Nie nachodzi na wtopienie wcięcia. 0 = twarde cięcie">Wtopienie krawędzi zewn. <input id="vmOuterFeatherS" type="range" min="0" max="80" step="1" title="Wtopienie krawędzi zewnętrznej (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmOuterFeather" type="number" min="0" max="200" step="1" class="form-input edge-num" title="Wtopienie krawędzi zewnętrznej (px)"> px</label>
-        <label class="edge-px" title="Na ilu px wynik VideoMaMa przenika się z głębszą bazą na wewnętrznym brzegu pasa. 0 = twarde przejście">Wtopienie wcięcia <input id="vmFeatherS" type="range" min="0" max="24" step="1" title="Wtopienie wcięcia (px) – podgląd na żywo, zapis po puszczeniu"><input id="vmFeather" type="number" min="0" max="64" step="1" class="form-input edge-num" title="Wtopienie wcięcia (px)"> px</label>
+        ${bandRow('out', 'VideoMaMa', 'vmReachS', 'vmReach')}
+        ${bandRow('in', 'VideoMaMa', 'vmInsetS', 'vmInset')}
+        ${bandRow('feather', 'VideoMaMa', 'vmFeatherS', 'vmFeather')}
+        ${bandRow('outFeather', 'VideoMaMa', 'vmOuterFeatherS', 'vmOuterFeather')}
       </div>
       <div class="pp-sec vm-band-pts"><div class="band-mode" id="vmBandMode"></div><span class="muted pp-hint" id="vmBandInfo"></span>
         <button type="button" class="btn btn-ghost btn-xs" id="vmBandClear" title="Usuń wszystkie punkty bieżącej klatki kluczowej pasa (= usuń klatkę kluczową)">🗑 Usuń wszystkie punkty (ta klatka)</button>
@@ -2660,8 +2672,8 @@
     const n = (id, d) => { const v = +$(id).value; return isFinite(v) && $(id).value !== '' ? Math.max(0, v) : d; };
     // the unified sliders: inset / feather are sent (and saved) as soon as they exist in the palette – an object never
     // touched still shows inset 0, feather 0, which for the mask 1+2 base is the former composition exactly
-    return { base: $('vmBase').value, reach_px: n('vmReach', 40), inset_px: n('vmInset', 0), feather_px: n('vmFeather', 0),
-             outer_feather_px: n('vmOuterFeather', 0) };
+    return { base: $('vmBase').value, reach_px: n('vmReach', 40), inset_px: n('vmInset', 2), feather_px: n('vmFeather', 8),
+             outer_feather_px: n('vmOuterFeather', 8) };
   }
   const vmmQuery = (p) => Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
   function drawVmmPreview(ctx, img, f, bandsOnly = false) {
@@ -2740,66 +2752,18 @@
   async function vmmSetting(body) {
     if (!S.obj) return;
     await api('PUT', `/api/object/${S.obj}/videomama`, body);
-    await loadStages(); await loadVmm();
+    await loadStages(); await reloadBandPalettes();
   }
-  // ---- „Motion blur alfy” (user decision 2026-10-16): MatAnyone2 does not reproduce the motion blur (4-5 px ramp on a
-  // 12-17 px plate blur), so it is added on a version: vector blur of the alpha along the object's own motion (plate flow
-  // x shutter x strength). Floating palette in stages MatAnyone / ViTMatte / Eksperymenty, on the version of that stage
-  // (stage 3: its MatAnyone result, stage 4: its ViTMatte result – separately), preview of this frame, „Zastosuj” = new
-  // version (a stage's result stays that stage's result, so ViTMatte on the MatAnyone base then reads the blurred one).
-  function mbPaletteHtml() {
-    return `<div class="pts-palette mb-palette" id="mbPalette" style="display:none">
-      <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> Motion blur alfy</div>
-      <div class="muted pp-hint" id="mbBase"></div>
-      <label class="chk" title="Podgląd tej klatki: wersja etapu z dodanym rozmyciem ruchu (liczone na żywo, nic nie zapisuje). Wyłącz, żeby zobaczyć wersję bez rozmycia"><input type="checkbox" id="mbPv"> 👁 podgląd (ta klatka)</label>
-      <div class="pp-sec">
-        <label title="Siła rozmycia: mnożnik długości rozmycia (ruch obiektu z przepływu × shutter / 360°); 1 = fizycznie, 0 = bez zmian. Suwak 0–2×, w polu dowolna wartość (do 10×). Rozmycie tylko tam, gdzie obiekt się rusza (krótsze niż 1 px = bez zmian)">Siła: <input id="mbStrN" type="number" class="form-input edge-num" min="0" max="10" step="0.1" value="1" title="Dowolna wartość 0–10× – wpisz i Enter">×<input id="mbStr" type="range" min="0" max="2" step="0.05" value="1"></label>
-        <label title="Kąt migawki (shutter, stopnie): jaka część klatki naświetla ruch – 180° = pół klatki (typowo), 360° = cała klatka, 90° = ćwierć. Domyślnie z manifestu ujęcia (shutter_deg). Długość rozmycia = ruch na klatkę × shutter / 360° × siła">Shutter: <input id="mbShutN" type="number" class="form-input edge-num" min="0" max="720" step="5" value="180" title="Kąt migawki w stopniach (0–720) – wpisz i Enter">°<input id="mbShut" type="range" min="0" max="360" step="5" value="180"></label>
-        <button type="button" class="btn btn-ghost btn-xs" id="mbShutReset" title="Shutter z manifestu ujęcia">↺ shutter z manifestu</button>
-      </div>
-      <div class="muted pp-hint" id="mbInfo"></div>
-      <div class="pp-btns"><button type="button" class="btn btn-primary btn-sm" id="mbApply" title="Rozmycie ruchu we wszystkich klatkach wersji → nowa wersja (stara zostaje na liście wersji). Wynik etapu zostaje wynikiem etapu">✔ Zastosuj motion blur</button></div>
-    </div>`;
+  // ONE refresh of every band palette (user report 2026-10-24: a VideoMaMa slider moved the shared band, the stage-3
+  // palette kept its old values): the band is the object's (engine/objband.BandSettings), so after a slider / mode
+  // change made ANYWHERE stages 3 / 4 / 7 read their values again and so does the zone card of stage 5 (`zones` = false
+  // when the zone panel itself made the change – it already shows the answer).
+  async function reloadBandPalettes({ zones = true } = {}) {
+    if (!S.obj) return;
+    await Promise.all([loadEdge().catch(() => {}), loadVmm().catch(() => {}), loadLtx().catch(() => {})]);
+    if (zones && S.stage === ST.VITMATTE) await loadZones().catch(() => {});
   }
-  const mbPos = {
-    get: () => { try { return JSON.parse(localStorage.getItem('md_mb_palette') || 'null'); } catch (e) { return null; } },
-    set: (p) => { try { if (p) localStorage.setItem('md_mb_palette', JSON.stringify(p)); else localStorage.removeItem('md_mb_palette'); } catch (e) { /* storage blocked */ } },
-  };
-  const mbStage = () => S.stage === ST.MATANYONE || S.stage === ST.VITMATTE || S.stage === ST.EXPERIMENTS;
-  function mbBase() {   // the version the palette works on: the result of the current stage
-    const sr = (S.info && S.info.stage_runs) || {};
-    if (S.stage === ST.MATANYONE) return sr.matanyone || '';
-    if (S.stage === ST.VITMATTE) return vmRunFor(vmEngine());   // the engine's version shown in the HUD (2026-10-22)
-    return S.viewRun || S.activeRun || '';
-  }
-  const mbStrength = () => { const v = +$('mbStrN').value; return isFinite(v) && v >= 0 ? Math.min(10, v) : 1; };
-  const mbShutterManifest = () => { const m = V() && V().manifest; const v = m ? +m.shutter_deg : NaN; return isFinite(v) && v > 0 ? v : 180; };
-  const mbShutter = () => { const v = +$('mbShutN').value; return isFinite(v) && v >= 0 ? Math.min(720, v) : mbShutterManifest(); };
-  const mbPreviewOn = () => !!(S.mbPv && mbStage() && S.obj && !S.auxMode && mbBase());
-  function renderMbPalette() {
-    const box = $('mbPalette'); const w = $('canvasWrapper'); if (!box || !w) return;
-    const show = mbStage() && !!S.obj && !S.auxMode && !!(V() && V().projectLoaded);
-    box.style.display = show ? '' : 'none';
-    if (!show) return;
-    const base = mbBase();
-    const what = S.stage === ST.MATANYONE ? `wynik MatAnyone2 (etap ${ST.MATANYONE})` : S.stage === ST.VITMATTE ? `wynik ViTMatte (etap ${ST.VITMATTE})` : 'oglądana / aktywna wersja';
-    const r = (S.runs || []).find((x) => x.run === base);
-    $('mbBase').textContent = base ? `Na: ${base} – ${what}${r && r.motion_blur ? ` (ma już motion blur ×${r.motion_blur.strength})` : ''}`
-      : `Brak wersji – najpierw ${S.stage === ST.VITMATTE ? '„Zastosuj na ujęcie” (ViTMatte)' : '„▶ Przelicz MatAnyone2”'}`;
-    $('mbPv').checked = !!S.mbPv; $('mbPv').disabled = !base;
-    if (S.mbShutFor !== S.obj + '|' + mbShutterManifest()) {   // a new project / object: the manifest's shutter
-      S.mbShutFor = S.obj + '|' + mbShutterManifest();
-      $('mbShutN').value = mbShutterManifest(); $('mbShut').value = mbShutterManifest();
-    }
-    $('mbApply').disabled = !base || document.body.classList.contains('job-busy') || mbStrength() <= 0 || mbShutter() <= 0;
-    if (!S.mbPv) $('mbInfo').textContent = '';
-    placeFloating(box, w, mbPos.get());
-  }
-  function mbOverlay(f) {   // Image | 'missing' | null – the preview alpha of frame f (same format as view=alpha)
-    const base = mbBase(), s = mbStrength(), sh = mbShutter();
-    return settledOverlay(`${S.obj}_mb@${base}x${s}s${sh}_${f}`, `/api/object/${S.obj}/motion_blur/${f}?v=${encodeURIComponent(base)}&strength=${s}&shutter=${sh}`, f);
-  }
-
+  const BAND_SLIDER_KEYS3 = ['band_out_px', 'band_in_px', 'band_in_feather_px', 'band_out_feather_px'];   // stage 3's names of the four sliders
   function buildPanes() {
     const host = $('stagePanel');
     const add = (n, html, hooks) => { const e = el(html); e.style.display = 'none'; host.appendChild(e); PANES[n] = { el: e, ...hooks }; };
@@ -2819,7 +2783,7 @@
         <div class="muted">Narzędzia na pływającej palecie: <b class="ok">Punkt + (G)</b> – dodaj to, co wskazujesz, albo <b class="err">Punkt − (R)</b> – odejmij – bez narzędzia klik niczego nie dodaje (przeciąganie = przesuwanie). PPM = odwrotny znak, Alt (przytrzymaj) = łapka, klik na punkt = usuń, Esc = wyłącz narzędzie. Prompt (opcjonalny) to baza maski. Postaw punkty, potem <b>„▶ Przelicz klatkę” (Enter)</b> – SAM 3.1 liczy maskę i zapisuje ją jako klucz tej klatki (różowa nakładka). Punkty jeszcze nieprzeliczone są pomarańczowe. „✕ Wyczyść punkty” + „Przelicz klatkę” usuwa klucz. Te same przyciski i pole promptu są na pływającej palecie.</div>
         <div id="st1PtsInfo"></div>
         <div class="row"><button class="btn btn-primary btn-sm" id="st1PtsRedo" title="Policz maskę tej klatki: prompt (baza) + punkty + (dodaj) − punkty − (odejmij); zapis jako klucz (Enter)">▶ Przelicz klatkę</button><button class="btn btn-secondary btn-sm" id="st1PtsClear" title="Usuń wszystkie punkty tej klatki (klucz zniknie po „Przelicz”)">✕ Wyczyść punkty</button></div>
-        <div class="row"><button class="btn btn-primary" id="st1All" title="Kadry (automatycznie, gdy trzeba) + rdzeń SAM 3.1 na całym ujęciu – maska w każdej klatce. Po zmianie kluczy liczy tylko zmienione przedziały">▶▶ Przelicz całość</button>
+        <div class="row"><button class="btn btn-primary" id="st1All" title="Liczy tylko to, co nieaktualne po ostatnim przeliczeniu: odcinki ze zmienionymi kluczami (reszta z cache). Za pierwszym razem – całe ujęcie (kadry automatycznie, gdy trzeba + rdzeń SAM 3.1)">▶▶ Przelicz nieaktualne</button>
           <button class="btn btn-secondary" id="st3Rerun" title="Przelicza tylko przedziały zmienione przez klucze">↻ Przelicz zmienione przedziały</button></div>
       </div>
       <div class="pane-section">
@@ -2828,9 +2792,9 @@
         <div class="row"><button class="btn btn-secondary" id="st3KeySave" title="Zapisz bieżące kreski / wielokąty jako klucz SAM 3.1 tej klatki (zwykle zapisuje się samo)">🔑 Zapisz klucz (ta klatka)</button><button class="btn btn-ghost" id="st3KeyDel" title="Usuwa klucz bieżącej klatki (Ctrl+Z cofa)">🗑 Usuń klucz</button></div>
       </div>
       <div class="pane-section"><div id="st1Keys" class="muted"></div></div>
-      <details class="pane-section" id="st1CropsBox"><summary title="Kadry pod obiekt dla SAM 3.1 – liczone same przez „▶▶ Przelicz całość”; rozwinięcie pokazuje ramki na podglądzie (żółte)">Kadry SAM 3.1 (automatyczne)</summary>
-        <div class="muted">SAM 3.1 liczy maskę na obrazie <b>najwyżej 1008 px</b>; kadr przycięty pod obiekt daje mu dużo więcej szczegółu niż cała klatka 4K. „▶▶ Przelicz całość” liczy kadry sam, gdy ich brak albo klucz z nich wychodzi.</div>
-        <button class="btn btn-secondary btn-sm" id="st2Crops" title="Wyznacz kadry obiektu dla SAM 3.1 od nowa (zwykle niepotrzebne – robi to „▶▶ Przelicz całość”)">⬚ Kadruj od nowa</button>
+      <details class="pane-section" id="st1CropsBox"><summary title="Kadry pod obiekt dla SAM 3.1 – liczone same przez „▶▶ Przelicz nieaktualne”; rozwinięcie pokazuje ramki na podglądzie (żółte)">Kadry SAM 3.1 (automatyczne)</summary>
+        <div class="muted">SAM 3.1 liczy maskę na obrazie <b>najwyżej 1008 px</b>; kadr przycięty pod obiekt daje mu dużo więcej szczegółu niż cała klatka 4K. „▶▶ Przelicz nieaktualne” liczy kadry sam, gdy ich brak albo klucz z nich wychodzi.</div>
+        <button class="btn btn-secondary btn-sm" id="st2Crops" title="Wyznacz kadry obiektu dla SAM 3.1 od nowa (zwykle niepotrzebne – robi to „▶▶ Przelicz nieaktualne”)">⬚ Kadruj od nowa</button>
         <div id="st2List"></div></details>
       <div class="stage-status" id="st1Status2"></div>
       ${nextBtn(ST.SAM3)}
@@ -2976,7 +2940,6 @@
     // the shared edge settings live in a hidden holder until the first pane that shows them
     const cw = $('canvasWrapper');
     if (cw) { const pal = el(edgeSettingsHtml()); cw.appendChild(pal); makeFloating(pal, cw, '.pp-head', epPos); }
-    if (cw) { const mp = el(mbPaletteHtml()); cw.appendChild(mp); makeFloating(mp, cw, '.pp-head', mbPos); }
     if (cw) { const lp = el(ltxPaletteHtml()); cw.appendChild(lp); makeFloating(lp, cw, '.pp-head', ltxPos); }
     if (cw) { const vp = el(vmmPaletteHtml()); cw.appendChild(vp); makeFloating(vp, cw, '.pp-head', vmmPos); }
     if (cw) { const xp = el(expPaletteHtml()); cw.appendChild(xp); makeFloating(xp, cw, '.pp-head', expPos); }
@@ -3126,7 +3089,7 @@
     } else {
       html = `<b>${esc(d.what)}</b> nie jest policzony na ${esc(d.scope)}. Brakujące klatki:<ul>` +
         Object.entries(d.missing || {}).map(([n, l]) => `<li><b>${esc(n)}</b>: ${esc(iv(l))}</li>`).join('') + '</ul>' +
-        (d.what === 'Rdzeń' ? 'Policz rdzeń w tych klatkach: „▶▶ Przelicz całość” z zakresem pracy obejmującym je (Alt+X = całe ujęcie).'
+        (d.what === 'Rdzeń' ? 'Policz rdzeń w tych klatkach: „▶▶ Przelicz nieaktualne” z zakresem pracy obejmującym je (Alt+X = całe ujęcie).'
                             : 'Przelicz finalnie w tych klatkach (zakres pracy obejmujący je, Alt+X = całe ujęcie) albo wyeksportuj tylko „work area”. Nic nie zostało zapisane.');
     }
     V().uiDialog({ title: d.code === 'no_key_in_range' ? 'Brak klucza w zakresie pracy' : 'Brakujące klatki', tone: 'warn', html });
@@ -3163,7 +3126,7 @@
   async function ltxSetting(body) {
     if (!S.obj) return;
     await api('PUT', `/api/object/${S.obj}/ltx`, body);
-    await loadStages(); await loadLtx();
+    await loadStages(); await reloadBandPalettes();
   }
 
   async function run(btnId, fn) {
@@ -3181,7 +3144,7 @@
     invalidateFrame(f);
     status(`Klucz startowy (kandydat #${i}) zapisany w klatce ${f}.`, 'ok');
     await loadKeys(); await loadStages();
-    toast(`Klucz z kandydata zapisany – „▶▶ Przelicz całość” policzy maskę w każdej klatce`, 5000);
+    toast(`Klucz z kandydata zapisany – „▶▶ Przelicz nieaktualne” policzy maskę w każdej klatce`, 5000);
   }
   function candAt(e) {   // index of the candidate box under the cursor (smallest box wins), -1 = none
     const v = V(); const img = v.getCurrentImage(); const ps = plateSize();
@@ -3274,35 +3237,16 @@
     // no interval-engine choice in stage 1 (user decision 2026-10-16): CoTracker3 is stage 2; the API (/interval_engine) stays for agents
 
     // stage 4
-    const setting = (body) => api('PUT', `/api/object/${S.obj}/settings`, body).then(() => { status('Ustawienie zmienione – „Przelicz finalnie” zrobi nową wersję', 'ok'); loadStages(); }).catch((e) => status(`Błąd: ${e.message}`, 'err'));
+    const setting = (body) => api('PUT', `/api/object/${S.obj}/settings`, body).then(() => {
+      status('Ustawienie zmienione – „Przelicz finalnie” zrobi nową wersję', 'ok'); loadStages();
+      if (Object.keys(body).some((k) => BAND_SLIDER_KEYS3.includes(k))) reloadBandPalettes().catch(() => {});   // the shared band: stages 4 / 7 too
+    }).catch((e) => status(`Błąd: ${e.message}`, 'err'));
     $('st4Edge').addEventListener('change', (e) => run('st4Final', async () => {
       await api('PUT', `/api/object/${S.obj}/edge_mode`, { mode: e.target.value }); await loadEdge();
       status('Tryb krawędzi zmieniony – „Przelicz finalnie” zrobi nową wersję (A/B)', 'ok');
     }));
     const epvLive = () => { clearTimeout(S.epvTimer); S.epvTimer = setTimeout(() => { S.epvParams = edgePvParams(); V().render(); }, 250); };
-    const mbLive = () => { clearTimeout(S.mbTimer); S.mbTimer = setTimeout(() => { renderMbPalette(); V().render(); }, 250); };
-    $('mbPv').addEventListener('change', () => {
-      S.mbPv = $('mbPv').checked;
-      if (S.mbPv && S.view !== 'alpha' && S.view !== 'comp') setView('alpha');
-      if (S.mbPv && S.edgePv) { S.edgePv = false; renderEdgePalette(); }   // the band preview would cover it
-      renderMbPalette(); V().render();
-    });
-    $('mbStr').addEventListener('input', () => { $('mbStrN').value = $('mbStr').value; mbLive(); });
-    $('mbStrN').addEventListener('input', () => { $('mbStr').value = $('mbStrN').value; mbLive(); });
-    $('mbShut').addEventListener('input', () => { $('mbShutN').value = $('mbShut').value; mbLive(); });
-    $('mbShutN').addEventListener('input', () => { $('mbShut').value = $('mbShutN').value; mbLive(); });
-    $('mbShutReset').addEventListener('click', () => { $('mbShutN').value = mbShutterManifest(); $('mbShut').value = mbShutterManifest(); mbLive(); });
-    $('mbApply').addEventListener('click', () => run('mbApply', async () => {
-      const base = mbBase(), s = mbStrength(), sh = mbShutter();
-      status(`Motion blur alfy ×${s}, shutter ${sh}° na ${base} (wszystkie klatki → nowa wersja)…`);
-      const d = await api('POST', `/api/object/${S.obj}/motion_blur`, { run: base, strength: s, shutter_deg: sh });
-      S.mbPv = false;   // the new version has the blur: the preview would add it twice
-      clearOverlays(); await refreshList(S.obj); await loadStages(); setView('alpha');
-      const st = (d.motion_blur.stages || []).length ? ` – wynik etapu: ${d.motion_blur.stages.join(', ')}` : '';
-      status(`Wersja ${d.run}: ${base} + motion blur ×${s}, shutter ${sh}° (najdłuższe rozmycie ${d.motion_blur.longest_px} px)${st}`, 'ok');
-      loadRuns().catch(() => {}); renderStageInfo(); renderMbPalette();
-    }));
-    $('ePv').addEventListener('change', () => { S.edgePv = $('ePv').checked; if (S.edgePv && S.mbPv) { S.mbPv = false; renderMbPalette(); } S.epvParams = edgePvParams(); renderEdgePalette(); V().render(); });
+    $('ePv').addEventListener('change', () => { S.edgePv = $('ePv').checked; S.epvParams = edgePvParams(); renderEdgePalette(); V().render(); });
     $('epStagePv').addEventListener('click', () => stagePreview('matanyone', 'epStagePv'));
     $('vmStagePv').addEventListener('click', () => stagePreview('videomama', 'vmStagePv'));
     $('epCompute').addEventListener('click', () => {
@@ -3313,8 +3257,11 @@
     });
     // slider = shortcut, number field = the value (any, typed for experiments – user request 2026-10-16)
     // px sliders: moving one switches a legacy object (×scale / shift) to the px mode – scale 1, no shift, both px saved
-    const pxSave = () => setting({ band_out_px: Math.max(0, +$('o4OutV').value || 0), band_in_px: Math.max(0, +$('o4InV').value || 0),
-                                   ...(S.edgeLegacy ? { band_scale: 1, shift_px: 0 } : {}) });
+    const pxSave = () => {
+      const out = Math.max(0, +$('o4OutV').value || 0), inn = Math.max(0, +$('o4InV').value || 0);
+      const o = S.objects.find((x) => x.name === S.obj); if (o) { o.band_out_px = out; o.band_in_px = inn; }   // the live scale's reference
+      return setting({ band_out_px: out, band_in_px: inn });
+    };
     // band preview while a slider is held (user request 2026-10-17): with the preview switched off, grabbing an edge
     // slider shows the band until it is released; then the preview is back to what was set (on / off)
     const pvHold = (key, ids) => ids.forEach((id) => {
@@ -3330,9 +3277,9 @@
     pvHold('vmm', ['vmReachS', 'vmReach', 'vmInsetS', 'vmInset', 'vmFeatherS', 'vmFeather', 'vmOuterFeatherS', 'vmOuterFeather']);
     pvHold('ltx', ['lx6RegionS', 'lx6Region', 'lx6SoftS', 'lx6Soft', 'lx6ErodeS', 'lx6Erode', 'lx6FeatherS', 'lx6Feather']);
     for (const id of ['o4Out', 'o4In']) {
-      $(id).addEventListener('input', () => { $(`${id}V`).value = $(id).value; S.edgePxTouched = true; epvLive(); });
+      $(id).addEventListener('input', () => { $(`${id}V`).value = $(id).value; epvLive(); });
       $(id).addEventListener('change', pxSave);
-      $(`${id}V`).addEventListener('input', () => { $(id).value = $(`${id}V`).value; S.edgePxTouched = true; epvLive(); });
+      $(`${id}V`).addEventListener('input', () => { $(id).value = $(`${id}V`).value; epvLive(); });
       $(`${id}V`).addEventListener('change', () => { const v = $(`${id}V`).value; if (v !== '' && isFinite(+v) && +v >= 0) pxSave(); });
     }
     {   // outer edge feather (one band system, 2026-10-22): from the outer band edge into the core
@@ -3387,6 +3334,10 @@
     $('lx6Combine').addEventListener('change', (e) => { S.ltxPv = null; ltxSetting({ combine: e.target.value }).catch((er) => status(`Błąd: ${er.message}`, 'err')); });
     $('exBase').addEventListener('change', () => run('exBase', async () => {
       S.exRun = $('exBase').value || null; S.edgeFix = null;
+      if (S.exRun === 'core_base') {   // mask 1+2 not yet a version: write it (reused while current), then use its id
+        const d = await api('POST', `/api/object/${S.obj}/core_base`);
+        S.exRun = d.run; await loadStages(); await loadRuns();
+      }
       if (!S.exRun) { await loadQA(); renderExpPalette(); return; }
       showRun(S.exRun);
       await expAnalyze();   // measured once per version, then only the thresholds
@@ -3445,8 +3396,9 @@
     const vmmSave = (body) => vmmSetting(body).catch((er) => status(`Błąd: ${er.message}`, 'err'));
     $('vmBase').addEventListener('change', (e) => { vmmLive(); vmmSave({ base: e.target.value }); });
     // saving one of them saves the three together (inset_px present = the unified composition)
-    const vmmEdgeSave = () => vmmSave({ reach_px: +$('vmReach').value || 0, inset_px: +$('vmInset').value || 0, feather_px: +$('vmFeather').value || 0,
-                                        outer_feather_px: +$('vmOuterFeather').value || 0 });
+    const vmmEdgeSave = () => { if (!S.vmm) return;   // the palette not filled yet (loadVmm): empty fields would save zeros to the shared band
+      vmmSave({ reach_px: +$('vmReach').value || 0, inset_px: +$('vmInset').value || 0, feather_px: +$('vmFeather').value || 0,
+                outer_feather_px: +$('vmOuterFeather').value || 0 }); };
     // the whiskers of the band points scale with „Pas na zewnątrz” / „Wcięcie w rdzeń” while dragging (as stage 5)
     const vmmBandLive = () => { const s0 = (S.vmm && S.vmm.settings) || {}; if (window.MD_BANDPTS) window.MD_BANDPTS.setLive(+s0.reach_px || 0, +s0.inset_px || 0, +$('vmReach').value || 0, +$('vmInset').value || 0); };
     for (const id of ['vmReach', 'vmInset', 'vmFeather', 'vmOuterFeather']) {
@@ -3602,7 +3554,7 @@
     if ($('hudMaskAlt')) $('hudMaskAlt').addEventListener('click', (e) => {   // stage 5: the other engine's mask (2026-10-22)
       const eng = e.currentTarget.dataset.eng; if (!eng) return;
       S.vmPick = eng === ((S.info && S.info.edge_engine) || 'vitmatte') ? null : eng;
-      updateMaskHud(V().currentFrame); renderMbPalette(); V().render();
+      updateMaskHud(V().currentFrame); V().render();
     });
 
     // view tabs
@@ -3893,11 +3845,15 @@
     const hooks = { S, ST, api, el, esc, toast, status, run, invalidateFrame, clearOverlays, overlayFor, tintCanvas, putComp, compCanvas,
                     drawVarStroke, plateSize, loadStages, loadQA, setView, ensurePointsSaved, tileOverlays,
                     makeFloating, placeFloating, setTool, stageState, canvasToPlate, renderKeysLane, loadOverlay,
-                    reloadStageBand: async () => {
+                    reloadStageBand: async () => {   // a band edit / mode change: every band palette again (the shared band, 2026-10-24)
                       await loadStages();
-                      if (S.stage === ST.VIDEOMAMA) await loadVmm(); else if (S.stage === ST.LTX) await loadLtx();
-                      else { S.epvParams = null; await fillBandSources('ep'); }
-                    } };
+                      S.epvParams = null;
+                      await reloadBandPalettes({ zones: false });   // the zone panel reloads itself (MD_ZONES.reloadBand)
+                    },
+                    reloadBandPalettes,
+                    // stage 5: the active whole-outline zone's band („zone:<id>”) – static/bandpoints.js edits it (2026-10-24)
+                    zoneBand: () => (window.MD_ZONES && window.MD_ZONES.activeBandKey ? window.MD_ZONES.activeBandKey() : null),
+                    updateDelKey: () => updateDelKeyBtn() };
     if (window.MD_ZONES) window.MD_ZONES.init(hooks);
     if (window.MD_BANDPTS) window.MD_BANDPTS.init(hooks);
     if (window.MD_BRUSH) window.MD_BRUSH.init(hooks);

@@ -198,18 +198,34 @@ def clamp_band_px(v: float) -> float:
     return float(min(BAND_PX_RANGE[1], max(BAND_PX_RANGE[0], float(v))))
 
 
-def band_px_limits(obj: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    """(out_px, in_px) when the object uses the px mode, else None."""
-    o, i = obj.get("band_out_px"), obj.get("band_in_px")
-    if o is None and i is None:
-        return None
-    return float(o or 0.0), float(i or 0.0)
+def edge_settings(obj: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The stage-3 MatAnyone2 band settings – an instance of the one band settings model (engine/objband.BandSettings,
+    user request 2026-10-24): `s["band"]` = objband.band_for(obj, "matanyone", overrides) (the shared object band unless
+    the stage is detached, unset = engine/bandsys.BAND_DEFAULTS, `overrides` = the palette's values not saved yet,
+    canonical or legacy names); the legacy keys {band_out_px, band_in_px, band_in_feather_px, band_out_feather_px,
+    band_points, band_ref_out, band_ref_in, band_owner} are its thin mapping for old readers."""
+    from engine.objband import band_for
+    b = band_for(obj, "matanyone", overrides=overrides)
+    return {**b.legacy(), "band": b}
+
+
+def band_px_limits(obj: Dict[str, Any]) -> Tuple[float, float]:
+    """(out_px, in_px) of the stage-3 band (edge_settings)."""
+    s = edge_settings(obj)
+    return s["band_out_px"], s["band_in_px"]
+
+
+def band_feathers(obj: Dict[str, Any]) -> Tuple[float, float]:
+    """(inset feather, outer feather) of the stage-3 band (edge_settings)."""
+    s = edge_settings(obj)
+    return s["band_in_feather_px"], s["band_out_feather_px"]
 
 
 def band_px(core: np.ndarray, width_map: np.ndarray, out_px: float, in_px: float) -> np.ndarray:
-    """Asymmetric band of the px mode: max(adaptive width, out_px) outside the edge, max(adaptive, in_px) inside."""
-    d = sdf(core)
-    return (d <= np.maximum(width_map, in_px)) & (d >= -np.maximum(width_map, out_px))
+    """Asymmetric band of the px mode: max(adaptive width, out_px) outside the edge, max(adaptive, in_px) inside
+    (engine/bandsys.band_area of the two width maps – the one band geometry, 2026-10-24)."""
+    from engine.bandsys import band_area
+    return band_area(sdf(core), np.maximum(width_map, out_px), np.maximum(width_map, in_px))
 
 
 def apply_shift(core: np.ndarray, disp: np.ndarray) -> np.ndarray:
@@ -324,7 +340,9 @@ def _smooth_along_contours(width: np.ndarray, pieces: Sequence[Tuple[int, int]],
 
 
 def adaptive_band(core: np.ndarray, width_map: np.ndarray) -> np.ndarray:
-    return np.abs(sdf(core)) <= width_map
+    """|SDF| <= the half-width map = engine/bandsys.band_area with the map on both sides (2026-10-24)."""
+    from engine.bandsys import band_area
+    return band_area(sdf(core), width_map, width_map)
 
 
 # ----------------------------------------------------------------------------- 3. flow consistency

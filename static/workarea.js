@@ -3,7 +3,7 @@
 // Work area on the timeline (zakres pracy, user request 2026-10-15) – like the AE / Nuke work area.
 // Two brackets [ ] on the timeline track, dragged with the mouse; Shift+B / Shift+N = start / end at the current frame,
 // Alt+X = the whole shot. Stored per shot in project.json -> work_area (PUT /api/project/work_area).
-// „▶▶ Przelicz całość”, „Przelicz finalnie” and the export "work area" compute only these frames.
+// „▶▶ Przelicz nieaktualne”, „Przelicz finalnie” and the export "work area" compute only these frames.
 (function () {
   'use strict';
   const V = () => window.viewer;
@@ -20,7 +20,7 @@
     const track = document.getElementById('timelineTrack');
     if (!track || W.els) return;
     const mk = (cls, title) => { const d = document.createElement('div'); d.className = cls; if (title) d.title = title; track.appendChild(d); return d; };
-    const tip = 'Zakres pracy (work area): przeciągnij [ / ] – „▶▶ Przelicz całość”, „Przelicz finalnie” i eksport „work area” liczą tylko te klatki. ' +
+    const tip = 'Zakres pracy (work area): przeciągnij [ / ] – „▶▶ Przelicz nieaktualne”, „Przelicz finalnie” i eksport „work area” liczą tylko te klatki. ' +
       'Shift+B = początek w bieżącej klatce, Shift+N = koniec, Alt+X = całe ujęcie; dwuklik na znaczniku = całe ujęcie';
     W.els = {
       dimL: mk('wa-dim'), dimR: mk('wa-dim'),

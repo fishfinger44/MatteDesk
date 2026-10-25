@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import zlib
 import re
 import threading
 import logging
@@ -2451,7 +2452,7 @@ def _sam3_preview_mask(name: str, frame: int, prompt: Optional[str], positive: L
     crops_p = store.dir(name) / "crops.json"
     seg = None
     # use_crops=False („▶ Przelicz klatkę” in stage Wykryj, user decision 2026-10-15): the object's crops come from
-    # „▶▶ Przelicz całość” – while the selection is being decided they must not restrict SAM3
+    # „▶▶ Przelicz nieaktualne” – while the selection is being decided they must not restrict SAM3
     if use_crops and crops_p.exists():
         segs = frame_segments(load_crops(crops_p), frame)
         seg = segs[0] if segs else None
@@ -2640,13 +2641,15 @@ def _pipeline():
     gain_dir = Path(STATE["work_dir"]) / "deflicker" / "gain_beauty"
     plate = m["plates"].get("beauty_clean") or m["plates"]["beauty"]   # exported _deflicker EXR, if chosen (4b pkt 1)
     gain = str(gain_dir / "gain_%04d.exr") if (not m["plates"].get("beauty_clean") and gain_dir.exists()) else None
-    return ObjectPipeline(Path(STATE["work_dir"]), plate, w, h,
+    pipe = ObjectPipeline(Path(STATE["work_dir"]), plate, w, h,
                           STATE.get("comfy_client") or ComfyClient.from_config(), display=_plate_display,
                           backlit_pattern=_backlit_pattern(), backlit_params=defaults.get("backlit", {}),
                           ltx_workflow=_ltx_workflow(), use_mplate=_mask_plate_denoise(),
                           gain_pattern=gain, frames=_shot_frames(), shutter_deg=float(m.get("shutter_deg", 180)),
                           cleanplate_pattern=m["plates"].get("cleanplate_align") or m["plates"].get("cleanplate") or None,
                           io_mode=_comfy_io_mode())
+    pipe.work_frames = _work_frames()   # the mask 1+2 of the band previews = the work-area batch (2026-10-24)
+    return pipe
 
 
 EDGE_MODES = ("auto", "backlit", "matanyone", "core", "ltx")
@@ -2663,8 +2666,11 @@ def edge_modes(name: str):
         items.append({"mode": "backlit", "label": "Backlit", "enabled": True})
     items += [{"mode": "matanyone", "label": "MatAnyone2", "enabled": True},
               {"mode": "core", "label": "Ostra (rdzeń)", "enabled": True}]
+    from engine.edge import band_feathers, band_px_limits
     return {"current": obj.get("edge_mode", "auto"), "auto": obj.get("edge_mode_auto"),
-            "reason": obj["tool"].get("edge_auto_reason", ""), "use_backlit": obj.get("use_backlit", True), "modes": items}
+            "reason": obj["tool"].get("edge_auto_reason", ""), "use_backlit": obj.get("use_backlit", True), "modes": items,
+            "band_px": list(band_px_limits(obj)),            # the band the stage uses (unset = BAND_DEFAULTS, 2026-10-24)
+            "band_feather_px": list(band_feathers(obj))}
 
 
 class EdgeModeRequest(BaseModel):
@@ -2732,7 +2738,7 @@ def _require_stage(name: str, stage: str) -> None:
 @app.get("/api/project/work_area")
 def get_work_area():
     """Work area (AE / Nuke style, user request 2026-10-15): `range` = [first, last] or None (whole shot), `shot`,
-    `effective` = the frames „▶▶ Przelicz całość”, „Przelicz finalnie” and the export "work area" compute."""
+    `effective` = the frames „▶▶ Przelicz nieaktualne”, „Przelicz finalnie” and the export "work area" compute."""
     if not STATE.get("work_dir"):
         raise HTTPException(status_code=400, detail="Brak otwartego projektu")
     wa = _work_area()
@@ -2937,9 +2943,9 @@ def _crops_needed(name: str) -> Optional[str]:
 
 
 @app.post("/api/object/{name}/compute_all")
-@long_job("Przelicz całość: {name}")
+@long_job("Przelicz nieaktualne: {name}")
 async def compute_all(name: str):
-    """„▶▶ Przelicz całość” (user decision 2026-10-15): crops only when missing or when a user key no longer fits its
+    """„▶▶ Przelicz nieaktualne” (user decision 2026-10-15): crops only when missing or when a user key no longer fits its
     crop, then the core on the whole shot (unchanged intervals from the cache) – the mask in every frame. Repeated
     after adding / removing keys it recomputes only the changed intervals."""
     _require_stage(name, "crops")
@@ -3017,7 +3023,7 @@ async def core_fix_object(name: str):
     cov = core_coverage(_objects().dir(name)) or []
     frames = [f for f in _shot_frames() if any(a <= f <= b for a, b in cov)]
     if not frames:
-        raise HTTPException(status_code=409, detail="Brak rdzenia – „▶▶ Przelicz całość” (etap 1)")
+        raise HTTPException(status_code=409, detail="Brak rdzenia – „▶▶ Przelicz nieaktualne” (etap 1)")
     pipe = _pipeline()
     cb = _ws_progress("object_progress", name)
     try:
@@ -3066,7 +3072,7 @@ class LtxSettingsRequest(BaseModel):
     seed: Optional[int] = None
     region_px: Optional[float] = None
     region_soft_px: Optional[float] = None
-    combine: Optional[str] = None        # region | max_core | raw | band (one band system, 2026-10-22)
+    combine: Optional[str] = None        # band (the one band of every stage) | raw (no band) – 2026-10-24
     core_erode_px: Optional[int] = None
     feather_px: Optional[float] = None   # band mode: inset feather into the core
     mask_source: Optional[str] = None    # core | matanyone | vitmatte (2026-10-16)
@@ -3103,9 +3109,16 @@ def ltx_info(name: str):
 @object_edit
 def ltx_set(name: str, req: LtxSettingsRequest):
     from engine.ltx_alpha import ltx_settings, object_settings
+    from engine.objband import save_sliders, slider_fields
     store = _objects()
+    body = req.model_dump()
+    # the band sliders: the one save path of every palette (engine/objband.save_sliders – the shared object band, or
+    # the stage's own fields when detached); the rest of the body = the stage's own settings
+    save_sliders(store, name, "ltx", body)
+    for k in slider_fields("ltx").values():
+        body[k] = None
     cur = dict(store.get(name).get("ltx") or {})
-    cur.update({k: v for k, v in req.model_dump().items() if v is not None})
+    cur.update({k: v for k, v in body.items() if v is not None})
     clean = ltx_settings({"ltx": cur})
     store.update(name, ltx={k: clean[k] for k in cur})
     return {"success": True, "settings": object_settings(store.get(name))}
@@ -3191,12 +3204,10 @@ async def ltx_compute(name: str):
 
 class VmmSettingsRequest(BaseModel):
     base: Optional[str] = None           # core (mask 1+2) | matanyone (stage-3 result)
-    reach_px: Optional[float] = None
-    protect_px: Optional[float] = None
-    protect_auto: Optional[bool] = None  # True = protect band by base (0 core / 3 matanyone)
-    inset_px: Optional[float] = None     # unified sliders (2026-10-17): VideoMaMa replaces the base this far inside
-    feather_px: Optional[float] = None   # ... blended into the deeper base over this many px
-    outer_feather_px: Optional[float] = None   # band system (2026-10-22): feather from the outer band edge
+    reach_px: Optional[float] = None     # the band (engine/bandsys.py, one in every stage): outside the base edge
+    inset_px: Optional[float] = None     # ... inside it
+    feather_px: Optional[float] = None   # the inset feather (from the inner band edge)
+    outer_feather_px: Optional[float] = None   # the outer feather (from the outer band edge)
     band_points: Optional[List[Dict[str, Any]]] = None   # Ctrl+Z of the band points (static/bandpoints.js): the points
     band_ref_out: Optional[float] = None                 # as they were, with the sliders' reference (None = none)
     band_ref_in: Optional[float] = None
@@ -3237,17 +3248,19 @@ def vmm_info(name: str):
 @app.put("/api/object/{name}/videomama")
 @object_edit
 def vmm_set(name: str, req: VmmSettingsRequest):
-    """Stage VideoMaMa settings of the object (base, reach / protect px, resolution, batch / overlap); protect_auto =
-    the protect band by base again."""
+    """Stage VideoMaMa settings of the object (base, the band sliders, resolution, batch / overlap)."""
+    from engine.objband import save_sliders, slider_fields
     from engine.videomama import object_settings, vmm_settings
     store = _objects()
-    cur = dict(store.get(name).get("videomama") or {})
     body = req.model_dump()
-    cur.update({k: v for k, v in body.items() if v is not None and k not in ("protect_auto", "band_ref_out", "band_ref_in")})
+    save_sliders(store, name, "videomama", body)   # the band sliders: the one save path of every palette (engine/objband)
+    for k in slider_fields("videomama").values():
+        body[k] = None
+    cur = dict(store.get(name).get("videomama") or {})
+    cur.pop("protect_px", None)   # the former protect composition (gone 2026-10-24)
+    cur.update({k: v for k, v in body.items() if v is not None and k not in ("band_ref_out", "band_ref_in")})
     if body.get("band_points") is not None:   # restoring the band points: their reference goes with them (also None)
         cur["band_ref_out"], cur["band_ref_in"] = body.get("band_ref_out"), body.get("band_ref_in")
-    if body.get("protect_auto"):
-        cur.pop("protect_px", None)
     clean = vmm_settings({"videomama": cur})
     store.update(name, videomama={k: clean[k] for k in cur})
     return {"success": True, "settings": object_settings(store.get(name))}
@@ -3255,17 +3268,14 @@ def vmm_set(name: str, req: VmmSettingsRequest):
 
 @app.get("/api/object/{name}/videomama_preview/{frame}")
 def vmm_preview(name: str, frame: int, what: str = "band", base: Optional[str] = None, reach_px: Optional[float] = None,
-                protect_px: Optional[float] = None, protect_auto: Optional[int] = None,
                 inset_px: Optional[float] = None, feather_px: Optional[float] = None, outer_feather_px: Optional[float] = None):
-    """VideoMaMa palette, live: what=band – 128 = where VideoMaMa adds, 255 = protect band (proxy PNG); what=alpha –
+    """VideoMaMa palette, live: what=band – 128 = the band, 255 = the base deeper inside (proxy PNG); what=alpha –
     the current VideoMaMa version's raw matte put over the base with these values (404 without a VideoMaMa version)."""
     from engine.videomama import object_settings, vmm_settings
     name = _objects().get(name).get("part_of") or name
-    cur = {k: v for k, v in object_settings(_objects().get(name)).items() if k != "protect"}
-    cur.update({k: v for k, v in {"base": base, "reach_px": reach_px, "protect_px": protect_px, "inset_px": inset_px,
+    cur = dict(object_settings(_objects().get(name)))
+    cur.update({k: v for k, v in {"base": base, "reach_px": reach_px, "inset_px": inset_px,
                                   "feather_px": feather_px, "outer_feather_px": outer_feather_px}.items() if v is not None})
-    if protect_auto:
-        cur["protect_px"] = None
     s = vmm_settings({"videomama": cur})
     try:
         band, alpha = _pipeline().vmm_frame_preview(name, frame, s)
@@ -3284,8 +3294,8 @@ def vmm_preview(name: str, frame: int, what: str = "band", base: Optional[str] =
 @app.post("/api/object/{name}/videomama/refinish")
 @long_job("VideoMaMa – suwaki na wynik: {name}", quiet=True)
 async def vmm_refinish(name: str, auto: bool = False):
-    """„✚ Suwaki na wynik”: the current VideoMaMa version's raw mattes put over the base again with the saved base /
-    reach / protect -> a new version (no model run)."""
+    """„✚ Suwaki na wynik”: the current VideoMaMa version's raw mattes put over the base again with the saved base and
+    band sliders -> a new version (no model run)."""
     name = _objects().get(name).get("part_of") or name
     pipe = _pipeline()
     cb = _ws_progress("object_progress", name)
@@ -3343,6 +3353,27 @@ def _analysis_target(name: str, run: str) -> Tuple[str, str]:
     if not (o.dir(name) / "runs" / run / "run.json").exists():
         raise HTTPException(status_code=404, detail=f"Brak wersji {run}")
     return name, run
+
+
+@app.post("/api/object/{name}/core_base")
+@long_job("Maska 1+2 jako wersja: {name}")
+async def make_core_base(name: str):
+    """Stage Eksperymenty: the mask 1+2 written as a version (reused while current), so it can be picked as a base
+    like any stage result. Needs only the computed core (stages 1 + 2), not a MatAnyone2 / ViTMatte run."""
+    name = _objects().get(name).get("part_of") or name
+    frames = _work_frames()
+    _require_core_on(name, frames)
+    pipe = _pipeline()
+    cb = _ws_progress("object_progress", name)
+    from engine.zones import MissingFront
+    try:
+        run = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: pipe.core_base_run(name, frames, cb))
+    except MissingFront as e:
+        raise _missing_front_409(e)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"success": True, "run": run, "object": name}
 
 
 @app.post("/api/object/{name}/analyze")
@@ -3426,53 +3457,6 @@ async def apply_edge_fix(name: str, req: EdgeFixRequest = EdgeFixRequest()):
     from engine.export import mark_dependents
     deps = mark_dependents(_objects(), name)
     return {"success": True, "run": run_dir.name, "report": rep.to_dict(), "dependents_to_recompute": deps}
-
-
-@app.get("/api/object/{name}/motion_blur/{frame}")
-def motion_blur_preview(name: str, frame: int, v: Optional[str] = None, strength: float = 1.0,
-                        shutter: Optional[float] = None):
-    """Stage Eksperymenty „Motion blur alfy” (2026-10-16): preview of one frame – the version `v` (default the active
-    one) with the object's motion blur at `strength` and `shutter` (deg, default the manifest's shutter_deg)
-    (engine/motionblur.py), proxy PNG like view=alpha.
-    Headers X-MD-MB-Max-Px (longest blur, plate px), X-MD-MB-Moving-Px, X-MD-MB-Run."""
-    _objects().get(name)
-    try:
-        a, st = _pipeline().motion_blur_frame(name, frame, _shot_frames(), v, strength, shutter)
-    except (FileNotFoundError, ValueError) as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    s = _proxy_scale()
-    w, h = _plate_size()
-    small = cv2.resize(_export_quantize(a), (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
-    r = _png_response(_alpha_u8(small))
-    r.headers["X-MD-MB-Max-Px"] = str(st["max_px"])
-    r.headers["X-MD-MB-Moving-Px"] = str(st["moving_px"])
-    r.headers["X-MD-MB-Run"] = st["run"]
-    return r
-
-
-class MotionBlurRequest(BaseModel):
-    run: Optional[str] = None      # base version (default: the active one)
-    strength: float = 1.0          # x the physical blur of the shutter (0-10)
-    shutter_deg: Optional[float] = None   # shutter angle (deg, 0-720); None = the manifest's shutter_deg
-
-
-@app.post("/api/object/{name}/motion_blur")
-@object_edit
-@long_job("Motion blur alfy: {name}")
-async def apply_motion_blur(name: str, req: MotionBlurRequest = MotionBlurRequest()):
-    """„Zastosuj motion blur” (stage Eksperymenty, 2026-10-16): new runs/v### = the base version with the object's
-    motion blur in every frame (alpha only)."""
-    _require_stage(name, "final")
-    pipe = _pipeline()
-    cb = _ws_progress("object_progress", name)
-    try:
-        run_dir, mb = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: pipe.apply_motion_blur(name, _shot_frames(), req.run, req.strength, cb, req.shutter_deg))
-    except (RuntimeError, FileNotFoundError, ValueError) as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    from engine.export import mark_dependents
-    deps = mark_dependents(_objects(), name)
-    return {"success": True, "run": run_dir.name, "motion_blur": mb, "dependents_to_recompute": deps}
 
 
 @app.get("/api/object/{name}/edge_preview/{frame}")
@@ -3945,7 +3929,7 @@ def correct_frame(name: str, frame: int, req: CorrectRequest):
     else:
         m = cv2.imread(str(store.dir(name) / "core" / f"c_{frame:04d}.png"), cv2.IMREAD_GRAYSCALE)
         if m is None:
-            raise HTTPException(status_code=400, detail="Brak rdzenia w tej klatce – najpierw „▶▶ Przelicz całość”")
+            raise HTTPException(status_code=400, detail="Brak rdzenia w tej klatce – najpierw „▶▶ Przelicz nieaktualne”")
         base = m > 127
     if not base.any():
         raise HTTPException(status_code=400, detail="Maska tej klatki jest pusta – postaw punkty obiektu w etapie 1")
@@ -4157,7 +4141,7 @@ def zone_interpret(name: str, req: ZoneInterpretRequest):
     d = store.dir(name)
     core = cv2.imread(str(d / "core" / f"c_{req.frame:04d}.png"), cv2.IMREAD_GRAYSCALE)
     if core is None:
-        raise HTTPException(status_code=404, detail=f"Brak rdzenia w klatce {req.frame} – „▶▶ Przelicz całość” (etap 1 / 2)")
+        raise HTTPException(status_code=404, detail=f"Brak rdzenia w klatce {req.frame} – „▶▶ Przelicz nieaktualne” (etap 1 / 2)")
     cb = core > 127
     region = None
     if req.zone_id:
@@ -4194,7 +4178,7 @@ def zone_propose(name: str, req: ZoneProposeRequest):
     d = store.dir(name)
     core = cv2.imread(str(d / "core" / f"c_{req.frame:04d}.png"), cv2.IMREAD_GRAYSCALE)
     if core is None:
-        raise HTTPException(status_code=404, detail=f"Brak rdzenia w klatce {req.frame} – „▶▶ Przelicz całość” (etap 1 / 2)")
+        raise HTTPException(status_code=404, detail=f"Brak rdzenia w klatce {req.frame} – „▶▶ Przelicz nieaktualne” (etap 1 / 2)")
     cb = core > 127
     plan = interpret_prompt(req.prompt or "")
     fg = plan.fg_en or (obj.get("detect", {}).get("prompts") or [None])[0] or None
@@ -4290,6 +4274,14 @@ def save_zone_ep(name: str, zone_id: str, req: ZoneRequest, preview_frame: Optio
         except MissingFront as e:
             raise _missing_front_409(e)
     save_zone(d, z)
+    if z.criterion == "matte" and str((z.params or {}).get("region", "draw")) == "outline":
+        # a whole-outline zone (2026-10-24): band sliders given with the zone go through the one save path
+        # (engine/objband.save_sliders – the shared object band; the zone file keeps none of its own while shared)
+        from engine.objband import ZONE_SLIDER_KEYS, save_sliders
+        if save_sliders(store, name, f"zone:{zid}", z.params, zone=z) == "shared":
+            z.params = {k: v for k, v in (z.params or {}).items() if k not in ZONE_SLIDER_KEYS}
+            save_zone(d, z)
+            z = _load_zone_or_404(name, zid)   # the effective params (the shared band) for the answer / the preview
     store.update(name, tool={"final_valid": False})
     out: Dict[str, Any] = {"success": True, "zone": _zone_dict(name, z), **({"plan": plan.to_dict()} if plan else {})}
     if preview_frame is not None and z.criterion == "matte":
@@ -4356,7 +4348,9 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
         # life range – the whole shot asked for F1 and failed with 409 (user report 2026-10-16, CLIP2_A F44–70)
         frames = [x for x in _active_run_frames(name) if (d / "core" / f"c_{x:04d}.png").exists()] or [frame]
         try:
-            regs, _, _ = pipe.zone_regions(name, z, frames, pipe.preview_core(name, frames), only=[frame])
+            # the band of this frame on the mask 1+2 the stages compute on, as the dashed band (2026-10-24)
+            regs, _, _ = pipe.zone_regions(name, z, frames, pipe.preview_core(name, frames), only=[frame],
+                                           band_core=pipe.preview_core(name, [frame]) if len(frames) > 1 else None)
         except (ValueError, FileNotFoundError) as e:
             raise HTTPException(status_code=409, detail=str(e))
         region = regs.get(frame, np.zeros_like(cb))
@@ -4382,15 +4376,14 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
         note = "podgląd = podpowiedź klucza (clean / chroma); MatAnyone2 na kadrze strefy liczy się przy „Przelicz finalnie” / „Zastosuj”"
     if eng == "vitmatte":    # per-frame engine on the zone crop: the preview IS the engine (one frame, no cache; station 2026-10-13)
         from engine.localmatte import LocalMatteResult
-        from engine.zones import edge_model_px, edge_model_runner, vitmatte_tile_px, vitmatte_zone
+        from engine.zones import band_is_unknown, edge_model_px, edge_model_runner, vitmatte_tile_px, vitmatte_zone, zone_force_core
         hold_m = hold_fn(frame) if z.holdout else None
-        # forced to 1 = the core eroded by the inset, as the full run passes it (engine/zones.py): without force_core
-        # ViTMatte pasted 1 into the WHOLE core – the hard SAM3 edge in the raw preview alpha (user report 2026-10-17)
+        # forced to 1 = as the full run (engine/zones.py zone_force_core): the core outside the band for a whole-outline
+        # zone (2026-10-25), else the core eroded by the inset – without force_core ViTMatte pasted 1 into the WHOLE
+        # core, the hard SAM3 edge in the raw preview alpha (user report 2026-10-17)
         fpx = int((kz.params or {}).get("force_core_erode_px", 0) or 0)
-        force_pv = cb.astype(bool)
-        if fpx > 0:
-            kf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fpx + 1, 2 * fpx + 1))
-            force_pv = cv2.erode(cb.astype(np.uint8), kf).astype(bool)
+        band_unk = band_is_unknown(kz)
+        force_pv = zone_force_core(kz, cb, region, fpx)
         bgm = zone_bg_mask_at(kz, cb.shape)
         pipe.release_comfy_gpu("podgląd ViTMatte")      # Comfy's models off the GPU first (idle queue only)
         al, tris, st = vitmatte_zone(kz, [frame], {frame: cb}, {frame: region}, lambda f: pipe.loader.frame(f),
@@ -4401,7 +4394,8 @@ def _matte_preview(name: str, d: Path, z, frame: int) -> Optional[Dict[str, Any]
                                      unknown_value=float((kz.params or {}).get("unknown_value", 0.5)),
                                      tile_px=vitmatte_tile_px(kz.params),
                                      fg_sure={frame: fgm} if fg_fn is not None else None,
-                                     force_core={frame: force_pv} if fpx > 0 else None)
+                                     force_core={frame: force_pv} if (fpx > 0 or band_unk) else None,
+                                     band_unknown=band_unk)
         a = al.get(frame, np.zeros(cb.shape, np.float32))
         res = LocalMatteResult(alpha=a, area=region, trimap=tris.get(frame, np.zeros(cb.shape, np.uint8)),
                                box=tuple(st.get("bbox", (0, 0, 0, 0))), scale=float(st.get("scale", 1.0)),
@@ -4476,11 +4470,20 @@ def patch_zone(name: str, zone_id: str, req: ZonePatchRequest):
     changes = {k: v for k, v in req.model_dump().items() if v is not None}
     if not changes:
         raise HTTPException(status_code=400, detail="Nic do zmiany")
-    from engine.objband import KEYS, mode
+    from engine.objband import KEYS, ZONE_SLIDER_KEYS, mode, save_sliders
     if "params" in changes and mode(_objects().get(name), f"zone:{zone_id}") == "shared":
         # the card sends the params as shown (with the shared object band): the band is never written through a zone
         # (a stale copy would overwrite another stage's edit) – its edits / Ctrl+Z go to /band
         changes["params"] = {k: v for k, v in changes["params"].items() if k not in KEYS}
+        # the band sliders of a shared zone go through the one save path (engine/objband.save_sliders; only the ones
+        # that changed – the inset = fg / force erode); the zone file keeps no slider of its own while shared
+        pz, old = changes["params"], (z.params or {})
+        sl = {k: pz.get(k) for k in ZONE_SLIDER_KEYS if pz.get(k) != old.get(k)}
+        if "fg_erode_px" not in sl and "force_core_erode_px" in sl:
+            sl["fg_erode_px"] = sl["force_core_erode_px"]
+        if save_sliders(_objects(), name, f"zone:{zone_id}", sl, zone=z) == "shared":
+            for k in ZONE_SLIDER_KEYS:
+                changes["params"].pop(k, None)
     if "matting" in changes and changes["matting"] not in ENGINES:
         raise HTTPException(status_code=400, detail=f"Silnik: {'|'.join(ENGINES)}")
     if "preset" in changes and changes["preset"] not in PRESETS:
@@ -4529,7 +4532,7 @@ def zone_preview_ep(name: str, zone_id: str, frame: int):
     except MissingFront as e:
         raise _missing_front_409(e)
     if pv is None:
-        raise HTTPException(status_code=404, detail=f"Brak rdzenia w klatce {frame} – „▶▶ Przelicz całość” (etap 1 / 2)")
+        raise HTTPException(status_code=404, detail=f"Brak rdzenia w klatce {frame} – „▶▶ Przelicz nieaktualne” (etap 1 / 2)")
     return {"success": True, "zone_id": zone_id, "preview": pv}
 
 
@@ -4610,8 +4613,9 @@ class _BandOwner:
         return {"out": int(round(self.out)), "in": int(round(self.inn))}
 
     def scales(self) -> Tuple[float, float]:
-        ro, ri = self.params.get("band_ref_out"), self.params.get("band_ref_in")
-        return (self.out / float(ro) if ro else 1.0), (self.inn / float(ri) if ri else 1.0)
+        from engine.objband import BandSettings, scales
+        return scales(BandSettings(self.out, self.inn, 0.0, 0.0, band_ref_out=self.params.get("band_ref_out"),
+                                   band_ref_in=self.params.get("band_ref_in")))
 
     def refs(self) -> Dict[str, float]:
         return {"band_ref_out": self.out, "band_ref_in": self.inn}
@@ -4631,8 +4635,9 @@ def _shared_save(root: str):
     """Save of the shared object band (engine/objband.py): the main object of the group, field `band`."""
     from engine.objband import KEYS
 
-    def save(params):
-        _objects().update(root, band={k: params.get(k) for k in KEYS})
+    def save(params):   # the points; the band's sliders (2026-10-24) stay as they are
+        store = _objects()
+        store.update(root, band={**(store.get(root).get("band") or {}), **{k: params.get(k) for k in KEYS}})
     return save
 
 
@@ -4647,20 +4652,20 @@ def _zone_own_save(name: str, z):
 
 
 def _zone_owner(name: str, z) -> _BandOwner:
-    """The band of a whole-outline zone: the shared object band (default, 2026-10-22) or its own points (detached)."""
-    from engine.objband import KEYS, SHARED_OWNER, mode, shared
-    from engine.zones import OUTLINE_OUT_PX, outline_in_px
-    p = z.params or {}
-    out, inn = float(p.get("outline_out_px", OUTLINE_OUT_PX)), float(outline_in_px(p))
+    """The band of a whole-outline zone (engine/objband.band_for): the shared object band (default, 2026-10-22) or its
+    own points (detached)."""
+    from engine.objband import KEYS, band_for
     store = _objects()
     obj = store.get(name)
+    root = obj.get("part_of") or name
     key = f"zone:{z.zone_id}"
-    if mode(obj, key) == "shared":
-        root = obj.get("part_of") or name
-        ow = _BandOwner(root, "zone", {**{k: v for k, v in p.items() if k not in KEYS}, **shared(store.get(root))},
-                        SHARED_OWNER, out, inn, _shared_save(root))
+    b = band_for(obj, key, root=store.get(root), zone=z)
+    p = z.params or {}
+    if b.shared:
+        ow = _BandOwner(root, "zone", {**{k: v for k, v in p.items() if k not in KEYS}, **b.points_params()},
+                        b.owner_id, b.out_px, b.in_px, _shared_save(root))
     else:
-        ow = _BandOwner(name, "zone", p, z.zone_id, out, inn, _zone_own_save(name, z))
+        ow = _BandOwner(name, "zone", p, b.owner_id, b.out_px, b.in_px, _zone_own_save(name, z))
     ow.key, ow.obj_name = key, name
     return ow
 
@@ -4668,65 +4673,58 @@ def _zone_owner(name: str, z) -> _BandOwner:
 BAND_STAGES = ("videomama", "matanyone", "ltx")
 
 
-def _stage_own(name: str, stage: str) -> Tuple[Dict[str, Any], Any, float, float]:
-    """(own params, own save, slider out, slider in) of a stage band (VideoMaMa: „Pas na zewnątrz” = reach, „Wcięcie
-    w rdzeń” = inset; MatAnyone2: the px mode of the edge band, object field `edge_band`; LTX-2.5: the band mode)."""
+def _stage_own_save(name: str, stage: str):
+    """The save of a stage's own band points (detached): the object field `edge_band` (stage 3), the stage dict (4 / 7)."""
     from engine.objband import KEYS
-    from engine.videomama import object_settings
     store = _objects()
-    if stage == "ltx":
-        from engine.ltx_alpha import object_settings as ltx_object_settings
-        ls = ltx_object_settings(store.get(name))
-        if ls["combine"] != "band":
-            raise HTTPException(status_code=409, detail="Punkty pasa LTX-2.5 działają w trybie wyniku „pas” – wybierz go w palecie LTX-2.5")
-        lraw = dict(store.get(name).get("ltx") or {})
-
-        def save_ltx(params):
-            cur = dict(store.get(name).get("ltx") or {})
-            cur.update({k: params.get(k) for k in KEYS})
-            store.update(name, ltx=cur)
-        return {k: lraw.get(k) for k in KEYS}, save_ltx, ls["region_px"], float(ls["core_erode_px"])
     if stage == "matanyone":
-        from engine.edge import band_px_limits
-        o = store.get(name)
-        lim = band_px_limits(o)
-        if not lim:
-            raise HTTPException(status_code=409, detail="Punkty pasa MatAnyone2 działają w trybie px – ustaw „Pas na zewnątrz” / "
-                                                        "„Wcięcie” w palecie Krawędź")
-        eb = dict(o.get("edge_band") or {})
-
         def save_ma(params):
             pts = params.get("band_points") or []
             store.update(name, edge_band={k: params.get(k) for k in KEYS} if pts else None)
-        return {k: eb.get(k) for k in KEYS}, save_ma, lim[0], lim[1]
-    s = object_settings(store.get(name))
-    raw = dict(store.get(name).get("videomama") or {})
+        return save_ma
 
     def save(params):
-        cur = dict(store.get(name).get("videomama") or {})
+        cur = dict(store.get(name).get(stage) or {})
         cur.update({k: params.get(k) for k in KEYS})
-        store.update(name, videomama=cur)
-    return {k: raw.get(k) for k in KEYS}, save, s["reach_px"], float(s.get("inset_px") or 0.0)
+        store.update(name, **{stage: cur})
+    return save
 
 
 def _stage_owner(name: str, stage: str) -> _BandOwner:
-    """The band of a stage: the shared object band (default, 2026-10-22) or the stage's own points (detached); a part =
-    its group. `stage` = a stage name or "zone:<zone_id>" (a whole-outline zone of stage 5)."""
-    from engine.objband import SHARED_OWNER, mode, shared
+    """The band of a stage (engine/objband.band_for): the shared object band (default, 2026-10-22) or the stage's own
+    points (detached); a part = its group. `stage` = a stage name or "zone:<zone_id>" (a whole-outline zone of stage 5).
+    The band settings of the stage come from its settings function (edge_settings / videomama / ltx object_settings –
+    an instance of the one model), so a detached stage reads defaults.json like its run does."""
     if stage.startswith("zone:"):
         return _zone_owner(name, _load_zone_or_404(name, stage[5:]))
     if stage not in BAND_STAGES:
         raise HTTPException(status_code=400, detail=f"Pas z punktami: etap {'|'.join(BAND_STAGES)}")
     store = _objects()
     name = store.get(name).get("part_of") or name
-    own, save, out, inn = _stage_own(name, stage)
-    obj = store.get(name)
-    if mode(obj, stage) == "shared":
-        ow = _BandOwner(name, "stage", shared(obj), SHARED_OWNER, out, inn, _shared_save(name))
+    b = _stage_settings(stage, store.get(name))["band"]
+    if not b.active:
+        raise HTTPException(status_code=409, detail="Wynik LTX-2.5 „surowy” nie ma pasa – wybierz „pas” w palecie LTX-2.5")
+    if b.shared:
+        ow = _BandOwner(name, "stage", b.points_params(), b.owner_id, b.out_px, b.in_px, _shared_save(name))
     else:
-        ow = _BandOwner(name, "stage", own, f"stage_{stage}", out, inn, save)
+        own = {"videomama": store.get(name).get("videomama"), "ltx": store.get(name).get("ltx"),
+               "matanyone": store.get(name).get("edge_band")}[stage] or {}
+        from engine.objband import KEYS
+        ow = _BandOwner(name, "stage", {k: own.get(k) for k in KEYS}, b.owner_id, b.out_px, b.in_px, _stage_own_save(name, stage))
     ow.key, ow.obj_name = stage, name
     return ow
+
+
+def _stage_settings(stage: str, obj: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The settings dict of a stage with a band – each an instance of the one band settings model (`s["band"]` =
+    engine/objband.BandSettings); `overrides` = palette values not saved yet (canonical names)."""
+    if stage == "ltx":
+        from engine.ltx_alpha import object_settings
+    elif stage == "videomama":
+        from engine.videomama import object_settings
+    else:
+        from engine.edge import edge_settings as object_settings
+    return object_settings(obj, overrides)
 
 
 def _band_state(name: str, z, frame: int) -> Dict[str, Any]:
@@ -4734,7 +4732,7 @@ def _band_state(name: str, z, frame: int) -> Dict[str, Any]:
 
 
 def _band_state_o(name: str, ow: "_BandOwner", frame: int) -> Dict[str, Any]:
-    from engine.bandmap import band_points, snap_normal, widths_at
+    from engine.bandmap import angle_at, band_points, snap_frame, widths_at
     from engine.bandtrack import track_positions
     from engine.zonecache import ZoneCache
     name = ow.name
@@ -4767,10 +4765,12 @@ def _band_state_o(name: str, ow: "_BandOwner", frame: int) -> Dict[str, Any]:
         x, y, vis = pos.get(q["id"], (None, None, False))
         o, i = widths_at(q, frame)
         o, i = o * so, i * si
-        sn = snap_normal(core, x, y, cs) if core is not None and x is not None else None
+        sn = snap_frame(core, x, y, cs) if core is not None and x is not None else None
         out.append({"id": q["id"], "x": x, "y": y, "visible": vis, "out": round(o, 2), "in": round(i, 2),
+                    "ang": round(angle_at(q, frame), 2),
                     "key": str(frame) in q["keys"], "keys": sorted(int(k) for k in q["keys"]),
-                    **({"sx": round(sn[0], 2), "sy": round(sn[1], 2), "nx": round(sn[2], 4), "ny": round(sn[3], 4)} if sn else {})})
+                    **({"sx": round(sn[0], 2), "sy": round(sn[1], 2), "nx": round(sn[2], 4), "ny": round(sn[3], 4),
+                                                                      "tx": round(sn[4], 4), "ty": round(sn[5], 4)} if sn else {})})
     return {"frame": frame, "points": out, "defaults": defaults, "tracking": bool(tinfo.get("pending")),
             "scale": {"out": round(so, 4), "in": round(si, 4)}}
 
@@ -4794,6 +4794,7 @@ class BandPointRequest(BaseModel):
     y: Optional[float] = None
     out: Optional[float] = None          # whisker into the background (px); absent = the current (animated) value
     in_: Optional[float] = Field(None, alias="in")   # whisker into the object (px)
+    ang: Optional[float] = None          # tilt of the whisker pair round the point, degrees (0 = along the normal; ±80 max)
 
 
 @app.put("/api/object/{name}/zones/{zone_id}/band/{frame}")
@@ -4806,6 +4807,13 @@ def put_zone_band(name: str, zone_id: str, frame: int, req: BandPointRequest):
     if z.criterion != "matte" or region_mode(z) != "outline":
         raise HTTPException(status_code=400, detail="Punkty pasa tylko dla strefy „cały obrys”")
     return _band_put(_zone_owner(name, z), frame, req)
+
+
+def _ang_field(new: Optional[float], cur: Any) -> Dict[str, float]:
+    """The key's tilt: the request's, else the one shown now; 0 is not stored (keys of old projects stay as they are)."""
+    from engine.bandmap import MAX_ANGLE_DEG
+    a = float(max(-MAX_ANGLE_DEG, min(MAX_ANGLE_DEG, float(new if new is not None else (cur or 0.0)))))
+    return {"ang": round(a, 2)} if a else {}
 
 
 def _band_put(ow: "_BandOwner", frame: int, req: "BandPointRequest") -> Dict[str, Any]:
@@ -4827,7 +4835,8 @@ def _band_put(ow: "_BandOwner", frame: int, req: "BandPointRequest") -> Dict[str
         n = 1 + max([int(p["id"][1:]) for p in pts if str(p["id"]).startswith("p") and str(p["id"])[1:].isdigit()] or [0])
         pts.append({"id": f"p{n}", "keys": {str(frame): {"x": float(req.x), "y": float(req.y),
                                                          "out": raw_o(req.out if req.out is not None else d0["out"]),
-                                                         "in": raw_i(req.in_ if req.in_ is not None else d0["in"])}}})
+                                                         "in": raw_i(req.in_ if req.in_ is not None else d0["in"]),
+                                                         **_ang_field(req.ang, 0.0)}}})
         pid = f"p{n}"
     else:
         p = next((q for q in pts if q["id"] == req.id), None)
@@ -4840,7 +4849,8 @@ def _band_put(ow: "_BandOwner", frame: int, req: "BandPointRequest") -> Dict[str
             raise HTTPException(status_code=409, detail="Punkt jest w tej klatce niewidoczny – podaj jego położenie (x, y)")
         p["keys"] = {**p["keys"], str(frame): {"x": float(x), "y": float(y),
                                                "out": raw_o(req.out if req.out is not None else c.get("out", 0)),
-                                               "in": raw_i(req.in_ if req.in_ is not None else c.get("in", 0))}}
+                                               "in": raw_i(req.in_ if req.in_ is not None else c.get("in", 0)),
+                                               **_ang_field(req.ang, c.get("ang", 0.0))}}
         pid = req.id
     ow.store(pts)
     return {"success": True, "point": pid, "band": _band_state_o(name, ow, frame)}
@@ -4928,7 +4938,7 @@ def put_stage_band_mode(name: str, stage: str, req: BandModeRequest):
     """„Odłącz → własny pas” (own: the stage gets a copy of the shared band – nothing changes in its result) or „wróć do
     wspólnego” (shared: the stage's own points are dropped, it reads the object band again). `stage` = a stage or
     "zone:<zone_id>"."""
-    from engine.objband import KEYS, mode
+    from engine.objband import mode
     if req.mode not in ("shared", "own"):
         raise HTTPException(status_code=400, detail="mode: shared | own")
     store = _objects()
@@ -4937,12 +4947,17 @@ def put_stage_band_mode(name: str, stage: str, req: BandModeRequest):
     if mode(store.get(obj_name), key) == req.mode:
         return {"success": True, "mode": req.mode, "changed": False}
     if req.mode == "own":
-        copy = {k: ow.params.get(k) for k in KEYS}
+        from engine.objband import band_for, save_sliders
+        zone = _load_zone_or_404(obj_name, key[5:]) if key.startswith("zone:") else None
+        # the band as this stage works with it now (the shared one): one detach for the points AND the sliders
+        # (2026-10-24) – the stage keeps a copy of both in its own fields (objband.save_sliders in the own mode)
+        b = band_for(store.get(obj_name), key, root=store.get(store.get(obj_name).get("part_of") or obj_name), zone=zone)
         _set_band_mode(obj_name, key, "own")
+        save_sliders(store, obj_name, key, b.slider_dict(), zone=zone)
         own = _stage_owner(name, stage)
-        own.params = {**own.params, **copy}
-        if copy.get("band_points"):
-            own.store([dict(p) for p in copy["band_points"]])
+        own.params = {**own.params, **b.points_params()}
+        if b.band_points:
+            own.store(b.points_params()["band_points"])
     else:
         ow.params = {**ow.params, "band_ref_out": None, "band_ref_in": None}
         ow.store([])
@@ -5046,10 +5061,7 @@ def _band_owner_keys(name: str) -> List[Tuple[str, str]]:
 
 
 def _band_active(obj: Dict[str, Any], key: str) -> bool:
-    """Whether the stage reads band points in its current mode (MatAnyone2: the px mode; LTX-2.5: the result „pas”)."""
-    if key == "matanyone":
-        from engine.edge import band_px_limits
-        return bool(band_px_limits(obj))
+    """Whether the stage reads band points in its current mode: always, apart from LTX-2.5 „raw” (no band, 2026-10-24)."""
     if key == "ltx":
         from engine.ltx_alpha import object_settings as ltx_object_settings
         return ltx_object_settings(obj)["combine"] == "band"
@@ -5061,7 +5073,7 @@ def get_object_band(name: str):
     """The shared band of the object (its group): points, keys, reference and the mode of every band owner
     (stages 3 / 4 / 7, the whole-outline zones of stage 5) – shared or own (detached, with its own point count)."""
     from engine.bandmap import band_points
-    from engine.objband import mode, own_params, shared
+    from engine.objband import SHARED_OWNER, mode, own_params, shared
     store = _objects()
     root = store.get(name).get("part_of") or name
     b = shared(store.get(root))
@@ -5079,8 +5091,12 @@ def get_object_band(name: str):
         else:
             n = len(pts)
         owners.append({"object": m, "key": key, "mode": md, "points": n, "active": _band_active(obj, key)})
+    from engine.objband import band_for, sliders_migrated
+    # the object band ITSELF (key SHARED_OWNER – never detached), not what some stage shows (a detached stage shows its own)
+    sl = band_for(store.get(root), SHARED_OWNER).slider_dict() if sliders_migrated(store.get(root)) else None
     return {"object": root, "points": len(pts), "keys": sorted({int(k) for p in pts for k in p["keys"]}),
-            "band_ref_out": b["band_ref_out"], "band_ref_in": b["band_ref_in"], "owners": owners}
+            "band_ref_out": b["band_ref_out"], "band_ref_in": b["band_ref_in"], "owners": owners,
+            "sliders": sl}   # the shared sliders (2026-10-24; None = the object is not migrated yet)
 
 
 @app.get("/api/object/{name}/band/params")
@@ -5098,8 +5114,8 @@ def put_object_band_params(name: str, req: BandParamsRequest):
     store = _objects()
     root = store.get(name).get("part_of") or name
     pts = [dict(p) for p in req.band_points]
-    store.update(root, band={"band_points": pts, "band_ref_out": req.band_ref_out if pts else None,
-                             "band_ref_in": req.band_ref_in if pts else None})
+    store.update(root, band={**(store.get(root).get("band") or {}), "band_points": pts,
+                             "band_ref_out": req.band_ref_out if pts else None, "band_ref_in": req.band_ref_in if pts else None})
     store.update(root, tool={"final_valid": False})
     return {"success": True}
 
@@ -5135,7 +5151,11 @@ def set_object_band_from(name: str, req: BandFromRequest):
         raise HTTPException(status_code=404, detail="Źródło nie ma punktów pasa")
     store = _objects()
     root = store.get(src.obj_name).get("part_of") or src.obj_name
-    store.update(root, band={k: src.params.get(k) for k in KEYS})
+    # „ustaw jako wspólny” = this owner's band – its points AND its sliders (one band, 2026-10-24) – becomes the object's
+    from engine.objband import band_for
+    zone = _load_zone_or_404(src.obj_name, src.key[5:]) if src.key.startswith("zone:") else None
+    b = band_for(store.get(src.obj_name), src.key, root=store.get(root), zone=zone)
+    store.update(root, band={**(store.get(root).get("band") or {}), **{k: src.params.get(k) for k in KEYS}, **b.slider_dict()})
     src.params = {**src.params, "band_ref_out": None, "band_ref_in": None}
     src.store([])
     _set_band_mode(src.obj_name, src.key, "shared")
@@ -5201,7 +5221,32 @@ def propose_band(name: str, req: BandProposeRequest):
 
 
 from collections import OrderedDict
-_LINES_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()   # stage-3 band lines (stage_band_lines)
+_LINES_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()   # band lines by CONTENT (stage_band_lines)
+
+
+def _band_lines_cached(name: str, frame: int, mask: np.ndarray, out: float, inn: float, fi: float, fo: float, pts,
+                       cacheable: bool) -> Dict[str, Any]:
+    """The band lines of `mask` (bool, plate px) for the sliders / points / feathers, computed ONCE per content: every
+    stage on the shared band (3 / 4 / 7 on the same base) asks for the very same lines – one entry serves them all
+    (user request 2026-10-24: connected stages share one cache). Not kept while the mask is the stand-in or the band
+    points are still tracked (`cacheable`)."""
+    from engine.bandsys import band_widths, feather_lines, preview_lines
+    from engine.ltx_alpha import sdf_px
+    m = np.asarray(mask) > 0.5
+    pts = list(pts or [])
+    key = json.dumps([name, frame, list(m.shape), int(zlib.crc32(np.packbits(m).tobytes())), float(out), float(inn),
+                      float(fi), float(fo), [[round(float(v), 2) for v in p] for p in pts]])
+    hit = _LINES_CACHE.get(key) if cacheable else None
+    if hit is not None:
+        _LINES_CACHE.move_to_end(key)
+        return dict(hit)
+    o, i = band_widths(m, out, inn, pts or None)
+    res = preview_lines(*feather_lines(sdf_px(m.astype(np.float32)), o, i, fi, fo))
+    if cacheable:
+        _LINES_CACHE[key] = res
+        while len(_LINES_CACHE) > 160:
+            _LINES_CACHE.popitem(last=False)
+    return dict(res)
 
 
 def _STATE_PLATE_KEY() -> Any:
@@ -5209,102 +5254,46 @@ def _STATE_PLATE_KEY() -> Any:
     return [(m.get("plates") or {}).get("beauty_clean") or (m.get("plates") or {}).get("beauty"), _mask_plate_denoise()]
 
 
+@app.get("/api/object/{name}/mask12_status")
+def mask12_status(name: str):
+    """Is the exact mask 1+2 of the work area ready (the band previews stop being „przybliżony” then)? A cheap poll –
+    nothing is computed here (the batch runs once in the background, started by the first preview; 2026-10-24)."""
+    name = _objects().get(name).get("part_of") or name
+    return _pipeline().mask12_status(name)
+
+
 @app.get("/api/object/{name}/stage_band/{stage}/{frame}/lines")
 def stage_band_lines(name: str, stage: str, frame: int, outer_feather_px: Optional[float] = None,
                      reach_px: Optional[float] = None, inset_px: Optional[float] = None, feather_px: Optional[float] = None,
                      band_scale: Optional[float] = None, shift_px: Optional[float] = None):
     """Preview lines of a stage band in `frame` (plate px): band edges (dashed), where the inset / outer feather end
-    (thin dashes) – the same drawing as the stage-5 zone (2026-10-22). Slider values may be given for a live preview."""
-    from engine.bandsys import band_widths, feather_lines
-    from engine.ltx_alpha import sdf_px
-    from engine.videomama import object_settings, vmm_settings
-    ow = _stage_owner(name, stage)
-    def lines(m, mode):
-        if m is None or not m.any():
-            return []
-        cnts, _ = cv2.findContours(m.astype(np.uint8), mode, cv2.CHAIN_APPROX_SIMPLE)
-        return [cv2.approxPolyDP(c, 1.5, True).reshape(-1, 2).tolist() for c in cnts if len(c) >= 3]
-    if stage == "ltx":   # the band mode of the LTX-2.5 result: region (out) / core erode (in), feathers into the core
-        from engine.ltx_alpha import ltx_settings
-        from engine.ltx_alpha import object_settings as ltx_object_settings
-        cur = dict(ltx_object_settings(_objects().get(ow.name)))
-        cur.update({k: v for k, v in {"region_px": reach_px, "core_erode_px": inset_px, "feather_px": feather_px,
-                                      "region_soft_px": outer_feather_px}.items() if v is not None})
-        s = ltx_settings({"ltx": cur})
-        pipe = _pipeline()
-        try:
-            mask = pipe.ltx_mask(ow.name, [frame], s, pipe.preview_core(ow.name, [frame]))[frame]
-        except (FileNotFoundError, ValueError) as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        pf = pipe.ltx_band_points(ow.name, s, [frame], only=[frame])
-        m = (np.asarray(mask) > 0.5).astype(np.float32)
-        o, i = band_widths(m, s["region_px"], float(s["core_erode_px"]), pf(frame) if pf else None)
-        band, inner, outer = feather_lines(sdf_px(m), o, i, s.get("feather_px", 0.0), s["region_soft_px"])
-        return {"frame": frame, "band_contours": lines(band, cv2.RETR_CCOMP),
-                "inset_feather_contours": lines(inner, cv2.RETR_EXTERNAL), "feather_contours": lines(outer, cv2.RETR_EXTERNAL)}
-    if stage == "matanyone":   # the edge band of the palette (adaptive / px + points), feathers into the core
-        from engine.stages import mask_sig, settings_sig
-        from engine.zones import feather_maps
-        o = _objects().get(ow.name)
-        # the stage-3 band takes ~0.5 s (core stabilisation, adaptive widths): kept per frame + settings, so going back
-        # to a frame (and the neighbours the UI prefetches) is instant (user report 2026-10-22: slow on a frame change)
-        root = _objects().root
-        cores = sorted((p.parent.parent.name, p.stat().st_mtime_ns) for p in root.glob("*/core/core.json"))
-        ck = json.dumps([str(root), ow.name, frame, band_scale, shift_px, reach_px, inset_px, feather_px, outer_feather_px,
-                         settings_sig(o), mask_sig(_objects(), ow.name), cores, _STATE_PLATE_KEY()], default=str)
-        from engine import bandtrack
-        from engine.objband import edge_band
-        from engine.stages import EDGE_KEYS, EDGE_KEYS_OPT
-        # band points: their positions settle when the CoTracker3 tracking ends – kept only when no tracking runs
-        # (before and after this request; settings_sig carries the points, 2026-10-23)
-        if edge_band(o) and bandtrack._RUNNING:
-            ck = None
-        hit = _LINES_CACHE.get(ck) if ck else None
-        if hit is not None:
-            _LINES_CACHE.move_to_end(ck)
-            return hit
-        # the shifted mask 1+2 (core stabilisation ~2 s) does not depend on the band points: kept across point edits
-        sk = {k: o.get(k) for k in EDGE_KEYS + EDGE_KEYS_OPT if k != "edge_band"}
-        objs = [(x["name"], x.get("depth_order"), x.get("part_of"), x.get("life")) for x in _objects().list()]
-        core_key = json.dumps([str(root), ow.name, frame, band_scale, shift_px, reach_px, inset_px, sk, objs,
-                               mask_sig(_objects(), ow.name), cores, _STATE_PLATE_KEY()], default=str)
-        try:
-            # adaptive mode (0 / 0): band_scale / shift_px of the palette (2026-10-22: the lines in both modes)
-            m, info = _pipeline().edge_preview(ow.name, frame, band_scale, shift_px, band_out_px=reach_px, band_in_px=inset_px,
-                                               core_key=core_key)
-        except (FileNotFoundError, ValueError) as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        if edge_band(o) and bandtrack._RUNNING:
-            ck = None
-        band, core = m == 128, np.asarray(info["core"]).astype(bool)
-        fi = float(feather_px if feather_px is not None else (o.get("band_in_feather_px") or 0.0))
-        fo = float(outer_feather_px if outer_feather_px is not None else (o.get("band_out_feather_px") or 0.0))
-        d_in, d_out, li, lo = feather_maps(band, core, fi, fo)
-        solid = core & ~band
-        res = {"frame": frame, "band_contours": lines(band, cv2.RETR_CCOMP),
-               "inset_feather_contours": lines(solid | (band & (d_in < li)), cv2.RETR_EXTERNAL) if fi > 0 else [],
-               "feather_contours": lines(solid | (band & (d_out >= lo)), cv2.RETR_EXTERNAL) if fo > 0 else []}
-        if ck:
-            _LINES_CACHE[ck] = res
-        while len(_LINES_CACHE) > 64:
-            _LINES_CACHE.popitem(last=False)
-        return res
-    cur = {k: v for k, v in object_settings(_objects().get(ow.name)).items() if k != "protect"}
-    cur.update({k: v for k, v in {"reach_px": reach_px, "inset_px": inset_px, "feather_px": feather_px,
-                                  "outer_feather_px": outer_feather_px}.items() if v is not None})
-    s = vmm_settings({"videomama": cur})
+    (thin dashes) – one lines function for every band (engine/bandsys.py; a zone's lines come with GET
+    …/zones/{id}/region/{f}) and ONE cache by content (_band_lines_cached, 2026-10-24): stages 3 / 4 / 7 on the shared
+    band with the same base mask get the same entry. Slider values may be given for a live preview."""
+    from engine import bandtrack
+    ow = _stage_owner(name, stage)   # every stage has its band (2026-10-24: no adaptive / region modes – no 409)
     pipe = _pipeline()
+    # the band = the one settings model (engine/objband.BandSettings) with the palette values on top; the only thing
+    # a stage adds is WHICH base mask its band lies on (mask 1+2 for 3, the VideoMaMa base for 4, the LTX mask source for 7)
+    s = _stage_settings(stage, _objects().get(ow.name), {"out_px": reach_px, "in_px": inset_px, "inset_feather_px": feather_px,
+                                                        "outer_feather_px": outer_feather_px})
+    b = s["band"]
     try:
-        core = pipe.preview_core(ow.name, [frame])
-        base = pipe.vmm_base(ow.name, [frame], s, core)[0][frame]
+        if stage == "ltx":
+            mask = pipe.ltx_mask(ow.name, [frame], s, pipe.preview_core(ow.name, [frame]))[frame]
+        elif stage == "matanyone":
+            mask = pipe.mask12_preview(ow.name, frame)[0]
+        else:
+            mask = pipe.vmm_base(ow.name, [frame], s, pipe.preview_core(ow.name, [frame]))[0][frame]
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=404, detail=str(e))
-    pf = pipe.vmm_band_points(ow.name, s, [frame], only=[frame])
-    b = np.clip(base.astype(np.float32), 0, 1)
-    o, i = band_widths(b, s["reach_px"], float(s.get("inset_px") or 0.0), pf(frame) if pf else None)
-    band, inner, outer = feather_lines(sdf_px(b), o, i, s.get("feather_px", 0.0), s.get("outer_feather_px", 0.0))
-    return {"frame": frame, "band_contours": lines(band, cv2.RETR_CCOMP),
-            "inset_feather_contours": lines(inner, cv2.RETR_EXTERNAL), "feather_contours": lines(outer, cv2.RETR_EXTERNAL)}
+    pf = pipe.band_points_fn(ow.name, b, [frame], only=[frame])
+    out, inn, fi, fo = b.sliders
+    pts = pf(frame) if pf else []
+    approx = bool(pipe.last_mask12_approx)
+    # band points: their positions settle when the CoTracker3 tracking ends – kept only when no tracking runs
+    lines = _band_lines_cached(ow.name, frame, mask, out, inn, fi, fo, pts, cacheable=not approx and not bandtrack._RUNNING)
+    return {"frame": frame, "approx": approx, **lines}
 
 
 @app.post("/api/object/{name}/zones/{zone_id}/apply")
@@ -5413,7 +5402,7 @@ def object_runs(name: str):
                     "stage": rj.get("stage"),         # matanyone / vitmatte / core (stage 3 / 4 result, base 1+2) or None
                     "edge_engine": edge_engine,       # stage 5 versions: vitmatte | birefnet
                     "base": rj.get("base"),           # vitmatte: core | matanyone
-                    "motion_blur": rj.get("motion_blur"),   # „Motion blur alfy” (2026-10-16): strength, base_run, longest_px
+                    "motion_blur": rj.get("motion_blur"),   # legacy: versions made before 2026-10-24 (the stage-version motion blur was removed, Final Touch only)
                     "base_run": rj.get("base_run"), "base_stage": rj.get("base_stage"),   # Experiments: made from this version
                     "base_outdated": bool(rj.get("base_run") and rj.get("base_stage") in ("matanyone", "videomama", "vitmatte", "ltx", "core")
                                           and rj.get("base_run") not in cur_stage.values()),
@@ -5555,14 +5544,12 @@ def object_settings(name: str, req: ObjectSettingsRequest):
     if req.shift_px is not None:
         upd["shift_px"] = clamp_shift_px(req.shift_px)
     from engine.edge import clamp_band_px
-    if req.band_out_px is not None:
-        upd["band_out_px"] = clamp_band_px(req.band_out_px)
-    if req.band_in_px is not None:
-        upd["band_in_px"] = clamp_band_px(req.band_in_px)
-    if req.band_in_feather_px is not None:
-        upd["band_in_feather_px"] = float(min(64.0, max(0.0, req.band_in_feather_px)))
-    if req.band_out_feather_px is not None:
-        upd["band_out_feather_px"] = float(min(200.0, max(0.0, req.band_out_feather_px)))
+    sl = {"out_px": None if req.band_out_px is None else clamp_band_px(req.band_out_px),
+          "in_px": None if req.band_in_px is None else clamp_band_px(req.band_in_px),
+          "inset_feather_px": None if req.band_in_feather_px is None else float(min(64.0, max(0.0, req.band_in_feather_px))),
+          "outer_feather_px": None if req.band_out_feather_px is None else float(min(200.0, max(0.0, req.band_out_feather_px)))}
+    from engine.objband import save_sliders
+    save_sliders(_objects(), name, "matanyone", sl)   # the one save path of every palette (engine/objband)
     if req.temporal_smoothing is not None:
         if req.temporal_smoothing not in ("weak", "normal", "strong"):
             raise HTTPException(status_code=400, detail="wygładzanie: weak | normal | strong")
@@ -5851,7 +5838,7 @@ def _export_source_run(name: str, source: str, run: Optional[str] = None, build_
         return (FT_PREFIX + b["run"], "") if b["run"] else (None, b["why"])
     st = {s["id"]: s["state"] for s in object_stages(store, name, Path(STATE["work_dir"]), mplate=_mask_plate_denoise())["stages"]}
     if st["core"] != "done":
-        return None, "rdzeń SAM 3.1 nieaktualny albo nie policzony – „▶▶ Przelicz całość” (etap 1)"
+        return None, "rdzeń SAM 3.1 nieaktualny albo nie policzony – „▶▶ Przelicz nieaktualne” (etap 1)"
     if not build_core and not core_fix_state(store, name)[1]:
         return None, "maska 1+2 nieaktualna – „▶▶ Zastosuj poprawki” (etap 2)"
     return "core", ""
@@ -6252,6 +6239,57 @@ def final_touch_layer(name: str, frame: int, c: Optional[str] = None):
     return _png_response(bgra)
 
 
+_FT_BASE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()   # the base of a Final Touch frame (+ its quantized copies) – strokes do not change it
+_FT_BASE_CACHE_MAX = 2
+
+
+def _ft_base_sig(od: Path, b: str, frame: int) -> tuple:
+    """Stat signature of every file the base loader reads for `frame` (a recomputed base changes it)."""
+    def st(p: Path):
+        try:
+            x = p.stat(); return (str(p), x.st_mtime_ns, x.st_size)
+        except OSError:
+            return (str(p), None, None)
+    if b == "core":
+        return tuple(st(od / sub / f"c_{frame:04d}.png") for sub in ("core_fix", "core"))
+    rd = od / "runs" / b
+    return (st(rd / "run.json"),) + tuple(st(p) for p in sorted(rd.glob(f"alpha/*/a_{frame:04d}.exr")))
+
+
+def _ft_frame_quantized(od: Path, b: str, frame: int, w: int, h: int) -> np.ndarray:
+    """What the export writes for source „Final Touch” in `frame` (base + corrections, `_export_quantize`d), full
+    resolution – the same pixels as _export_quantize(run_alpha_loader(od, FT_PREFIX + b, w, h)(frame)). The base and
+    its quantized copy are cached per frame; a stroke only recomputes its own box (outside it the correction is 0)."""
+    from engine.export import resolve_export_format, run_alpha_loader
+    from engine import final_touch as ft
+    d = ft.load(od)
+    if ft.finish_active(d.get("finish") or {}):   # motion blur / levels / blur act on the whole frame: the plain path
+        return _export_quantize(run_alpha_loader(od, FT_PREFIX + b, w, h)(frame))
+    strokes = (d.get("frames") or {}).get(str(int(frame))) or []
+    fmt = resolve_export_format(_export_format_setting(), int(STATE["manifest"].get("bit_depth", 16)))
+    key = (str(od), b, int(frame), w, h, fmt, _ft_base_sig(od, b, frame))
+    ent = _FT_BASE_CACHE.get(key)
+    if ent is None:
+        ent = {"base": run_alpha_loader(od, b, w, h)(frame)}
+        _FT_BASE_CACHE[key] = ent
+        while len(_FT_BASE_CACHE) > _FT_BASE_CACHE_MAX:
+            _FT_BASE_CACHE.popitem(last=False)
+    else:
+        _FT_BASE_CACHE.move_to_end(key)
+    if not strokes:
+        if "q0" not in ent:
+            ent["q0"] = _export_quantize(ent["base"])
+        return ent["q0"]
+    if "q1" not in ent:   # corrected frames go through compose's clip(0, 1)
+        ent["q1"] = _export_quantize(np.clip(ent["base"], 0.0, 1.0).astype(np.float32))
+    c, box = ft.layer_box(strokes, w, h)
+    out = ent["q1"].copy()
+    if box is not None:
+        x0, y0, x1, y1 = box
+        out[y0:y1, x0:x1] = _export_quantize(ft.compose(ent["base"][y0:y1, x0:x1], c[y0:y1, x0:x1]))
+    return out
+
+
 @app.get("/api/object/{name}/final_touch/frame/{frame}")
 def final_touch_frame(name: str, frame: int, b: Optional[str] = None, c: Optional[str] = None):
     """Proxy PNG of base + corrections in `frame` – the alpha the export writes for source „Final Touch” (same loader,
@@ -6270,7 +6308,7 @@ def final_touch_frame(name: str, frame: int, b: Optional[str] = None, c: Optiona
         if rf is not None and frame not in set(rf):
             raise HTTPException(status_code=404, detail=f"Baza {b} obejmuje {fmt_intervals(run_coverage(od, b))} – klatka {frame} poza nią")
     w, h = _plate_size()
-    a = _export_quantize(run_alpha_loader(od, FT_PREFIX + b, w, h)(frame))
+    a = _ft_frame_quantized(od, b, frame, w, h)
     s = _proxy_scale()
     small = cv2.resize(a, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
     return _png_response(_alpha_u8(small))
@@ -6788,7 +6826,7 @@ async def compute_crops(name: str):
 
 
 def _compute_crops(name: str) -> Dict[str, Any]:
-    """Crop segments of the object from its keys (stage Kadruj; automatic in „Przelicz całość”)."""
+    """Crop segments of the object from its keys (stage Kadruj; automatic in „Przelicz nieaktualne”)."""
     from engine.crop import run_crop_engine, save_crops
     _require_plates_ok()
     store = _objects()

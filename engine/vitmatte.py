@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -131,6 +131,10 @@ class VitMatteRunner:
         """`img_bgr` HxWx3 float32 display (0..1), `trimap_u8` HxW (0 / 128 / 255) -> alpha HxW float32 (0..1)."""
         return finish_alpha(self.forward(prepare_input(img_bgr, trimap_u8, unknown_value)), trimap_u8)
 
+    def run_many(self, imgs: Sequence[np.ndarray], tris: Sequence[np.ndarray], unknown_value: float = 0.5) -> List[np.ndarray]:
+        """The tiles of one frame, one after the other (each its own forward, batch 1 = `run`)."""
+        return [self.run(i, t, unknown_value) for i, t in zip(imgs, tris)]
+
 
 def worker_python() -> Optional[Path]:
     """ComfyUI's Python (config `comfy_python`, else Desktop .venv / portable embedded) – torch + CUDA + transformers."""
@@ -173,6 +177,7 @@ class ComfyVitMatteRunner:
     doctor_item = "Model: ViTMatte"
     worker = WORKER
     tmp_prefix = "md_vitmatte_"
+    batched = True                     # the worker takes an (N, H, W, 4) stack = the tiles of one frame in ONE request
 
     def __init__(self, model_id: str = DEFAULT_MODEL, python: Optional[Union[str, Path]] = None,
                  env: Optional[Dict[str, str]] = None, timeout_s: float = 600.0):
@@ -234,6 +239,7 @@ class ComfyVitMatteRunner:
         return json.loads(line)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
+        """(H', W', 4) -> (H', W') alpha; an (N, H', W', 4) stack -> (N, H', W') (every tile its own forward)."""
         with self._lock:
             if self._dir is None:
                 self._dir = tempfile.TemporaryDirectory(prefix=self.tmp_prefix)
@@ -257,6 +263,19 @@ class ComfyVitMatteRunner:
 
     def run(self, img_bgr: np.ndarray, trimap_u8: np.ndarray, unknown_value: float = 0.5) -> np.ndarray:
         return finish_alpha(self.forward(prepare_input(img_bgr, trimap_u8, unknown_value)), trimap_u8)
+
+    def run_many(self, imgs: Sequence[np.ndarray], tris: Sequence[np.ndarray], unknown_value: float = 0.5) -> List[np.ndarray]:
+        """The tiles of one frame in ONE request (plan docs/PLAN_EDGE_SPEED.md A5, 2026-10-25): one .npy with the
+        (N, H', W', 4) stack, the worker runs the same forward per tile (batch 1, so the alphas are the ones `run`
+        gives) and writes one (N, H', W') file – the per-tile protocol cost (58 ms measured) is paid once per frame.
+        Tiles of different sizes, or a worker without stacks (`batched` False), go one by one."""
+        xs = [prepare_input(i, t, unknown_value) for i, t in zip(imgs, tris)]
+        if not xs:
+            return []
+        if not self.batched or len(xs) == 1 or any(x.shape != xs[0].shape for x in xs):
+            return [finish_alpha(self.forward(x), t) for x, t in zip(xs, tris)]
+        outs = self.forward(np.stack(xs))
+        return [finish_alpha(a, t) for a, t in zip(outs, tris)]
 
     def close(self) -> None:
         """Stop the worker (frees its GPU memory); the next `run` starts a new one."""

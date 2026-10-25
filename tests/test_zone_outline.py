@@ -33,7 +33,8 @@ def test_band_follows_the_core_and_drops_exclusions():
     assert band[core & (d_in <= 5)].all() and not band[core & (d_in > 8)].any()
     z = Zone("z_01", "add", "matte", 1, matting="vitmatte", params={"region": "outline", "outline_out_px": 20,
                                                                         "fg_erode_px": 2, "exclude_grow_px": 3})
-    assert outline_in_px(z.params) == 6 and outline_in_px({"force_core_erode_px": 10}) == 14 and outline_in_px({"outline_in_px": 1}) == 1
+    # the inset slider IS the band inside (2026-10-24: no hidden +4 px margin), as in stages 3 / 4 / 7
+    assert outline_in_px(z.params) == 2 and outline_in_px({"force_core_erode_px": 10}) == 10 and outline_in_px({"outline_in_px": 1}) == 1
     drawn = np.zeros_like(core); drawn[:, :90] = True                    # "skin" drawn on the left = excluded
     hand = np.zeros_like(core); hand[150:, 120:150] = True               # an object (hand) at the bottom
     reg = outline_regions(z, {1: core}, {1: drawn}, lambda f: hand)[1]
@@ -89,8 +90,10 @@ def test_outline_feathers_blend_into_core_and_black(monkeypatch):
     """User rule 2026-10-22: in a whole-outline zone the inset feather blends the CORE (1) into the matte from the inner
     band edge, the outer feather the matte into the core (black where there is none) – not into the stage base."""
     import engine.vitmatte as vm
-    from engine.zones import feather_maps, outline_in_px
+    from engine.bandsys import area_dists
+    from engine.zones import outline_in_px
     from test_zone_vitmatte import MockRunner, _frames_scene
+    feather_maps = lambda area, core, fi, fo: area_dists(area, core)[:2]   # (d_in, d_out) – the one band system
     img, core, hair, region, frames = _frames_scene(3)
     monkeypatch.setattr(vm, "get_runner", lambda model_id=None: MockRunner())
     tr = {"z_01": {f: np.eye(2, 3, dtype=np.float32) for f in frames}}
@@ -100,14 +103,17 @@ def test_outline_feathers_blend_into_core_and_black(monkeypatch):
     f = frames[0]
     a, area = r.soft[f]
     assert (r.weights[f][area] == 255).all()                       # the area wins outright (partners are in the alpha)
-    d_in, d_out, li, lo = feather_maps(area, core, 6, 10)
+    d_in, d_out = feather_maps(area, core, 6, 10)
     assert a[area & (d_in < 1.5)].min() > 0.8                      # at the inner band edge: the core (1)
     assert a[area & (d_out < 1.5)].max() < 0.2                     # at the outer band edge: black (0)
     # an outer band edge ON the core (band 0 px outside): the outer feather blends into the core there, not into black
-    z0 = Zone("z_01", "add", "matte", frames[0], matting="vitmatte", params={**params, "outline_out_px": 0})
+    # (2026-10-25: the band is the model's – the mock gives < 1 there – so the outer feather needs length left after the
+    # inset one: a 12 px band, feathers 2 + 6; the first band row at the outer edge is then >= 5/6 core)
+    z0 = Zone("z_01", "add", "matte", frames[0], matting="vitmatte",
+              params={**params, "outline_out_px": 0, "outline_in_px": 12, "inset_feather_px": 2, "outer_feather_px": 6})
     a0, area0 = apply_zones(frames, {f: core for f in frames}, lambda f: img, [z0], tr).soft[f]
-    _, d_out0, _, _ = feather_maps(area0, core, 6, 10)
-    assert a0[area0 & core & (d_out0 < 1.5)].min() > 0.8
+    _, d_out0 = feather_maps(area0, core, 2, 6)
+    assert a0[area0 & core & (d_out0 < 1.1)].min() > 0.8
     # a soft stage base (MatAnyone2 / VideoMaMa, user decision 2026-10-22): the outer feather blends into max(core, base)
     # – the outer band edge is continuous with the base, no step; the inner edge still goes to the core (1)
     soft = np.full(core.shape, 0.4, np.float32); soft[core] = 1.0
@@ -171,7 +177,9 @@ def test_preview_forces_only_the_eroded_core(tmp_path, monkeypatch):
             return a
     app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
     monkeypatch.setattr(vm, "get_runner", lambda model_id=None: Half())
-    params = {"region": "outline", "outline_out_px": 30, "tile_px": 160, "temporal": "none", "alpha_black": 0.05}
+    # the band reaches 12 px into the core (explicit, deeper than the forced inset) so a forced ring lies inside it
+    params = {"region": "outline", "outline_out_px": 30, "outline_in_px": 12, "tile_px": 160, "temporal": "none",
+              "alpha_black": 0.05}
     body = {"mode": "add", "criterion": "matte", "frame": start, "polygon": [], "matting": "vitmatte", "preset": "hair",
             "params": params}
     zid = api.post("/api/object/obj/zones/new", json=body).json()["zone"]["zone_id"]
@@ -185,10 +193,11 @@ def test_preview_forces_only_the_eroded_core(tmp_path, monkeypatch):
         raw = cv2.imread(str(od / "preview" / f"zraw_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
         ring = core & (a > 0) & (a < 255)                      # the core rim the zone decides (inside the inset)
         return int((a == 255).sum()), int((a > 0).sum()), raw, ring
-    whole, _, _, _ = forced()
     api.patch(f"/api/object/obj/zones/{zid}", json={"params": {**params, "fg_erode_px": 8, "force_core_erode_px": 8}})
     eroded, region, raw, ring = forced()
-    assert 0 < eroded < whole and region > eroded
+    # the band inside = the forced inset (one slider, 2026-10-24): the forced core starts where the band ends, so the
+    # zone area holds no forced pixel – the core rim inside the band is the engine's
+    assert eroded == 0 and region > 0
     # the raw ViTMatte alpha in the core rim is the engine's, not a pasted 1 (the hard SAM3 edge, 2026-10-17)
     assert ring.any() and (raw[ring] < 200).mean() > 0.5
 
@@ -224,3 +233,47 @@ def test_zone_core_view_is_the_group_core(tmp_path, monkeypatch):
     g = cv2.imdecode(np.frombuffer(grp.content, np.uint8), cv2.IMREAD_GRAYSCALE) > 127
     o = cv2.imdecode(np.frombuffer(own.content, np.uint8), cv2.IMREAD_GRAYSCALE) > 127
     assert g.sum() > o.sum() and (g & o).sum() >= 0.98 * o.sum()      # the object + the hand, one piece
+
+
+@pytest.mark.parametrize("tile_px", [0, 96])
+def test_band_inside_the_core_is_the_models_not_the_cores(monkeypatch, tile_px):
+    """User report 2026-10-25 (sh060, Woman): SAM 3.1 took background between the strands for hair, deep inside the
+    core; band points with long inner whiskers put it inside the band, but the trimap kept it sure FG (the core eroded
+    by the inset only) and the result was forced back to 1 there. Rule: the band IS the unknown of the trimap - inside
+    it the model replaces the core, the inset feather blends into the core at the inner band edge only."""
+    import engine.vitmatte as vm
+    from engine.bandsys import area_dists
+    from engine.zones import band_is_unknown, zone_force_core
+    from test_zone_vitmatte import MockRunner, _frames_scene
+
+    class Half(MockRunner):        # unknown = 0.5: a forced 1 inside the band is then unmistakable
+        def run(self, img, tri, unknown_value=0.5):
+            self.calls.append((int((tri == 255).sum()), int((tri == 128).sum())))
+            a = np.full(tri.shape, 0.5, np.float32)
+            a[tri == 255] = 1.0
+            a[tri == 0] = 0.0
+            return a
+    img, core, hair, region, frames = _frames_scene(3)
+    runner = Half()
+    monkeypatch.setattr(vm, "get_runner", lambda model_id=None: runner)
+    params = {"region": "outline", "outline_out_px": 10, "outline_in_px": 2, "inset_feather_px": 4, "outer_feather_px": 0,
+              "tile_px": tile_px, "temporal": "none"}
+    z = Zone("z_01", "add", "matte", frames[0], matting="vitmatte", params=params)
+    assert band_is_unknown(z) and not band_is_unknown(Zone("z", "add", "matte", 1, matting="vitmatte"))
+    # one band point on the right edge of the core with a 40 px whisker into the core (the inset slider says 2 px)
+    ys, xs = np.where(core)
+    x = int(xs.max()); y = int(np.median(ys[xs == x]))
+    regs = outline_regions(z, {f: core for f in frames}, {}, band_at=lambda f: [(float(x), float(y), 10.0, 40.0)])
+    reg0 = regs[frames[0]]
+    d_in, _, _ = area_dists(reg0, core)
+    deep = reg0 & core & (d_in > 8)                                   # past the inset feather: the model alone decides
+    assert deep.sum() > 200
+    assert not (zone_force_core(z, core, reg0, 2) & reg0).any()        # nothing forced to 1 inside the band
+    assert (zone_force_core(z, core, reg0, 2) == (core & ~reg0)).all()
+    tr = {"z_01": {f: np.eye(2, 3, dtype=np.float32) for f in frames}}
+    r = apply_zones(frames, {f: core for f in frames}, lambda f: img, [z], tr, regions_by_zone={"z_01": regs})
+    a, area = r.soft[frames[0]]
+    assert np.array_equal(area, reg0)
+    assert abs(float(a[deep].mean()) - 0.5) < 0.05 and float(a[deep].max()) < 0.75   # the model (0.5), not the core (1)
+    assert a[area & (d_in < 1.5)].min() > 0.8                                        # the inner band edge: the core (1)
+    assert runner.calls and all(u > 0 for _fg, u in runner.calls)

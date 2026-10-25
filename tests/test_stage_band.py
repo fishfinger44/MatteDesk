@@ -60,9 +60,12 @@ def test_stage_band_points_lines_copy_and_delete(tmp_path, monkeypatch):
 
 
 def test_matanyone_band_points_need_px_mode_and_undo_restores(tmp_path, monkeypatch):
-    """Stage 3: band points shape the px mode of the edge band; Ctrl+Z (params PUT) restores points + reference."""
+    """Stage 3: band points shape the edge band (always – one band like stage 5, 2026-10-24: no adaptive mode, no 409;
+    unset sliders = the zone defaults); Ctrl+Z (params PUT) restores points + reference."""
+    from engine.zones import OUTLINE_OUT_PX, outline_in_px
     app_module, api, shot, pipe, frames, start = _proj(tmp_path, monkeypatch)
-    assert api.get(f"/api/object/obj/stage_band/matanyone/{start}").status_code == 409        # no px mode yet
+    st0 = api.get(f"/api/object/obj/stage_band/matanyone/{start}")
+    assert st0.status_code == 200 and st0.json()["defaults"] == {"out": OUTLINE_OUT_PX, "in": outline_in_px({})}
     assert api.put("/api/object/obj/settings", json={"band_out_px": 10, "band_in_px": 4, "band_in_feather_px": 2,
                                                      "band_out_feather_px": 5}).status_code == 200
     st = api.get(f"/api/object/obj/stage_band/matanyone/{start}").json()
@@ -87,15 +90,17 @@ def test_matanyone_band_points_need_px_mode_and_undo_restores(tmp_path, monkeypa
 
 def test_ltx_band_mode_points_and_core_blend(tmp_path, monkeypatch):
     """Stage 7 LTX-2.5, result mode „pas”: the matte blends into the core (1 inside, 0 outside) through the band; band
-    points need that mode (409 otherwise); the former modes keep their signature (band keys out of it)."""
+    points need that mode (409 in „surowy” – no band, 2026-10-24); the former „region” reads as „pas”."""
     from engine.ltx_alpha import finish, ltx_settings, settings_sig
     core = np.zeros((120, 120), np.float32); core[30:90, 30:90] = 1.0
     s = ltx_settings({"ltx": {"combine": "band", "region_px": 10, "core_erode_px": 4, "feather_px": 0, "region_soft_px": 0}})
     a = finish(np.full(core.shape, 0.5, np.float32), core, s)
     assert a[60, 60] == 1.0 and a[60, 5] == 0.0 and a[60, 95] == 0.5 and a[60, 88] == 0.5   # core / outside / band
-    old = ltx_settings({"ltx": {"combine": "region"}})
-    assert settings_sig(old) == settings_sig({**old, "feather_px": 3.0})                     # band keys not in old sigs
+    assert ltx_settings({"ltx": {"combine": "region"}})["combine"] == "band"
+    raw = ltx_settings({"ltx": {"combine": "raw"}})
+    assert settings_sig(raw) == settings_sig({**raw, "feather_px": 3.0})                     # band keys not in raw sigs
     app_module, api, shot, pipe, frames, start = _proj(tmp_path, monkeypatch)
+    assert api.put("/api/object/obj/ltx", json={"combine": "raw"}).status_code == 200
     assert api.get(f"/api/object/obj/stage_band/ltx/{start}").status_code == 409
     assert api.put("/api/object/obj/ltx", json={"combine": "band", "region_px": 12, "core_erode_px": 4,
                                                 "feather_px": 2, "region_soft_px": 5}).status_code == 200

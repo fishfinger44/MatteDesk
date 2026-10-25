@@ -122,11 +122,14 @@ SOFT_BG_P = 0.05   # ... unknown where SOFT_BG_P < p < SOFT_FG_P
 
 
 def build_trimap(core: np.ndarray, region: np.ndarray, forced_bg: np.ndarray, fg_erode_px: int = 2,
-                 prob: Optional[np.ndarray] = None) -> Trimap:
+                 prob: Optional[np.ndarray] = None, band_unknown: bool = False) -> Trimap:
     """FG = core eroded, unknown = region \\ FG \\ forced BG, BG = rest (incl. forced BG).
     `prob` (SAM 3.1 probability 0..1, consistent with the core; user decision 2026-10-14): the trimap from SAM 3.1's own
     uncertainty instead of the erosion – FG = core ∩ p >= 0.95, unknown = region ∪ (0.05 < p < 0.95) ∪ the rest of the
-    core rim; `fg_erode_px` unused."""
+    core rim; `fg_erode_px` unused.
+    `band_unknown` (whole-outline zones, user decision 2026-10-25): the region IS the unknown – no pixel of it is sure
+    FG, whatever the erosion or SAM 3.1's confidence says (the band points' inner whiskers reach deeper than the inset,
+    where SAM 3.1 took background for hair); the sure FG is the core outside the region."""
     core = core.astype(bool)
     region = region.astype(bool)
     if prob is not None:
@@ -137,6 +140,8 @@ def build_trimap(core: np.ndarray, region: np.ndarray, forced_bg: np.ndarray, fg
         fg = cv2.erode(core.astype(np.uint8), _disk(fg_erode_px)).astype(bool) if fg_erode_px > 0 else core.copy()
         fg &= core
         uncertain = np.zeros_like(core)
+    if band_unknown:
+        fg &= ~region
     forced = forced_bg.astype(bool) & ~core          # forced BG never touches the core (semantic errors = SAM3 key)
     # the eroded 2 px rim of the core is unknown everywhere (also outside the region): never a BG seed next to FG
     unknown = (region | core | uncertain) & ~fg & ~forced
