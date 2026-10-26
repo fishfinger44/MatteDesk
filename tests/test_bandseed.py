@@ -191,3 +191,37 @@ def test_propose_with_inset_slider_at_zero_has_no_inset_and_px_whiskers(tmp_path
     st = api.get(f"/api/object/obj/stage_band/videomama/{start}").json()
     by = {p["id"]: p["in"] for p in st["points"]}
     assert by[pid] == 6 and all(v == 0 for k, v in by.items() if k != pid)       # one point cuts in, the rest not
+
+
+def test_proposals_never_cross_the_core_edge_2026_10_26():
+    """User decision 2026-10-26 (test_e3 + sh060: inset 2 / inset feather 8 put the feather ramp ~6 px OUTSIDE the core –
+    the hard core step showed and the model alpha just outside it was scaled down, 1.0 -> 0.3): the sliders stay the
+    artist's, but what MatteDesk sets by itself must not cross – the band defaults (inset feather <= inset) and the
+    Sapiens2 proposal (every point's inset >= the current inset feather; the inset slider at 0 still means 0)."""
+    from engine.bandsys import BAND_DEFAULTS
+    assert BAND_DEFAULTS["inset_feather_px"] <= BAND_DEFAULTS["in_px"]
+    core = _disc()
+    pts, _ = bandseed.propose(core, _halves(core), 7, min_in=11.0)
+    ins = [p["keys"]["7"]["in"] for p in pts]
+    assert ins and min(ins) >= 11.0
+    pts0, _ = bandseed.propose(core, _halves(core), 7, inset=False, min_in=11.0)
+    assert all(p["keys"]["7"]["in"] == 0 for p in pts0)
+
+
+def test_propose_endpoint_takes_the_inset_feather_as_the_inset_floor(tmp_path, monkeypatch):
+    from engine.pipeline import ObjectPipeline
+    from test_zone_matte import _api_project
+    monkeypatch.setattr(ObjectPipeline, "_zone_tracker", lambda self: None)
+    app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
+
+    class Seg:
+        def classes(self, img):                                      # upper half hair (in 8), lower skin (in 2)
+            c = np.full(img.shape[:2], 3, np.uint8)
+            c[: img.shape[0] // 2] = 4
+            return c
+    monkeypatch.setattr(sapiens2, "get_runner", lambda *a, **k: Seg())
+    assert api.put("/api/object/obj/videomama", json={"reach_px": 12, "inset_px": 4, "feather_px": 11}).status_code == 200
+    assert api.post("/api/object/obj/band/propose", json={"frame": start, "stage": "videomama"}).status_code == 200
+    band = pipe.store.get("obj")["band"]
+    assert min(p["keys"][str(start)]["in"] for p in band["band_points"]) >= 11.0
+    assert band["inset_feather_px"] == 11                            # the artist's slider untouched

@@ -196,11 +196,14 @@ def cotracker_worker(python: Union[str, Path], env: Optional[Dict[str, str]] = N
     return w
 
 
-def close_workers() -> None:
+def close_workers(idle_only: bool = False) -> None:
+    """Stop the served workers (frees their GPU memory; the next request starts a new one). `idle_only`
+    (engine/gpu_release before a Comfy stage): a worker answering a request right now is left running."""
     with _WORKERS_LOCK:
-        ws = list(_WORKERS.values())
-        _WORKERS.clear()
-    for w in ws:
+        ws = [(k, w) for k, w in _WORKERS.items() if not (idle_only and w.busy)]
+        for k, _ in ws:
+            del _WORKERS[k]
+    for _, w in ws:
         w.close()
 
 

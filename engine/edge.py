@@ -12,7 +12,7 @@
 3. Flow consistency: DIS flow on the plate-to-mask, alpha(t) warped to t+1, IoU in the band (occlusions excluded by a
    forward/backward check) -> flags / key hints.
 4. Hygiene (last step before QA/export): clip to [0, 1]; core outside the band exactly 1; outside the object exactly 0;
-   islands < 600 px removed; interior holes filled unless from a Remove zone / user key; counts reported.
+   islands < 600 px removed; interior holes filled unless from a Remove zone / user key or already a hole of the core (mask 1+2); counts reported.
 """
 
 from __future__ import annotations
@@ -366,6 +366,16 @@ def flow_consistency(a0: np.ndarray, a1: np.ndarray, g0: np.ndarray, g1: np.ndar
 
 
 # ----------------------------------------------------------------------------- 4. hygiene
+def enclosed_holes(mask: np.ndarray) -> np.ndarray:
+    """Background of `mask` (> 0.5) enclosed by it: 4-connected components not touching the image border."""
+    bg = (np.asarray(mask) <= 0.5).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bg, connectivity=4)
+    h, w = bg.shape
+    inner = [i for i in range(1, n) if not (st[i, 0] == 0 or st[i, 1] == 0 or st[i, 0] + st[i, 2] >= w
+                                            or st[i, 1] + st[i, 3] >= h)]
+    return np.isin(lab, inner) if inner else np.zeros((h, w), bool)
+
+
 def hygiene(alpha: np.ndarray, core: np.ndarray, band: np.ndarray, keep_holes: Optional[np.ndarray] = None,
             island_px: int = 600, keep_islands: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, int]]:
     """Exact 1 inside / 0 outside, islands and unexplained holes cleaned. Returns (alpha, report counts).
@@ -401,12 +411,17 @@ def hygiene(alpha: np.ndarray, core: np.ndarray, band: np.ndarray, keep_holes: O
     n, lab, st, _ = cv2.connectedComponentsWithStats(bg, connectivity=4)
     holes = 0
     h, w = a.shape
+    # holes of the core itself (mask 1+2) are the object's topology, not model defects (sh060 F71 2026-10-26: a gap
+    # between arm and body, open in SAM 3.1 / mask 1+2, was filled to 1 whenever the model closed it off from the background)
+    core_holes = enclosed_holes(core) if n > 1 else None
     for i in range(1, n):
         x, y, bw, bh, area = st[i]
         if x == 0 or y == 0 or x + bw >= w or y + bh >= h:
             continue
         reg = lab == i
         if keep_holes is not None and keep_holes[reg].mean() > 0.5:
+            continue
+        if core_holes is not None and core_holes[reg].mean() > 0.5:
             continue
         a[reg] = 1.0
         holes += 1

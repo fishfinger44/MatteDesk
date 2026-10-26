@@ -116,13 +116,15 @@ def _runs(lab: np.ndarray) -> List[List[int]]:
 
 
 def propose(core: np.ndarray, cls: np.ndarray, frame: int, auto_w: Optional[np.ndarray] = None,
-            default: Tuple[float, float] = (40.0, 8.0), id_prefix: str = "s", inset: bool = True
-            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+            default: Tuple[float, float] = (40.0, 8.0), id_prefix: str = "s", inset: bool = True,
+            min_in: float = 0.0) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Band points (band_points@1, one key in `frame`, widths in px at the band reference) + stats.
     `auto_w` = the automatic half-width map (engine/edge.adaptive_band_width): each point's widths = max(rule, auto)
     at its outline pixel – baked in, so stages without the automatic width (4 / 5 / 7) get it too.
     A group without a rule ("none": background on the edge) takes `default` (the sliders = the constant band).
-    `inset=False` („Wcięcie w rdzeń” at 0, user decision 2026-10-23): every point's inner width is 0."""
+    `inset=False` („Wcięcie w rdzeń” at 0, user decision 2026-10-23): every point's inner width is 0.
+    `min_in` = the band's inset feather now: every inner width is at least that, so the feather ramp ends inside the
+    core (user decision 2026-10-26: a proposal must not set up a crossing; the sliders stay the artist's)."""
     pts: List[Dict[str, Any]] = []
     share = {g: 0 for g in GROUPS}
     total = 0
@@ -166,8 +168,7 @@ def propose(core: np.ndarray, cls: np.ndarray, frame: int, auto_w: Optional[np.n
                 if auto_w is not None:
                     aw = float(auto_w[y, x])
                     po, pi = max(o, aw), max(i, aw)
-                if not inset:
-                    pi = 0.0
+                pi = max(pi, float(min_in)) if inset else 0.0
                 pts.append({"id": f"{id_prefix}{len(pts) + 1}",
                             "keys": {str(int(frame)): {"x": float(x), "y": float(y), "out": round(float(po), 2),
                                                        "in": round(float(pi), 2)}}})

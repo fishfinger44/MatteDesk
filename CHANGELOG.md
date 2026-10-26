@@ -1,5 +1,28 @@
 # MatteDesk – changelog
 
+## 0.42 – 2026-10-26
+- **Version comparison for stages 3–7:** one A / B / difference panel (keys A / B / D, Q = band preview), a list of versions with
+  a trash button each (moved to the project trash after showing the size; a version in use cannot be deleted and says why),
+  a click on a version makes it active; the picked version always reaches the viewport.
+- **Alpha / Comp only with a result:** in the edge stages (3 / 4 / 5 / 7) the Alpha and Comp tabs open once the stage has its own
+  result (a version, a "Preview frames" run or a picked version) – an uncomputed stage no longer shows the SAM 3.1 core as its
+  cut-out; switching stages quickly no longer leaves them on from the previous stage. The view you pick rules in every stage;
+  no green tint over Comp / Alpha.
+- **Smooth playback in Alpha / Comp:** the preload and the background sweep load the mask that is actually drawn (the stage's
+  mask), so Play no longer stutters.
+- **Stages 1–2:** the Plate view shows the selected object's core in every frame like the Core view (the eye in the Objects
+  palette hides it). Stage bar grouped into Core (1 + 2) and Edges (3 / 4 / 5); stage 5 panel tidied.
+- **Stage 5:** one whole-outline zone per object (a second one is refused, "New zone" is disabled while one exists); "Preview
+  frames" stays visible in Alpha even when the stage has an older version.
+- **Band points:** an object behind another one no longer waits minutes before CoTracker3 starts (the front object's mask is
+  read once per frame); the tilt of the points is kept on crops (MatAnyone2, VideoMaMa, LTX-2.5); default bands and Sapiens2
+  proposals never cross the core edge.
+- **GPU memory:** one release before every stage (our GPU workers + ComfyUI's models), waiting until ComfyUI has really freed
+  its memory, and a warning whenever ComfyUI's GPU memory spills into system RAM.
+- **Fixes:** the "Update changes" progress counts frames (one key showed "2/2"); the SAM 3.1 core is stabilised once per run
+  (cached on disk); the mask 1+2 cleanup keeps holes; reading and saving an object is safe when two
+  tasks touch it at once (Windows: an object could briefly look as if it had no mask).
+
 ## 0.41 – 2026-10-25
 - **One edge band in every stage:** MatAnyone2 (stage 3), VideoMaMa (4), ViTMatte (5) and LTX-2.5 (7) use the same band –
   the same sliders (outer band, core inset, both feathers), the same band points and the same defaults (40 / 2 px, feathers

@@ -54,9 +54,8 @@
     st4Final: 'Dawne „Przelicz finalnie” – w etapie 5 zastąpione „▶ Przelicz z tej bazy” (paleta Eksperymenty)',
     // stage 4 ViTMatte – base + comparison (objects.js), zone panel (static/zones.js, plan step 5)
     st4BaseSel: 'Baza ViTMatte: MatAnyone2 (etap 3, miękka krawędź poza strefą) albo maska 1+2 (twarda maska SAM 3.1 + poprawki – etap dostępny zaraz po etapach 1 + 2). Każda baza ma własny wynik do porównania',
-    st4CmpA: 'Wersja A porównania (domyślnie ViTMatte na masce 1+2)',
-    st4CmpB: 'Wersja B porównania (domyślnie ViTMatte na MatAnyone2); klawisz B przełącza A ↔ B',
-    z4New: 'Odznacz aktywną strefę: następna kreska (G / R / P) tworzy NOWĄ strefę z wybranym presetem',
+    cmpB: 'Wersja B porównania: dowolna wersja obiektu – najpierw ten etap, niżej pozostałe; klawisz B pokazuje B, drugie B = aktywna ★',
+    z4New: 'Nowa strefa ViTMatte wzdłuż całego obrysu obiektu – jedna na obiekt (nieaktywne, gdy obiekt ma już strefę)',
     z4Prompt: 'Opis strefy: co wyciąć, czego pozbyć się z tła (np. „włosy, bez złotej linii”) – zapisany w strefie; reguły promptu i opis sceny (VLM) w kolejnych krokach',
     z4Engine: 'Silnik mattingu w strefie: MatAnyone2 (domyślnie, na kadrze strefy przy „Zastosuj”; podgląd = podpowiedź klucza), auto (dobór per fragment), clean (klucz różnicowy od clean plate’u), chroma (jednolite tło), knn (pstre, ostre tło)',
     z4Holdout: 'Maski obiektów z przodu (finalna alpha / rdzeń) wymuszają tło w strefie; bez nich – żółta flaga QA „strefa bez holdoutu”',

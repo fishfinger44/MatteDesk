@@ -322,9 +322,12 @@ class CorePropagator:
             digest = self._hash(None if a is None else (a, keys[a]), None if b is None else (b, keys[b]), (lo, hi))
             span_frames = list(range(lo, hi + 1))
             label = f"Propagacja rdzenia: przedział {n_done + 1}/{len(spans)} (kl. {lo}–{hi})"
-            self._step = (lambda d, _l=label, _n=n_done: progress_cb(f"{_l}, {d}", _n, len(spans))) if progress_cb else None
+            # done / total in FRAMES (the job window shows them as frames): with one key the run has 2 intervals and
+            # "2/2" read as "only two frames computed" (Woman2, 2026-10-26)
+            f_done = lo - frames[0] + (a is not None)   # the start key was counted with the previous interval
+            self._step = (lambda d, _l=label, _n=f_done: progress_cb(f"{_l}, {d}", _n, len(frames))) if progress_cb else None
             if progress_cb:
-                progress_cb(label, n_done, len(spans))
+                progress_cb(label, f_done, len(frames))
             cached = self._cache_get(name, digest, span_frames)
             soft_part: Dict[int, np.ndarray] = {}
             if cached is not None:
@@ -355,7 +358,7 @@ class CorePropagator:
                     res.soft[f] = soft_part[f]
             res.fwd_bwd_iou.update(ious)
             if progress_cb:
-                progress_cb("Propagacja rdzenia SAM 3.1", n_done + 1, len(spans))
+                progress_cb("Propagacja rdzenia SAM 3.1", hi - frames[0] + 1, len(frames))
         res.uncertain = sorted(f for f, v in res.fwd_bwd_iou.items() if v < IOU_UNCERTAIN)
         res.suggested_keys = suggest_keys(res.uncertain)
         return res

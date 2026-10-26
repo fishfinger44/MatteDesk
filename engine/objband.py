@@ -345,16 +345,19 @@ def zone_params(zone: Dict[str, Any], obj: Optional[Dict[str, Any]], root: Optio
 
 # ----------------------------------------------------------------------------- migration
 def _read(p: Path) -> Optional[Dict[str, Any]]:
+    from engine.objects import ObjectStore
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        return ObjectStore._read(p)   # retries a read that collides with another thread's replace (Windows)
     except (OSError, ValueError):
         return None
 
 
 def _write(p: Path, d: Dict[str, Any]) -> None:
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)
+    # the store's writer (retries the Windows replace while another thread reads the file): the migration runs on the
+    # first read, so a request and the mask 1+2 background batch migrated the same object at once and the bare replace
+    # failed with WinError 5 – the object then looked as if it had no mask (2026-10-26)
+    from engine.objects import ObjectStore
+    ObjectStore._write(p, d)
 
 
 def _slider_tuple(obj, key, zone=None):

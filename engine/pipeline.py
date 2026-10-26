@@ -86,10 +86,11 @@ def _read_mask_cached(fp: Path, w: int, h: int) -> Optional[np.ndarray]:
     if m.shape != (h, w):
         m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
     return _cache_put(k, m > 127)
+from engine.bandmap import crop_points
 from engine.crop import CropSegment, extract_crop, load_crops, pad_border, paste_crop
 from engine.depth import frame_path
 from engine.objects import ObjectStore
-from engine.refine import Finalizer, contiguous_chunks, core_soft_start_on, next_run_dir
+from engine.refine import Finalizer, contiguous_chunks, core_soft_start_on, next_run_dir, write_run_json
 from engine.sam3 import Sam3Runner
 from engine.segment import CorePropagator, CoreResult
 
@@ -440,7 +441,9 @@ class ObjectPipeline:
         return p
 
     def run_core(self, name: str, frames: Sequence[int], progress_cb=None) -> CoreResult:
+        from engine.gpu_release import before_stage
         from engine.stages import keys_signature
+        before_stage("comfy", self.client, "SAM 3.1")
         keys_sig = keys_signature(self.store, name)   # inputs of this run (stage "core" goes stale when keys change)
         segs = self.segments(name)
         engines = self.store.get(name)["tool"].get("interval_engines", {})
@@ -655,21 +658,10 @@ class ObjectPipeline:
     def release_comfy_gpu(self, reason: str = "") -> bool:
         """Before GPU work outside Comfy (CoTracker3 tracking, ViTMatte): ask ComfyUI to unload its models
         (`POST /free`) – only when its queue is idle (never under someone's running job). Comfy reloads the models on
-        the next prompt (~10-30 s). Returns True when a release was requested; silent no-op without a client."""
-        client = getattr(self, "client", None)
-        if client is None or not hasattr(client, "free_vram"):
-            return False
-        try:
-            q = client.get_queue()
-            if q.get("busy"):
-                return False
-            ok = bool(client.free_vram(unload_models=True, free_memory=True))
-            if ok:
-                import logging
-                logging.getLogger(__name__).info("Comfy: modele zwolnione przed liczeniem na GPU (%s)", reason)
-            return ok
-        except Exception:
-            return False
+        the next prompt (~10-30 s). Returns True when a release was requested; silent no-op without a client.
+        = engine/gpu_release.before_stage("local") – the one release of every stage."""
+        from engine.gpu_release import before_stage
+        return before_stage("local", getattr(self, "client", None), reason)["comfy"]
 
     def load_core_soft(self, name: str, frames: Sequence[int], core: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
         """SAM 3.1 soft probabilities written by run_core (`core_soft/p_####.png`, uint8) of the frames that have them."""
@@ -698,18 +690,29 @@ class ObjectPipeline:
                 gcache[f] = cv2.cvtColor((np.clip(self.loader.read(f), 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
             return gcache[f]
         user_keys = [f for f, k in keys.items()] if keys else []
+        me = self.store.get(name)
+        fronts = [o["name"] for o in self.store.list()
+                  if o["name"] != name and o.get("depth_order", 0) < me.get("depth_order", 0)]
+        # whole runs (no `only`): the result is on disk once per signature (stage 1 writes it, stages 3 / 4 / 5 / 7 read
+        # it – 2026-10-25: ~2.5 min per run on sh060 were recomputed bit for bit)
+        sig = self._corestab_sig(name, frames, keys, fronts, radius, band_px) if only is None else None
+        if sig is not None:
+            hit = self._corestab_load(name, sig, frames)
+            if hit is not None:
+                stab, stats, po = hit
+                if probs_out is not None:
+                    probs_out.update(po)
+                return stab, stats
+        po: Dict[int, np.ndarray] = {}
         # SAM3 soft probabilities (run_core with the PlateMatte soft node) -> probability mode; missing frames = binary
         probs = self.load_core_soft(name, frames, core)
         stab, stats = stabilize_core(core, gray, radius=radius, band_px=band_px, keys=user_keys, probs=probs or None,
-                                     progress=lambda d, t: job_progress("Stabilizacja rdzenia", d, t), probs_out=probs_out,
+                                     progress=lambda d, t: job_progress("Stabilizacja rdzenia", d, t), probs_out=po,
                                      only=only)
         # the edge against an object in front is the run_core front subtraction, not SAM jitter: it must follow the
         # front object in every frame – the temporal vote dragged it after the moving front object and opened seams
         # in the export union (E6 synthetic: 5 -> 14 px). Within band_px of a front core the frame keeps its own value
         # (core and, for the soft start, its own probability map consistent with it).
-        me = self.store.get(name)
-        fronts = [o["name"] for o in self.store.list()
-                  if o["name"] != name and o.get("depth_order", 0) < me.get("depth_order", 0)]
         if fronts:
             from engine.corestab import consistent_soft
             k = np.ones((2 * band_px + 1, 2 * band_px + 1), np.uint8)
@@ -723,9 +726,111 @@ class ObjectPipeline:
                     near = d if near is None else (near | d)
                 if near is not None:
                     stab[f] = np.where(near, core[f], stab[f])
-                    if probs_out is not None and f in probs_out and f in probs:
-                        probs_out[f] = np.where(near, consistent_soft(probs[f], core[f]), probs_out[f]).astype(np.uint8)
+                    if f in po and f in probs:
+                        po[f] = np.where(near, consistent_soft(probs[f], core[f]), po[f]).astype(np.uint8)
+        if sig is not None:
+            self._corestab_save(name, sig, frames, stab, stats, po)
+        if probs_out is not None:
+            probs_out.update(po)
         return stab, stats
+
+    # ---- the stabilised core of a whole run on disk (2026-10-25): <obj>/cache/corestab/<sig>/
+    _CORESTAB_V = 1          # bump when stabilized_core changes what it returns (corestab.py is hashed on its own)
+    _CORESTAB_KEEP = 2       # signatures kept per object (stage 1's frame list + a different work area)
+
+    def _corestab_sig(self, name: str, frames: Sequence[int], keys: Dict[int, np.ndarray], fronts: Sequence[str],
+                      radius: int, band_px: int) -> Optional[str]:
+        """Everything stabilized_core reads: the exact frame list (crop box and window ends depend on it), the core and
+        soft-map files of the object (stat), the key masks (content), the front objects' cores (stat), the plate the
+        flow is measured on (pattern, gain maps, display, frame files) and the code. None = not cacheable."""
+        import hashlib
+        h = hashlib.sha1()
+        try:
+            src = (Path(__file__).resolve().parent / "corestab.py").read_bytes()
+        except OSError:
+            return None
+        disp = self.loader.display
+        h.update(json.dumps([self._CORESTAB_V, hashlib.sha1(src).hexdigest(), name, [int(f) for f in frames],
+                             int(radius), int(band_px), list(fronts), str(self.loader.pattern),
+                             str(self.loader.gain_pattern), getattr(disp, "__name__", repr(disp)),
+                             getattr(disp, "lut_white", None)]).encode())
+
+        def st(p: Path):
+            try:
+                s = p.stat()
+                return [s.st_mtime_ns, s.st_size]
+            except OSError:
+                return None
+        od = self.store.dir(name)
+        for f in frames:
+            row = [st(od / "core" / f"c_{f:04d}.png"), st(od / "core_soft" / f"p_{f:04d}.png"),
+                   st(frame_path(self.loader.pattern, f))]
+            if self.loader.gain_pattern:
+                row.append(st(frame_path(self.loader.gain_pattern, f)))
+            row += [st(self.store.dir(o) / "core" / f"c_{f:04d}.png") for o in fronts]
+            h.update(json.dumps(row).encode())
+        for f in sorted(keys or {}):
+            m = np.ascontiguousarray(keys[f])
+            h.update(f"k{int(f)}{m.dtype}{m.shape}".encode())
+            h.update(m.tobytes())
+        return h.hexdigest()[:20]
+
+    def _corestab_dir(self, name: str) -> Path:
+        return self.store.dir(name) / "cache" / "corestab"
+
+    def _corestab_load(self, name: str, sig: str, frames: Sequence[int]):
+        """(stab, stats, soft) from disk when the signature matches and every frame is there, else None."""
+        d = self._corestab_dir(name) / sig
+        try:
+            j = json.loads((d / "corestab.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if j.get("sig") != sig or j.get("frames") != [int(f) for f in frames]:
+            return None
+        stab: Dict[int, np.ndarray] = {}
+        soft: Dict[int, np.ndarray] = {}
+        for f in frames:
+            m = cv2.imread(str(d / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
+            if m is None or m.shape != (self.h, self.w):
+                return None
+            stab[f] = m > 127
+        for f in j.get("soft_frames") or []:
+            p = cv2.imread(str(d / f"p_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
+            if p is None:
+                return None
+            soft[int(f)] = p
+        try:
+            os.utime(d)          # most recently used = kept
+        except OSError:
+            pass
+        job_progress("Stabilizacja rdzenia (z dysku)", len(frames), len(frames))
+        return stab, j.get("stats") or {}, soft
+
+    def _corestab_save(self, name: str, sig: str, frames: Sequence[int], stab: Dict[int, np.ndarray],
+                       stats: Dict[str, Any], soft: Dict[int, np.ndarray]) -> None:
+        """Write the cache (json last = complete); older signatures beyond _CORESTAB_KEEP are removed. Never fails
+        the run."""
+        import shutil
+        root = self._corestab_dir(name)
+        d = root / sig
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "corestab.json").unlink(missing_ok=True)
+            png = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+            for f in frames:
+                cv2.imwrite(str(d / f"c_{f:04d}.png"), stab[f].astype(np.uint8) * 255, png)
+            for f, p in soft.items():
+                cv2.imwrite(str(d / f"p_{f:04d}.png"), np.asarray(p, np.uint8), png)
+            (d / "corestab.json").write_text(json.dumps({"sig": sig, "frames": [int(f) for f in frames],
+                                                         "soft_frames": sorted(int(f) for f in soft),
+                                                         "stats": stats}, default=float), encoding="utf-8")
+            os.utime(d)
+            old = sorted((p for p in root.iterdir() if p.is_dir() and p.name != sig), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+            for p in old[self._CORESTAB_KEEP - 1:]:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError as e:
+            logging.getLogger("matte_desk").warning("core stabilisation cache (%s): %s", name, e)
 
     def core_with_soft(self, name: str, frames: Sequence[int], keys: Dict[int, np.ndarray], stabilize: bool,
                        only: Optional[Sequence[int]] = None):
@@ -825,9 +930,16 @@ class ObjectPipeline:
 
     def write_mask12(self, name: str, frames: Sequence[int], progress_cb=None) -> Optional[Dict[str, Any]]:
         """After the SAM 3.1 core (stage 1, 2026-10-22): the mask 1+2 (stabilised core) written to core_fix/ when the
-        object has no brush corrections – with corrections that is „▶▶ Zastosuj poprawki” (stage 2) as before."""
+        object has no brush corrections – with corrections that is „▶▶ Zastosuj poprawki” (stage 2) as before, and
+        only the stabilised core goes to its cache (stabilized_core, read by stages 2 / 3 / 4 / 5 / 7)."""
         from engine.stages import zone_dicts
         if zone_dicts(self.store.dir(name), ("brush",)):
+            obj = self.store.get(name)
+            if core_stabilize_on(obj):
+                fr = self._visible(name, frames)
+                if self.loader.frames is None:
+                    self.loader.frames = list(fr)
+                self.core_with_soft(name, fr, self.keys(name), True)
             return None
         return self.build_core_fix(name, frames, progress_cb)
 
@@ -930,7 +1042,7 @@ class ObjectPipeline:
                       group_outside_crop_px=self._crop_outside(segs, frames, core2))
         if object_life(obj) is not None:
             rj["coverage"] = intervals_from_frames(frames)
-        (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_run_json(run_dir, rj)
         self.store.update(name, tool={"stage_runs": {**(self.store.get(name)["tool"].get("stage_runs") or {}),
                                                      "core_base": run_dir.name}})
         if progress_cb:
@@ -1016,10 +1128,14 @@ class ObjectPipeline:
         core2 = self.ltx_mask(name, frames, s, zres.core if zres else core)
         others = self.ltx_others(name, frames, members or [name]) if s["guide"] != "plain" else {}
         segs = self._work_segments(name, frames) if members else self._segments_in(name, frames)
+        pts_at = self.band_points_fn(name, s["band"], frames)   # CoTracker3 tracking awaited before the release
+        # the 22B model needs ~22.5 GB of a 24 GB card: what Comfy (SAM 3.1, MatAnyone2…) and our workers (Sapiens2,
+        # CoTracker3) still held pushed 10.1 GB into shared RAM (Woman_01 2026-10-26)
+        from engine.gpu_release import before_stage
+        before_stage("comfy", self.client, "LTX-2.5 Alpha-Gen")
         gen = AlphaGen(self.client, self.work / "comfy_io", s, models=models,
                        progress=lambda t, d, n: job_progress(t, d, n))
-        pts_at = self.band_points_fn(name, s["band"], frames)
-        crop_pts = lambda f, seg: [(x - seg.crop[0], y - seg.crop[1], o, i) for x, y, o, i in pts_at(f)] if pts_at else None
+        crop_pts = lambda f, seg: crop_points(pts_at, f, seg)   # noqa: E731
         run_dir = next_run_dir(self.store.dir(name))
         for seg in segs:
             sf = [f for f in frames if seg.first <= f <= seg.last]
@@ -1049,7 +1165,7 @@ class ObjectPipeline:
                       group_outside_crop_px=self._crop_outside(segs, frames, core2))
         if object_life(obj) is not None:
             rj["coverage"] = intervals_from_frames(frames)
-        (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_run_json(run_dir, rj)
         self.store.update(name, tool={"stage_runs": {**(self.store.get(name)["tool"].get("stage_runs") or {}),
                                                      "ltx": run_dir.name}})
         if progress_cb:
@@ -1129,7 +1245,7 @@ class ObjectPipeline:
                 job_progress("LTX-2.5: suwaki na wynik", n, len(frames))
                 m = extract_crop(raw(f).astype(np.float32), seg)
                 cc = extract_crop(mask[f].astype(np.float32), seg)
-                a = finish(m, cc, s, [(x - seg.crop[0], y - seg.crop[1], o, i) for x, y, o, i in pts_at(f)] if pts_at else None)
+                a = finish(m, cc, s, crop_points(pts_at, f, seg))
                 write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
                 write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
                 write_alpha_exr(run_dir / "ltx_raw" / seg.seg_id / f"a_{f:04d}.exr", m)
@@ -1148,7 +1264,7 @@ class ObjectPipeline:
                 rj[k] = srj[k]
         if "coverage" not in rj and object_life(obj) is not None:
             rj["coverage"] = intervals_from_frames(frames)
-        (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_run_json(run_dir, rj)
         self.store.update(name, tool={"stage_runs": {**(self.store.get(name)["tool"].get("stage_runs") or {}),
                                                      "ltx": run_dir.name}})
         if progress_cb:
@@ -1195,8 +1311,7 @@ class ObjectPipeline:
                    guide_c: np.ndarray, s: Dict[str, Any], pts_at=None) -> None:
         from engine.refine import write_alpha_exr
         from engine.videomama import compose
-        x0, y0 = seg.crop[0], seg.crop[1]
-        pts = [(x - x0, y - y0, o, i) for x, y, o, i in pts_at(f)] if pts_at else None   # plate px -> crop px
+        pts = crop_points(pts_at, f, seg)
         a = compose(base_c, raw, s["reach_px"], s["inset_px"], s.get("feather_px", 0.0), s.get("outer_feather_px", 0.0), pts)
         write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
         write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
@@ -1226,7 +1341,7 @@ class ObjectPipeline:
                 rj["group_outside_crop_px"] = self._crop_outside(segs, frames, core2)
         if object_life(obj) is not None and "coverage" not in rj:
             rj["coverage"] = intervals_from_frames(frames)
-        (run_dir / "run.json").write_text(json.dumps(rj, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_run_json(run_dir, rj)
         self.store.update(name, tool={"stage_runs": {**(self.store.get(name)["tool"].get("stage_runs") or {}),
                                                      "videomama": run_dir.name}})
 
@@ -1249,12 +1364,11 @@ class ObjectPipeline:
         core2 = zres.core if zres else core
         base, base_run = self.vmm_base(name, frames, s, core2)
         segs = self._work_segments(name, frames) if members else self._segments_in(name, frames)
-        try:   # the VideoMaMa pipeline lives outside Comfy's model management: free what Comfy holds (SAM3, MatAnyone…)
-            self.client.free_vram()
-        except Exception:
-            pass
+        pts_at = self.band_points_fn(name, s["band"], frames)   # CoTracker3 tracking awaited before the release
+        # the VideoMaMa pipeline lives outside Comfy's model management: free what Comfy and our workers hold
+        from engine.gpu_release import before_stage
+        before_stage("comfy", self.client, "VideoMaMa")
         gen = VideoMaMa(self.client, self.work / "comfy_io", s, models_dir, progress=lambda t, d, n: job_progress(t, d, n))
-        pts_at = self.band_points_fn(name, s["band"], frames)
         run_dir = next_run_dir(self.store.dir(name))
         for seg in segs:
             sf = [f for f in frames if seg.first <= f <= seg.last]
@@ -1380,7 +1494,9 @@ class ObjectPipeline:
         (alpha_base for every frame, tool.stage_runs.matanyone).
         `preview_dir` (stage preview, engine/stage_preview.py): the same edge pass written into that scratch folder –
         no version, no QA, nothing in the object state; returns {frame: full-frame alpha}."""
+        from engine.gpu_release import before_stage
         from engine.stages import mask_sig, settings_sig
+        before_stage("comfy", self.client, "MatAnyone2")
         obj = self.store.get(name)
         frames = self._visible(name, frames)      # object life range: only the visible frames are computed
         mode = "matanyone" if stage == "matanyone" else (edge_mode or obj.get("edge_mode", "auto"))
@@ -1661,9 +1777,7 @@ class ObjectPipeline:
         def fn(f, seg, core_crop, _bw):
             o, i = lim
             if pts_of:
-                x0, y0 = seg.crop[0], seg.crop[1]
-                pts = [(x - x0, y - y0, po, pi) for x, y, po, pi in pts_of(f)]   # plate px -> crop px
-                o, i = band_widths(core_crop, lim[0], lim[1], pts)
+                o, i = band_widths(core_crop, lim[0], lim[1], crop_points(pts_of, f, seg))
             return band_area(sdf(core_crop), o, i)
         return fn
 
@@ -2691,11 +2805,11 @@ class ObjectPipeline:
         full = assemble_full(per_seg, segs, frames, self.w, self.h)
         rj2 = {**rj, "run": new_dir.name, "applied_from": run, "applied_zone": zone_id,
                "zones": zres.stats if zres else {}, "created_at": datetime.now().isoformat(timespec="seconds")}
-        for k in ("stage", "core_fix_sig", "settings_sig"):
+        for k in ("stage", "core_fix_sig", "settings_sig", "gpu_spill_gb"):   # the spill: this job's own
             rj2.pop(k, None)
         if stage == "vitmatte":
             rj2.update(stage="vitmatte", base=vbase, matte_sig=matte_sig(self.store.dir(name)))
-        (new_dir / "run.json").write_text(json.dumps(rj2, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_run_json(new_dir, rj2)
         qa = self.run_qa(name, frames, full, segs, new_dir, removed=zres.removed if zres else None,
                          soft_areas={f: a for f, (_, a) in zres.soft.items()} if zres and zres.soft else None)
         if zres:
@@ -2736,16 +2850,33 @@ class ObjectPipeline:
         # uint8 gray: _GrayCache keeps it as is and returns float32 (same values, no per-frame integrality check)
         gray = lambda f: cv2.cvtColor((np.clip(self.loader.read(f), 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
         # holes / islands inside the area of a soft `matte` zone are the zone's topology (gaps between strands), not
-        # defects (plan section 12); holes from Remove zones were already allowed
+        # defects (plan section 12); holes from Remove zones were already allowed; holes of the core (mask 1+2, as
+        # written to the run's core/) are the object's own shape – hygiene keeps them, QA does not flag them
+        core_dir = run_dir / "core"
+
+        def _core_holes(f):
+            from engine.edge import enclosed_holes
+            m = None
+            for s in segs:
+                p = core_dir / s.seg_id / f"c_{f:04d}.png"
+                c = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
+                if c is not None:
+                    c = paste_crop(c.astype(np.float32) / 255.0, s, self.w, self.h) > 0.5
+                    m = c if m is None else (m | c)
+            return enclosed_holes(m) if m is not None and m.any() else None
+
         def _allowed(f):
             m = removed[f] if removed else None
+            ch = _core_holes(f)
+            if ch is not None:
+                m = ch if m is None else (m | ch)
             if soft_areas and f in soft_areas:
                 # + 8 px: a pocket of the base's soft edge (alpha ~0.4) closed by the zone's strands lies just outside
                 # the area (SH020 2026-10-13: 17-44 px slivers along the zone border) – zone topology, not a defect
                 sa = cv2.dilate(soft_areas[f].astype(np.uint8), np.ones((17, 17), np.uint8)).astype(bool)
                 m = sa if m is None else (m | sa)
             return m
-        allowed = _allowed if (removed or soft_areas) else None
+        allowed = _allowed
         allowed_isl = (lambda f: soft_areas.get(f)) if soft_areas else None
         cgray = None
         if self.clean is not None:

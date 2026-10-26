@@ -63,7 +63,7 @@ VMM_DEFAULTS: Dict[str, Any] = {
     # shape the band (engine/bandmap.py; [] = constant band), the sliders' reference scales them
     "reach_px": 40.0,
     "inset_px": 2.0,
-    "feather_px": 8.0,
+    "feather_px": 2.0,
     "outer_feather_px": 8.0,
     "band_points": [],
     "band_ref_out": None,
@@ -74,6 +74,10 @@ VMM_DEFAULTS: Dict[str, Any] = {
     "seed": 42,
     "offload": "auto",        # model CPU offload: auto = on when the Comfy GPU has < 20 GB (16 GB peak at 1280 px)
 }
+# the band values FROM BAND_DEFAULTS, as LTX-2.5 does (the inset feather stayed 8 here when 166fa62 made it 2)
+from engine.bandsys import BAND_DEFAULTS as _BD  # noqa: E402
+VMM_DEFAULTS.update(reach_px=_BD["out_px"], inset_px=_BD["in_px"], feather_px=_BD["inset_feather_px"],
+                    outer_feather_px=_BD["outer_feather_px"])
 SETTING_KEYS = tuple(VMM_DEFAULTS)
 
 

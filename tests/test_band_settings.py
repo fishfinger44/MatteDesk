@@ -285,3 +285,30 @@ def test_no_band_resolution_of_its_own_in_any_stage_module():
         src = (root / rel).read_text(encoding="utf-8")
         assert "band_modes" not in src and "shared(" not in src and "own_params(" not in src, rel
         assert "band_for(" in src, rel
+
+
+def test_first_read_migration_survives_concurrent_readers(tmp_path):
+    """A fresh object migrates its band sliders on the first read and writes object.json; a request and the mask 1+2
+    background batch read it at once – on Windows the bare replace failed with WinError 5 and the object looked as if it
+    had no mask (test_zone_outline flaky, 2026-10-26). Every reader must get the object."""
+    import threading
+    from engine.objects import ObjectStore
+    store = ObjectStore(tmp_path)
+    errors = []
+    for round_ in range(6):
+        name = f"o{round_}"
+        store.create(name, [name])
+        go = threading.Barrier(12)
+
+        def read():
+            go.wait()
+            try:
+                for _ in range(5):
+                    store.get(name)
+            except Exception as e:   # noqa: BLE001
+                errors.append(repr(e))
+        ts = [threading.Thread(target=read) for _ in range(12)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+    assert not errors, errors[:3]
+    assert not list(tmp_path.glob("objects/*/*.tmp"))

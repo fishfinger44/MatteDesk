@@ -247,7 +247,9 @@ def test_kadruj_is_automatic_przelicz_calosc():
     src = (STATIC / "objects.js").read_text(encoding="utf-8")
     assert "autoCrop" not in src and "id: 'crops'" not in src and 'id="st1CropsBox"' in src
     assert "compute_all" in src and src.count("run('st1All', computeAll)") == 1 and "run('ppAll', computeAll)" in src
-    assert src.count("S.view === 'none' && S.stage === ST.SAM3) return 'key'") == 2
+    # 2026-10-26: the plate in stages SAM 3.1 / CoTracker3 shows the core like the Rdzeń view (not only the key frames)
+    assert "S.view === 'none' && (S.stage === ST.SAM3 || S.stage === ST.BRUSH)" in src
+    assert src.count("if (coreView()) return 'core';") == 2 and "return 'key';" not in src
 
 
 def test_stage_layout_2026_10_15():
@@ -419,6 +421,24 @@ def test_gpu_overlays_with_cpu_fallback():
     assert "mdGpu.comp(beauty, m.img, c, W, H)" in app
 
 
+def test_spill_warning_in_the_progress_window_2026_10_26():
+    """User request 2026-10-26: GPU memory spilled to RAM during a Comfy prompt (comfy_info.spill_gb, comfy_client) shows
+    as a warning row in the progress window, next to „Przerwij”."""
+    js = (STATIC / "jobs.js").read_text(encoding="utf-8")
+    assert 'id="jmSpill"' in js and "const sp = (j.comfy_info || {}).spill_gb;" in js
+    assert "przelało się do RAM" in js and "Przerwij" in js
+
+
+def test_band_keys_are_of_the_band_not_the_frame_2026_10_26():
+    """User report 2026-10-26: the band key triangles hid while scrubbing – they came from the current frame's points
+    (empty until loaded, occluded points missing). The lane reads the stored band points' keys (GET …/params), cached per
+    object + stage and dropped with every band change (dirty / reset)."""
+    bp = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
+    assert "H.api('GET', `${base()}/params`)" in bp and "Object.keys(p.keys || {}).map(Number)" in bp
+    assert "if (B.keyset && B.keyset.k === owner()) return B.keyset.keys;" in bp
+    assert "B.keyset = null; dirtyLines();" in bp and "function reset() { B.data = {}; B.keyset = null;" in bp
+
+
 def test_one_band_drawing_2026_10_24():
     """One band path (user request 2026-10-24): every band preview is drawn by MD_BANDPTS.strokeLines (dashed band
     edges + thin feather-end lines) – stage 5 zones.js no longer strokes its own yellow lines; stage 3 shows a refused
@@ -458,3 +478,50 @@ def test_one_band_palette_2026_10_24():
         assert gone not in zon, gone
     assert "zoneBand: () =>" in obj and "activeBandKey, pushBandUndo, reloadBand" in zon
     assert "S().stage === H.ST.VITMATTE && H.zoneBand ? H.zoneBand() : null" in bp
+
+
+def test_one_version_comparison_2026_10_26():
+    """One version comparison (user decision 2026-10-26): a single block (cmpHtml) mounted into the .cmp-slot of stages
+    3 / 4 / 5 / 6 / 7; the list shows (and deletes) only the stage's versions, B = any version grouped by stage;
+    keys A / B / D, Q = the stage's band preview. No per-stage copies (old st4Cmp*, vmShow*, lx6Show*)."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    assert obj.count("function cmpHtml()") == 1 and obj.count('id="stCmp"') == 1
+    assert obj.count('<div class="cmp-slot"></div>') == 5
+    assert "const CMP_STAGES = () => [ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.EXPERIMENTS, ST.LTX]" in obj
+    assert "own.map(" in obj and "<optgroup label=" in obj               # the list = this stage, B grouped by stage
+    assert "mountCmp(n !== prevStage)" in obj
+    for gone in ("st4CmpA", "st4CmpRuns", "vmShowMa", "lx6ShowMa"):
+        assert gone not in obj, gone
+    for key in ("KeyA", "KeyD", "KeyQ"):
+        assert f"e.code === '{key}'" in obj, key
+
+
+def test_one_stage_alpha_switch_2026_10_26():
+    """„👁 alfa” is one switch with one meaning in stages 3 / 4 / 5 / 7 (user request 2026-10-26): every stage palette has
+    it next to the band preview, the stage preview tint obeys it (stageAlphaOn), the stage result is tinted where nothing
+    else is, and Alpha / Comp never get a green tint over the matte (live results of 4 / 7, zone preview of 5)."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    zon = (STATIC / "zones.js").read_text(encoding="utf-8")
+    for cid in ("ePvAlpha", "vmPvAlpha", "lxPvAlpha"):
+        assert re.search(rf'id="{cid}"[^>]*> 👁 alfa</label>', obj), cid
+    assert "👁 wynik" not in obj
+    assert "const alphaOff = !stageAlphaOn(st);" in obj
+    assert "function drawStageResultTint(ctx, img, f)" in obj and "drawStageResultTint(ctx, img, f); if (t)" in obj
+    assert "bandsOnly || !tintView() ||" in obj and "!bandsOnly && tintView() &&" in obj
+    assert "const tintOk = S().view !== 'alpha' && S().view !== 'comp';" in zon
+    assert "(tintOk || Z.ov !== 'alpha')" in zon
+    # Comp: the stage frame preview is the matte, never tinted (drawStagePreview)
+    assert "const bw = alphaBw() || S.view === 'comp';" in obj
+
+
+def test_top_view_tab_rules_2026_10_26():
+    """The view tab on top (Plate / Core / Alpha / Comp) is the user's in every stage (user decision 2026-10-26): the
+    version comparison (entering a stage puts its version A on the view) and finished computations never switch it."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    body = obj[obj.index("function showRun(runName) {"):obj.index("function updateRunHud()")]
+    assert "setView(" not in body
+    body = obj[obj.index("function cmpShow(which) {"):obj.index("function cmpKey(which) {")]
+    assert "setView(" not in body
+    for name in ("objects.js", "brush.js", "zones.js"):
+        src = (STATIC / name).read_text(encoding="utf-8")
+        assert not re.search(r"loadStages\(\);\s*(H\.)?setView\('(alpha|core)'\)", src), name

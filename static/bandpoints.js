@@ -15,7 +15,8 @@
   let H = null;
   const S = () => H.S;
   const obj = () => H.S.obj;
-  const B = { data: {}, lines: {}, lastLines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false, keep: null };
+  const B = { data: {}, lines: {}, lastLines: {}, busy: {}, drag: null, live: null, undo: [], tracking: false, keep: null,
+              keyset: null, keyBusy: null };
   // the band being edited: a stage (3 MatAnyone2 / 4 VideoMaMa / 7 LTX-2.5) or, in stage 5, the active whole-outline zone
   // („zone:<id>” – one editor for every band, user decision 2026-10-24; the server's stage_band endpoints take both)
   const STAGE_OF = () => (!H ? null : S().stage === H.ST.VIDEOMAMA ? 'videomama' : S().stage === H.ST.MATANYONE ? 'matanyone'
@@ -40,7 +41,28 @@
 
   const st = (f) => B.data[key(f)] || null;
   const pts = (f) => ((st(f) || {}).points || []);
-  const allKeys = () => { const s = st(V().currentFrame); return s ? [...new Set(s.points.flatMap((p) => p.keys || []))].sort((a, b) => a - b) : []; };
+  // the band keys = a property of the band, not of the frame (user report 2026-10-26: the triangles hid while scrubbing –
+  // they came from the current frame, empty until it loaded and without the points occluded there): read from the
+  // stored band points (GET …/params), the current frame's points only until that answer arrives
+  const owner = () => `${obj()}|${STAGE_OF()}`;
+  async function loadKeyset() {
+    const k = owner();
+    if (B.keyBusy === k || !on()) return;
+    B.keyBusy = k;
+    try {
+      const d = await H.api('GET', `${base()}/params`);
+      if (k === owner()) {
+        B.keyset = { k, keys: [...new Set((d.band_points || []).flatMap((p) => Object.keys(p.keys || {}).map(Number)))].sort((a, b) => a - b) };
+        renderLane(); info();
+      }
+    } catch (e) { /* no band (yet): the frame's points stand in */ }
+    finally { if (B.keyBusy === k) B.keyBusy = null; }
+  }
+  const allKeys = () => {
+    if (B.keyset && B.keyset.k === owner()) return B.keyset.keys;
+    loadKeyset();
+    const s = st(V().currentFrame); return s ? [...new Set(s.points.flatMap((p) => p.keys || []))].sort((a, b) => a - b) : [];
+  };
 
   async function load(f) {
     const k = key(f);
@@ -59,7 +81,7 @@
     }
     finally { delete B.busy[k]; }
   }
-  function dirty() { B.data = B.keep ? { [B.keep.k]: B.keep.d } : {}; dirtyLines(); B.live = null; }
+  function dirty() { B.data = B.keep ? { [B.keep.k]: B.keep.d } : {}; B.keyset = null; dirtyLines(); B.live = null; }
   function dirtyLines() { B.lines = {}; B.lastLines = {}; }
   // preview lines of the band: the palette's slider values (live while dragging = the whiskers scale, lines after release)
   async function loadLines(f, params, prefetch) {
@@ -481,7 +503,7 @@
     if (clr) { clr.style.display = n ? '' : 'none'; clr.disabled = !hasKeyAt(f); }
   }
   function onFrame() { if (on()) { if (!st(V().currentFrame)) load(V().currentFrame); renderLane(); info(); } else renderLane(); }
-  function reset() { B.data = {}; B.lines = {}; B.lastLines = {}; B.undo = []; B.live = null; B.drag = null; renderLane(); }
+  function reset() { B.data = {}; B.keyset = null; B.lines = {}; B.lastLines = {}; B.undo = []; B.live = null; B.drag = null; renderLane(); }
 
   function init(hooks) {
     H = hooks;

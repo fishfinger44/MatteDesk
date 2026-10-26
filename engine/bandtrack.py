@@ -98,6 +98,8 @@ def track_positions(points: Sequence[Dict[str, Any]], frames: Sequence[int], tra
     frames = list(frames)
     if not points or not frames:
         return {f: {} for f in frames}
+    if occluder_at is not None:
+        occluder_at = _frame_memo(occluder_at)
     out = static_positions(points, frames)
     geo = _Geometry(core_at) if core_at is not None else None
     want = set(resolve) if resolve is not None else None
@@ -251,6 +253,21 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
 
 
 _MEM: Dict[str, Any] = {}          # tracks without a cache dir (tests)
+
+
+def _frame_memo(fn: Callable[[int], Any]) -> Callable[[int], Any]:
+    """fn(f) kept for the last frame asked: the loops go frame by frame, point by point, and the occluder is a 4K
+    alpha of the objects in front read from disk – per point it was 26 points x 148 frames reads, twice (Woman_02 behind
+    Woman_01, 2026-10-26: VideoMaMa sat ~15 min in „Śledzenie punktów pasa” with CoTracker3 idle)."""
+    last: Dict[str, Any] = {}
+
+    def at(f: int):
+        if last.get("f", None) != f or "v" not in last:
+            last.clear()
+            last["v"] = fn(f)
+            last["f"] = f
+        return last["v"]
+    return at
 
 
 def _accepts_cancel(tracker: Any) -> bool:

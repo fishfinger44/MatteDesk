@@ -35,6 +35,7 @@
   modal.innerHTML = `<div id="jobCard"><div class="t" id="jmTitle"></div><div class="s" id="jmStep"></div>
     <div class="jobTrack"><div class="jobFill" id="jmFill"></div></div>
     <div class="s" id="jmMeta"></div>
+    <div class="s" id="jmSpill" style="display:none;margin-top:8px;padding:6px 8px;border-radius:6px;background:rgba(240,112,58,.18);color:#fde68a"></div>
     <div class="jobDet" id="jmDet"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn btn-ghost" id="jmDetBtn" title="GPU / VRAM / RAM, co liczy Comfy, krok i ETA" style="margin-right:auto">Szczegóły ▾</button>
@@ -205,6 +206,10 @@
       $('jmStep').textContent = j.step || 'start…';
       fill($('jmFill'), j);
       $('jmMeta').textContent = meta(j);
+      // GPU memory spilled to RAM (comfy_client.wait_for_prompt, user request 2026-10-26): the run goes on, many times slower
+      const sp = (j.comfy_info || {}).spill_gb;
+      $('jmSpill').style.display = sp ? '' : 'none';
+      if (sp) $('jmSpill').textContent = `⚠ ${sp.toFixed(1)} GB pamięci GPU przelało się do RAM – liczenie będzie kilka razy wolniejsze (może też skończyć się brakiem pamięci). Rozważ „Przerwij” i mniejszą rozdzielczość / skalę / kadr albo krótszy zakres.`;
       $('jmCancel').disabled = stopping; $('jobCancel').disabled = stopping;
       // bar
       $('jobDot').style.background = stopping ? '#f0703a' : '#e8a33d';

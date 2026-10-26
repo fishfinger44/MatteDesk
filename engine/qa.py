@@ -6,7 +6,7 @@ Metrics (per frame, full plate coordinates, inside the whole-object bbox = union
 - flicker: mean |a(t) - a(t-1)| after camera compensation (ECC translation on plate luma at 1/4, exactly as
   tools/pm_qa_figure.py); gate: median over frames <= 0.004; frames > 2.5 x median flagged; per-pixel flicker map
 - area jump / IoU with the previous frame (camera-compensated) -> flags
-- interior holes = 0 (unless from a Remove zone / user key), islands < 600 px = 0
+- interior holes = 0 (unless from a Remove zone / user key or a hole of the core = mask 1+2), islands < 600 px = 0
 - seams (multi-object split): pixels < 0.9 surrounded by > 0.99 in the union = 0
 - fwd/bwd agreement of the core (7.2 pkt 4), jumps at crop-segment boundaries
 Flags -> timeline colours: red (metric gate), yellow (suspicious), green; blue = key frames (UI).

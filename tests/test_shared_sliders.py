@@ -107,7 +107,7 @@ def test_migration_detaches_the_owners_whose_sliders_differ(tmp_path):
     pts = {"band_points": [{"id": "p1", "keys": {"1": {"x": 10.0, "y": 10.0, "out": 20, "in": 4}}}], "band_ref_out": 52.0, "band_ref_in": 0.0}
     obj = {"name": "obj", "band": pts, "band_modes": {"ltx": "own"},
            "band_out_px": 57, "band_in_px": 3, "band_in_feather_px": 5, "band_out_feather_px": 2,          # stage 3: differs
-           "videomama": {"reach_px": 52.0, "inset_px": 0.0, "feather_px": 8.0, "outer_feather_px": 15.0},  # stage 4: = the zone
+           "videomama": {"reach_px": 52.0, "inset_px": 0.0, "feather_px": 2.0, "outer_feather_px": 15.0},  # stage 4: = the zone (its unset inset feather = BAND_DEFAULTS 2)
            "ltx": {"region_px": 35, "core_erode_px": 5, "band_points": [], "band_ref_out": None, "band_ref_in": None},
            "tool": {}}
     (od / "object.json").write_text(json.dumps(obj), encoding="utf-8")
@@ -116,12 +116,12 @@ def test_migration_detaches_the_owners_whose_sliders_differ(tmp_path):
     (od / "zones" / "z_01.json").write_text(json.dumps(zone), encoding="utf-8")
     objband.migrate_sliders(root, "obj")
     o = json.loads((od / "object.json").read_text(encoding="utf-8"))
-    assert o["band"]["out_px"] == 52 and o["band"]["in_px"] == 0 and o["band"]["inset_feather_px"] == 8 and o["band"]["outer_feather_px"] == 15
+    assert o["band"]["out_px"] == 52 and o["band"]["in_px"] == 0 and o["band"]["inset_feather_px"] == 2 and o["band"]["outer_feather_px"] == 15
     assert o["band_modes"] == {"ltx": "own", "matanyone": "own"}            # stage 3 differs -> detached; stage 4 = the zone -> shared
     assert o["edge_band"]["band_points"] == pts["band_points"]              # ... with a copy of the shared points
     assert o["band_out_px"] == 57                                           # ... and its own sliders as they were
     assert objband.sliders(o, "matanyone") == (57.0, 3.0, 5.0, 2.0)
-    assert objband.sliders(o, "videomama") == (52.0, 0.0, 8.0, 15.0)
+    assert objband.sliders(o, "videomama") == (52.0, 0.0, 2.0, 15.0)
     assert objband.sliders(o, "ltx") == (35.0, 5.0, BAND_DEFAULTS["inset_feather_px"], BAND_DEFAULTS["outer_feather_px"])
     z = json.loads((od / "zones" / "z_01.json").read_text(encoding="utf-8"))
     assert "band_points" not in z["params"] and objband.mode(o, "zone:z_01") == "shared"

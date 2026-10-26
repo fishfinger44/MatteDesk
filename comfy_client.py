@@ -24,6 +24,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+SPILL_WARN_GB = 1.0     # GPU memory of Comfy in shared RAM from which the job warns (idle Comfy: ~0.3 GB)
+SPILL_SAMPLE_S = 5.0    # how often it is read (Get-Counter ~1-2 s, background thread)
+
 # prompts interrupted by "Przerwij" (process-wide): a node without an interrupt check keeps running them
 INTERRUPTED_PROMPTS: set = set()
 
@@ -57,6 +60,10 @@ class ComfyClient:
         self.busy_after_s = 900.0
         self._clock = time.monotonic       # injectable (tests: fake clock)
         self._sleep = time.sleep
+        # GPU memory of Comfy spilled to RAM (Windows lets CUDA overflow into shared memory – no OOM, 5-10x slower):
+        # watched during every prompt (user request 2026-10-26); None = default sampler, a callable = tests
+        self.spill_watch_factory: Optional[Any] = None
+        self._spill_reader: Optional[Any] = None
 
     @staticmethod
     def is_timeout(err: Any) -> bool:
@@ -194,7 +201,38 @@ class ComfyClient:
         Comfy not answering for `down_after_s` -> kind "comfy_down"; our prompt neither queued nor in the history for
         `lost_after_s` (Comfy restarted) -> kind "lost"; execution_error -> readable message (GPU / RAM out of memory)
         with the raw text in `raw_error`. A request that TIMES OUT (the connection is accepted, no answer) means
-        Comfy is busy, not down: waited for up to `busy_after_s`, then kind "comfy_hung"."""
+        Comfy is busy, not down: waited for up to `busy_after_s`, then kind "comfy_hung". While our prompt runs, GPU
+        memory spilled to RAM >= SPILL_WARN_GB is reported in the job (comfy text + comfy_info.spill_gb + gpu_spill_gb)."""
+        spill = self._spill_watch()
+        if spill is None:
+            return self._wait_loop(prompt_id, timeout_sec, poll_interval, progress_callback, None)
+        with spill:
+            return self._wait_loop(prompt_id, timeout_sec, poll_interval, progress_callback, spill)
+
+    def _spill_watch(self) -> Optional[Any]:
+        """The spill sampler of one prompt: engine.sysinfo.SpillSampler on the Comfy process (absolute shared memory –
+        idle Comfy holds ~0.3 GB, sh060 2026-10-26), None without the counter (not Windows, MD_SHARED_PROBE=0)."""
+        if self.spill_watch_factory is not None:
+            return self.spill_watch_factory()
+        try:
+            from engine.sysinfo import SpillSampler, comfy_shared_reader
+            if self._spill_reader is None:
+                self._spill_reader = comfy_shared_reader(self) or False
+            return SpillSampler(self._spill_reader, interval_s=SPILL_SAMPLE_S, base=0.0) if self._spill_reader else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def spill_note(spill: Optional[Any], text: str, info: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Optional[float]]:
+        """(text, info, gb): the job's Comfy text and info with the spill warning when >= SPILL_WARN_GB."""
+        gb = getattr(spill, "spill_gb", None) if spill is not None else None
+        if gb is None or gb < SPILL_WARN_GB:
+            return text, info, None
+        return (f"{text} · ⚠ {gb:.1f} GB pamięci GPU przelało się do RAM – liczenie kilka razy wolniejsze",
+                {**info, "spill_gb": round(gb, 1)}, gb)
+
+    def _wait_loop(self, prompt_id: str, timeout_sec: float, poll_interval: float, progress_callback: Optional[Any],
+                   spill: Optional[Any]) -> Dict[str, Any]:
         from engine.jobs import JOBS, JobCancelled
         clock = self._clock
         start = clock()
@@ -242,7 +280,8 @@ class ComfyClient:
                     if status_info.get("completed", False):
                         return {"success": True, "outputs": hist.get("outputs", {}), "history": hist}
                 text, info = self._queue_info(prompt_id, elapsed)
-                JOBS.update(comfy=text, comfy_info=info)
+                text, info, gb = self.spill_note(spill if info.get("state") == "ours" else None, text, info)
+                JOBS.update(comfy=text, comfy_info=info, gpu_spill_gb=gb)
                 if not hist and info.get("state") == "missing":
                     lost_since = lost_since if lost_since is not None else clock()
                     if clock() - lost_since >= self.lost_after_s:

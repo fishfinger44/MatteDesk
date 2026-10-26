@@ -203,9 +203,9 @@ def test_preview_forces_only_the_eroded_core(tmp_path, monkeypatch):
 
 
 def test_zone_feather_px():
-    from engine.refine import ZONE_FEATHER_PX
+    from engine.bandsys import BAND_DEFAULTS
     from engine.zones import Zone, zone_feather_px
-    assert zone_feather_px(Zone("z", "add", "matte", 1)) == ZONE_FEATHER_PX              # default = the former fixed value
+    assert zone_feather_px(Zone("z", "add", "matte", 1)) == BAND_DEFAULTS["inset_feather_px"]   # the one band default
     assert zone_feather_px(Zone("z", "add", "matte", 1, params={"inset_feather_px": 3})) == 3.0
     assert zone_feather_px(Zone("z", "add", "matte", 1, params={"inset_feather_px": 0})) == 0.5   # never a hard 0
 
@@ -277,3 +277,23 @@ def test_band_inside_the_core_is_the_models_not_the_cores(monkeypatch, tile_px):
     assert abs(float(a[deep].mean()) - 0.5) < 0.05 and float(a[deep].max()) < 0.75   # the model (0.5), not the core (1)
     assert a[area & (d_in < 1.5)].min() > 0.8                                        # the inner band edge: the core (1)
     assert runner.calls and all(u > 0 for _fg, u in runner.calls)
+
+
+def test_api_one_matte_zone_per_object(tmp_path, monkeypatch):
+    """User decision 2026-10-25: one whole-outline zone per object – a second matte zone is refused (409), the existing
+    one can still be saved, a threshold (non-matte) zone is not affected."""
+    import engine.vitmatte as vm
+    from test_zone_matte import _api_project
+    from test_zone_vitmatte import MockRunner
+    app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(vm, "get_runner", lambda model_id=None: MockRunner())
+    body = {"mode": "add", "criterion": "matte", "frame": start, "polygon": [], "matting": "vitmatte", "preset": "hair",
+            "params": {"region": "outline", "temporal": "none"}}
+    r = api.post("/api/object/obj/zones/new", json=body)
+    assert r.status_code == 200, r.text
+    zid = r.json()["zone"]["zone_id"]
+    again = api.post("/api/object/obj/zones/new", json=body)
+    assert again.status_code == 409 and zid in again.json()["detail"]
+    assert api.post("/api/object/obj/zones/z_99", json=body).status_code == 409      # an explicit new id too
+    assert api.post(f"/api/object/obj/zones/{zid}", json=body).status_code == 200   # the existing zone saves
+    assert [z["zone_id"] for z in api.get("/api/object/obj/zones").json()["zones"] if z["criterion"] == "matte"] == [zid]

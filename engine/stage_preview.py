@@ -131,6 +131,7 @@ def _videomama(pipe: Any, name: str, frames: List[int], models_dir: Optional[Pat
     from engine.comfy_io import job_progress
     from engine.crop import extract_crop
     from engine.refine import assemble_full, contiguous_chunks
+    from engine.bandmap import crop_points
     from engine.videomama import VideoMaMa, compose, object_settings
     obj = pipe.store.get(name)
     s = object_settings(obj)
@@ -139,11 +140,10 @@ def _videomama(pipe: Any, name: str, frames: List[int], models_dir: Optional[Pat
     zres = pipe.apply_zones(name, frames, core, keys, probs=soft, kinds=("brush",))
     core2 = zres.core if zres else core
     base, _ = pipe.vmm_base(name, frames, s, core2)
-    segs = pipe._work_segments(name, frames) if members else pipe._segments_in(name, frames)
-    try:
-        pipe.client.free_vram()
-    except Exception:
-        pass
+    pts_at = pipe.band_points_fn(name, s["band"], frames)   # the band points, as in the full run (bug 2026-10-26)
+    segs =pipe._work_segments(name, frames) if members else pipe._segments_in(name, frames)
+    from engine.gpu_release import before_stage
+    before_stage("comfy", pipe.client, "podgląd VideoMaMa")
     gen = VideoMaMa(pipe.client, pipe.work / "comfy_io", s, models_dir, progress=lambda t, d, n: job_progress(t, d, n))
     per_seg: Dict[str, Dict[int, np.ndarray]] = {}
     for seg in segs:
@@ -158,7 +158,7 @@ def _videomama(pipe: Any, name: str, frames: List[int], models_dir: Optional[Pat
             mattes = gen.run(f"pv_{name}_{seg.seg_id}_{chunk[0]}", imgs, guides)
             for f, m in zip(chunk, mattes):
                 res[f] = compose(extract_crop(base[f], seg), m, s["reach_px"], s["inset_px"], s.get("feather_px", 0.0),
-                                 s.get("outer_feather_px", 0.0))
+                                 s.get("outer_feather_px", 0.0), crop_points(pts_at, f, seg))
         per_seg[seg.seg_id] = res
     return assemble_full(per_seg, segs, frames, pipe.w, pipe.h)
 

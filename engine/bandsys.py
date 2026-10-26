@@ -43,7 +43,9 @@ Width = Union[float, np.ndarray]
 BAND_DEFAULTS: Dict[str, float] = {
     "out_px": 40.0,            # the band outside the base mask edge
     "in_px": 2.0,              # the band inside it (the zone's trimap inset)
-    "inset_feather_px": 8.0,   # from the inner band edge: the core blends into the model result
+    # from the inner band edge: the core blends into the model result; <= in_px, else the ramp runs past the core edge
+    # (the hard core step shows, the model alpha just outside it is scaled down – test_e3, sh060 2026-10-26; was 8.0)
+    "inset_feather_px": 2.0,
     "outer_feather_px": 8.0,   # from the outer band edge: the model result blends into the core (0 = a hard edge)
 }
 

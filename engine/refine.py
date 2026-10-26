@@ -738,7 +738,8 @@ def pick_keyframes(keys: Sequence[int], start: int, max_keys: Optional[int] = No
 def next_run_dir(obj_dir: Path) -> Path:
     runs = obj_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    n = max([int(p.name[1:]) for p in runs.glob("v[0-9][0-9][0-9]")] + [0]) + 1
+    from engine.run_trash import last_run_number
+    n = last_run_number(runs) + 1      # deleted versions keep their numbers (engine/run_trash.py)
     d = runs / f"v{n:03d}"
     d.mkdir()
     return d
@@ -794,23 +795,20 @@ def _vram_used_gb(client: Any) -> Optional[float]:
 
 
 def _comfy_shared_reader(client: Any) -> Optional[Callable[[], Optional[float]]]:
-    """Reader of the Comfy process' shared (spilled) GPU memory: a real ComfyClient on Windows only; MD_SHARED_PROBE=0
-    turns it off (synthetic tests). The PID is looked up once, on the first read."""
-    import os
-    try:
-        port = getattr(client, "port", None)
-    except Exception:   # stand-in clients may refuse unknown attributes
-        port = None
-    if os.name != "nt" or os.environ.get("MD_SHARED_PROBE", "1") == "0" or not isinstance(port, int):
-        return None
-    from engine.sysinfo import gpu_shared_gb, pid_on_port
-    state: Dict[str, Any] = {}
+    """Reader of the Comfy process' shared (spilled) GPU memory – engine.sysinfo.comfy_shared_reader (one reader for the
+    MatAnyone2 scale probe and the spill warning of every Comfy prompt, 2026-10-26)."""
+    from engine.sysinfo import comfy_shared_reader
+    return comfy_shared_reader(client)
 
-    def read() -> Optional[float]:
-        if "pid" not in state:
-            state["pid"] = pid_on_port(port)
-        return gpu_shared_gb(state["pid"]) if state["pid"] else None
-    return read
+
+def write_run_json(run_dir: Path, rj: Dict[str, Any]) -> None:
+    """The one run.json writer of a version: + `gpu_spill_gb` = the running job's peak of GPU memory spilled to RAM
+    when it reached comfy_client.SPILL_WARN_GB (user request 2026-10-26: why a run took 10x longer)."""
+    from comfy_client import SPILL_WARN_GB
+    from engine.jobs import JOBS
+    sp = JOBS.spill_gb()
+    out = {**rj, **({"gpu_spill_gb": round(sp, 1)} if sp is not None and sp >= SPILL_WARN_GB else {})}
+    (Path(run_dir) / "run.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def contiguous_chunks(frames: Sequence[int]) -> List[List[int]]:
@@ -1281,15 +1279,14 @@ class Finalizer:
 
         full = assemble_full(per_seg, segs, frames, self.w, self.h)
         rep.seconds = round(time.time() - t0, 1)
-        (run_dir / "run.json").write_text(json.dumps({"schema": "matte_desk/run@1.0", **rep.to_dict(),
+        write_run_json(run_dir, {"schema": "matte_desk/run@1.0", **rep.to_dict(),
                                                       "frames": [int(frames[0]), int(frames[-1])],
                                                       "segments_def": [s.to_dict() for s in segs],
                                                       "params": {**{k: obj.get(k) for k in ("edge_mode", "band_scale",
                                                                  "temporal_smoothing", "ma_scale", "ma_scale_mode", "key_band_same",
                                                                  "shift_px")},
                                                                  **{k: obj[k] for k in ("band_out_px", "band_in_px")
-                                                                    if obj.get(k) is not None}}},
-                                                     indent=2, ensure_ascii=False), encoding="utf-8")
+                                                                    if obj.get(k) is not None}}})
         return full, rep
 
 

@@ -268,6 +268,26 @@ def test_lost_track_follows_the_object_and_front_object_occludes(tmp_path):
     assert pos[1]["p1"][2] is False
 
 
+def test_front_object_read_once_per_frame_not_per_point(tmp_path):
+    """Woman_02 behind Woman_01 (2026-10-26): the occluder is a 4K alpha read from disk – one read per frame and pass,
+    not one per point (26 points x 148 frames kept VideoMaMa ~15 min in „Śledzenie punktów pasa”)."""
+    from types import SimpleNamespace
+    from engine import bandtrack as T
+    cores = {f: _disk(w=300, c=(100 + 10 * f, 100)) for f in range(4)}
+
+    class Stay:
+        def track(self, imgs, q):
+            t = np.repeat(q[None, :, 1:], len(imgs), axis=0)
+            return SimpleNamespace(tracks=t, visible=np.ones(t.shape[:2], bool))
+
+    pts = [{"id": f"p{i}", "keys": {"0": {"x": 40.0 + i, "y": 100.0, "out": 20, "in": 4}}} for i in range(10)]
+    reads = []
+    T.track_positions(pts, list(range(4)), Stay(), lambda fs: ([np.zeros((4, 4, 3), np.uint8)] * len(fs), 1.0),
+                      tmp_path, core_at=lambda f: cores[f],
+                      occluder_at=lambda f: reads.append(f) or np.zeros((200, 300), bool))
+    assert len(reads) <= 2 * 4          # the core-motion pass + the tracked pass, each frame once
+
+
 def test_tracking_once_in_background_and_shared(tmp_path):
     """Station 2026-10-21: every band / region / preview request started its own CoTracker3 worker (7 at once).
     Interactive calls (wait=False) get the nearest keys' positions at once and one background tracking; callers of the

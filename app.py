@@ -54,7 +54,7 @@ install_log_buffer()   # last log lines for "Zgłoś problem" (the start_v*.bat 
 
 class _QuietPolling(logging.Filter):
     """Hide successful UI polling (job progress, Comfy health) from the uvicorn access log; errors still show."""
-    PATHS = ("/api/jobs", "/api/comfy/health")
+    PATHS = ("/api/jobs", "/api/jobs/details", "/api/comfy/health")
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
@@ -4253,6 +4253,14 @@ def save_zone_ep(name: str, zone_id: str, req: ZoneRequest, preview_frame: Optio
     store = _objects()
     d = store.dir(name)
     zid = next_zone_id(d) if zone_id == "new" else zone_id
+    if req.criterion == "matte":
+        # one whole-outline zone per object (user decision 2026-10-25): every matte zone rides the shared object band and
+        # a later one overwrites the earlier inside it – extra zones only cost time; existing ones stay as they are
+        from engine.zones import load_zones
+        have = [x.zone_id for x in load_zones(d) if x.criterion == "matte"]
+        if have and zid not in have:
+            raise HTTPException(status_code=409, detail=f"Obiekt {name} ma już strefę ViTMatte ({', '.join(have)}) – jedna strefa "
+                                                        "„cały obrys” na obiekt; zmieniaj ustawienia istniejącej")
     z = Zone(zid, **fields)       # station: engine / params resolved from the (prompt-derived) preset above (hair = vitmatte + flow r3 x2)
     if req.criterion != "matte":
         plan = None
@@ -4608,6 +4616,7 @@ class _BandOwner:
         self.name, self.kind, self.params, self.owner_id = name, kind, dict(params or {}), owner_id
         self.out, self.inn, self._save = float(out), float(inn), save
         self.key, self.obj_name = "", name      # band owner key (engine/objband.py) and the object it belongs to
+        self.inset_feather = 0.0                # the inset feather slider now (the proposal's inset floor, 2026-10-26)
 
     def defaults(self) -> Dict[str, Any]:
         return {"out": int(round(self.out)), "in": int(round(self.inn))}
@@ -4667,6 +4676,7 @@ def _zone_owner(name: str, z) -> _BandOwner:
     else:
         ow = _BandOwner(name, "zone", p, b.owner_id, b.out_px, b.in_px, _zone_own_save(name, z))
     ow.key, ow.obj_name = key, name
+    ow.inset_feather = float(b.inset_feather_px or 0.0)
     return ow
 
 
@@ -4712,6 +4722,7 @@ def _stage_owner(name: str, stage: str) -> _BandOwner:
         from engine.objband import KEYS
         ow = _BandOwner(name, "stage", {k: own.get(k) for k in KEYS}, b.owner_id, b.out_px, b.in_px, _stage_own_save(name, stage))
     ow.key, ow.obj_name = stage, name
+    ow.inset_feather = float(b.inset_feather_px or 0.0)
     return ow
 
 
@@ -5211,7 +5222,9 @@ def propose_band(name: str, req: BandProposeRequest):
     # „Wcięcie w rdzeń” at 0 means 0 (user decision 2026-10-23: the proposed points cut 10–14 px into the core): no
     # inset on any point; the 0 reference keeps them at scale 1, so a whisker dragged on one point is plain px there
     # (as hand-set points made at 0)
-    pts, stats = propose(core, cls, req.frame, auto_w, (ow.out, ow.inn), inset=ow.inn > 0)
+    # every point's inset >= the inset feather now: the proposal never makes the feather ramp cross the core edge
+    # (2026-10-26); the points are at scale 1 for the sliders as they are (refs below), so px compare directly
+    pts, stats = propose(core, cls, req.frame, auto_w, (ow.out, ow.inn), inset=ow.inn > 0, min_in=ow.inset_feather)
     if not pts:
         raise HTTPException(status_code=422, detail="Brak części ciała na obrysie – pas zostaje stały")
     ow.params = {**ow.params, **ow.refs()}      # the sliders as they are now = scale 1 for these points
@@ -5410,6 +5423,27 @@ def object_runs(name: str):
                     if re.fullmatch(r"v\d{3,}", str((rj.get("ltx") or {}).get("mask_source", ""))) else None,
                     "coverage": _run_cov(d.parent.parent, d.name)})   # frames the version computed ([[a, b], ...])
     return {"object": name, "active_run": active, "runs": out}
+
+
+@app.delete("/api/object/{name}/runs/{run}")
+@object_edit
+def delete_run(name: str, run: str, dry: bool = False):
+    """Delete a version (user request 2026-10-25, stage 5 "Version comparison"): `dry=1` = what would go (size) and
+    what still uses it; otherwise the folder moves to <work>/trash/runs/ (engine/run_trash.py). A version still named
+    by the object (active, a stage's current result, the base of another version …) is refused with 409 + where."""
+    from engine.run_trash import RUN_RE, run_refs, run_size, trash_run
+    store = _objects()
+    od = store.dir(name)
+    if not RUN_RE.fullmatch(run) or not (od / "runs" / run).is_dir():
+        raise HTTPException(status_code=404, detail=f"Brak wersji {run}")
+    refs = run_refs(od, run)
+    size = run_size(od / "runs" / run)
+    if dry:
+        return {"run": run, **size, "refs": refs}
+    if refs:
+        raise HTTPException(status_code=409, detail=f"Wersja {run} jest w użyciu – nie usuwam: {'; '.join(refs[:5])}")
+    dest = trash_run(od, store.root.parent, name, run)
+    return {"success": True, "run": run, **size, "trash": str(dest)}
 
 
 def _run_cov(obj_dir: Path, run: str):

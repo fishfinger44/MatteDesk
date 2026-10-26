@@ -119,7 +119,17 @@
   function renderStageBar() {
     const list = $('stageList'); if (!list) return;
     list.innerHTML = '';
+    // stage groups in the bar (user request 2026-10-25): 1 + 2 = one base mask ("Core"), 3 / 4 / 5 = edge stages ("Edges")
+    const GROUPS = [{ key: 'core', label: 'Core', ns: [ST.SAM3, ST.BRUSH], join: '+', title: 'Rdzeń: maska 1+2 = SAM 3.1 + poprawki pędzla (CoTracker3) – jedna baza dla dalszych etapów' },
+      { key: 'edges', label: 'Edges', ns: [ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE], title: 'Etapy krawędzi: miękka krawędź na masce 1+2 (MatAnyone2, VideoMaMa, ViTMatte / BiRefNet)' }];
+    let box = null;
     for (const st of STAGES) {
+      const g = GROUPS.find((x) => x.ns.includes(st.n));
+      if (!g) box = null;
+      else if (st.n === g.ns[0]) {
+        const gl = el(`<li class="stage-group stage-group-${g.key}" title="${esc(g.title)}"><span class="stage-group-label">${esc(g.label)}</span><ol class="stage-group-items"></ol></li>`);
+        list.appendChild(gl); box = gl.querySelector('ol');
+      } else if (g.join) box.appendChild(el(`<li class="stage-join" aria-hidden="true">${esc(g.join)}</li>`));
       let state = 'info', why = st.hint;
       if (st.n !== ST.PLATES) {
         if (!S.obj) { state = st.n === ST.SAM3 ? 'todo' : 'locked'; why = st.n === ST.SAM3 ? 'Dodaj albo wybierz obiekt' : 'Najpierw dodaj / wybierz obiekt'; }
@@ -134,7 +144,7 @@
         <span class="stage-n">${st.d}</span><span class="stage-ic">${state === 'done range' ? '◐' : (ICON[state] || '')}</span><span class="stage-label">${stageLabel(st)}</span>${edgeMenu ? '<span class="stage-menu" title="Silnik etapu: ViTMatte (tylko niekomercyjnie) albo BiRefNet (wagi MIT, komercyjnie)">▼</span>' : ''}</li>`);
       li.addEventListener('click', () => { if (!disabled && state !== 'locked') setStage(st.n); else toast(li.title); });
       if (edgeMenu) li.querySelector('.stage-menu').addEventListener('click', (e) => { e.stopPropagation(); openEdgeEngineMenu(li); });
-      list.appendChild(li);
+      (box || list).appendChild(li);
     }
     const hint = $('stageHint');
     if (hint) {
@@ -168,6 +178,10 @@
     if (S.auxMode && n !== ST.PLATES) n = ST.PLATES;
     const prevStage = S.stage;
     S.stage = n;
+    // the version shown belongs to the stage it was picked / entered in: drop it NOW – it used to stay until the new
+    // stage's versions loaded (mountCmp), so the tabs below still saw it and kept Alpha on in an uncomputed stage
+    // (user report 2026-10-26: VideoMaMa → ViTMatte quickly); the new stage's A comes back through showRun
+    if (n !== prevStage && S.viewRun) { S.viewRun = null; S.cmpMode = null; S.cmpDiff = null; }
     if (n !== ST.PLATES) S.lastObjStage = n;
     if (CLICK_TOOLS[S.tool] && CLICK_TOOLS[S.tool] !== n) S.tool = 'none';
     if (S.tool === 'brush_erase' && n !== ST.BRUSH && n !== ST.FINAL_TOUCH) S.tool = 'none';
@@ -192,6 +206,7 @@
       if (window.MD_BANDPTS && window.MD_BANDPTS.ready && BAND_STAGES().includes(n)) { window.MD_BANDPTS.dirty(); window.MD_BANDPTS.renderMode(); }
       if (n === ST.VITMATTE && prevStage != null) loadZones();
     }
+    mountCmp(n !== prevStage);   // the version comparison of stages 3–7: the stage's newest version in A on entering
     updateViewTabs();   // Alpha / Comp availability depends on the stage (its own mask, 2026-10-22)
     renderPointsPalette();
     renderEdgePalette();
@@ -212,10 +227,18 @@
     const has = S.info.has || {};
     const coreOk = !!has.core || ['done', 'stale'].includes(stageState('core').state);
     if (v === 'core') return coreOk;
-    // stages with their own mask show it in Alpha / Comp – the core / mask 1+2 until the stage is computed (2026-10-22)
-    if (coreOk && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH].includes(S.stage)) return true;
-    // a stage result that is not the active version (LTX, stage 6) or a version picked for viewing also has an alpha
+    // stages with their own mask show it in Alpha / Comp: stages 1 / 2 / Final Touch the core / mask 1+2 (their result);
+    // the edge stages only once they have a result of their own – a version or a „👁 Podgląd klatek” preview (user rule
+    // 2026-10-26, „Alpha / Comp tylko gdy wynik istnieje”: an uncomputed LTX-2.5 stage showed the SAM 3.1 core as its cut-out)
     const sr = S.info.stage_runs || {};
+    if (coreOk && [ST.SAM3, ST.BRUSH, ST.FINAL_TOUCH].includes(S.stage)) return true;
+    const own = { [ST.MATANYONE]: () => sr.matanyone, [ST.VIDEOMAMA]: () => sr.videomama, [ST.LTX]: () => sr.ltx,
+                  [ST.VITMATTE]: () => vmRunFor(vmEngine()) }[S.stage];
+    if (own) {
+      const st = spvStage(), pv = spvOf(st);
+      return !!(own() || (pv && (pv.frames || []).length && spvWanted(st)) || S.viewRun);
+    }
+    // a stage result that is not the active version (LTX, stage 6) or a version picked for viewing also has an alpha
     return !!has.final || ['done', 'stale'].includes(stageState('final').state) || !!S.viewRun || !!sr.ltx;
   }
   function updateViewTabs() {
@@ -225,6 +248,8 @@
       b.classList.toggle('disabled', !ok);
       if (!ok && b.dataset.view !== 'none') b.title = S.auxMode ? 'Widoki wyniku tylko na beauty' : (!S.obj ? 'Wybierz obiekt' :
         (b.dataset.view === 'core' ? `Rdzeń jeszcze nie policzony – „▶▶ Przelicz nieaktualne” (etap ${ST.SAM3})`
+          : [ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX].includes(S.stage)
+            ? `Etap ${S.stage} · ${STAGE_NAME()[S.stage] || ''} jeszcze niepoliczony – Alpha / Comp pokażą jego wynik (albo „👁 Podgląd klatek”)`
           : `Brak wyniku z krawędzią – „▶ Przelicz MatAnyone2” (etap ${ST.MATANYONE}) albo „Przelicz finalnie” (etap ${ST.EXPERIMENTS})`));
       else if (ok && b.dataset.view !== 'none') {
         const stale = b.dataset.view === 'core' ? stageState('core').state !== 'done' : stageState('final').state !== 'done';
@@ -236,6 +261,8 @@
   }
   // remember = the layer the user chose (tabs, V, stage change) – kept when switching objects (bug 2026-10-15: switching
   // the object reset the view to Plate, the mask "vanished"); automatic fallbacks (no result yet) do not overwrite it
+  // the view the user picked on top, again (after a computation made it available); the stage default before any pick
+  function restoreUserView() { setView(S.userView || S.view, true, false); }
   function setView(v, render = true, remember = true) {
     S.view = viewAllowed(v) ? v : 'none';
     if (remember && S.view === v) S.userView = v;
@@ -402,34 +429,66 @@
     const ex = kind === 'alpha' ? exportCtx() : '';
     return `${S.obj}_${kind}${ver ? '@' + ver : ''}${ex ? '#x' : ''}_${f}`;
   };
-  function overlayFor(kind, f) {
-    // kind: core | alpha | key | preview | zone_* … Returns Image (complete), 'missing', or null (loading)
+  const overlayUrl = (kind, f) => {
     const ver = kind === 'alpha' && S.viewRun ? S.viewRun : '';
     const ex = kind === 'alpha' ? exportCtx() : '';
-    return loadOverlay(overlayKey(kind, f), `/api/object/${S.obj}/frame/${f}?view=${kind}${ver ? '&v=' + ver : ''}${ex}`);
+    return `/api/object/${S.obj}/frame/${f}?view=${kind}${ver ? '&v=' + ver : ''}${ex}`;
+  };
+  function overlayFor(kind, f) {
+    // kind: core | alpha | key | preview | zone_* … Returns Image (complete), 'missing', or null (loading)
+    return loadOverlay(overlayKey(kind, f), overlayUrl(kind, f));
   }
   // ---- Z20: overlays ahead of the playhead + background sweep of the whole shot + load bar over the timeline
+  // the core layer is drawn in the Rdzeń view AND on the plate in stages SAM 3.1 / CoTracker3 (user decision 2026-10-26:
+  // the selected object shows its mask in every frame like the other objects; 👁 in the Objects palette hides it)
+  const coreView = () => S.view === 'core' || (S.view === 'none' && (S.stage === ST.SAM3 || S.stage === ST.BRUSH));
+  // Alpha / Comp in a stage with its own mask = exactly the mask of the stage (matteFor; user report 2026-10-22)
+  const stageMaskView = () => !!(S.obj && !S.auxMode && !S.viewRun && (S.view === 'alpha' || S.view === 'comp')
+    && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH].includes(S.stage));
   function neededLayer() {   // the overlay layer the current view draws (null = none)
     if (!S.obj || S.auxMode) return null;
     if (S.view === 'alpha' || S.view === 'comp') return 'alpha';
-    if (S.view === 'core') return 'core';
-    if (S.view === 'none' && S.stage === ST.SAM3) return 'key';
+    if (coreView()) return 'core';
     return null;
   }
-  function neededKind(f) {   // the overlay kind drawn in frame f for the current view (null = nothing to load)
-    const l = neededLayer(); if (!l) return null;
-    if (l === 'core') return coreKind(f);
-    if (l === 'key') return keyOf(f) ? 'key' : null;
-    return 'alpha';
+  // {key, url} of the image drawOverlay draws for the selected object in frame f (null = nothing to load ahead): the
+  // preload, the background sweep, the load bar and Play wait for THAT image. Alpha / Comp in a stage draw the stage's
+  // mask (matteFor), not the active alpha – the preload fetched the active alpha while each played frame fetched its
+  // stage mask on the spot, so Play stuttered (user report 2026-10-26). Live previews (stage preview, VideoMaMa /
+  // LTX-2.5 sliders, Final Touch, zone preview) are made per frame on request and are not loaded ahead.
+  function neededSrc(f) {
+    if (!neededLayer()) return null;
+    const ov = (kind) => ({ key: overlayKey(kind, f), url: overlayUrl(kind, f) });
+    const sw = selGroup();
+    const whole = (src, v = '') => ({ key: wholeKey(sw, f, src, v, S.obj), url: wholeUrl(sw, f, src, v, S.obj) });
+    if (stageMaskView()) {
+      const has12 = S.info && S.info.has && S.info.has.core_fix;
+      if (S.stage === ST.SAM3) return sw ? whole('core') : ov(keyOf(f) ? 'key' : 'core');
+      if (S.stage === ST.BRUSH) return sw ? whole(has12 ? 'core_fix' : 'core') : ov(coreKind(f));
+      if (S.stage === ST.FINAL_TOUCH) return null;
+      const st = spvStage(), pv = spvOf(st);
+      if (pv && (pv.frames || []).includes(f) && spvWanted(st)) return null;
+      if ((S.stage === ST.VIDEOMAMA && S.vmm && S.vmm.run && $('vmBase')) || (S.stage === ST.LTX && S.ltx && S.ltx.run)) return null;
+      if (S.stage === ST.VITMATTE && window.MD_ZONES && window.MD_ZONES.previewMatte) return null;
+      const run = stageAlphaRun();
+      if (run === '') return sw ? whole(has12 ? 'core_fix' : 'core') : ov(has12 ? 'core_fix' : (keyOf(f) ? 'key' : 'core'));
+      if (run) return { key: `${S.obj}_alpha@${run}_${f}`, url: `/api/object/${S.obj}/frame/${f}?view=alpha&v=${encodeURIComponent(run)}` };
+      return ov('alpha');
+    }
+    if (sw && (coreView() || S.view === 'alpha')) {
+      const src = selWholeSrc();
+      return whole(src, src === 'alpha' && S.viewRun ? S.viewRun : '');
+    }
+    return ov(coreView() ? coreKind(f) : 'alpha');
   }
   function overlayState(f) {   // 'ready' | 'loading' | 'missing' | 'none' (no overlay needed in this frame)
-    const kind = neededKind(f); if (!kind) return 'none';
-    const cur = S.overlay[overlayKey(kind, f)];
+    const src = neededSrc(f); if (!src) return 'none';
+    const cur = S.overlay[src.key];
     if (cur === 'missing') return 'missing';
     if (cur && cur.complete && cur.naturalWidth > 0 && !cur.mdStale) return 'ready';
     return 'loading';
   }
-  function ensureOverlay(f) { const kind = neededKind(f); if (kind) overlayFor(kind, f); }
+  function ensureOverlay(f) { const src = neededSrc(f); if (src) loadOverlay(src.key, src.url); }
   function preloadOverlays(center, dir) {   // same range as the plate preload (±6, ±15 when playing, forward only while playing)
     const v = V(); if (!v || (!neededLayer() && !otherObjs().length)) return;
     const range = v.isPlaying ? 15 : 6;
@@ -448,10 +507,10 @@
     for (let o = 0; o <= v.lastFrame - v.firstFrame && inflight < SWEEP_PAR; o++) {   // outward from the playhead
       for (const f of (o ? [cur + o, cur - o] : [cur])) {
         if (f < v.firstFrame || f > v.lastFrame || inflight >= SWEEP_PAR) continue;
-        const kind = neededKind(f); if (!kind) continue;
-        const cur_ = S.overlay[overlayKey(kind, f)];
-        if (cur_ && (!cur_.mdStale || (S.overlayNext && S.overlayNext[overlayKey(kind, f)]))) continue;   // loaded / loading / missing / replacing
-        overlayFor(kind, f); inflight++;
+        const src = neededSrc(f); if (!src) continue;
+        const cur_ = S.overlay[src.key];
+        if (cur_ && (!cur_.mdStale || (S.overlayNext && S.overlayNext[src.key]))) continue;   // loaded / loading / missing / replacing
+        loadOverlay(src.key, src.url); inflight++;
       }
     }
   }
@@ -570,8 +629,7 @@
   const hexRgb = (h) => { const n = parseInt(String(h).replace('#', ''), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
   function overlayLayer() {
     if (!S.obj || S.auxMode) return null;
-    if (S.view === 'core') return 'core';
-    if (S.view === 'none' && S.stage === ST.SAM3) return 'key';
+    if (coreView()) return 'core';
     return null;   // comp has its own background (V); alpha is shown black / white
   }
   function syncOverlayStyleUi() {
@@ -702,10 +760,11 @@
   // src = the layer of the view (alpha | core | core_fix), v = the version shown (comparison) of the selected object only –
   // otherwise the Rdzeń / maska 1+2 / Alpha views of a linked object were the same picture (bug 2026-10-15)
   const wholeKey = (p, f, src = 'alpha', v = '', who = p) => `${p}_full_s${seamOf(p)}${src !== 'alpha' ? '_' + src : ''}${v ? '@' + who + ':' + v : ''}_${f}`;
-  const wholeOverlay = (p, f, src = 'alpha', v = '', who = p) => loadOverlay(wholeKey(p, f, src, v, who),
-    `/api/object/${encodeURIComponent(v ? who : p)}/frame/${f}?view=full&s=${seamOf(p)}&src=${src}${v ? '&v=' + v : ''}`);
+  const wholeUrl = (p, f, src = 'alpha', v = '', who = p) =>
+    `/api/object/${encodeURIComponent(v ? who : p)}/frame/${f}?view=full&s=${seamOf(p)}&src=${src}${v ? '&v=' + v : ''}`;
+  const wholeOverlay = (p, f, src = 'alpha', v = '', who = p) => loadOverlay(wholeKey(p, f, src, v, who), wholeUrl(p, f, src, v, who));
   // the whole of the selected group in the current view: core view = the core (stage 2: the mask 1+2), alpha = the version shown
-  const selWholeSrc = () => (S.view === 'core' ? (S.stage === ST.BRUSH && S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core') : 'alpha');
+  const selWholeSrc = () => (coreView() ? (S.stage === ST.BRUSH && S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core') : 'alpha');
   function ensureOthers(f) {
     const cfg = othersCfg(); if (!cfg.on || !othersVisibleIn()) return;
     const sel = selGroup();
@@ -913,9 +972,8 @@
       else if (!S.auxMode) drawOthers(ctx, img, f);   // other computed objects, under the selected one
       // Alpha / Comp in a stage with its own mask = exactly the mask of the stage, the one „Maska: …” names (matteFor –
       // SAM 3.1 core, mask 1+2, the stage's version; user report 2026-10-22: stage SAM 3.1 showed the active soft alpha)
-      const stageMask = S.obj && !S.auxMode && !S.viewRun && (S.view === 'alpha' || S.view === 'comp')
-        && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH].includes(S.stage);
-      const sw = S.obj && !S.auxMode && (S.view === 'core' || (S.view === 'alpha' && !stageMask)) ? selGroup() : null;
+      const stageMask = stageMaskView();
+      const sw = S.obj && !S.auxMode && (coreView() || (S.view === 'alpha' && !stageMask)) ? selGroup() : null;
       if (S.hideSel && S.obj && !S.auxMode) {   // 👁 off in the Objects palette: no mask of the selected object
         noteTxt = noteTxt || 'Maska wybranego obiektu ukryta – 👁 w palecie Obiekty';
       } else if (stageMask) {
@@ -929,14 +987,14 @@
         const src = selWholeSrc(), vr = src === 'alpha' && S.viewRun ? S.viewRun : '';
         const ov = wholeOverlay(sw, f, src, vr, S.obj);
         if (ov === 'missing') noteTxt = `Brak masek „${sw}” i jego części w klatce ${f}` + (src === 'alpha' ? '' : ` (${src === 'core' ? 'rdzeń' : 'maska 1+2'})`);
-        else if (ov) drawTinted(ctx, ov, S.view === 'core' ? 'core' : 'alpha', wholeKey(sw, f, src, vr, S.obj), img.width, img.height);
+        else if (ov) drawTinted(ctx, ov, coreView() ? 'core' : 'alpha', wholeKey(sw, f, src, vr, S.obj), img.width, img.height);
         if (!noteTxt) noteTxt = `Grupa „${sw}” – całość ze szwem: ${src === 'core' ? 'rdzeń SAM 3.1' : src === 'core_fix' ? 'maska 1+2' : (vr ? `wersja ${vr} (${S.obj})` : 'aktywne wersje')}`;
       } else if (S.obj && !S.auxMode) {
         if (S.view === 'comp' || S.view === 'alpha') {
           const ov = overlayFor('alpha', f);
           if (ov === 'missing') noteTxt = `Brak wyniku w klatce ${f} – „▶ Przelicz MatAnyone2” (etap ${ST.MATANYONE}) albo „Przelicz finalnie” (etap ${ST.EXPERIMENTS})`;
           else if (ov) { const vk = S.viewRun ? '@' + S.viewRun : ''; if (S.view === 'comp') ctx.drawImage(compCanvas(img, ov, `${S.obj}${vk}${exportCtx() ? '#x' : ''}_${f}`, f), 0, 0); else drawLayer(ctx, 'alpha', ov, 'alpha', f, img); }
-        } else if (S.view === 'core') {
+        } else if (coreView()) {
           const kf = keyOf(f);   // in a key frame the result IS the key – show it, not the old core
           const ck = coreKind(f);  // stage 2: the mask 1+2 when „Zastosuj poprawki” made it
           // Final Touch: the core overlay shows base + this frame's hand corrections, like Alpha / Comp (user report 2026-10-24)
@@ -954,19 +1012,14 @@
               if (d && d !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.85; ctx.drawImage(tintCanvas(d, rgb, `${S.obj}_${kind}_${f}`, true), 0, 0, img.width, img.height); ctx.globalAlpha = pa; }
             }
           }
-        } else if (S.stage === ST.SAM3) {
-          // stage SAM3 without a view: the SAM3 mask of the points / chosen candidate in this frame (if any)
-          if (S.keys.some((x) => x.frame === f)) {
-            const ov = overlayFor('key', f);
-            if (ov && ov !== 'missing') drawLayer(ctx, 'key', ov, 'key', f, img);
-          }
         }
       }
       { const t = drawEdgePreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }   // stage 3 / 5: edge band before computing
       { const t = drawLtxPreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }    // stage LTX: band / re-limited result
       { const t = drawVmmPreview(ctx, img, f); if (t) noteTxt = noteTxt || t; }    // stage VideoMaMa: band / recomposed result
       { const t = drawStagePreview(ctx, img, f); if (t) noteTxt = t; }               // stages 3 / 4 / 5: preview of a few frames
-      if (S.obj && !S.auxMode && S.cmpDiff && (S.view === 'alpha' || S.view === 'comp')) {   // stage-4 comparison |A − B|
+      { const t = drawStageResultTint(ctx, img, f); if (t) noteTxt = noteTxt || t; }  // stages 3 / 4 / 7: „👁 alfa” elsewhere
+      if (S.obj && !S.auxMode && S.cmpDiff) {   // comparison |A − B| (every view: the view tab is the user's, 2026-10-26)
         const c = S.cmpDiff;
         const d = loadOverlay(`${S.obj}_adiff@${c.a}~${c.b}_${f}`, `/api/object/${S.obj}/frame/${f}?view=alpha_diff&v=${c.a}&v2=${c.b}`);
         if (d && d !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.9; ctx.drawImage(tintCanvas(d, [255, 40, 40], `${S.obj}_adiff@${c.a}~${c.b}_${f}`), 0, 0, img.width, img.height); ctx.globalAlpha = pa; }
@@ -1008,8 +1061,11 @@
           if (d && d !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.85; ctx.drawImage(tintCanvas(d, rgb, `${S.obj}_${kind}_${f}`, true), 0, 0, img.width, img.height); ctx.globalAlpha = pa; }
         }
       }
-      if (!noteTxt && S.obj && versionStage() && S.viewRun && (S.view === 'alpha' || S.view === 'comp'))
-        noteTxt = `Wersja ${S.viewRun} (aktywna: ${S.activeRun || '–'}) – B wraca do aktywnej`;
+      if (!noteTxt && S.obj && versionStage() && S.viewRun) {
+        const c = cmpStage() ? cmpCur() : null, w = c && (S.viewRun === c.a ? 'A' : S.viewRun === c.b ? 'B' : '');
+        noteTxt = w ? `Oglądasz ${w}: ${S.viewRun} (aktywna ★: ${S.activeRun || '–'}) – ${w} drugi raz kończy porównanie`
+          : `Wersja ${S.viewRun} (aktywna: ${S.activeRun || '–'}) – B wraca do aktywnej`;
+      }
       note(noteTxt);
       const showEdge = !!(S.obj && !S.auxMode && S.stage === ST.EXPERIMENTS && S.edgeFix && !S.edgeFix.dismissed && expPvGet('edge', true));
       const lg = edgeLegendEl(); if (lg) lg.style.display = showEdge ? '' : 'none';
@@ -1095,6 +1151,7 @@
     if (S.obj === o) { S.info = info; S.infoObj = o; }
     renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderVmmPalette();
     renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderExpPalette();
+    renderCmp();   // the version list's "in use" reasons read stage_runs
     if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.onStages();
     if (window.MD_FT && window.MD_FT.ready) window.MD_FT.onStages();
     updateDelKeyBtn();   // every stage module calls loadStages after a key change
@@ -1132,7 +1189,7 @@
   }
   // „Maska: …” next to the HUD mode (user request 2026-10-17): which mask the preview shows right now – the stage's
   // version with its frames, the mask 1+2 / SAM3 core, or a stage preview – and when the version misses this frame
-  const STAGE_NAME = () => ({ [ST.MATANYONE]: 'MatAnyone2', [ST.VIDEOMAMA]: 'VideoMaMa', [ST.VITMATTE]: 'ViTMatte', [ST.LTX]: 'LTX' });
+  const STAGE_NAME = () => ({ [ST.MATANYONE]: 'MatAnyone2', [ST.VIDEOMAMA]: 'VideoMaMa', [ST.VITMATTE]: 'ViTMatte', [ST.LTX]: 'LTX-2.5' });
   function updateMaskHud(f) {
     const el = $('hudMask');
     if (!el) return;
@@ -1214,6 +1271,15 @@
       S.matteNote = `Baza Final Touch (${ref.run}) nie obejmuje klatki ${f} – wybierz inną bazę albo przejdź do policzonych klatek`;
       return null;
     }
+    if (S.viewRun) {   // a version picked for viewing (comparison A / B, list of versions) wins over the stage's own result
+      // and its previews (user report 2026-10-26: stage 3 kept showing A after switching to B)
+      const vr = S.viewRun, key = `${S.obj}_alpha@${vr}_${f}`;
+      const al = loadOverlay(key, `/api/object/${S.obj}/frame/${f}?view=alpha&v=${encodeURIComponent(vr)}`);
+      if (al && al !== 'missing') { S.matteNote = ''; return { img: al, key, kind: 'alpha', run: vr }; }
+      if (!al) return 'loading';
+      S.matteNote = `Wersja ${vr} nie obejmuje klatki ${f}`;
+      return null;
+    }
     const run = stageAlphaRun();
     const withZonePv = (m) => {   // user report 2026-10-16: „Przelicz klatkę” changed nothing on the cut-out
       const pm = S.stage === ST.VITMATTE && m && m !== 'loading' && window.MD_ZONES && window.MD_ZONES.previewMatte
@@ -1247,6 +1313,19 @@
         if (al && al !== 'missing') return { img: al, key, kind: 'alpha', run: `podgląd ${spvLabel(st)} F${pv.frames[0]}–${pv.frames[pv.frames.length - 1]}` };
         if (!al) return 'loading';
       }
+    }
+    {   // stages 4 / 7 with a computed version: the live result (current sliders) is the cut-out, like the zone preview of
+        // stage 5 – the green tint of it is gone in Alpha / Comp (user report 2026-10-26)
+      let live = null, lk = '';
+      if (S.stage === ST.VIDEOMAMA && S.vmm && S.vmm.run && $('vmBase')) {
+        const q = vmmQuery(S.vmmPv || vmmPvParams()); lk = `${S.obj}_vmma_${S.vmm.run}_${q}_${f}`;
+        live = settledOverlay(lk, `/api/object/${S.obj}/videomama_preview/${f}?what=alpha&${q}`, f);
+      } else if (S.stage === ST.LTX && S.ltx && S.ltx.run) {
+        const q = ltxQuery(S.ltxPv || ltxPvParams()); lk = `${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`;
+        live = settledOverlay(lk, `/api/object/${S.obj}/ltx_preview/${f}?what=alpha&${q}`, f);
+      }
+      if (live && live !== 'missing') return { img: live, key: lk, kind: 'alpha', run: `${S.stage === ST.LTX ? S.ltx.run : S.vmm.run} · bieżące suwaki` };
+      if (lk && !live) return 'loading';
     }
     if (run === '') return withZonePv(sw ? wholeMatte(has12 ? 'core_fix' : 'core') : coreMatte(has12 ? 'core_fix' : (keyOf(f) ? 'key' : 'core')));
     if (run) {
@@ -1447,7 +1526,7 @@
     status(`Przelicz nieaktualne: kadry (gdy trzeba) + rdzeń SAM 3.1 – ${window.MD_WA && window.MD_WA.range ? `zakres pracy ${window.MD_WA.label()}` : 'całe ujęcie'}…`);
     const d = await api('POST', `/api/object/${S.obj}/compute_all`);
     if (d.crops_recomputed) { clearOverlays(); await loadCrops(); } else invalidateIntervals(d.recomputed);
-    await loadStages(); setView('core');
+    await loadStages(); restoreUserView();
     const fl = Object.entries(d.crop_flags || {});
     const where = d.whole_shot ? 'na całym ujęciu' : `w F${d.frames[0]}–${d.frames[1]} (zakres pracy F${d.work_area[0]}–${d.work_area[1]}, do najbliższych kluczy)`;
     status(`Maska policzona ${where}: przeliczono ${d.recomputed.length} przedz., z cache ${d.cached.length}` +
@@ -1570,7 +1649,7 @@
   }
   async function loadObject() {
     renderOrder();
-    clearOverlays(); S.preview = {}; S.points = {}; S.strokes = {}; S.polys = {}; S.poly = null; S.crops = null; S.keys = []; S.viewRun = null; S.runs = []; S.cmpDiff = null; S.cmpUser = false; S.edgePv = null; S.epvParams = null; S.pvLast = {};
+    clearOverlays(); S.preview = {}; S.points = {}; S.strokes = {}; S.polys = {}; S.poly = null; S.crops = null; S.keys = []; S.viewRun = null; S.runs = []; S.cmpDiff = null; S.cmpPicks = {}; S.edgePv = null; S.epvParams = null; S.pvLast = {};
     if (window.MD_ZONES && window.MD_ZONES.ready) window.MD_ZONES.reset();
     if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.reset();
     if (window.MD_FT && window.MD_FT.ready) window.MD_FT.reset();
@@ -1829,16 +1908,17 @@
   }
   function showRun(runName) {
     S.viewRun = runName;
-    if (runName && S.view !== 'alpha' && S.view !== 'comp') setView('alpha', false);
+    if (!runName) S.cmpMode = null;
+    // the view stays what the user picked on top (Plate / Core / Alpha / Comp, user decision 2026-10-26): entering a stage
+    // put its version A here and switched (and remembered) Alpha, so every stage after it opened in Alpha
+    updateViewTabs(); restoreUserView();   // Alpha / Comp follow the version shown (a stage's A arrives after entering it)
     V().render();
     const box = $('st4Runs'); if (box) box.querySelectorAll('.run-row').forEach((el) => el.classList.toggle('cur', el.dataset.run === (runName || S.activeRun)));
   }
   function updateRunHud() { V().render(); }
   function toggleRunB() {
     if (!versionStage()) return;                    // the core has no versions
-    if (S.stage === ST.VITMATTE && $('st4CmpA') && $('st4CmpA').value && $('st4CmpB').value && $('st4CmpA').value !== $('st4CmpB').value) {
-      cmpShow(S.viewRun === $('st4CmpA').value ? 'b' : 'a'); toast(`Porównanie: ${S.viewRun}`); return;
-    }
+    if (cmpKey('b')) return;                         // stages with the version comparison: B = field B
     const runs = (S.runs || []).map((r) => r.run);
     if (runs.length < 2 || !S.activeRun) { toast('Jedna wersja – nie ma z czym porównać'); return; }
     const i = runs.indexOf(S.activeRun);
@@ -2264,7 +2344,8 @@
   function edgeSettingsHtml() {
     return `<div class="pts-palette edge-palette" id="edgePalette" style="display:none">
       <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> Krawędź (MatAnyone2)</div>
-      <label class="chk" title="Podgląd przed liczeniem: przerywane linie = krawędzie pasa, w którym MatAnyone2 decyduje o alfie (ten sam pas co w etapach 4 / 5 / 7: suwaki + punkty pasa), cienkie przerywane = koniec wtopień; w środku zostaje maska 1+2. Wyłącz, gdy oglądasz policzony wynik"><input type="checkbox" id="ePv" title="Podgląd pasa krawędzi na obrazie (wł. / wył.)"> 👁 podgląd pasa krawędzi</label>
+      <div class="pp-chk"><label class="chk" title="Podgląd przed liczeniem: przerywane linie = krawędzie pasa, w którym MatAnyone2 decyduje o alfie (ten sam pas co w etapach 4 / 5 / 7: suwaki + punkty pasa), cienkie przerywane = koniec wtopień; w środku zostaje maska 1+2. Wyłącz, gdy oglądasz policzony wynik"><input type="checkbox" id="ePv" title="Podgląd pasa krawędzi na obrazie (wł. / wył.)"> 👁 podgląd pasa</label>
+        <label class="chk" title="Zielona alfa etapu na obrazie (widok Plate): podgląd klatek etapu na jego klatkach, inaczej wynik etapu (albo wersja z porównania). Wyłącz, żeby widzieć same linie pasa i plate. W widokach Alpha / Comp zawsze widać samą maskę – bez zielonego nalotu."><input type="checkbox" id="ePvAlpha" title="Zielona alfa etapu na obrazie (wł. / wył.)"> 👁 alfa</label></div>
       <div class="band-seed" id="epBandSeed"></div>
       <div class="muted pp-hint" id="ePvInfo"></div>
       <div class="pp-sec edge-settings" id="edgeSettings">
@@ -2290,6 +2371,39 @@
     set: (p) => { try { if (p) localStorage.setItem('md_edge_palette', JSON.stringify(p)); else localStorage.removeItem('md_edge_palette'); } catch (e) { /* storage blocked */ } },
   };
   const edgeStage = () => S.stage === ST.MATANYONE;   // stage 5 has its own palette „Eksperymenty” (2026-10-16)
+  const edgePvGet = (k, d) => { try { const v = localStorage.getItem(`md_edge_${k}`); return v == null ? d : v === '1'; } catch (e) { return d; } };
+  const edgePvSet = (k, on) => { try { localStorage.setItem(`md_edge_${k}`, on ? '1' : '0'); } catch (e) { /* storage blocked */ } };
+  // ---- „👁 alfa” of stages 3 / 4 / 5 / 7 = one switch with one meaning (user request 2026-10-26, as „👁 alfa strefy” of
+  // stage 5): in the Plate view the stage's current alpha in green – the frame preview of the stage on its frames, the
+  // live result with the palette's sliders (4 / 7), else the stage result (or the version picked for comparison);
+  // off = only the band lines and the tools. Alpha / Comp show the matte itself, never a tint over it (matteFor)
+  function stageAlphaOn(st) {
+    if (st === 'matanyone') return edgePvGet('alpha', true);
+    if (st === 'videomama') return vmmPvGet('alpha', true);
+    if (st === 'ltx') return ltxPvGet('alpha', true);
+    if (st === 'vitmatte') return !(window.MD_ZONES && window.MD_ZONES.ready && !window.MD_ZONES.alphaPvOn);
+    return true;
+  }
+  const tintView = () => S.view !== 'alpha' && S.view !== 'comp';   // views where a stage alpha is a green tint
+  // stages 3 / 4 / 7 in the Plate view, frame without a stage preview / live result: the stage result (or the picked
+  // version) in green, as stage 5 does it in static/zones.js (hook stageRunAlpha)
+  function drawStageResultTint(ctx, img, f) {
+    const st = ({ [ST.MATANYONE]: 'matanyone', [ST.VIDEOMAMA]: 'videomama', [ST.LTX]: 'ltx', [ST.EXPERIMENTS]: 'experiments' })[S.stage];
+    if (!st || (st === 'experiments' && !S.viewRun) || !S.obj || S.auxMode || !tintView() || selMaskHidden() || !stageAlphaOn(st)) return '';
+    if (!S.viewRun) {
+      const pv = spvOf(st);
+      if (pv && (pv.frames || []).includes(f) && spvWanted(st)) return '';         // drawStagePreview draws it
+      if (st === 'videomama' && S.vmm && S.vmm.run) return '';                      // the live result (drawVmmPreview)
+      if (st === 'ltx' && S.ltx && S.ltx.run) return '';                            // the live result (drawLtxPreview)
+    }
+    const r = S.viewRun || stageAlphaRun(); if (!r) return '';
+    const key = `${S.obj}_alpha@${r}_${f}`;
+    const al = loadOverlay(key, `/api/object/${S.obj}/frame/${f}?view=alpha&v=${encodeURIComponent(r)}`);
+    if (!al || al === 'missing') return '';
+    const pa = ctx.globalAlpha; ctx.globalAlpha = 0.6;
+    ctx.drawImage(tintCanvas(al, [60, 255, 90], `${S.obj}_srt_${r}_${f}`), 0, 0, img.width, img.height); ctx.globalAlpha = pa;
+    return S.viewRun ? '' : `Wynik etapu: ${r} (zielone)`;   // a picked version: the comparison note („Oglądasz A …”) says it
+  }
   // preview params: the slider values (also while dragging, before they are saved); debounced so a drag is one request
   // px mode (2026-10-16): once the object has band_out_px / band_in_px or a px slider moved; else its old ×scale / shift
   function edgePvParams() {
@@ -2302,6 +2416,7 @@
     if (!show) return;
     if (S.edgePv == null) S.edgePv = stageState('matanyone').state !== 'done';   // on until a MatAnyone result exists
     $('ePv').checked = !!S.edgePv;
+    $('ePvAlpha').checked = edgePvGet('alpha', true);
     const b = $('epCompute');
     const maPrev = S.info && S.info.stage_runs && S.info.stage_runs.matanyone;
     b.textContent = S.stage === ST.MATANYONE ? (maPrev ? '▶ Policz ponownie' : '▶ Przelicz MatAnyone2') : '✔ Przelicz finalnie';
@@ -2333,8 +2448,18 @@
   const spvEngQ = (st, eng) => (st === 'vitmatte' ? `&engine=${eng || vmEngine()}` : '');
   const spvLabel = (st, eng) => (st === 'vitmatte' ? EDGE_ENGINE_LABEL[eng || vmEngine()] : SPV_LABEL[st]);
   const spvOf = (st) => (st && S.spv ? S.spv[spvKey(st)] : null);
-  // the preview of a stage shows while the stage has no result to show instead – stage 5: no version of the picked engine
-  const spvWanted = (st) => (st === 'vitmatte' ? !vmRunFor(vmEngine()) : !(stageState(st) && stageState(st).state === 'done'));
+  // the preview of a stage shows while the stage has no result to show instead – stage 5: no version of the picked
+  // engine – or when it is NEWER than that result (user report 2026-10-25: after a ViTMatte setting + „👁 Podgląd
+  // klatek” the alpha kept showing v004, so the change looked like it did nothing)
+  const spvWanted = (st) => {
+    const sr = (S.info && S.info.stage_runs) || {};
+    const done = st === 'vitmatte' ? !!vmRunFor(vmEngine()) : !!(stageState(st) && stageState(st).state === 'done');
+    if (!done) return true;
+    const run = st === 'vitmatte' ? vmRunFor(vmEngine()) : sr[st];
+    const r = run && (S.runs || []).find((x) => x.run === run);
+    const pv = spvOf(st);
+    return !!(pv && r && r.created_at && pv.created_at && String(pv.created_at) > String(r.created_at));   // ISO seconds
+  };
   async function loadStagePreviews() {
     const obj = S.obj; S.spv = {};
     if (!obj) return;
@@ -2343,6 +2468,7 @@
       const st = Array.isArray(s) ? s[0] : s, eng = Array.isArray(s) ? s[1] : null;
       try { const d = await api('GET', `/api/object/${obj}/stage_preview/${st}${eng ? `?engine=${eng}` : ''}`); if (S.obj === obj && d.exists) S.spv[spvKey(st, eng)] = d; } catch (e) { /* none */ }
     }
+    if (S.obj === obj) { updateViewTabs(); restoreUserView(); }   // a preview unlocks Alpha / Comp of its stage
     if (S.obj === obj && V()) V().render();
   }
   async function stagePreview(stage, btnId) {
@@ -2354,8 +2480,12 @@
       const d = await api('POST', `/api/object/${S.obj}/stage_preview/${f}?stage=${stage}`);
       S.spv = { ...(S.spv || {}), [spvKey(stage, d.engine || eng)]: d };
       if (stage === 'vitmatte') S.vmPick = null;   // show what was just computed
+      updateViewTabs(); restoreUserView();
+      const cmpWasOn = !!(S.viewRun || S.cmpDiff);
+      if (cmpWasOn) cmpOff();   // a picked version would hide the new preview (user request 2026-10-26)
       status(`Podgląd ${spvLabel(stage, d.engine || eng)}: F${d.frames[0]}–${d.frames[d.frames.length - 1]} (${d.seconds} s) – zielone na obrazie. ` +
-        'To nie jest wynik etapu: nic nie zostało zapisane jako wersja i nic się nie odblokowało.', 'ok');
+        'To nie jest wynik etapu: nic nie zostało zapisane jako wersja i nic się nie odblokowało.' +
+        (cmpWasOn ? ' Porównanie wersji wyłączone.' : ''), 'ok');
       V().render();
     });
   }
@@ -2365,13 +2495,14 @@
   function drawStagePreview(ctx, img, f) {
     const st = spvStage(); const m = spvOf(st);
     if (!m || !S.obj || S.auxMode || !(m.frames || []).includes(f)) return '';
-    if (!spvWanted(st)) return '';   // the stage result is there – show it, not the preview
+    if (!spvWanted(st) || S.viewRun) return '';   // the stage result is there, or a version is picked – show it, not the preview
     if (selMaskHidden()) return 'Maska wybranego obiektu ukryta – 👁 w palecie Obiekty';
-    const bw = alphaBw();   // the Alpha view is black / white only (user rule 2026-10-22): the preview is the matte there
-    // (matteFor shows it), never a green tint over it; the note still says it is a preview
+    // the Alpha view is black / white only (user rule 2026-10-22) and Comp is the cut-out on its background: in both the
+    // preview IS the matte (matteFor shows it), never a green tint over it (user report 2026-10-26: Comp kept the tint);
+    // the note still says it is a preview
+    const bw = alphaBw() || S.view === 'comp';
     // the stage's own „👁 alfa” switch hides the green tint too (user report 2026-10-22: „zone alpha” off, still green)
-    const alphaOff = (st === 'vitmatte' && window.MD_ZONES && window.MD_ZONES.ready && !window.MD_ZONES.alphaPvOn)
-      || (st === 'videomama' && !vmmPvGet('alpha', true));
+    const alphaOff = !stageAlphaOn(st);
     if (!bw && !alphaOff) {
       const key = `${S.obj}_spv_${spvKey(st)}_${m.created_at}_${f}`;
       const al = settledOverlay(key, `/api/object/${S.obj}/stage_preview/${st}/${f}?c=${encodeURIComponent(m.created_at)}${spvEngQ(st)}`, f);
@@ -2547,7 +2678,7 @@
       <label title="Maska, która przycina i kieruje LTX-2.5: maska 1+2 (SAM 3.1 + poprawki; grupa = całość ze szwem) albo wynik etapu ${ST.MATANYONE} / ${ST.VITMATTE} (alfa > 0,5)">Maska<select id="lx6Mask" class="form-input" title="Z której maski korzysta LTX-2.5">
         <option value="core">Maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH})</option><option value="matanyone">MatAnyone2 (etap ${ST.MATANYONE})</option><option value="vitmatte">ViTMatte (etap ${ST.VITMATTE})</option></select></label>
       <div class="pp-chk"><label class="chk" title="Przerywane linie = krawędzie obszaru, w którym zostaje alfa LTX-2.5 (maska + pas na zewnątrz; w środku wymuszone 1 przy „+ wnętrze” / „pas”), cienkie = koniec wtopień"><input type="checkbox" id="lxPvBand" title="Podgląd pasa LTX-2.5 (wł. / wył.)"> 👁 podgląd pasa</label>
-        <label class="chk" title="Wynik LTX-2.5 tej klatki przycięty bieżącymi suwakami (z zapisanej surowej alfy LTX-2.5 – bez liczenia modelu)"><input type="checkbox" id="lxPvAlpha" title="Wynik LTX-2.5 z bieżącymi suwakami (wł. / wył.)"> 👁 wynik</label></div>
+        <label class="chk" title="Zielona alfa etapu na obrazie (widok Plate): podgląd klatek etapu na jego klatkach, inaczej wynik etapu (albo wersja z porównania). Wyłącz, żeby widzieć same linie pasa i plate. W widokach Alpha / Comp zawsze widać samą maskę – bez zielonego nalotu. Wynik LTX-2.5 idzie przycięty bieżącymi suwakami (z zapisanej surowej alfy LTX-2.5 – bez liczenia modelu)"><input type="checkbox" id="lxPvAlpha" title="Zielona alfa etapu na obrazie (wł. / wył.)"> 👁 alfa</label></div>
       <div class="band-seed" id="lxBandSeed"></div>
       <div class="muted pp-hint" id="lxPvInfo"></div>
       <div class="pp-sec">
@@ -2587,14 +2718,13 @@
       const sel = $('lx6Mask'); const cur = (S.ltx && S.ltx.settings && S.ltx.settings.mask_source) || sel.value;
       fillMaskSelect(sel, ['core', 'matanyone', 'vitmatte'], { versions: 'experiment', keep: cur });
     }
-    $('lxPvAlpha').disabled = !has;
     placeFloating(box, w, ltxPos.get());
   }
   // the palette values (also while dragging, before they are saved)
   function ltxPvParams() {
     const n = (id, d) => { const v = +$(id).value; return isFinite(v) && $(id).value !== '' ? Math.max(0, v) : d; };
     return { region_px: n('lx6Region', 40), region_soft_px: n('lx6Soft', 8), core_erode_px: Math.round(n('lx6Erode', 2)),
-             combine: $('lx6Combine').value, mask_source: $('lx6Mask').value, feather_px: n('lx6Feather', 8) };
+             combine: $('lx6Combine').value, mask_source: $('lx6Mask').value, feather_px: n('lx6Feather', 2) };
   }
   const ltxQuery = (p) => Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
   function ltxAlphaOverlay(f) {   // the live re-limited LTX matte of frame f (Image), 'missing' or null (loading)
@@ -2606,7 +2736,7 @@
     if (!(S.stage === ST.LTX && S.obj && !S.auxMode)) return '';
     const p = S.ltxPv || ltxPvParams(); const q = ltxQuery(p);
     let note = '';
-    const al = bandsOnly || selMaskHidden() ? null : ltxAlphaOverlay(f);
+    const al = bandsOnly || !tintView() || selMaskHidden() || S.viewRun ? null : ltxAlphaOverlay(f);   // a picked version: no live result over it
     if (al && al !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.75; ctx.drawImage(tintCanvas(al, [60, 255, 90], `${S.obj}_ltxa_${S.ltx.run}_${q}_${f}`), 0, 0, img.width, img.height); ctx.globalAlpha = pa; note = `Wynik LTX-2.5 ${S.ltx.run} z bieżącymi suwakami (zielone)`; }
     if (ltxPvGet('band', true) || S.pvDrag === 'ltx') {
       // the one band of every stage (2026-10-24): dashed band edges + thin feather-end lines, no fill, nothing while
@@ -2629,7 +2759,7 @@
       <label title="Na co nakłada się wynik VideoMaMa. Maska 1+2 (domyślnie) – VideoMaMa robi całą krawędź (na CLIP2_A najspokojniejsza twarda krawędź). MatAnyone2 (etap ${ST.MATANYONE}) – twarda krawędź MatAnyone2 zostaje w pasie ochrony, VideoMaMa dokłada kosmyki dalej. VideoMaMa zawsze prowadzi maska 1+2">Baza<select id="vmBase" class="form-input" title="Na co nakłada się wynik VideoMaMa">
         <option value="core">Maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH})</option><option value="matanyone">MatAnyone2 (etap ${ST.MATANYONE})</option></select></label>
       <div class="pp-chk"><label class="chk" title="Przerywane linie = krawędzie pasa, w którym decyduje VideoMaMa (pas na zewnątrz + wcięcie), cienkie = koniec wtopień; w środku zostaje baza"><input type="checkbox" id="vmPvBand" title="Podgląd pasa VideoMaMa (wł. / wył.)"> 👁 podgląd pasa</label>
-        <label class="chk" title="Wynik VideoMaMa tej klatki nałożony na bazę bieżącymi suwakami (z zapisanej surowej alfy – bez liczenia modelu)"><input type="checkbox" id="vmPvAlpha" title="Wynik VideoMaMa z bieżącymi suwakami (wł. / wył.)"> 👁 wynik</label></div>
+        <label class="chk" title="Zielona alfa etapu na obrazie (widok Plate): podgląd klatek etapu na jego klatkach, inaczej wynik etapu (albo wersja z porównania). Wyłącz, żeby widzieć same linie pasa i plate. W widokach Alpha / Comp zawsze widać samą maskę – bez zielonego nalotu. Wynik VideoMaMa idzie z bieżącymi suwakami (z zapisanej surowej alfy – bez liczenia modelu)"><input type="checkbox" id="vmPvAlpha" title="Zielona alfa etapu na obrazie (wł. / wył.)"> 👁 alfa</label></div>
       <div class="band-seed" id="vmBandSeed"></div>
       <div class="muted pp-hint" id="vmPvInfo"></div>
       <div class="pp-sec">
@@ -2663,8 +2793,6 @@
     if (!show) return;
     $('vmPvBand').checked = vmmPvGet('band', true);
     $('vmPvAlpha').checked = vmmPvGet('alpha', true);
-    const has = !!(S.vmm && S.vmm.run);
-    $('vmPvAlpha').disabled = !has;
     placeFloating(box, w, vmmPos.get());
   }
   // the palette values (also while dragging, before they are saved)
@@ -2672,7 +2800,7 @@
     const n = (id, d) => { const v = +$(id).value; return isFinite(v) && $(id).value !== '' ? Math.max(0, v) : d; };
     // the unified sliders: inset / feather are sent (and saved) as soon as they exist in the palette – an object never
     // touched still shows inset 0, feather 0, which for the mask 1+2 base is the former composition exactly
-    return { base: $('vmBase').value, reach_px: n('vmReach', 40), inset_px: n('vmInset', 2), feather_px: n('vmFeather', 8),
+    return { base: $('vmBase').value, reach_px: n('vmReach', 40), inset_px: n('vmInset', 2), feather_px: n('vmFeather', 2),
              outer_feather_px: n('vmOuterFeather', 8) };
   }
   const vmmQuery = (p) => Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
@@ -2680,7 +2808,7 @@
     if (!(S.stage === ST.VIDEOMAMA && S.obj && !S.auxMode && $('vmBase'))) return '';
     const p = S.vmmPv || vmmPvParams(); const q = vmmQuery(p);
     let note = '';
-    if (!bandsOnly && !selMaskHidden() && S.vmm && S.vmm.run && vmmPvGet('alpha', true)) {
+    if (!bandsOnly && tintView() && !selMaskHidden() && !S.viewRun && S.vmm && S.vmm.run && vmmPvGet('alpha', true)) {   // a picked version: no live result over it
       const key = `${S.obj}_vmma_${S.vmm.run}_${q}_${f}`;
       const al = settledOverlay(key, `/api/object/${S.obj}/videomama_preview/${f}?what=alpha&${q}`, f);
       if (al && al !== 'missing') { const pa = ctx.globalAlpha; ctx.globalAlpha = 0.75; ctx.drawImage(tintCanvas(al, [60, 255, 90], key), 0, 0, img.width, img.height); ctx.globalAlpha = pa; note = `Wynik VideoMaMa ${S.vmm.run} na bazie, bieżące suwaki (zielone)`; }
@@ -2814,6 +2942,7 @@
       <div class="muted">Suwaki krawędzi i podgląd pasa: paleta „Krawędź (MatAnyone2)” na podglądzie (przeciągnij za ⠿).</div>
       <button class="btn btn-primary" id="st3Ma" title="MatAnyone2 na masce 1+2 (rdzeń SAM 3.1 + poprawki pędzlem z etapu ${ST.BRUSH}), bez stref ViTMatte → nowa wersja (baza etapu ${ST.VITMATTE}); zakres pracy z osi czasu">▶ Przelicz MatAnyone2</button>
       <div class="muted" id="st3MaInfo"></div>
+      <div class="cmp-slot"></div>
       <div class="stage-status" id="st${ST.MATANYONE}Status"></div>
       ${nextBtn(ST.MATANYONE)}
     </div>`, { show() { renderEdgePalette(); renderStageInfo(); } });
@@ -2823,10 +2952,8 @@
       ${descHtml('VIDEOMAMA')}
       <div class="muted" id="vmModels"></div>
       <div class="muted">Ustawienia i podgląd: paleta „VideoMaMa” na obrazie (po lewej, przeciągnij za ⠿).</div>
-      <div class="row"><button class="btn btn-secondary btn-sm" id="vmShow" title="Pokaż wynik VideoMaMa (widok Alpha / Comp)">👁 Wynik VideoMaMa</button>
-        <button class="btn btn-secondary btn-sm" id="vmShowMa" title="Pokaż wynik MatAnyone2 (etap ${ST.MATANYONE}) – do porównania">MatAnyone2</button>
-        <button class="btn btn-ghost btn-sm" id="vmShowOff" title="Wróć do aktywnej wersji">Aktywna</button></div>
       <div class="muted" id="vmInfo"></div>
+      <div class="cmp-slot"></div>
       <div class="stage-status" id="st${ST.VIDEOMAMA}Status"></div>
       ${nextBtn(ST.VIDEOMAMA)}
     </div>`, { show() { loadVmm().then(renderVmmPalette).catch((e) => status(`VideoMaMa: ${e.message}`, 'err')); } });
@@ -2840,16 +2967,7 @@
         <option value="videomama" title="Wynik VideoMaMa z etapu ${ST.VIDEOMAMA} (musi być aktualny) – kosmyki VideoMaMa poza strefą">VideoMaMa (etap ${ST.VIDEOMAMA})</option></select></label>
       <div class="muted" id="st4Base"></div></div>
       <div class="pane-section" id="st4ZonePanel"><div id="z4Panel"></div></div>
-      <div class="pane-section" id="st4Cmp">
-        <div class="sec-title" title="Porównanie dwóch wersji obiektu na podglądzie (widok Alpha): A, B albo różnica |A − B| (czerwona, ×3)">Porównanie wersji</div>
-        <div class="row"><label title="Wersja A (domyślnie: ViTMatte na masce 1+2)">A<select id="st4CmpA" class="form-input"></select></label>
-          <label title="Wersja B (domyślnie: ViTMatte na MatAnyone2)">B<select id="st4CmpB" class="form-input"></select></label></div>
-        <div class="row"><button type="button" class="btn btn-secondary btn-sm" id="st4CmpShowA" title="Pokaż wersję A (widok Alpha / Comp)">A</button>
-          <button type="button" class="btn btn-secondary btn-sm" id="st4CmpShowB" title="Pokaż wersję B">B</button>
-          <button type="button" class="btn btn-secondary btn-sm" id="st4CmpDiff" title="Różnica |A − B| na czerwono (×3, żeby słabe różnice półprzezroczystości były widoczne) na wersji A">Różnica</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="st4CmpOff" title="Koniec porównania – aktywna wersja">Wył.</button></div>
-        <div class="muted" id="st4CmpInfo"></div>
-      </div>
+      <div class="cmp-slot"></div>
       <div class="stage-status" id="st${ST.VITMATTE}Status"></div>
       ${nextBtn(ST.VITMATTE)}
     </div>`, { show() { renderStageInfo(); loadRuns().then(renderCmp).catch(() => {}); if (window.MD_ZONES && window.MD_ZONES.ready) window.MD_ZONES.onShow(); } });
@@ -2882,7 +3000,8 @@
         <div class="muted">Comp: V zmienia tło (czarne / białe / 18 % / szachownica / kolor). M = mapa migotania wersji.</div>
       </div>
       <div class="pane-section" id="st4EdgeFix"></div>
-      <div class="pane-section"><div class="sec-title">Wersje <span class="muted">(klik = podgląd, B = aktywna ↔ poprzednia)</span></div><div id="st4Runs" class="muted"></div></div>
+      <div class="cmp-slot"></div>
+      <div class="pane-section"><div class="sec-title">Wersje – szczegóły <span class="muted">(klik = podgląd)</span></div><div id="st4Runs" class="muted"></div></div>
       <div class="stage-status" id="st${ST.EXPERIMENTS}Status"></div>
       ${nextBtn(ST.EXPERIMENTS)}
     </div>`, { show() { renderEdgePalette(); loadQA().then(renderExpPalette).catch(() => {}); } });
@@ -2892,10 +3011,8 @@
       ${descHtml('LTX')}
       <div class="muted" id="lx6Models"></div>
       <div class="muted">Ustawienia LTX-2.5 i podgląd: paleta „LTX-2.5” na obrazie (po lewej, przeciągnij za ⠿).</div>
-      <div class="row"><button class="btn btn-secondary btn-sm" id="lx6Show" title="Pokaż wynik LTX-2.5 (widok Alpha / Comp)">👁 Wynik LTX-2.5</button>
-        <button class="btn btn-secondary btn-sm" id="lx6ShowMa" title="Pokaż wynik MatAnyone2 (etap ${ST.MATANYONE}) – do porównania">MatAnyone2</button>
-        <button class="btn btn-ghost btn-sm" id="lx6ShowOff" title="Wróć do aktywnej wersji">Aktywna</button></div>
       <div class="muted" id="lx6Info"></div>
+      <div class="cmp-slot"></div>
       <div class="stage-status" id="st${ST.LTX}Status"></div>
       ${nextBtn(ST.LTX)}
     </div>`, { show() { loadLtx().then(renderLtxPalette).catch((e) => status(`LTX-2.5: ${e.message}`, 'err')); } });
@@ -2937,6 +3054,8 @@
       </div>
       <div class="stage-status" id="st${ST.EXPORT}Status"></div>
     </div>`, { show() { loadExportDir(); renderExportSource(); } });
+    // the version comparison (2026-10-26): ONE block, moved into the .cmp-slot of the stage shown (mountCmp)
+    { const c = el(cmpHtml()); c.style.display = 'none'; host.appendChild(c); }
     // the shared edge settings live in a hidden holder until the first pane that shows them
     const cw = $('canvasWrapper');
     if (cw) { const pal = el(edgeSettingsHtml()); cw.appendChild(pal); makeFloating(pal, cw, '.pp-head', epPos); }
@@ -2991,28 +3110,156 @@
     : r.stage === 'videomama' ? `VideoMaMa na ${r.base === 'matanyone' ? 'MatAnyone2' : 'masce 1+2'}`
     : r.stage === 'matanyone' ? 'MatAnyone2' : r.stage === 'core' ? 'maska 1+2' : r.stage === 'ltx' ? 'LTX-2.5 Alpha-Gen'
     : r.stage === 'experiment' ? `eksperyment z ${r.base_run || '?'}` : (r.edge_mode || '')}${r.motion_blur ? ` + motion blur ×${r.motion_blur.strength}` : ''}`;
-  function renderCmp() {
-    const a = $('st4CmpA'), b = $('st4CmpB'); if (!a || !b) return;
-    const runs = (S.runs || []).slice().reverse();
-    const opts = runs.map((r) => `<option value="${r.run}">${esc(runLabel(r))}</option>`).join('');
-    const keepA = a.value, keepB = b.value;
-    a.innerHTML = opts; b.innerHTML = opts;
-    const sr = (S.info && S.info.stage_runs) || {};
+  // one comparison block for the stages 3 / 4 / 5 / 6 / 7 (user decision 2026-10-26): the list = versions of THIS stage
+  // (click = A, 🗑 only here), B = any version, grouped this stage first; A / B / D keys, the same key again = active ★
+  const CMP_RUN_STAGE = () => ({ [ST.MATANYONE]: 'matanyone', [ST.VIDEOMAMA]: 'videomama', [ST.VITMATTE]: 'vitmatte', [ST.LTX]: 'ltx' });
+  const CMP_STAGES = () => [ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.EXPERIMENTS, ST.LTX];
+  const CMP_NAME = () => ({ [ST.MATANYONE]: 'MatAnyone2', [ST.VIDEOMAMA]: 'VideoMaMa', [ST.VITMATTE]: 'ViTMatte', [ST.EXPERIMENTS]: 'Eksperymenty', [ST.LTX]: 'LTX-2.5' });
+  const cmpStage = () => CMP_STAGES().includes(S.stage);
+  // the stage a version belongs to; everything without its own stage (experiments, mask 1+2, old versions) = Eksperymenty
+  const runStageNo = (r) => { const m = CMP_RUN_STAGE(); return +(Object.keys(m).find((k) => m[k] === r.stage) ?? ST.EXPERIMENTS); };
+  const cmpPick = () => ((S.cmpPicks = S.cmpPicks || {})[S.stage] = (S.cmpPicks[S.stage] || {}));
+  // A / B of the stage: the user's pick while it exists, else A = newest version of the stage, B = the previous one of the
+  // stage, else the base of A, else the newest version of another stage
+  function cmpCur() {
+    const runs = (S.runs || []).slice().reverse();             // newest first
     const has = (v) => v && runs.some((r) => r.run === v);
-    a.value = S.cmpUser && has(keepA) ? keepA : (has(sr['vitmatte@core']) ? sr['vitmatte@core'] : (runs[0] || {}).run || '');
-    b.value = S.cmpUser && has(keepB) ? keepB : (has(sr['vitmatte@matanyone']) ? sr['vitmatte@matanyone'] : has(sr.matanyone) ? sr.matanyone : (runs[1] || runs[0] || {}).run || '');
-    const off = runs.length < 2;
-    ['st4CmpShowA', 'st4CmpShowB', 'st4CmpDiff'].forEach((id) => { $(id).disabled = off; });
-    $('st4CmpInfo').textContent = off ? 'Potrzebne co najmniej dwie wersje (np. ViTMatte na masce 1+2 i na MatAnyone2 – zmień bazę i „Zastosuj na ujęcie”)'
-      : S.cmpDiff ? `Różnica |A − B| (czerwone, ×3): ${S.cmpDiff.a} − ${S.cmpDiff.b}` : S.viewRun ? `Na podglądzie: ${S.viewRun}` : 'Na podglądzie: aktywna wersja';
+    const own = runs.filter((r) => runStageNo(r) === S.stage);
+    const p = cmpPick(), sr = (S.info && S.info.stage_runs) || {};
+    const a = has(p.a) && own.some((r) => r.run === p.a) ? p.a : (own[0] || {}).run || '';
+    const ra = runs.find((r) => r.run === a) || {};
+    const baseOfA = ra.base_run || ra.applied_from || ra.ltx_mask_run || (ra.base && sr[ra.base]) || '';
+    const b = has(p.b) && p.b !== a ? p.b
+      : ((own.find((r) => r.run !== a) || {}).run || (has(baseOfA) && baseOfA !== a ? baseOfA : '') || (runs.find((r) => r.run !== a) || {}).run || '');
+    return { runs, own, a, b };
+  }
+  function mountCmp(entered) {
+    const c = $('stCmp'); if (!c) return;
+    const pane = PANES[S.stage] && PANES[S.stage].el, slot = pane && pane.querySelector('.cmp-slot');
+    if (!cmpStage() || !slot) { c.style.display = 'none'; if (entered) { S.cmpDiff = null; if (S.viewRun) showRun(null); } return; }
+    if (c.parentNode !== slot) slot.appendChild(c);
+    c.style.display = '';
+    if (entered) S.cmpDiff = null;
+    renderCmp();
+    const st = S.stage, ob = S.obj;
+    loadRuns().then(() => {   // entering the stage: its newest version (A) goes onto the view once the versions are known
+      if (!entered || S.stage !== st || S.obj !== ob) return;
+      // a fresh „👁 Podgląd klatek” of the stage stays on the view instead (user request 2026-10-26)
+      const { a } = cmpCur();
+      if (a && !cmpFreshPv()) { S.cmpMode = 'a'; showRun(a); } else if (S.viewRun) showRun(null);
+      renderCmp();
+    }).catch(() => {});
+  }
+  function renderCmp() {
+    const box = $('stCmp'); if (!box || !cmpStage()) return;
+    const { runs, own, a, b } = cmpCur();
+    const nm = CMP_NAME();
+    const lbl = (v) => { const r = runs.find((x) => x.run === v); return r ? runLabel(r) : '–'; };
+    $('cmpNameA').textContent = a ? lbl(a) : `brak wersji etapu ${S.stage}`;
+    $('cmpNameB').textContent = b ? lbl(b) : '–';
+    // B: this stage first, then the other stages in the bar's order (no 🗑 here)
+    const groups = [S.stage, ...CMP_STAGES().filter((n) => n !== S.stage)].map((n) => {
+      const rs = runs.filter((r) => runStageNo(r) === n); if (!rs.length) return '';
+      return `<optgroup label="${esc(`${n} · ${nm[n]}${n === S.stage ? ' (ten etap)' : ''}`)}">${rs.map((r) => `<option value="${esc(r.run)}">${r.run === b ? '● ' : ''}${esc(runLabel(r))}</option>`).join('')}</optgroup>`;
+    }).join('');
+    // the name stands in the field's header only: the chooser keeps a fixed caption, the current B marked ● inside
+    const sel = $('cmpB'); sel.innerHTML = `<option value="" disabled hidden>zmień wersję B ▾</option>${groups}`; sel.value = '';
+    // which mask the view shows: the filled field (A orange, B blue); the difference marks both
+    // the comparison is an explicit state (S.cmpMode, 2026-10-26): A is often the active version ★ itself, so "the view
+    // shows A" and "no comparison" looked the same and the second A did nothing
+    const shown = S.viewRun || S.activeRun;
+    const on = S.cmpDiff ? 'diff' : S.viewRun ? (S.cmpMode || (S.viewRun === a ? 'a' : S.viewRun === b ? 'b' : '')) : '';
+    $('cmpFieldA').classList.toggle('on', on === 'a' || on === 'diff');
+    $('cmpFieldB').classList.toggle('on', on === 'b' || on === 'diff');
+    $('cmpDiff').classList.toggle('on', on === 'diff');
+    $('cmpShowA').disabled = !a; $('cmpShowB').disabled = !b; $('cmpDiff').disabled = !a || !b || a === b;
+    $('cmpRunsTitle').textContent = `Wersje etapu ${S.stage} · ${nm[S.stage]} (klik = A, 🗑 = usuń)`;
+    // delete (2026-10-25): a version the object still uses (active, a stage's current result, base of another version)
+    // cannot go – the server also checks every other reference before moving it to the trash
+    const sr = (S.info && S.info.stage_runs) || {};
+    const why = (r) => [r.run === S.activeRun ? T('aktywna') : '',
+      Object.entries(sr).some(([k, v]) => v === r.run && k !== 'active') ? T('wynik etapu') : '',
+      runs.some((x) => x.run !== r.run && (x.base_run === r.run || x.applied_from === r.run || x.ltx_mask_run === r.run)) ? T('baza innej wersji') : '']
+      .filter(Boolean).join(', ');
+    const lb = $('cmpRuns');
+    lb.innerHTML = own.length ? own.map((r) => { const w = why(r); const isA = r.run === a, act = r.run === S.activeRun;
+      return `<div class="row-item cmp-run ${isA ? 'cur' : ''}" data-a-run="${esc(r.run)}" title="${esc(isA ? `${r.run} jest w polu A` : `Klik = ${r.run} do pola A i na podgląd`)}">
+        <span class="cmp-run-txt"><span class="cmp-run-name">${esc(runLabel(r))}</span>${w ? `<span class="cmp-run-why">${esc(w)}</span>` : ''}</span>
+        ${act ? '' : `<button type="button" class="btn btn-ghost btn-xs cmp-run-act" data-act-run="${esc(r.run)}" title="${esc(`Ustaw ${r.run} jako aktywną wersję (★) – eksport i obiekty zależne`)}">★</button>`}
+        <button type="button" class="btn btn-ghost btn-xs cmp-run-del" data-del-run="${esc(r.run)}" ${w ? 'disabled' : ''} title="${esc(w ? `Wersja ${r.run} jest w użyciu (${w}) – nie można jej usunąć` : `Usuń wersję ${r.run} do kosza projektu (trash/runs) – pokażę rozmiar przed usunięciem`)}">🗑</button></div>`; }).join('')
+      : `brak wersji – policz etap ${S.stage}`;
+    lb.querySelectorAll('button[data-del-run]').forEach((bt) => bt.addEventListener('click', (e) => { e.stopPropagation(); run('cmpRuns', () => cmpDelete(bt.dataset.delRun)); }));
+    lb.querySelectorAll('button[data-act-run]').forEach((bt) => bt.addEventListener('click', (e) => {
+      e.stopPropagation();
+      run('cmpRuns', async () => {
+        const r = await api('PUT', `/api/object/${S.obj}/active_run`, { run: bt.dataset.actRun });
+        clearOverlays(); await refreshList(S.obj); await loadStages(); await loadRuns();
+        status(`Aktywna wersja: ${r.active_run}${r.dependents_to_recompute.length ? ` · do przeliczenia: ${r.dependents_to_recompute.join(', ')}` : ''}`, 'ok');
+        loadQA();
+      });
+    }));
+    lb.querySelectorAll('.cmp-run[data-a-run]').forEach((row) => row.addEventListener('click', () => {
+      cmpPick().a = row.dataset.aRun; cmpShow(S.cmpDiff ? 'diff' : 'a');
+    }));
+    $('cmpInfo').textContent = S.cmpDiff ? `Różnica |A − B| (czerwone, ×3): ${S.cmpDiff.a} − ${S.cmpDiff.b}`
+      : on ? `Na podglądzie: ${on.toUpperCase()} – ${shown} (aktywna ★: ${S.activeRun || '–'})`
+      : S.viewRun ? `Na podglądzie: ${S.viewRun}`
+      : cmpFreshPv() ? 'Porównanie wyłączone – na podglądzie: podgląd klatek etapu (poza jego klatkami wynik etapu)'
+      : `Na podglądzie: aktywna wersja ★ ${S.activeRun || '–'}`;
+  }
+  // a „👁 Podgląd klatek” of this stage newer than its result: what the view shows when the comparison is off
+  function cmpFreshPv() { const st = spvStage(); return !!(st && spvOf(st) && spvWanted(st)); }
+  // end of the comparison: the stage's own view again (its fresh preview on the preview frames, else its result)
+  function cmpOff() { S.cmpDiff = null; S.cmpMode = null; showRun(null); renderCmp(); V().render(); }
+  async function cmpDelete(run) {
+    if (!run || !S.obj) return;
+    const d = await api('DELETE', `/api/object/${S.obj}/runs/${run}?dry=1`);
+    if (d.refs && d.refs.length) { status(`Wersja ${run} jest w użyciu – nie usuwam (${d.refs.slice(0, 3).join('; ')})`, 'warn'); return; }
+    const mb = (d.bytes / 1048576).toFixed(1);
+    if (!(await V().uiConfirm(`Usunąć wersję ${run}? ${d.files} plików, ${mb} MB.\nFolder trafia do kosza projektu (trash/runs) – można go przywrócić ręcznie.`, { ok: 'Usuń wersję' }))) return;
+    await api('DELETE', `/api/object/${S.obj}/runs/${run}`);
+    if (S.cmpDiff && (S.cmpDiff.a === run || S.cmpDiff.b === run)) S.cmpDiff = null;
+    if (S.viewRun === run) showRun(null);
+    await loadRuns(); renderCmp(); V().render();
+    status(`Wersja ${run} przeniesiona do kosza projektu (${mb} MB)`, 'ok');
   }
   function cmpShow(which) {
-    const a = $('st4CmpA').value, b = $('st4CmpB').value;
-    if (!a || !b) return;
-    if (which === 'diff') { S.cmpDiff = { a, b }; showRun(a); }
-    else { S.cmpDiff = null; showRun(which === 'a' ? a : b); }
-    if (S.view !== 'alpha' && S.view !== 'comp') setView('alpha');
+    if (!cmpStage()) return;
+    const { a, b } = cmpCur();
+    if (which === 'diff') { if (!a || !b || a === b) return; S.cmpDiff = { a, b }; showRun(a); }
+    else { const v = which === 'a' ? a : b; if (!v) return; S.cmpDiff = null; showRun(v); }
+    S.cmpMode = which;
     renderCmp(); V().render();
+  }
+  // keys A / B / D: show that field; the same key again = end of the comparison (the stage preview / result again)
+  function cmpKey(which) {
+    if (!cmpStage()) return false;
+    const { a, b } = cmpCur();
+    const showing = S.cmpDiff ? 'diff' : S.viewRun ? S.cmpMode : null;
+    if (showing === which) {
+      cmpOff();
+      toast(cmpFreshPv() ? 'Porównanie wyłączone – podgląd klatek etapu' : `Porównanie wyłączone – aktywna wersja ★ ${S.activeRun || ''}`);
+      return true;
+    }
+    cmpShow(which);
+    toast(which === 'diff' ? `Różnica |A − B|: ${a} − ${b}` : `${which.toUpperCase()}: ${which === 'a' ? a : b}`);
+    return true;
+  }
+  function cmpHtml() {
+    return `<div class="pane-section cmp" id="stCmp">
+      <div class="sec-title" title="Porównanie dwóch wersji na podglądzie (widok Alpha / Comp): A, B albo różnica |A − B| (czerwona, ×3). Klawisze A / B / D; ten sam klawisz drugi raz = koniec porównania (podgląd klatek etapu albo wynik etapu)">Porównanie wersji</div>
+      <div class="cmp-fields">
+        <div class="cmp-field cmp-a" id="cmpFieldA"><button type="button" class="cmp-head" id="cmpShowA" title="Pokaż wersję A (klawisz A; drugie A = koniec porównania). Wersję A wybierasz kliknięciem na liście wersji etapu niżej"><b>A</b><span id="cmpNameA">–</span></button>
+          <div class="cmp-sub">wersja z listy etapu niżej</div></div>
+        <div class="cmp-field cmp-b" id="cmpFieldB"><button type="button" class="cmp-head" id="cmpShowB" title="Pokaż wersję B (klawisz B; drugie B = koniec porównania)"><b>B</b><span id="cmpNameB">–</span></button>
+          <select id="cmpB" class="form-input" title="Wersja B: dowolna wersja obiektu – najpierw ten etap, niżej pozostałe"></select></div>
+      </div>
+      <div class="row"><button type="button" class="btn btn-secondary btn-sm cmp-diff" id="cmpDiff" title="Różnica |A − B| na czerwono (×3, żeby słabe różnice półprzezroczystości były widoczne) na wersji A (klawisz D)">Różnica (D)</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="cmpOff" title="Koniec porównania – podgląd klatek etapu (jeśli świeży), poza nim wynik etapu">★ Aktywna</button></div>
+      <details class="cmp-runs" open><summary id="cmpRunsTitle" title="Wersje tylko tego etapu; klik = do pola A; ★ = ustaw jako aktywną; 🗑 = do kosza projektu (trash/runs) po pokazaniu rozmiaru. Wersji w użyciu (aktywnej, wyniku etapu, bazy innej wersji) nie da się usunąć">Wersje etapu</summary>
+        <div id="cmpRuns" class="muted"></div></details>
+      <div class="muted" id="cmpInfo"></div>
+    </div>`;
   }
   // export source (2026-10-15): default = the highest current result of the selected object; "version" = the list of versions
   function renderExportSource() {
@@ -3219,7 +3466,7 @@
       await ensurePointsSaved();
       const f = V().currentFrame;
       const d = await api('POST', `/api/object/${S.obj}/rerun_from/${f}`);
-      invalidateIntervals(d.recomputed); setView('core');   // Z20: only the recomputed intervals reload (old overlay shown meanwhile)
+      invalidateIntervals(d.recomputed); restoreUserView();   // Z20: only the recomputed intervals reload (old overlay shown meanwhile)
       status(`Przeliczono ${d.recomputed.length} przedz. (${d.seconds}s), z cache ${d.cached.length}.` + (d.suggested_keys.length ? `\nSugerowane klucze: ${d.suggested_keys.join(', ')}` : '') + frontMissingText(d), frontMissingKind(d));
     }));
     $('st3KeySave').addEventListener('click', () => run('st3KeySave', async () => {
@@ -3247,6 +3494,7 @@
     }));
     const epvLive = () => { clearTimeout(S.epvTimer); S.epvTimer = setTimeout(() => { S.epvParams = edgePvParams(); V().render(); }, 250); };
     $('ePv').addEventListener('change', () => { S.edgePv = $('ePv').checked; S.epvParams = edgePvParams(); renderEdgePalette(); V().render(); });
+    $('ePvAlpha').addEventListener('change', (e) => { edgePvSet('alpha', e.target.checked); V().render(); });
     $('epStagePv').addEventListener('click', () => stagePreview('matanyone', 'epStagePv'));
     $('vmStagePv').addEventListener('click', () => stagePreview('videomama', 'vmStagePv'));
     $('epCompute').addEventListener('click', () => {
@@ -3320,7 +3568,7 @@
       if (window.MD_BRUSH && window.MD_BRUSH.ready) await window.MD_BRUSH.flush();
       const d = await api('POST', `/api/object/${S.obj}/finalize`, { stage: 'matanyone' });
       S.edgePv = false;   // the result is there: the band preview would cover it (the checkbox brings it back)
-      clearOverlays(); await loadStages(); setView('alpha');
+      clearOverlays(); await loadStages(); restoreUserView();
       const grp = d.group ? ` · grupa liczona jako całość ze szwem: ${d.group.join(' + ')}${d.asked !== d.object ? ` (na obiekcie głównym „${d.object}”)` : ''}` : '';
       const out = d.group_outside_crop_px ? `
 ⚠ ${d.group_outside_crop_px} px całości grupy poza kadrami „${d.object}” (ucięte) – dodaj klucz obiektu głównego obejmujący część albo „Kadruj od nowa”` : '';
@@ -3388,9 +3636,6 @@
       await loadLtx();
       toast(`Gotowe – wersja ${d.run} (LTX-2.5). Porównaj z MatAnyone2, eksport: źródło „LTX-2.5”`, 6000);
     }));
-    $('lx6Show').addEventListener('click', () => { const r = S.info && S.info.stage_runs && S.info.stage_runs.ltx; if (r) showRun(r); else status('Brak wyniku LTX-2.5', 'warn'); });
-    $('lx6ShowMa').addEventListener('click', () => { const r = S.info && S.info.stage_runs && S.info.stage_runs.matanyone; if (r) showRun(r); else status(`Brak wyniku MatAnyone2 (etap ${ST.MATANYONE})`, 'warn'); });
-    $('lx6ShowOff').addEventListener('click', () => showRun(null));
     // stage VideoMaMa (2026-10-16)
     const vmmLive = () => { clearTimeout(S.vmmTimer); S.vmmTimer = setTimeout(() => { S.vmmPv = vmmPvParams(); V().render(); }, 200); };
     const vmmSave = (body) => vmmSetting(body).catch((er) => status(`Błąd: ${er.message}`, 'err'));
@@ -3426,14 +3671,11 @@
       await loadVmm(); renderVmmPalette();
       toast(`Gotowe – wersja ${d.run} (VideoMaMa). Porównaj z MatAnyone2; dalej: ViTMatte (baza „VideoMaMa”) albo eksport`, 6000);
     }));
-    $('vmShow').addEventListener('click', () => { const r = S.info && S.info.stage_runs && S.info.stage_runs.videomama; if (r) showRun(r); else status('Brak wyniku VideoMaMa', 'warn'); });
-    $('vmShowMa').addEventListener('click', () => { const r = S.info && S.info.stage_runs && S.info.stage_runs.matanyone; if (r) showRun(r); else status(`Brak wyniku MatAnyone2 (etap ${ST.MATANYONE})`, 'warn'); });
-    $('vmShowOff').addEventListener('click', () => showRun(null));
     $('st4Final').addEventListener('click', () => run('st4Final', async () => {
       status('Przeliczam finalnie (krawędź + QA)…');
       await ensurePointsSaved();
       const d = await api('POST', `/api/object/${S.obj}/finalize`, {});
-      clearOverlays(); await loadStages(); setView('alpha');
+      clearOverlays(); await loadStages(); restoreUserView();
       status(`Wersja ${d.run}${d.whole_shot ? '' : ` (zakres pracy F${d.frames[0]}–${d.frames[1]})`}: tryb ${d.report.edge_mode}, ma_scale ${d.report.ma_scale} (${d.report.ma_scale_mode || 'auto'}), ${d.report.seconds}s`, 'ok');
       loadEdge(); await loadQA();
       const bad = S.qa && S.qa.colours ? Object.values(S.qa.colours).filter((c) => c !== 'green').length : 0;   // Z6 toast
@@ -3497,11 +3739,11 @@
       V().render();
       status(`Baza ViTMatte: ${v === 'core' ? 'maska 1+2 (etapy ' + ST.SAM3 + ' + ' + ST.BRUSH + ')' : 'MatAnyone2 (etap ' + ST.MATANYONE + ')'} – „Zastosuj na ujęcie” zrobi wynik na tej bazie (drugi wynik zostaje do porównania)`, 'ok');
     }));
-    $('st4CmpShowA').addEventListener('click', () => cmpShow('a'));
-    $('st4CmpShowB').addEventListener('click', () => cmpShow('b'));
-    $('st4CmpDiff').addEventListener('click', () => cmpShow('diff'));
-    $('st4CmpOff').addEventListener('click', () => { S.cmpDiff = null; showRun(null); renderCmp(); V().render(); });
-    ['st4CmpA', 'st4CmpB'].forEach((id) => $(id).addEventListener('change', () => { S.cmpUser = true; if (S.cmpDiff) cmpShow('diff'); else renderCmp(); }));
+    $('cmpShowA').addEventListener('click', () => cmpKey('a'));   // the field again = end of the comparison, like the key
+    $('cmpShowB').addEventListener('click', () => cmpKey('b'));
+    $('cmpDiff').addEventListener('click', () => cmpKey('diff'));
+    $('cmpOff').addEventListener('click', () => cmpOff());
+    $('cmpB').addEventListener('change', () => { if (!$('cmpB').value) return; cmpPick().b = $('cmpB').value; cmpShow(S.cmpDiff ? 'diff' : 'b'); });
     $('e5DirPick').addEventListener('click', () => run('e5DirPick', async () => {
       const cur = await api('GET', '/api/project/export_dir');
       const r = await api('POST', '/api/dialog/pick_folder', { title: 'Katalog eksportu', initial_dir: cur.path });
@@ -3762,6 +4004,13 @@
       else if (e.code === 'KeyO' && !e.ctrlKey && !e.metaKey) { S.onion = !S.onion; toast(S.onion ? 'Onion skin ±1: czerwony = poprzednia, niebieski = następna klatka' : 'Onion skin wyłączony'); V().render(); }
       else if (e.code === 'KeyM' && !e.ctrlKey && !e.metaKey && versionStage()) { S.flicker = !S.flicker; toast(S.flicker ? 'Mapa migotania wersji (M wyłącza)' : 'Mapa migotania wyłączona'); V().render(); }
       else if (e.code === 'KeyB' && !e.ctrlKey && !e.metaKey && !e.shiftKey) toggleRunB();
+      else if (e.code === 'KeyQ' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {   // Q = „👁 podgląd pasa” of the stage (2026-10-26)
+        const id = { [ST.MATANYONE]: 'ePv', [ST.VIDEOMAMA]: 'vmPvBand', [ST.VITMATTE]: 'zpBandPv', [ST.LTX]: 'lxPvBand' }[S.stage];
+        const cb = id && $(id);
+        if (cb && !cb.disabled) { cb.click(); toast(cb.checked ? 'Podgląd pasa: wł. (Q)' : 'Podgląd pasa: wył. (Q)'); }
+      }
+      else if (e.code === 'KeyA' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && cmpStage()) cmpKey('a');
+      else if (e.code === 'KeyD' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && cmpStage()) cmpKey('diff');
       else if (e.code === 'KeyV' && viewAllowed('comp')) { const n = nextCompBg(); if (S.view !== 'comp') setView('comp', false); toast(`Tło compu: ${n}`); V().render(); }
       else if (drawStage() && e.code === 'BracketLeft') setRadius(S.radius / 1.25);
       else if (drawStage() && e.code === 'BracketRight') setRadius(S.radius * 1.25 + 1);
@@ -3795,13 +4044,13 @@
     // error over the cut-out), what the user ticks there is shown; leaving the view restores the previous state
     window.addEventListener('md-compare', (e) => {
       if (e.detail.covers) {
-        S.pvBeforeComp = { edge: S.edgePv, vb: vmmPvGet('band', true), va: vmmPvGet('alpha', true), lb: ltxPvGet('band', true), la: ltxPvGet('alpha', true),
+        S.pvBeforeComp = { edge: S.edgePv, ea: edgePvGet('alpha', true), vb: vmmPvGet('band', true), va: vmmPvGet('alpha', true), lb: ltxPvGet('band', true), la: ltxPvGet('alpha', true),
                            xe: expPvGet('edge', true), fl: !!S.flicker };
-        S.edgePv = false; vmmPvSet('band', false); vmmPvSet('alpha', false); ltxPvSet('band', false); ltxPvSet('alpha', false);
+        S.edgePv = false; edgePvSet('alpha', false); vmmPvSet('band', false); vmmPvSet('alpha', false); ltxPvSet('band', false); ltxPvSet('alpha', false);
         expPvSet('edge', false); S.flicker = false;
       } else if (S.pvBeforeComp) {
         const b = S.pvBeforeComp; S.pvBeforeComp = null;
-        S.edgePv = b.edge; vmmPvSet('band', b.vb); vmmPvSet('alpha', b.va); ltxPvSet('band', b.lb); ltxPvSet('alpha', b.la);
+        S.edgePv = b.edge; edgePvSet('alpha', b.ea); vmmPvSet('band', b.vb); vmmPvSet('alpha', b.va); ltxPvSet('band', b.lb); ltxPvSet('alpha', b.la);
         expPvSet('edge', b.xe); S.flicker = b.fl;
       }
       if (window.MD_ZONES && window.MD_ZONES.compareMode) window.MD_ZONES.compareMode(e.detail.covers);
@@ -3825,7 +4074,7 @@
 
   // ------------------------------------------------------------------------------------------------ public
   window.MD = {
-    S, ST, STAGES, api, el, esc, toast, setStage, setView, loadStages, refreshList, renderStageBar,
+    S, ST, STAGES, api, el, esc, toast, setStage, setView, restoreUserView, loadStages, refreshList, renderStageBar,
     makeFloating: (...a) => makeFloating(...a), placeFloating: (...a) => placeFloating(...a),
     registerPane(n, pane) { pane.el.style.display = 'none'; $('stagePanel').appendChild(pane.el); PANES[n] = pane; },
     get stage() { return S.stage; }, get auxMode() { return S.auxMode; },
@@ -3843,7 +4092,7 @@
     wire();
     wireOverlayStyle();
     const hooks = { S, ST, api, el, esc, toast, status, run, invalidateFrame, clearOverlays, overlayFor, tintCanvas, putComp, compCanvas,
-                    drawVarStroke, plateSize, loadStages, loadQA, setView, ensurePointsSaved, tileOverlays,
+                    drawVarStroke, plateSize, loadStages, loadQA, setView, restoreUserView, ensurePointsSaved, tileOverlays,
                     makeFloating, placeFloating, setTool, stageState, canvasToPlate, renderKeysLane, loadOverlay,
                     reloadStageBand: async () => {   // a band edit / mode change: every band palette again (the shared band, 2026-10-24)
                       await loadStages();
@@ -3853,7 +4102,15 @@
                     reloadBandPalettes,
                     // stage 5: the active whole-outline zone's band („zone:<id>”) – static/bandpoints.js edits it (2026-10-24)
                     zoneBand: () => (window.MD_ZONES && window.MD_ZONES.activeBandKey ? window.MD_ZONES.activeBandKey() : null),
-                    updateDelKey: () => updateDelKeyBtn() };
+                    updateDelKey: () => updateDelKeyBtn(),
+                    // the ACTIVE version (★, user decision 2026-10-25) at frame f for the „zone alpha” tint when the frame has
+                    // no zone preview; the stage preview of a few frames draws itself (drawStagePreview)
+                    stageRunAlpha: (f) => {
+                      const r = S.viewRun || S.activeRun || vmRunFor(vmEngine()); if (!r || !S.obj) return null;
+                      const al = loadOverlay(`${S.obj}_alpha@${r}_${f}`, `/api/object/${S.obj}/frame/${f}?view=alpha&v=${encodeURIComponent(r)}`);
+                      return al && al !== 'missing' ? { img: al, run: r } : null;
+                    },
+                    stagePreviewAt: (f) => { if (S.viewRun) return false; const pv = spvOf('vitmatte'); return !!(pv && (pv.frames || []).includes(f) && spvWanted('vitmatte')); } };
     if (window.MD_ZONES) window.MD_ZONES.init(hooks);
     if (window.MD_BANDPTS) window.MD_BANDPTS.init(hooks);
     if (window.MD_BRUSH) window.MD_BRUSH.init(hooks);

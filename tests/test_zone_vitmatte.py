@@ -201,6 +201,18 @@ def test_api_vitmatte_zone_preview_and_finalize(tmp_path, monkeypatch):
     poly = [[cx - 60, cy - 260], [cx + 60, cy - 260], [cx + 60, cy - 120], [cx - 60, cy - 120]]
     z = {"mode": "add", "criterion": "matte", "frame": start, "polygon": poly, "matting": "vitmatte", "preset": "hair",
          "params": {"temporal": "flow"}}
+    # preset default (user decision 2026-10-25): hair without an explicit engine -> vitmatte at 1/2 (504 px), fine tune 0.5,
+    # NO temporal smoothing (flow_mean r3 x2 stays the setting when switched on), black / white; fibres -> matanyone.
+    # Checked before the zone of this test: one matte zone per object (user decision 2026-10-25)
+    r3 = api.post(f"/api/object/obj/zones/new", json={k: v for k, v in z.items() if k not in ("matting", "params")})
+    assert r3.status_code == 200 and r3.json()["zone"]["matting"] == "vitmatte"
+    assert r3.json()["zone"]["params"] == {"temporal": "none", "temporal_radius": 3, "temporal_scale": 2,
+                                          "model_px": 504, "unknown_value": 0.5,
+                                          "alpha_black": 0.1, "alpha_white": 0.9, "soft_trimap": False}   # a drawn zone: no band sliders
+    api.delete(f"/api/object/obj/zones/{r3.json()['zone']['zone_id']}")
+    r4 = api.post(f"/api/object/obj/zones/new", json={**{k: v for k, v in z.items() if k not in ("matting", "params")}, "preset": "fibres"})
+    assert r4.status_code == 200 and r4.json()["zone"]["matting"] == "matanyone"
+    api.delete(f"/api/object/obj/zones/{r4.json()['zone']['zone_id']}")
     r = api.post(f"/api/object/obj/zones/new?preview_frame={start}", json=z)
     assert r.status_code == 200, r.text
     pv = r.json()["preview"]
@@ -214,17 +226,6 @@ def test_api_vitmatte_zone_preview_and_finalize(tmp_path, monkeypatch):
     st2 = r2.json()["preview"]["stats"]
     assert st2["model_px"] < pv["stats"]["model_px"] and st2["unknown_value"] == 0.3 and len(runner.calls) == 2
     assert r2.json()["zone"]["params"]["model_px"] == 504
-    # preset default (user decision 2026-10-25): hair without an explicit engine -> vitmatte at 1/2 (504 px), fine tune 0.5,
-    # NO temporal smoothing (flow_mean r3 x2 stays the setting when switched on), black / white; fibres -> matanyone
-    r3 = api.post(f"/api/object/obj/zones/new", json={k: v for k, v in z.items() if k not in ("matting", "params")})
-    assert r3.status_code == 200 and r3.json()["zone"]["matting"] == "vitmatte"
-    assert r3.json()["zone"]["params"] == {"temporal": "none", "temporal_radius": 3, "temporal_scale": 2,
-                                          "model_px": 504, "unknown_value": 0.5,
-                                          "alpha_black": 0.1, "alpha_white": 0.9, "soft_trimap": False}   # a drawn zone: no band sliders
-    r4 = api.post(f"/api/object/obj/zones/new", json={**{k: v for k, v in z.items() if k not in ("matting", "params")}, "preset": "fibres"})
-    assert r4.status_code == 200 and r4.json()["zone"]["matting"] == "matanyone"
-    for zz in (r3.json()["zone"]["zone_id"], r4.json()["zone"]["zone_id"]):
-        api.delete(f"/api/object/obj/zones/{zz}")
     fz = api.post("/api/object/obj/finalize", json={"edge_mode": "matanyone"})
     assert fz.status_code == 200, fz.text
     run = fz.json()["run"]

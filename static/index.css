@@ -1164,7 +1164,13 @@ kbd {
 .stage-object { display: flex; align-items: center; gap: 6px; min-width: 240px; }
 .stage-object .obj-label { color: var(--text-muted); font-size: 11px; }
 .stage-object select { width: 180px; padding: 3px 6px; font-size: 12px; }
-.stage-list { display: flex; list-style: none; gap: 4px; margin: 0; padding: 0; }
+.stage-list { display: flex; align-items: center; list-style: none; gap: 4px; margin: 0; padding: 0; }
+/* stage groups (2026-10-25): Core = 1 + 2, Edges = 3 / 4 / 5 – a thin frame with its name on the top edge */
+.stage-group { position: relative; display: flex; padding: 3px 4px; border: 1px solid #4a4a50; border-radius: 4px; margin-top: 4px; }
+.stage-group-items { display: flex; align-items: center; gap: 4px; list-style: none; margin: 0; padding: 0; }
+.stage-group-label { position: absolute; top: -6px; left: 8px; padding: 0 4px; background: var(--bg-panel); color: var(--text-muted);
+  font-size: 8.5px; line-height: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; pointer-events: none; }
+.stage-join { color: var(--text-muted); font-weight: 700; font-size: 13px; padding: 0 1px; }
 .stage-item {
   display: flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 3px; cursor: pointer;
   border: 1px solid var(--border-subtle); color: var(--text-muted); font-size: 12px; white-space: nowrap; transition: all .15s;
@@ -1389,6 +1395,40 @@ canvas.edge-hot { cursor: pointer !important; }
 .zone-cp.warn { border-color: rgba(240,112,58,.6); }
 .zone-ov button { padding: 3px 6px; }
 .zone-hint { font-size: 11px; }
+/* stage 5 panel (2026-10-25): the hint under "+ New zone", the overlay switch on its own line */
+.stage-pane .zone-new-row > .zone-hint { flex: 1 1 100%; line-height: 1.35; }
+.stage-pane .zone-new-row > #z4New { flex: 0 0 auto; }
+.zone-ov-row { display: flex; flex-direction: column; gap: 3px; }
+.zone-ov-row > .muted { font-size: 11px; }
+.zone-ov-row > .zone-ov button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* version list of the version comparison: one row per version, the reason it is kept under its name, 🗑 on the right */
+.cmp-runs > summary { font-size: 12px; margin-bottom: 4px; }
+#cmpRuns { display: flex; flex-direction: column; gap: 3px; }
+/* version comparison fields (2026-10-26): the header button = the field's name; the field on the view is filled */
+.cmp { --cmp-a: #e8a33d; --cmp-b: #4f9cf0; }
+.cmp-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 6px; }
+.cmp-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 4px; border: 1px solid var(--cmp-c); border-radius: 3px; }
+.cmp-a { --cmp-c: var(--cmp-a); } .cmp-b { --cmp-c: var(--cmp-b); }
+.cmp-head { display: flex; gap: 6px; align-items: center; min-width: 0; padding: 4px 6px; border: 0; border-radius: 2px; cursor: pointer;
+  background: transparent; color: var(--text-main); font-size: 11.5px; text-align: left; }
+.cmp-head > b { flex: none; color: var(--cmp-c); font-size: 13px; }
+.cmp-head > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cmp-head:disabled { opacity: .45; cursor: default; }
+.cmp-field.on { background: color-mix(in srgb, var(--cmp-c) 14%, transparent); box-shadow: 0 0 0 1px var(--cmp-c); }
+.cmp-field.on .cmp-head { background: var(--cmp-c); color: #111; }
+.cmp-field.on .cmp-head > b { color: #111; }
+.cmp-sub { font-size: 10.5px; color: var(--text-muted); padding: 0 2px; }
+.cmp-field select { font-size: 10.5px; padding: 1px 4px; height: auto; color: var(--text-muted); }
+.cmp-diff.on { background: rgba(239,68,68,.25); border-color: #ef4444; }
+.cmp-run-act { flex: none; width: 26px; height: 24px; padding: 0; font-size: 13px; }
+.cmp-run { cursor: pointer; align-items: center; border: 1px solid transparent; }
+.cmp-run.cur { outline: none; border-color: var(--accent-primary); background: rgba(232,163,61,.08); }
+.cmp-run.cur { cursor: default; }
+.cmp-run-txt { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 1px; }
+.cmp-run-name { color: var(--text-main); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cmp-run-why { color: var(--text-muted); font-size: 10.5px; }
+.cmp-run-del { flex: none; width: 26px; height: 24px; padding: 0; font-size: 13px; }
+.cmp-run-del:disabled { opacity: .3; }
 .zone-pv { font-size: 11px; line-height: 1.4; }
 .zone-tune { display: flex; flex-direction: column; gap: 4px; padding: 4px 6px; margin: 2px 0 4px; border: 1px solid rgba(148,163,184,.18); border-radius: 2px; }
 .zone-tune.off { opacity: .5; }

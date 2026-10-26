@@ -142,10 +142,10 @@ def test_prompt_api_preset_hints_interpret_propose_cli(tmp_path, monkeypatch):
     assert r.status_code == 200, r.text
     z1 = r.json()["zone"]; zid = z1["zone_id"]
     assert z1["preset"] == "fibres" and r.json()["plan"]["bg_line"] is True and r.json()["plan"]["fg_en"] == "fibres felt"
+    # one matte zone per object (user decision 2026-10-25): a second one is refused; the explicit preset is checked by PATCH
     r = api.post(f"/api/object/obj/zones/new?preview_frame={start}", json={"mode": "add", "criterion": "matte", "frame": start, "polygon": poly,
                                                                              "matting": "auto", "prompt": "włosy", "preset": "thin"})
-    assert r.json()["zone"]["preset"] == "thin"
-    api.delete(f"/api/object/obj/zones/{r.json()['zone']['zone_id']}")
+    assert r.status_code == 409 and zid in r.json()["detail"]
     # PATCH prompt -> preset + plan; an explicit preset in the same PATCH wins
     p = api.patch(f"/api/object/obj/zones/{zid}", json={"prompt": "dym nad kubkiem"})
     assert p.status_code == 200 and p.json()["zone"]["preset"] == "smoke" and p.json()["plan"]["preset"] == "smoke" and "preset" in p.json()["changed"]
@@ -201,8 +201,13 @@ def test_prompt_api_preset_hints_interpret_propose_cli(tmp_path, monkeypatch):
     # CLI
     code, out = _run(["zone-interpret", "obj", "włosy bez złotej linii", "--frame", str(start), "--zone", zid], TCHttp(api))
     assert code == 0 and "preset hair" in out and "SAM3 „hair”" in out and "zlotej linii" in out, out
+    # one matte zone per object (user decision 2026-10-25): accepting a proposal next to a zone is refused ...
+    code, out = _run(["zone-propose", "obj", "--frame", str(start), "--prompt", "włosy", "--accept", "0"], TCHttp(api))
+    assert code != 0 and "409" in out, out
+    # ... and works once the object has none
+    assert api.delete(f"/api/object/obj/zones/{zid}").status_code == 200
     code, out = _run(["zone-propose", "obj", "--frame", str(start), "--prompt", "włosy", "--accept", "0"], TCHttp(api))
     assert code == 0 and "propozycji" in out and "zapisana" in out, out
     zs = api.get("/api/object/obj/zones").json()["zones"]
-    assert len(zs) == 2 and zs[-1]["preset"] == "hair" and len(zs[-1]["polygon"]) == len(top["polygon"])
+    assert len(zs) == 1 and zs[-1]["preset"] == "hair" and len(zs[-1]["polygon"]) == len(top["polygon"])
     cv2.imwrite(str(cp), full)

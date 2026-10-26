@@ -106,6 +106,17 @@ def points_at(points: Sequence[Dict[str, Any]], f: int,
     return out
 
 
+def crop_points(pts_at, f: int, seg: Any) -> Optional[List[PointAt]]:
+    """Band points of frame f (a points function, pipeline.band_points_fn – plate px) in a crop's pixels, every field
+    after x, y kept (widths, the tilt angle); None without points. The one conversion for the stages that compose on a
+    crop (VideoMaMa run + „Preview frames”, LTX-2.5) – bug 2026-10-26: a tilted point (5 fields) broke the 4-field
+    unpacking there, and LTX-2.5 dropped the angle."""
+    if not pts_at:
+        return None
+    x0, y0 = seg.crop[0], seg.crop[1]
+    return [(p[0] - x0, p[1] - y0) + tuple(p[2:]) for p in pts_at(f)]
+
+
 def _contours(core: np.ndarray) -> List[np.ndarray]:
     cs, _ = cv2.findContours(core.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     return [c[:, 0, :].astype(np.float32) for c in cs if len(c) >= 3]

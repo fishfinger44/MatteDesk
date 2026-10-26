@@ -71,6 +71,53 @@ def test_vitmatte_preview_on_mask_1_2_makes_no_core_base(proj):
     assert r.status_code == 409 and "MatAnyone" in r.json()["detail"]
 
 
+def test_videomama_preview_composes_with_band_points(proj, monkeypatch):
+    """User report 2026-10-26 (sh060): the VideoMaMa „Preview frames” composed with the sliders alone – the band
+    points (CoTracker3) were ignored, so the inset feather crossed the core edge while the preview lines (with points)
+    showed it deep inside. The preview must give compose the same points as the full run (_vmm_write): plate -> crop px."""
+    import numpy as np
+    import engine.videomama as vmm
+    from engine.stage_preview import _videomama, window
+    app_module, api, shot, pipe, frames, start = proj
+    win = window(pipe._visible("obj", frames), start, 2)
+    plate_pts = [(40.0, 30.0, 12.0, 9.0), (50.0, 35.0, 10.0, 8.0, 25.0)]   # the 2nd one tilted (5 fields, 2026-10-26)
+    monkeypatch.setattr(pipe, "band_points_fn", lambda name, s, fr, only=None: (lambda f: list(plate_pts)))
+    monkeypatch.setattr(vmm.VideoMaMa, "run", lambda self, tag, imgs, masks: [np.full(m.shape[:2], 0.5, np.float32)
+                                                                               for m in masks])
+    seen = []
+    real = vmm.compose
+    monkeypatch.setattr(vmm, "compose", lambda *a, **k: (seen.append(a[6] if len(a) > 6 else k.get("pts")), real(*a, **k))[1])
+    _videomama(pipe, "obj", win, None)
+    segs = pipe._segments_in("obj", win)
+    x0, y0 = segs[0].crop[0], segs[0].crop[1]
+    assert seen and all(p == [(40.0 - x0, 30.0 - y0, 12.0, 9.0), (50.0 - x0, 35.0 - y0, 10.0, 8.0, 25.0)] for p in seen)
+
+
+def test_matanyone_band_takes_a_tilted_point(proj, monkeypatch):
+    """User report 2026-10-26: the MatAnyone2 „Preview frames” failed with „too many values to unpack (expected 4)” –
+    the stage-3 band (pipeline._band_fn) unpacked 4 fields of a band point; a tilted one has 5 (angle)."""
+    import numpy as np
+    from types import SimpleNamespace
+    app_module, api, shot, pipe, frames, start = proj
+    seen = []
+    monkeypatch.setattr(pipe, "band_points_fn",
+                        lambda name, s, fr, only=None: (lambda f: seen.append(f) or [(60.0, 40.0, 10.0, 6.0, 20.0)]))
+    core = np.zeros((80, 120), np.float32)
+    core[20:60, 30:90] = 1
+    band = pipe._band_fn(pipe.store.get("obj"))(start, SimpleNamespace(crop=(10, 5, 120, 80)), core, None)
+    assert seen == [start] and band.shape == core.shape and band.any()
+
+
+def test_crop_points_keep_every_field():
+    """The one plate -> crop conversion of band points (VideoMaMa, LTX-2.5): the tilt angle survives, none -> None."""
+    from types import SimpleNamespace
+    from engine.bandmap import crop_points
+    seg = SimpleNamespace(crop=(100, 50, 400, 300))
+    pts = [(140.0, 80.0, 12.0, 9.0), (150.0, 85.0, 10.0, 8.0, -30.0)]
+    assert crop_points(lambda f: pts, 7, seg) == [(40.0, 30.0, 12.0, 9.0), (50.0, 35.0, 10.0, 8.0, -30.0)]
+    assert crop_points(None, 7, seg) is None
+
+
 def test_bad_stage(proj):
     app_module, api, shot, pipe, frames, start = proj
     assert api.post(f"/api/object/obj/stage_preview/{start}?stage=ltx").status_code == 400

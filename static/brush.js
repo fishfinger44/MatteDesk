@@ -255,7 +255,7 @@
     await flush();
     status('Maska 1+2: rdzeń SAM 3.1 + poprawki na całym ujęciu (CoTracker3 dla kluczy, które nie mają jeszcze torów)…');
     const d = await api('POST', `/api/object/${obj()}/core_fix`);
-    H.clearOverlays(); await H.loadStages(); H.setView('core');
+    H.clearOverlays(); await H.loadStages(); H.restoreUserView();
     status(`Maska 1+2 policzona F${d.frames[0]}–${d.frames[1]}: zmienione ${d.changed_px} px względem SAM 3.1 (${(d.zones || []).length} poprawek). Widok Rdzeń pokazuje wynik; dalej etap ${H.ST.MATANYONE} (MatAnyone2).`, 'ok');
   }
 

@@ -218,6 +218,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | GET | `/api/object/{name}/color_lab/{frame}` | – | Pipette of the "color" zone criterion (Z24): median Lab of 5 x 5 px of the plate-to-mask display image (the image the zone key is computed on) around (x, y) in  |
 | DELETE | `/api/object/{name}/zones/{zone_id}` | object_edit |  |
 | GET | `/api/object/{name}/runs` | – | Versions of the final result (Z2): runs/v### with run.json + qa.json summary; `active` = tool.active_run. |
+| DELETE | `/api/object/{name}/runs/{run}` | object_edit | Delete a version (user request 2026-10-25, stage 5 "Version comparison"): `dry=1` = what would go (size) and what still uses it; otherwise the folder moves to < |
 | PUT | `/api/object/{name}/active_run` | object_edit | 'Ustaw jako aktywną' (Z2): export and dependent objects use this version; final_valid from its qa.json. |
 | GET | `/api/object/{name}/qa` | – |  |
 | PUT | `/api/object/{name}/edge_engine` | object_edit | Stage 5 engine of the object (user decision 2026-10-21: arrow menu in the stage bar when both are installed, default ViTMatte) |

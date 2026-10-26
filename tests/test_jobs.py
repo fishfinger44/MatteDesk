@@ -237,8 +237,13 @@ def test_core_progress_per_interval():
     assert any("przedział 2/3" in t and "w przód 3→9" in t for t in texts)
     assert any("przedział 2/3" in t and "wstecz 9→3" in t for t in texts)
     assert any("przedział 1/3" in t and "wstecz 3→1" in t for t in texts)
-    done = [d for _, d, _ in steps]
-    assert done == sorted(done) and done[-1] == 3 and {t for _, _, t in steps} == {3}
+    done = [d for _, d, _ in steps]   # done / total count FRAMES (the job window shows them as frames)
+    assert done == sorted(done) and done[-1] == 12 and {t for _, _, t in steps} == {12}
+    # one key (Woman2, 2026-10-26): 2 intervals must not read as "2/2 frames"
+    steps.clear()
+    CorePropagator(R(), [seg], w, w, load_crop_image=lambda f, s: np.zeros((w, w, 3), np.float32)).propagate(
+        list(range(1, 13)), {2: k}, lambda st, d, t: steps.append((st, d, t)))
+    assert steps[-1][1:] == (12, 12) and (2, 12) in [x[1:] for x in steps]
 
 
 def test_jobs_details_without_nvidia_smi(monkeypatch):
@@ -309,3 +314,84 @@ def test_comfy_busy_is_not_down_and_hung_after_the_limit():
     assert 60.0 <= srv2.t <= 90.0
     assert ComfyClient.is_timeout("<urlopen error timed out>") and not ComfyClient.is_timeout("[WinError 10061] connection refused")
 
+
+
+class _FakeSpill:
+    """Stand-in for the spilled-GPU-memory sampler (engine.sysinfo.SpillSampler): a fixed peak, no PowerShell."""
+
+    def __init__(self, gb):
+        self.peak, self.base = gb, 0.0
+        self.entered = self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc):
+        self.exited = True
+
+    @property
+    def spill_gb(self):
+        return self.peak
+
+
+def test_spill_to_ram_warns_while_comfy_computes():
+    """User request 2026-10-26 (sh060: MatAnyone2 ran 90+ min with 7.7 GB of GPU memory in RAM, nothing said so): every
+    Comfy prompt is watched; >= SPILL_WARN_GB spilled -> a warning in the job's Comfy text + comfy_info.spill_gb, and the
+    job keeps the peak (gpu_spill_gb) for run.json."""
+    import comfy_client as cc
+    c = ComfyClient()
+    spill = _FakeSpill(7.7)
+    c.spill_watch_factory = lambda: spill
+    srv = FakeComfyServer(c, at={4.0: lambda s: s.history.__setitem__("p1", {"status": {"completed": True}, "outputs": {}})})
+    srv.running = ["p1"]
+    c.our_prompts.add("p1")
+    seen = []
+    jid = JOBS.start("t", "Comfy test")
+    JOBS.bind(jid)
+    try:
+        res = c.wait_for_prompt("p1", timeout_sec=60, poll_interval=1.0,
+                                progress_callback=lambda e: seen.append(next(j for j in JOBS.snapshot() if j["id"] == jid)))
+        assert JOBS.spill_gb() == pytest.approx(7.7)
+    finally:
+        JOBS.finish(jid, "done")
+    assert res["success"] and spill.entered and spill.exited
+    last = seen[-1]
+    assert last["comfy_info"]["spill_gb"] == pytest.approx(7.7) and "do RAM" in last["comfy"]
+    assert last["gpu_spill_gb"] == pytest.approx(7.7)
+    assert cc.SPILL_WARN_GB == pytest.approx(1.0)
+
+
+def test_small_spill_says_nothing_and_no_reader_is_fine():
+    c = ComfyClient()
+    c.spill_watch_factory = lambda: _FakeSpill(0.4)
+    srv = FakeComfyServer(c, at={3.0: lambda s: s.history.__setitem__("p1", {"status": {"completed": True}, "outputs": {}})})
+    srv.running = ["p1"]
+    c.our_prompts.add("p1")
+    res, snap = _wait(c, "p1")
+    j = snap[-1]
+    assert res["success"] and "spill_gb" not in (j["comfy_info"] or {}) and "RAM" not in (j["comfy"] or "")
+    assert not j.get("gpu_spill_gb")
+    c2 = ComfyClient()
+    c2.spill_watch_factory = lambda: None              # no counter (Linux / tests): waits as before
+    srv2 = FakeComfyServer(c2, at={2.0: lambda s: s.history.__setitem__("p2", {"status": {"completed": True}, "outputs": {}})})
+    srv2.running = ["p2"]
+    assert _wait(c2, "p2")[0]["success"]
+
+
+def test_run_json_records_the_spill(tmp_path):
+    """The one run.json writer (engine/refine.write_run_json) adds the job's spill peak when it was >= SPILL_WARN_GB."""
+    import json
+    from engine.refine import write_run_json
+    jid = JOBS.start("t", "run")
+    JOBS.bind(jid)
+    try:
+        write_run_json(tmp_path, {"stage": "x"})
+        assert "gpu_spill_gb" not in json.loads((tmp_path / "run.json").read_text(encoding="utf-8"))
+        JOBS.update(gpu_spill_gb=3.26)
+        JOBS.update(gpu_spill_gb=1.5)                   # the peak stays
+        write_run_json(tmp_path, {"stage": "x"})
+        rj = json.loads((tmp_path / "run.json").read_text(encoding="utf-8"))
+        assert rj["stage"] == "x" and rj["gpu_spill_gb"] == pytest.approx(3.3)
+    finally:
+        JOBS.finish(jid, "done")

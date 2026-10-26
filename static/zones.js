@@ -19,6 +19,10 @@
   // drawing a zone area (brush / polygon, painted-area mode) is hidden for now (user decision 2026-10-21: it misled –
   // the band of a whole-outline zone is set by control points); the code stays, true brings the tools back
   const DRAW_TOOLS = false;
+  // presets, zone description / fix note, zone engine + holdout, clean plate (user decision 2026-10-25: one
+  // whole-outline zone per object, its settings live in the „Strefa” palette); the code stays – a possible future
+  // "settings preset" – and true brings the panel rows back
+  const PANEL_EXTRAS = false;
   let H = null;                      // hooks from objects.js (see init)
   const S = () => H.S;
   const obj = () => H.S.obj;
@@ -140,29 +144,31 @@
   function panelHtml() {
     return `<div class="sec-title">Strefy <span class="muted">(matting lokalny: włosy, futro, dym, włókna)</span></div>
       <div id="st4Zones" class="zone-list"></div>
-      <div class="row"><button class="btn btn-secondary btn-sm" id="z4New">＋ Nowa strefa</button>
+      <div class="row zone-new-row"><button class="btn btn-secondary btn-sm" id="z4New" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu – jedna na obiekt">＋ Nowa strefa</button>
         <button class="btn btn-secondary btn-sm" id="z4Propose" title="Zaproponuj strefę (krok 9): SAM 3.1 z opisem strefy na kadrze obiektu minus rdzeń + miękkie krawędzie poza rdzeniem → propozycje (żółte wielokąty z numerami); ✓ tworzy strefę z wybranym presetem, ✕ odrzuca">✨ Zaproponuj</button>
         <span class="muted zone-hint" id="z4Hint"></span></div>
       <div id="z4Props" class="zone-props"></div>
+      <div id="z4Extras"${PANEL_EXTRAS ? '' : ' style="display:none"'}>
       <div class="zone-presets" id="z4Presets">${PRESETS.map((p) => `<button class="tool-btn zp" data-preset="${p[0]}" title="${esc(p[3])}"><span class="tool-icon">${p[1]}</span><span class="tool-label">${p[2]}</span></button>`).join('')}</div>
       <label>Opis strefy<input id="z4Prompt" class="form-input" placeholder="co wyciąć, czego pozbyć się z tła (np. włosy, bez złotej linii)"></label>
       <div class="muted zone-plan" id="z4Plan"></div>
       <label>Uwaga do poprawki (ten klucz)<input id="z4Iter" class="form-input" placeholder="np. mniej tła przy uchu – zapisze się z następną kreską" title="Pętla korekty (krok 7): tekst trafia do klucza strefy tej klatki razem z następną kreską + / − i do historii iteracji strefy; reguły promptu (krok 9) czytają go w tej klatce. Ctrl+Z przywraca poprzedni klucz z jego uwagą"></label>
       <div class="row">
         <label>Silnik<select id="z4Engine" class="form-input"><option value="matanyone">MatAnyone2 (domyślnie)</option><option value="auto">auto (dobór per fragment)</option><option value="clean">clean (clean plate)</option><option value="chroma">chroma</option><option value="knn">knn</option><option value="vitmatte">ViTMatte (eksperyment)</option></select></label>
-        <label class="chk"><input type="checkbox" id="z4Holdout" checked> holdout obiektów z przodu</label>
       </div>
       <div class="muted zone-tune-note">Suwaki strefy (obszar, wygładzanie w czasie, wykończenie): paleta „Strefa” na podglądzie (przeciągnij za ⠿)</div>
       <div class="row zone-cp" id="z4CleanRow"><span class="muted" id="z4CleanTxt">Clean plate: …</span>
         <button class="btn btn-secondary btn-xs" id="z4CpAuto">Policz z ujęcia (auto)</button>
         <button class="btn btn-secondary btn-xs" id="z4CpFile">Mam plik…</button>
         <button class="btn btn-ghost btn-xs" id="z4CpNone">Bez clean plate’u</button></div>
-      <div class="row"><span class="muted">Nakładka</span>
-        <div class="seg zone-ov" id="z4Ov">${OVS.map(([k, l, t]) => `<button data-ov="${k}" class="${k === Z.ov ? 'active' : ''}" title="${esc(t)}">${l}</button>`).join('')}</div>
-        <button class="btn btn-ghost btn-xs" id="z4Refresh">↻ Podgląd</button>
-        <button class="btn btn-ghost btn-xs" id="z4Loupe">🔍 Lupa L</button></div>
+      </div>
+      <div class="row"><label class="chk" title="Obiekty z przodu (wcześniej w kolejności głębi) są wycinane ze strefy: alfa 0 pod nimi, a silnik liczy krawędź aż do ich krawędzi"><input type="checkbox" id="z4Holdout" checked> holdout obiektów z przodu</label></div>
+      <div class="zone-ov-row"><span class="muted">Nakładka</span>
+        <div class="seg zone-ov" id="z4Ov">${OVS.map(([k, l, t]) => `<button data-ov="${k}" class="${k === Z.ov ? 'active' : ''}" title="${esc(t)}">${l}</button>`).join('')}</div></div>
+      <div class="row"><button class="btn btn-secondary btn-xs" id="z4Refresh">↻ Podgląd</button>
+        <button class="btn btn-secondary btn-xs" id="z4Loupe">🔍 Lupa L</button></div>
       <div class="muted zone-pv" id="z4PvInfo"></div>
-      <div class="row"><button class="btn btn-primary btn-sm" id="z4ApplyShot">✚ Zastosuj na ujęcie</button><button class="btn btn-ghost btn-xs" id="z4KeyDel">🗑 Usuń klucz strefy (ta klatka)</button></div>`;
+      <div class="row"><button class="btn btn-primary btn-sm" id="z4ApplyShot">✚ Zastosuj na ujęcie</button><button class="btn btn-ghost btn-xs" id="z4KeyDel"${DRAW_TOOLS ? '' : ' style="display:none"'}>🗑 Usuń klucz strefy (ta klatka)</button></div>`;
   }
 
   // ------------------------------------------------------------------------------------------------ floating palette „Strefa”
@@ -179,8 +185,9 @@
       <div class="zp-pv"><label class="chk" title="Przerywany obrys obszaru ViTMatte (pas, w którym liczy) i podgląd „Wcięcie w rdzeń” przy przeciąganiu. Wyłącz, żeby oglądać sam wynik"><input type="checkbox" id="zpBandPv" title="Podgląd pasa ViTMatte na obrazie (wł. / wył.)"> 👁 podgląd pasa</label>
         <label class="chk" title="Zielona alfa podglądu strefy na obrazie (w wycięciu „Na tle” podgląd zostaje – to jest wynik)"><input type="checkbox" id="zpAlphaPv" title="Zielona alfa podglądu strefy (wł. / wył.)"> 👁 alfa strefy</label></div>
       <div class="band-seed" id="z4BandSeed"></div>
-      <div class="zp-none" id="zpNone"><span class="muted">Brak aktywnej strefy „matte”.</span>
-        <button type="button" class="btn btn-primary btn-sm" id="zpNewOutline" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu (preset włosy). Potem zaznacz miejsca BEZ włosów tego obiektu (twarz, szyja, skóra) – ViTMatte ich nie liczy. Dłoń / obiekt z przodu: ustaw go w kolejności PRZED tym obiektem (holdout)">＋ Strefa ViTMatte: cały obrys</button>
+      <div class="zp-none" id="zpNone"><span class="muted" id="zpNoneTxt">Brak aktywnej strefy „matte”.</span>
+        <button type="button" class="btn btn-primary btn-sm" id="zpPickZone" style="display:none" title="Wybierz istniejącą strefę obiektu – jedna strefa „cały obrys” na obiekt; jej ustawienia zmieniasz w tej palecie"></button>
+        <button type="button" class="btn btn-primary btn-sm" id="zpNewOutline" title="Nowa strefa ViTMatte wzdłuż całego obrysu obiektu (preset włosy), jedna na obiekt. Grubość pasa ustawiasz punktami pasa. Dłoń / obiekt z przodu: ustaw go w kolejności PRZED tym obiektem (holdout)">＋ Strefa ViTMatte: cały obrys</button>
         <button type="button" class="btn btn-secondary btn-sm" id="zpNewPaint" title="Nowa strefa ViTMatte: namaluj pędzlem pas wzdłuż krawędzi włosy–tło (może wjechać na dłoń). Obszar idzie za obiektem (CoTracker3, lokalnie); poprawka pędzlem w dowolnej klatce = klucz. Części obiektu (np. dłoń) są z obszaru wycinane same">🖌 Maluj obszar włosów (ViTMatte)</button>
         </div>
       <div class="zone-tune" id="z4Tune">
@@ -250,6 +257,17 @@
     $('zpAlphaPv').checked = Z.ov !== 'none';
     const auto = !z && wantsAutoZone();   // the band comes by itself
     $('zpNone').style.display = z || auto ? 'none' : '';
+    if (!z && !auto) {
+      // one whole-outline zone per object (user decision 2026-10-25): with a zone already there, offer to pick it, never
+      // to create another one (the server refuses with 409); the last enabled one is the one that wins in the alpha
+      const have = Z.list.filter((x) => x.criterion === 'matte');
+      const pick = have.filter((x) => x.enabled).pop() || have[have.length - 1];
+      $('zpNoneTxt').textContent = pick ? `Obiekt ma już strefę ${pick.zone_id} – jedna strefa „cały obrys” na obiekt.` : 'Brak aktywnej strefy „matte”.';
+      $('zpNewOutline').style.display = pick ? 'none' : '';
+      $('zpPickZone').style.display = pick ? '' : 'none';
+      $('zpPickZone').dataset.z = pick ? pick.zone_id : '';
+      $('zpPickZone').textContent = pick ? `Wybierz ${pick.zone_id}` : '';
+    }
     if (auto) ensureOutlineZone();
     $('z4Tune').style.display = z ? '' : 'none';
     $('zpTitle').textContent = z ? `Strefa ${z.zone_id} · ${zEngLabel(z)}${isOutline(z) ? ' · cały obrys' : ''}` : 'Strefa';
@@ -292,7 +310,8 @@
   function renderList() {
     const box = $('st4Zones'); if (!box) return;
     if (!Z.list.length) {
-      box.innerHTML = '<div class="muted">brak stref – pierwsza kreska pędzlem + (G) albo wielokąt (P) na klatce tworzy nową strefę z wybranym presetem</div>';
+      box.innerHTML = DRAW_TOOLS ? '<div class="muted">brak stref – pierwsza kreska pędzlem + (G) albo wielokąt (P) na klatce tworzy nową strefę z wybranym presetem</div>'
+        : '<div class="muted">brak strefy – strefa „cały obrys” powstaje sama po wejściu w etap (albo „＋ Nowa strefa”)</div>';
     } else {
       box.innerHTML = Z.list.map((z) => {
         const st = Z.status[z.zone_id] || {};
@@ -342,9 +361,18 @@
       if (z) {
         const ks = keyFrames(z);
         const kn = ks.includes(f) ? (keysOf(z)[f].prompt || '') : '';
-        hint.innerHTML = `aktywna: <b style="color:${zoneColour(z.zone_id)}">${esc(z.zone_id)}</b>${isOutline(z) ? ' · <b>cały obrys</b>: G / P = miejsca BEZ włosów' : ''} · klucze ${ks.length} · F${f}: ${ks.includes(f) ? '<b>klucz</b> – kreski poprawiają ten klucz' : 'bez klucza – pierwsza kreska tworzy klucz'}${kn ? ` · uwaga: <i>${esc(kn)}</i>` : ''}`;
-      } else if (active()) hint.textContent = `aktywna: ${active().zone_id} (strefa progowa) – kreski utworzą NOWĄ strefę „matte”`;
-      else hint.textContent = Z.list.length ? 'brak aktywnej strefy – kreska (G / R / P) tworzy nową z tym presetem' : '';
+        hint.innerHTML = !DRAW_TOOLS
+          ? `aktywna: <b style="color:${zoneColour(z.zone_id)}">${esc(z.zone_id)}</b>${isOutline(z) ? ' · <b>cały obrys</b>: grubość pasa = punkty pasa („Dodaj punkt”, G, na pasku po lewej)' : ''}`
+          : `aktywna: <b style="color:${zoneColour(z.zone_id)}">${esc(z.zone_id)}</b>${isOutline(z) ? ' · <b>cały obrys</b>: G / P = miejsca BEZ włosów' : ''} · klucze ${ks.length} · F${f}: ${ks.includes(f) ? '<b>klucz</b> – kreski poprawiają ten klucz' : 'bez klucza – pierwsza kreska tworzy klucz'}${kn ? ` · uwaga: <i>${esc(kn)}</i>` : ''}`;
+      } else if (active()) hint.textContent = DRAW_TOOLS ? `aktywna: ${active().zone_id} (strefa progowa) – kreski utworzą NOWĄ strefę „matte”` : `aktywna: ${active().zone_id} (strefa progowa)`;
+      else hint.textContent = Z.list.length ? (DRAW_TOOLS ? 'brak aktywnej strefy – kreska (G / R / P) tworzy nową z tym presetem' : 'brak aktywnej strefy – kliknij kartę strefy') : '';
+    }
+    const nz = $('z4New');
+    if (nz) {   // one whole-outline zone per object (user decision 2026-10-25)
+      const have = Z.list.filter((x) => x.criterion === 'matte').map((x) => x.zone_id);
+      nz.disabled = have.length > 0;
+      nz.title = have.length ? `Obiekt ma już strefę ${have.join(', ')} – jedna strefa „cały obrys” na obiekt; zmieniaj jej ustawienia (klik na karcie)`
+        : 'Nowa strefa ViTMatte wzdłuż całego obrysu obiektu – jedna na obiekt';
     }
     const kd = $('z4KeyDel'); if (kd) kd.disabled = !(z && keyFrames(z).includes(f));
     const lock = H.stageState ? H.stageState('vitmatte') : { state: 'todo' };   // needs a current stage-3 MatAnyone version
@@ -1234,7 +1262,10 @@
         }
       }
       const maskOff = !!(window.MD_OBJ && window.MD_OBJ.maskHidden && window.MD_OBJ.maskHidden());   // 👁 of the object off
-      if (Z.preview && Z.preview.f === f && Z.preview.zid === z.zone_id && Z.ov !== 'none' && !maskOff) {
+      // Alpha / Comp: the zone preview is in the matte itself (objects.js matteFor → previewMatte), no green tint over it
+      // (user report 2026-10-26); the other overlays (trimap, engines, comp) stay
+      const tintOk = S().view !== 'alpha' && S().view !== 'comp';
+      if (Z.preview && Z.preview.f === f && Z.preview.zid === z.zone_id && Z.ov !== 'none' && !maskOff && (tintOk || Z.ov !== 'alpha')) {
         const o = obj();
         const fc = finishedCanvas(f);
         // „👁 podgląd pasa” off: the trimap (blue sure / yellow band) is the band too – the zone alpha instead (2026-10-16)
@@ -1261,6 +1292,11 @@
           const en = H.overlayFor('zone_engines', f);
           if (en && en !== 'missing') { ctx.globalAlpha = 0.7; ctx.drawImage(enginesCanvas(en, `zeng_${o}_${f}_`), 0, 0, img.width, img.height); }
         }
+      } else if (Z.ov === 'alpha' && !maskOff && H.stageRunAlpha && !H.stagePreviewAt(f) && S().view !== 'alpha' && S().view !== 'comp') {
+        // no preview of this frame (user report 2026-10-25: „zone alpha” on, only the core visible): the stage 5 result
+        // (the active version ★) in green instead – „↻ Podgląd” / „👁 Podgląd klatek” computes the current settings
+        const ra = H.stageRunAlpha(f);
+        if (ra) { ctx.globalAlpha = 0.6; ctx.drawImage(H.tintCanvas(ra.img, [60, 255, 90], `${obj()}_zrun_${ra.run}_${f}`), 0, 0, img.width, img.height); }
       }
     } finally { ctx.restore(); }
   }
@@ -1396,14 +1432,15 @@
     }
     Z.active = d.zone.zone_id; Z.undo.push({ zid: Z.active, f, prev: null, created: true });
     await load();
-    toast(`Nowa strefa ${Z.active}: ViTMatte wzdłuż całego obrysu – zaznacz G / P miejsca bez włosów (twarz, szyja); dłoń z przodu = obiekt przed tym (holdout)`);
+    toast(DRAW_TOOLS ? `Nowa strefa ${Z.active}: ViTMatte wzdłuż całego obrysu – zaznacz G / P miejsca bez włosów (twarz, szyja); dłoń z przodu = obiekt przed tym (holdout)`
+      : `Nowa strefa ${Z.active}: ViTMatte wzdłuż całego obrysu – grubość pasa punktami pasa (G); dłoń z przodu = obiekt przed tym (holdout)`);
     setPreview(d.zone.zone_id, f, d.preview);
     H.loadStages().catch(() => {}); onFrame();
   }
 
   async function applyShot() {
     const z = activeMatte() || Z.list.find((x) => x.enabled && x.criterion === 'matte');
-    if (!z) { status('Brak strefy „matte” do zastosowania – narysuj strefę (G / P)', 'warn'); return; }
+    if (!z) { status(DRAW_TOOLS ? 'Brak strefy „matte” do zastosowania – narysuj strefę (G / P)' : 'Brak strefy „matte” do zastosowania – „＋ Nowa strefa”', 'warn'); return; }
     await H.ensurePointsSaved();
     if (Z.drawPending != null) await commitDraw(Z.drawPending);
     const base = (S().info && S().info.vitmatte_base) === 'core' ? `masce 1+2 (etapy ${H.ST.SAM3} + ${H.ST.BRUSH})` : `wersji MatAnyone2 (etap ${H.ST.MATANYONE})`;
@@ -1416,9 +1453,9 @@
       throw e;
     }
     H.clearOverlays();                 // a new version: every frame's alpha changed
-    await H.loadStages(); H.setView('alpha');
+    await H.loadStages(); H.restoreUserView();
     await load(); H.loadQA();
-    status(`Wersja ${d.run}: strefa ${z.zone_id} – przeliczone ${d.computed} kl., z cache ${d.cached}${d.dependents_to_recompute && d.dependents_to_recompute.length ? ` · do przeliczenia: ${d.dependents_to_recompute.join(', ')}` : ''}. Etap ${H.ST.VITMATTE} ViTMatte zaliczony; „Porównanie wersji” niżej (A / B / różnica, klawisz B).`, 'ok');
+    status(`Wersja ${d.run}: strefa ${z.zone_id} – przeliczone ${d.computed} kl., z cache ${d.cached}${d.dependents_to_recompute && d.dependents_to_recompute.length ? ` · do przeliczenia: ${d.dependents_to_recompute.join(', ')}` : ''}. Etap ${H.ST.VITMATTE} ViTMatte zaliczony; „Porównanie wersji” niżej (A / B / różnica, klawisze A / B / D).`, 'ok');
   }
   function frontDialog(mf, opts) {
     let m = $('zoneFrontModal');
@@ -1461,7 +1498,11 @@
 
   // ------------------------------------------------------------------------------------------------ wiring
   function wire() {
-    $('z4New').addEventListener('click', () => { setActive(null); status(DRAW_TOOLS ? `Nowa strefa: wybierz preset, opcjonalnie opis i silnik, potem maluj G (obszar) / R (tło) albo wielokąt P – pierwsza kreska tworzy strefę i klucz tej klatki` : `Nowa strefa: „Nowa strefa – cały obrys” w palecie, potem grubość pasa punktami („＋ Dodaj punkt pasa”)`, 'ok'); });
+    $('z4New').addEventListener('click', () => {
+      if (!DRAW_TOOLS) { H.run('z4New', newOutlineZone); return; }   // the whole-outline zone itself (one per object)
+      setActive(null); status(`Nowa strefa: wybierz preset, opcjonalnie opis i silnik, potem maluj G (obszar) / R (tło) albo wielokąt P – pierwsza kreska tworzy strefę i klucz tej klatki`, 'ok');
+    });
+    if (!DRAW_TOOLS) $('z4Propose').style.display = 'none';   // proposals become painted zones (hidden since 2026-10-21)
     document.querySelectorAll('#z4Presets .zp').forEach((b) => b.addEventListener('click', () => {
       const z = activeMatte();
       if (z) patchZone(z.zone_id, { preset: b.dataset.preset }, `preset ${PRESET_NAME[b.dataset.preset]}`);
@@ -1556,6 +1597,7 @@
       patchTune({ exclude_objects: [...cur] }, c.checked ? `wykluczony obiekt ${c.dataset.ex}` : `obiekt ${c.dataset.ex} znów w pasie ViTMatte`);
     });
     $('zpNewOutline').addEventListener('click', () => H.run('zpNewOutline', newOutlineZone));
+    $('zpPickZone').addEventListener('click', () => { if ($('zpPickZone').dataset.z) setActive($('zpPickZone').dataset.z); });
     if (!DRAW_TOOLS) $('zpNewPaint').style.display = 'none';
     $('z4Brush').querySelectorAll('button').forEach((b) => b.addEventListener('click', () => setBrush(b.dataset.b)));
     $('z4Track').addEventListener('change', () => patchTune({ track: $('z4Track').checked ? 'local' : 'rigid' }, $('z4Track').checked ? 'śledzenie lokalne (CoTracker3)' : 'śledzenie sztywne'));

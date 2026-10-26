@@ -154,6 +154,29 @@ def gpu_shared_gb(pid: int, run: Optional[Callable[..., Any]] = None) -> Optiona
         return None
 
 
+def comfy_shared_reader(client: Any) -> Optional[Callable[[], Optional[float]]]:
+    """Reader of the Comfy process' shared (spilled) GPU memory, GB: a real ComfyClient on Windows only (the process found
+    by its port); MD_SHARED_PROBE=0 turns it off (synthetic tests). The PID is looked up on the first read and again after
+    a read gave nothing (Comfy restarted under another PID)."""
+    import os
+    try:
+        port = getattr(client, "port", None)
+    except Exception:   # stand-in clients may refuse unknown attributes
+        port = None
+    if os.name != "nt" or os.environ.get("MD_SHARED_PROBE", "1") == "0" or not isinstance(port, int):
+        return None
+    state: Dict[str, Any] = {}
+
+    def read() -> Optional[float]:
+        if not state.get("pid"):
+            state["pid"] = pid_on_port(port)
+        v = gpu_shared_gb(state["pid"]) if state["pid"] else None
+        if v is None:
+            state["pid"] = None
+        return v
+    return read
+
+
 class SpillSampler:
     """Peak of `read()` (shared GB) sampled every `interval_s` in a background thread while the `with` block runs.
     `spill_gb` = peak - `base` (Comfy holds a little shared memory at idle; default = the value read when the block

@@ -487,7 +487,8 @@ def run_depth(client: Any, workflow: Union[str, Path, Dict[str, Any]], shot: str
     busy = client.busy_error()
     if busy:
         raise RuntimeError(busy)
-    client.free_vram()
+    from engine.gpu_release import before_stage
+    before_stage("comfy", client, "DepthCrafter")
     sub = client.queue_prompt(graph)
     if not sub.get("success"):
         raise RuntimeError(f"Comfy odrzucił graf: {sub.get('error')}")

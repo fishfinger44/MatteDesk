@@ -127,6 +127,15 @@ class VitMatteRunner:
             a = model(pixel_values=t).alphas[0, 0].float().clamp_(0, 1).cpu().numpy()
         return a.astype(np.float32)
 
+    def close(self) -> None:
+        """Drop the model (frees its GPU memory, engine/gpu_release); the next `run` loads it again."""
+        with self._lock:
+            m, self._model = self._model, None
+        if m is not None and self.device == "cuda":
+            del m
+            import torch
+            torch.cuda.empty_cache()
+
     def run(self, img_bgr: np.ndarray, trimap_u8: np.ndarray, unknown_value: float = 0.5) -> np.ndarray:
         """`img_bgr` HxWx3 float32 display (0..1), `trimap_u8` HxW (0 / 128 / 255) -> alpha HxW float32 (0..1)."""
         return finish_alpha(self.forward(prepare_input(img_bgr, trimap_u8, unknown_value)), trimap_u8)

@@ -74,16 +74,16 @@ class ObjectStore:
         p = self.dir(name) / "object.json"
         if not p.exists():
             raise FileNotFoundError(f"brak obiektu {name}")
-        obj = json.loads(p.read_text(encoding="utf-8"))
+        obj = self._read(p)
         if not isinstance(obj.get("band"), dict):   # the shared object band (2026-10-22): migrated on the first read
             from engine.objband import migrate
             migrate(self.root, name)
-            obj = json.loads(p.read_text(encoding="utf-8"))
+            obj = self._read(p)
         root = obj if not obj.get("part_of") else None
         if root is not None and "out_px" not in (obj.get("band") or {}):   # the sliders join the band (2026-10-24)
             from engine.objband import migrate_sliders
             migrate_sliders(self.root, name)
-            obj = json.loads(p.read_text(encoding="utf-8"))
+            obj = self._read(p)
         return obj
 
     def update(self, name: str, **fields: Any) -> Dict[str, Any]:
@@ -156,7 +156,7 @@ class ObjectStore:
         for d in sorted(self.root.iterdir()) if self.root.exists() else []:
             p = d / "object.json"
             if p.exists():
-                o = json.loads(p.read_text(encoding="utf-8"))
+                o = self._read(p)
                 out.append(o if isinstance(o.get("band"), dict) else self.get(d.name))
         return sorted(out, key=lambda o: o.get("depth_order", 0))
 
@@ -200,9 +200,26 @@ class ObjectStore:
                 p.unlink()
 
     @staticmethod
-    def _write(p: Path, data: Dict[str, Any]) -> None:
+    def _read(p: Path) -> Dict[str, Any]:
+        """object.json (JSON); Windows: opening fails (errno 13) for a moment while another thread replaces the file –
+        retried like the replace in _write (2026-10-26)."""
         import time
-        tmp = p.with_suffix(p.suffix + ".tmp")
+        for i in range(8):
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except PermissionError:
+                if i == 7:
+                    raise
+                time.sleep(0.05 * (i + 1))
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _write(p: Path, data: Dict[str, Any]) -> None:
+        import threading
+        import time
+        # a tmp of its own per thread: two threads writing the same object (a request + the mask 1+2 background batch,
+        # both migrating on the first read) overwrote one shared .tmp (test_zone_outline flaky, 2026-10-26)
+        tmp = p.with_name(f"{p.name}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         for i in range(8):   # Windows: the replace fails (WinError 5) while another process reads the file – a second
             try:             # server, a viewer, an antivirus (seen 2026-10-24: a slider save lost with a 500)

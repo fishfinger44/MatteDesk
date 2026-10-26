@@ -68,7 +68,8 @@ class Jobs:
             jid = next(self._ids)
             self._jobs[jid] = {"id": jid, "kind": kind, "label": label, "state": "running", "step": "",
                                "done": 0, "total": 0, "started": time.time(), "updated": time.time(), "comfy": None,
-                               "comfy_info": None, "obj": obj, "quiet": bool(quiet), "unit": "frames"}
+                               "comfy_info": None, "obj": obj, "quiet": bool(quiet), "unit": "frames",
+                               "gpu_spill_gb": None}
             return jid
 
     def bind(self, jid: int) -> None:
@@ -104,9 +105,11 @@ class Jobs:
 
     def update(self, step: Optional[str] = None, done: Optional[int] = None, total: Optional[int] = None,
                jid: Optional[int] = None, comfy: Optional[str] = None,
-               comfy_info: Optional[Dict[str, Any]] = None, unit: Optional[str] = None) -> None:
+               comfy_info: Optional[Dict[str, Any]] = None, unit: Optional[str] = None,
+               gpu_spill_gb: Optional[float] = None) -> None:
         """`unit`: what done / total count – "frames" (default) or "pct" (a job that only reports stage milestones in %:
-        the UI shows "postęp N %" and no ETA)."""
+        the UI shows "postęp N %" and no ETA). `gpu_spill_gb`: GPU memory of Comfy spilled to RAM – the job keeps the peak
+        (comfy_client.wait_for_prompt, run.json)."""
         jid = jid or getattr(self._local, "jid", None) or self._latest_running()
         with self._lock:
             j = self._jobs.get(jid) if jid else None
@@ -123,7 +126,16 @@ class Jobs:
                     j["comfy_info"] = comfy_info
                 if unit is not None:
                     j["unit"] = unit
+                if gpu_spill_gb is not None:
+                    j["gpu_spill_gb"] = max(float(gpu_spill_gb), j.get("gpu_spill_gb") or 0.0)
                 j["updated"] = time.time()
+
+    def spill_gb(self, jid: Optional[int] = None) -> Optional[float]:
+        """Peak GPU memory spilled to RAM in job `jid` (default: this thread's job / the latest running); None = none seen."""
+        jid = jid or getattr(self._local, "jid", None) or self._latest_running()
+        with self._lock:
+            j = self._jobs.get(jid) if jid else None
+            return j.get("gpu_spill_gb") if j else None
 
     def cancel(self) -> bool:
         with self._lock:
