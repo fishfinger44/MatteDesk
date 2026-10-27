@@ -20,6 +20,8 @@ Version: file [`VERSION`](VERSION) (also shown in the top-left corner of the UI)
 
 </div>
 
+[![MatteDesk – 2-min demo on YouTube](https://img.youtube.com/vi/GX3guDhhblk/maxresdefault.jpg)](https://youtu.be/GX3guDhhblk)
+
 https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
 
 ---
