@@ -24,7 +24,7 @@ Wersja: plik [`VERSION`](VERSION) (widoczna też w lewym górnym rogu UI) · his
 
 https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
 
-https://github.com/user-attachments/assets/4e303a27-0d49-44b9-b08f-4dc59134b190
+https://github.com/user-attachments/assets/0bfc7a20-2bf8-45e8-8b95-1f910b0657e8
 
 **Nowe w 0.50 (55 s):** obiekty → grupa z nich → szew zamykający przerwy między członkami → suwaki Final Touch i comp MergeMatte (eksport do Nuke'a jako węzeł).
 
