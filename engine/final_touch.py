@@ -282,6 +282,27 @@ def layer_box(strokes: Sequence[Dict[str, Any]], w: int, h: int):
     return c, box
 
 
+def layer_roi(strokes: Sequence[Dict[str, Any]], w: int, h: int):
+    """(box, C): the correction layer inside the union box (x0, y0, x1, y1) of the strokes only – the same values as
+    layer_box's C[y0:y1, x0:x1] without a full-frame array (the live preview, NEXT_STEPS 7c). (None, None) = no stroke
+    touched the frame."""
+    rois = [(s, r) for s in strokes for r in [stroke_mask_roi(s, w, h)] if r is not None]
+    if not rois:
+        return None, None
+    x0 = min(r[0] for _s, r in rois); y0 = min(r[1] for _s, r in rois)
+    x1 = max(r[0] + r[2].shape[1] for _s, r in rois); y1 = max(r[1] + r[2].shape[0] for _s, r in rois)
+    c = np.zeros((y1 - y0, x1 - x0), np.float32)
+    for s, (sx, sy, m) in rois:
+        v = c[sy - y0:sy - y0 + m.shape[0], sx - x0:sx - x0 + m.shape[1]]
+        if s["mode"] == "add":
+            v += m * (1.0 - v)
+        elif s["mode"] == "remove":
+            v -= m * (1.0 + v)
+        else:
+            v *= 1.0 - m
+    return (x0, y0, x1, y1), c
+
+
 def layer(strokes: Sequence[Dict[str, Any]], w: int, h: int) -> np.ndarray:
     """Correction layer C (float32, -1..1) of one frame's strokes, in order. Each stroke only touches its own box
     (outside it the stroke is 0, i.e. C stays) – same result as the full-frame arithmetic, far less work."""
@@ -325,3 +346,52 @@ def ft_loader(obj_dir: Path, base_loader: Callable[[int], np.ndarray]) -> Callab
     def load_f(f: int) -> np.ndarray:
         return apply(obj_dir, f, base_loader(f), d, ctx)
     return load_f
+
+
+# ---------------------------------------------------------------- MergeMatte settings (PLAN_FINAL_TOUCH.md §11)
+# Comp settings of the object for Nuke: they never change the alpha (no signature, no ↻) – the Final Touch palette
+# „MergeMatte” previews them on the Comp view and the Nuke export writes them into the MergeMatte group's knobs.
+def merge_matte_settings(d: Dict[str, Any]) -> Dict[str, Any]:
+    """{"node", "on", "knobs"} of a loaded final_touch.json – knobs = the node defaults + the stored values."""
+    from engine.merge_matte_nk import KNOB_DEFAULTS, NODE_NAME, VERSION
+    mm = d.get("merge_matte") or {}
+    knobs = {**KNOB_DEFAULTS, **{k: float(v) for k, v in (mm.get("knobs") or {}).items() if k in KNOB_DEFAULTS}}
+    return {"node": f"{NODE_NAME}_{VERSION}", "on": bool(mm.get("on", False)), "knobs": knobs}
+
+
+def set_merge_matte(obj_dir: Path, on: Optional[bool] = None, knobs: Optional[Dict[str, Any]] = None,
+                    reset: Optional[str] = None) -> Dict[str, Any]:
+    """Store the object's MergeMatte settings. knobs = changed values (clamped to the node's ranges, unknown names →
+    ValueError); reset = "default" | "sh010" replaces all knobs by a preset."""
+    from engine.merge_matte_nk import KNOB_DEFAULTS, KNOB_FIELD_RANGES as KNOB_RANGES, PRESET_SH010   # typed values may pass the slider
+    d = load(obj_dir)
+    cur = merge_matte_settings(d)
+    k = dict(cur["knobs"])
+    if reset:
+        presets = {"default": KNOB_DEFAULTS, "sh010": PRESET_SH010}
+        if reset not in presets:
+            raise ValueError(f"nieznany preset {reset}")
+        k = dict(presets[reset])
+    for n, v in (knobs or {}).items():
+        if n not in KNOB_DEFAULTS:
+            raise ValueError(f"nieznany knob MergeMatte: {n}")
+        v = float(v)
+        if n in KNOB_RANGES:
+            lo, hi = KNOB_RANGES[n]
+            v = min(max(v, lo), hi)
+        k[n] = v
+    d["merge_matte"] = {"on": cur["on"] if on is None else bool(on),
+                        "knobs": {n: v for n, v in k.items() if v != KNOB_DEFAULTS[n]}}   # only what differs from the node
+    save(obj_dir, d)
+    return merge_matte_settings(d)
+
+
+def merge_matte_export(work_dir: Path, names: Sequence[str], plate: str, colorspace: str) -> Optional[Dict[str, Any]]:
+    """`merge` argument of engine/nuke_mattes.mattes_nk: the exported objects whose MergeMatte is on, with their knobs;
+    None when no object has it on (the .nk then holds MASKI only, as before)."""
+    objs = {}
+    for n in names:
+        mm = merge_matte_settings(load(Path(work_dir) / "objects" / n))
+        if mm["on"]:
+            objs[n] = mm["knobs"]
+    return {"plate": plate, "colorspace": colorspace, "objects": objs} if objs and plate else None

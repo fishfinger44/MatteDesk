@@ -195,9 +195,37 @@
          ${me.points ? `<button type="button" class="btn btn-ghost btn-xs" data-bm="from" title="Punkty tego etapu stają się wspólnym pasem obiektu – zmienią się wszystkie etapy na wspólnym pasie (↻)">⇧ ${tr('ustaw jako wspólny')}</button>` : ''}`
       : `<span class="muted" title="Jeden pas dla etapów 3 / 4 / 5 / 7 – te same suwaki (pas, wcięcie, wtopienia) i punkty; zmiana suwaka lub punktu = ↻ we wszystkich etapach na wspólnym pasie">🔗 ${tr('pas obiektu (wspólny)')} · ${d.points} ${pk(d.points)}${keys ? ` · ${tr('klucze')} ${keys}` : ''}</span>${idle}
          <button type="button" class="btn btn-ghost btn-xs" data-bm="own" title="Odłącz → własny pas: ten etap dostaje kopię suwaków i punktów i dalej zmiany wspólnego pasa go nie dotyczą">⛓ ${tr('odłącz')}</button>`;
+    // „Wcięcie: cały rdzeń” (user decision 2026-10-29): the band covers the whole core – the model replaces it everywhere,
+    // „Wtopienie wcięcia” keeps that much core around the middle of each part (0 = nothing of the core is left)
+    const whole = !!me.whole_core;
+    el.insertAdjacentHTML('beforeend', `<label class="chk band-whole" title="Pas obejmuje CAŁY rdzeń: model (MatAnyone2 / VideoMaMa / ViTMatte / LTX-2.5) zastępuje rdzeń wszędzie, także jasne prześwity między włosami, które SAM 3.1 zalał. Wewnętrzną krawędzią pasa jest wtedy środek maski – „Wtopienie wcięcia” mówi, ile rdzenia zostaje wtopione w wynik modelu wokół środka (0 = nic, decyduje model); niebieski wąs punktu pasa zmienia to wtopienie lokalnie. Dobre dla włosów jako osobnego obiektu. ${own ? 'Ten etap (własny pas).' : 'Wspólny pas – zmiana = ↻ we wszystkich etapach na wspólnym pasie.'}"><input type="checkbox" data-bwhole="1"${whole ? ' checked' : ''} title="Wcięcie: cały rdzeń (wł. / wył.)"> ${tr('Wcięcie: cały rdzeń')}</label>`);
+    const pal = el.closest('.pts-palette, .zone-palette, .zp-body') || document;
+    pal.querySelectorAll('.band-in-row').forEach((r) => {
+      r.classList.toggle('whole-off', whole);
+      r.querySelectorAll('input').forEach((i) => { i.disabled = whole; });
+    });
+    // one feather with „cały rdzeń” (user decision 2026-10-29): the outer edge feather only acts on the outer band, so it
+    // is shown only while „Pas na zewnątrz” > 0
+    if (pal.dataset) pal.dataset.whole = whole ? '1' : '';
+    const outIn = pal.querySelector('.band-out-row input[type=range]');
+    const outfVis = () => pal.querySelectorAll('.band-outf-row').forEach((r) => {
+      r.style.display = pal.dataset && pal.dataset.whole && outIn && +outIn.value <= 0 ? 'none' : '';
+    });
+    outfVis();
+    if (outIn && !outIn.dataset.wholeWired) { outIn.dataset.wholeWired = '1'; outIn.addEventListener('input', outfVis); }
     renderSeed(document.getElementById(el.id.replace(/BandMode$/, 'BandSeed')), bkey, own, after);
     for (const c of copyEls || []) if (c) c.style.display = own ? '' : 'none';
     el.querySelectorAll('[data-bm]').forEach((b) => b.addEventListener('click', () => setMode(bkey, b.dataset.bm, after)));
+    el.querySelector('[data-bwhole]').addEventListener('change', (e) => setWhole(bkey, e.target.checked, after));
+  }
+  async function setWhole(bkey, on, after) {
+    try {
+      await H.api('PUT', `/api/object/${obj()}/band_whole`, { stage: bkey, on });
+      dirty(); await reloadStage(); renderLane(); V().render();
+      H.status(on ? 'Wcięcie: cały rdzeń – model zastępuje rdzeń w całym obiekcie; „Wtopienie wcięcia” = ile rdzenia zostaje wokół środka (↻)'
+                  : 'Wcięcie: z suwaka „Wcięcie w rdzeń” (↻)', 'ok');
+    } catch (e) { H.toast(`Wcięcie: cały rdzeń – ${e.message || e}`, 6000); }
+    if (after) after(); else renderMode();
   }
   // „Zaproponuj pas” (Sapiens2-seg-0.4B, 2026-10-22), under „👁 podgląd pasa” of the stage palette: always shown,
   // greyed out with a Doctor hint until the model is downloaded (info.band_seed; user decision 2026-10-23)

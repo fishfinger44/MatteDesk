@@ -101,7 +101,7 @@
         "params": {
           "temporal": "none",
           "temporal_radius": 3,
-          "temporal_scale": 2,
+          "temporal_scale": 1,
           "model_px": 504,
           "unknown_value": 0.5,
           "alpha_black": 0.1,

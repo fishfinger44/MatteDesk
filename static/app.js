@@ -277,7 +277,13 @@ class MatteDeskViewer {
     const bgColor = document.getElementById('cmpBgColor');
     if (bgColor) {
       bgColor.value = this.compare.bg.color;
-      bgColor.addEventListener('input', (e) => { this.compare.bg.color = e.target.value; this.compare.bg.checker = false; saveBg(); this.syncCompareUi(); this.render(); });
+      // dragging through the picker: only the background under the cached cut-out changes (bgComp), drawn at most once
+      // per screen frame; saved / the bar updated when the picker closes (user report 2026-10-29: very slow)
+      bgColor.addEventListener('input', (e) => {
+        this.compare.bg.color = e.target.value; this.compare.bg.checker = false;
+        if (!this._bgRaf) this._bgRaf = requestAnimationFrame(() => { this._bgRaf = 0; this.render(); });
+      });
+      bgColor.addEventListener('change', () => { saveBg(); this.syncCompareUi(); this.render(); });
     }
     // the comparison row under the header starts where the "Plate:" pill starts (user request 2026-10-15);
     // the pill folded into the "⋯" menu (narrow window) -> the row starts at the left edge
@@ -1567,10 +1573,12 @@ class MatteDeskViewer {
     const W = img.width, H = img.height;
     const comp = this.bgComp(W, H);
     if (!comp) return;
-    if (this.compare.holdC || mode === 'comp') { ctx.drawImage(comp, 0, 0, W, H); return; }
+    // stage Final Touch, palette „MergeMatte” on: the server's port of the Nuke group over the plain comp (static/mergematte.js)
+    const mm = (c) => { if (window.MD_MM && window.MD_MM.ready) window.MD_MM.drawOver(c, img); };
+    if (this.compare.holdC || mode === 'comp') { ctx.drawImage(comp, 0, 0, W, H); mm(ctx); return; }
     if (mode === 'wipe') {
       const x = W * this.compare.wipe;
-      ctx.save(); ctx.beginPath(); ctx.rect(0, 0, x, H); ctx.clip(); ctx.drawImage(comp, 0, 0, W, H); ctx.restore();
+      ctx.save(); ctx.beginPath(); ctx.rect(0, 0, x, H); ctx.clip(); ctx.drawImage(comp, 0, 0, W, H); mm(ctx); ctx.restore();
       ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 2 / this.zoom; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
       ctx.fillStyle = '#ffcc33'; ctx.font = `${12 / this.zoom}px "IBM Plex Sans", sans-serif`; ctx.textAlign = 'left';
       ctx.fillText(`na tle: ${this.bgRefLabel()}`, 6 / this.zoom, 16 / this.zoom); ctx.textAlign = 'right'; ctx.fillText(this.activePlate, W - 6 / this.zoom, 16 / this.zoom);
@@ -1611,19 +1619,15 @@ class MatteDeskViewer {
     } else if (bgSpec === 'bg') g.drawImage(bgImg, 0, 0, W, H);
     else { g.fillStyle = bgSpec; g.fillRect(0, 0, W, H); }
     const gc = m && window.mdGpu ? mdGpu.comp(beauty, m.img, c, W, H) : null;   // same pixels on the GPU (gpu_overlay.js)
-    if (gc) { g.drawImage(gc, 0, 0); }
+    if (gc) g.drawImage(gc, 0, 0);
+    // no GPU: plate over the background in linear light (gpu_overlay.js mdLinComp, the same as the GPU shader)
     else if (m) {
-      const b = g.getImageData(0, 0, W, H);
       const t = document.createElement('canvas'); t.width = W; t.height = H;
       const tg = t.getContext('2d');
       tg.drawImage(beauty, 0, 0, W, H); const p = tg.getImageData(0, 0, W, H);
       tg.clearRect(0, 0, W, H); tg.drawImage(m.img, 0, 0, W, H); const a = tg.getImageData(0, 0, W, H);
-      const bd = b.data, pd = p.data, ad = a.data;
-      for (let i = 0; i < bd.length; i += 4) {
-        const al = ad[i] / 255;
-        if (al <= 0) continue;
-        bd[i] = pd[i] * al + bd[i] * (1 - al); bd[i + 1] = pd[i + 1] * al + bd[i + 1] * (1 - al); bd[i + 2] = pd[i + 2] * al + bd[i + 2] * (1 - al);
-      }
+      const b = g.getImageData(0, 0, W, H);
+      window.mdLinComp(p.data, a.data, b.data);
       g.putImageData(b, 0, 0);
     }
     this._bgCompCache.delete(key);

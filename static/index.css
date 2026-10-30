@@ -1382,6 +1382,9 @@ canvas.edge-hot { cursor: pointer !important; }
 .zone-card:hover { background: var(--bg-hover); }
 .zone-card.cur { outline: 1px solid var(--zc, var(--accent-primary)); background: rgba(31,31,34,.9); }
 .zone-card.off { opacity: .55; }
+/* stage 2: the ACTIVE fix layer (strokes go to it) – clearly marked (user report 2026-10-30: not visible) */
+.zone-card.active { outline: 2px solid var(--zc, var(--accent-primary)); background: rgba(232,163,61,.12); }
+.zone-card .zone-act { color: var(--accent-primary); font-weight: 600; font-size: 11px; margin-left: 4px; }
 .zone-card .zone-ic { font-size: 16px; grid-row: 1 / span 2; text-align: center; }
 .zone-card .zone-name { line-height: 1.25; }
 .zone-card .zone-meta { grid-column: 2; font-size: 11px; color: var(--text-muted); }
@@ -1483,13 +1486,13 @@ canvas.edge-hot { cursor: pointer !important; }
 .p0-stale { color: #fbbf24; font-weight: 600; }
 
 /* other computed objects as extra overlay layers (static/objects.js renderOthersPanel) */
-.other-layers { position: absolute; top: 10px; right: 10px; z-index: 6; min-width: 280px; max-width: 360px; padding: 6px 8px;
+.other-layers { position: absolute; top: 10px; right: 10px; z-index: 6; min-width: 300px; max-width: 470px; padding: 6px 8px;
   background: rgba(20,20,22,.88); border: 1px solid var(--border-subtle); border-radius: 2px; font-size: 11px; color: var(--text-main);
   display: flex; flex-direction: column; gap: 4px; }
 .other-layers .ol-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .other-layers .ol-all { display: flex; align-items: center; gap: 5px; font-weight: 600; cursor: pointer; }
 .other-layers .ol-fold { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 12px; padding: 0 2px; }
-.other-layers .ol-row { display: grid; grid-template-columns: 12px 22px 22px minmax(70px, 1fr) 64px 30px 18px; align-items: center; gap: 5px;
+.other-layers .ol-row { display: grid; grid-template-columns: 12px 14px 22px 22px minmax(70px, 1fr) 64px 30px 18px; align-items: center; gap: 5px;
   padding: 2px 3px; border-radius: 2px; cursor: pointer; }
 .other-layers .ol-row:hover:not(.cur) { background: rgba(148,163,184,.10); }
 .other-layers .ol-row.cur { background: rgba(232,163,61,.22); box-shadow: inset 0 0 0 1px rgba(242,187,102,.55); }
@@ -1596,6 +1599,9 @@ canvas.edge-hot { cursor: pointer !important; }
 .pts-palette .pp-life .row { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
 .pts-palette .pp-life .row .btn { flex: 1; padding: 3px 6px; font-size: 11px; }
 .pts-palette .pp-hint { font-size: 10px; line-height: 1.35; }
+/* MergeMatte palette (Final Touch, PLAN_FINAL_TOUCH §11): on the RIGHT of the view (user decision 2026-10-29) */
+.mm-palette { left: auto; right: 10px; width: 260px; max-height: calc(100% - 60px); overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; box-sizing: border-box; }
+.mm-palette .zone-slider b { min-width: 34px; text-align: right; }
 .pts-palette.dragging { opacity: .85; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
 .pts-palette .pp-sec { display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--border-subtle); padding-top: 6px; margin-top: 2px; }
 .pts-palette .pp-sub { font-weight: 600; }
@@ -1694,6 +1700,22 @@ canvas.edge-hot { cursor: pointer !important; }
 .other-layers .ol-row.grp:not(.cur) { background: rgba(148,163,184,.05); }
 .other-layers .ol-row.grp-main .ol-name { font-weight: 600; }
 .other-layers .ol-row.grp-part { margin-left: 18px; position: relative; }
+/* groups (PLAN_GROUP_COMPOSE 2026-10-29): the group row (🔗, member count, ungroup) and a member's „Do grupy z:” */
+.other-layers .ol-row.grp-head { grid-template-columns: 14px 14px 22px minmax(60px, 1fr) auto 18px; }
+.other-layers .ol-row.grp-off .ol-name, .other-layers .ol-row.grp-off .ol-src { opacity: .45; text-decoration: line-through; }
+.other-layers .ol-gfold { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 11px; padding: 0; width: 14px; }
+.other-layers .ol-row.grp-head .ol-name { font-weight: 600; }
+.other-layers .ol-row.grp-head .ol-status { grid-column: auto; }
+.other-layers .ol-row.grp-part { grid-template-columns: 12px 14px 22px 22px minmax(50px, 1fr) 84px 58px 64px 30px 18px; }
+.other-layers .ol-mseam { display: flex; align-items: center; gap: 3px; }
+.other-layers .ol-mseam input { width: 38px; accent-color: var(--accent-primary); cursor: pointer; }
+.other-layers .ol-mseam b { font-weight: 400; font-size: 11px; min-width: 14px; text-align: right; font-variant-numeric: tabular-nums; }
+.other-layers .ol-mseam.inherit { opacity: .45; }
+.other-layers .ol-exp { margin: 0; width: 13px; height: 13px; accent-color: var(--accent-primary); cursor: pointer; }
+.other-layers .ol-src { font-size: 11px; padding: 0 2px; height: 18px; max-width: 84px; background: var(--bg-secondary, #1e1e1e); color: inherit;
+  border: 1px solid var(--border-subtle); border-radius: 3px; }
+.other-layers .ol-src.stale { border-color: #e8a33d; }
+.other-layers .ol-src.missing { border-color: #ef4444; color: #fca5a5; }
 .other-layers .ol-row.grp-part::before { content: ""; position: absolute; left: -10px; top: -2px; bottom: -2px; border-left: 1px solid var(--border-subtle); }
 .other-layers .ol-seam { margin-left: 18px; padding-left: 4px !important; border-left: 1px solid var(--border-subtle); }
 .other-layers .ol-seam { display: grid; grid-template-columns: 1fr 96px 36px; align-items: center; gap: 6px; padding: 1px 4px 4px 18px; color: var(--text-muted); }
@@ -1763,3 +1785,7 @@ canvas.edge-hot { cursor: pointer !important; }
 .band-seed-btn .bs-ico { width: 18px; height: 18px; flex: none; }
 .band-seed-hint { margin-top: 3px; font-size: 11px; color: #9a9aa0; line-height: 1.35; }
 .band-seed-hint a { color: var(--accent-primary); }
+
+/* „Wcięcie: cały rdzeń” (2026-10-29): the inset slider does not apply while the band covers the whole core */
+.band-in-row.whole-off { opacity: .4; }
+.band-mode .band-whole { display: inline-flex; margin-left: 6px; }

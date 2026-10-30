@@ -81,6 +81,23 @@ def finish_alpha(alpha_padded: np.ndarray, trimap_u8: np.ndarray) -> np.ndarray:
     return a
 
 
+def prof_add(r: Any, key: str, dt: float) -> None:
+    """Accumulate wall seconds of one runner phase in `r.prof` (plan docs/PLAN_EDGE_SPEED.md A6): the zone reads the
+    difference before / after its frames (`prof_delta`)."""
+    p = getattr(r, "prof", None)
+    if p is not None:
+        p[key] = p.get(key, 0.0) + float(dt)
+
+
+def prof_snapshot(r: Any) -> Dict[str, float]:
+    return dict(getattr(r, "prof", None) or {})
+
+
+def prof_delta(r: Any, before: Dict[str, float]) -> Dict[str, float]:
+    """Runner phases since `before` (prof_snapshot), seconds rounded; empty for runners without `prof` (mocks)."""
+    return {k: round(v - before.get(k, 0.0), 2) for k, v in (getattr(r, "prof", None) or {}).items()}
+
+
 class VitMatteRunner:
     """In-process model holder (MatteDesk's Python has torch + transformers): `run(img_bgr, trimap_u8)` -> alpha.
     One instance per model id (see `get_runner`)."""
@@ -93,6 +110,7 @@ class VitMatteRunner:
         self._model = None
         self._lock = threading.Lock()
         self.load_seconds = 0.0
+        self.prof: Dict[str, float] = {}       # prepare / forward (GPU incl. transfers) / finish, A6
 
     @staticmethod
     def available() -> Tuple[bool, str]:
@@ -121,14 +139,18 @@ class VitMatteRunner:
     def forward(self, x: np.ndarray) -> np.ndarray:
         """(H', W', 4) prepared input -> (H', W') alpha."""
         import torch
-        model = self._load()
-        t = torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))[None]).to(self.device)
-        with torch.inference_mode():
-            a = model(pixel_values=t).alphas[0, 0].float().clamp_(0, 1).cpu().numpy()
+        from engine.gpu_manager import GPU
+        with GPU.use(self, "ViTMatte (proces serwera)", self.close):
+            model = self._load()
+            t0 = time.perf_counter()
+            t = torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))[None]).to(self.device)
+            with torch.inference_mode():
+                a = model(pixel_values=t).alphas[0, 0].float().clamp_(0, 1).cpu().numpy()
+            prof_add(self, "forward", time.perf_counter() - t0)
         return a.astype(np.float32)
 
     def close(self) -> None:
-        """Drop the model (frees its GPU memory, engine/gpu_release); the next `run` loads it again."""
+        """Drop the model (frees its GPU memory; engine/gpu_manager evicts it); the next `run` loads it again."""
         with self._lock:
             m, self._model = self._model, None
         if m is not None and self.device == "cuda":
@@ -138,7 +160,14 @@ class VitMatteRunner:
 
     def run(self, img_bgr: np.ndarray, trimap_u8: np.ndarray, unknown_value: float = 0.5) -> np.ndarray:
         """`img_bgr` HxWx3 float32 display (0..1), `trimap_u8` HxW (0 / 128 / 255) -> alpha HxW float32 (0..1)."""
-        return finish_alpha(self.forward(prepare_input(img_bgr, trimap_u8, unknown_value)), trimap_u8)
+        t0 = time.perf_counter()
+        x = prepare_input(img_bgr, trimap_u8, unknown_value)
+        prof_add(self, "prepare", time.perf_counter() - t0)
+        a = self.forward(x)
+        t0 = time.perf_counter()
+        out = finish_alpha(a, trimap_u8)
+        prof_add(self, "finish", time.perf_counter() - t0)
+        return out
 
     def run_many(self, imgs: Sequence[np.ndarray], tris: Sequence[np.ndarray], unknown_value: float = 0.5) -> List[np.ndarray]:
         """The tiles of one frame, one after the other (each its own forward, batch 1 = `run`)."""
@@ -201,6 +230,9 @@ class ComfyVitMatteRunner:
         self._log = None
         self._lock = threading.Lock()
         self._n = 0
+        # A6: prepare / npy_write / worker_read / worker_forward / worker_load / worker_write / ipc_wait (request wall
+        # minus the worker's own phases: pipe + scheduling) / npy_read / finish; workers without timings -> "request"
+        self.prof: Dict[str, float] = {}
 
     def available(self) -> Tuple[bool, str]:
         ok, why, _ = check_worker_python(self.python, [self.model_id], env=self.env, worker=self.worker)
@@ -249,20 +281,35 @@ class ComfyVitMatteRunner:
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         """(H', W', 4) -> (H', W') alpha; an (N, H', W', 4) stack -> (N, H', W') (every tile its own forward)."""
-        with self._lock:
+        from engine.gpu_manager import GPU
+        with GPU.use(self, self.label, self.close), self._lock:
             if self._dir is None:
                 self._dir = tempfile.TemporaryDirectory(prefix=self.tmp_prefix)
             self._n += 1
             x_path = Path(self._dir.name) / f"x_{self._n}.npy"
             out_path = Path(self._dir.name) / f"a_{self._n}.npy"
+            t0 = time.perf_counter()
             np.save(x_path, np.ascontiguousarray(x, dtype=np.float32))
+            prof_add(self, "npy_write", time.perf_counter() - t0)
             try:
+                t0 = time.perf_counter()
                 resp = self._request(x_path, out_path)
+                wall = time.perf_counter() - t0
                 if not resp.get("ok"):
                     raise RuntimeError(f"{self.label} (Python ComfyUI): {resp.get('error')}")
                 self.device = resp.get("device") or self.device
                 self.load_seconds = float(resp.get("load_seconds") or self.load_seconds)
-                return np.load(out_path).astype(np.float32)
+                wt = resp.get("timings")
+                if isinstance(wt, dict):
+                    for k, v in wt.items():
+                        prof_add(self, f"worker_{k}", float(v))
+                    prof_add(self, "ipc_wait", wall - sum(float(v) for v in wt.values()))
+                else:
+                    prof_add(self, "request", wall)
+                t0 = time.perf_counter()
+                a = np.load(out_path).astype(np.float32)
+                prof_add(self, "npy_read", time.perf_counter() - t0)
+                return a
             finally:
                 for p in (x_path, out_path):
                     try:
@@ -271,20 +318,36 @@ class ComfyVitMatteRunner:
                         pass
 
     def run(self, img_bgr: np.ndarray, trimap_u8: np.ndarray, unknown_value: float = 0.5) -> np.ndarray:
-        return finish_alpha(self.forward(prepare_input(img_bgr, trimap_u8, unknown_value)), trimap_u8)
+        t0 = time.perf_counter()
+        x = prepare_input(img_bgr, trimap_u8, unknown_value)
+        prof_add(self, "prepare", time.perf_counter() - t0)
+        a = self.forward(x)
+        t0 = time.perf_counter()
+        out = finish_alpha(a, trimap_u8)
+        prof_add(self, "finish", time.perf_counter() - t0)
+        return out
 
     def run_many(self, imgs: Sequence[np.ndarray], tris: Sequence[np.ndarray], unknown_value: float = 0.5) -> List[np.ndarray]:
         """The tiles of one frame in ONE request (plan docs/PLAN_EDGE_SPEED.md A5, 2026-10-25): one .npy with the
         (N, H', W', 4) stack, the worker runs the same forward per tile (batch 1, so the alphas are the ones `run`
         gives) and writes one (N, H', W') file – the per-tile protocol cost (58 ms measured) is paid once per frame.
         Tiles of different sizes, or a worker without stacks (`batched` False), go one by one."""
+        t0 = time.perf_counter()
         xs = [prepare_input(i, t, unknown_value) for i, t in zip(imgs, tris)]
+        prof_add(self, "prepare", time.perf_counter() - t0)
         if not xs:
             return []
         if not self.batched or len(xs) == 1 or any(x.shape != xs[0].shape for x in xs):
-            return [finish_alpha(self.forward(x), t) for x, t in zip(xs, tris)]
-        outs = self.forward(np.stack(xs))
-        return [finish_alpha(a, t) for a, t in zip(outs, tris)]
+            outs = [self.forward(x) for x in xs]
+        else:
+            t0 = time.perf_counter()
+            stack = np.stack(xs)
+            prof_add(self, "prepare", time.perf_counter() - t0)
+            outs = self.forward(stack)
+        t0 = time.perf_counter()
+        res = [finish_alpha(a, t) for a, t in zip(outs, tris)]
+        prof_add(self, "finish", time.perf_counter() - t0)
+        return res
 
     def close(self) -> None:
         """Stop the worker (frees its GPU memory); the next `run` starts a new one."""

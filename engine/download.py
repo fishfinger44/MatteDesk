@@ -9,12 +9,16 @@
   GitHub release assets (`digest` in the releases API, see `github_asset`). A mismatch deletes the `.part`
   (a corrupted part must not be resumed) and raises.
 - No third-party packages (urllib only): the installer runs it with the bundled Python before anything else exists.
+- **Certificates:** `ssl_context()` = the Windows store PLUS the certifi bundle (certifi, else pip's vendored copy).
+  Python reads only the roots already in the Windows store and never makes Windows fetch a missing one, so on a
+  fresh machine HTTPS failed with CERTIFICATE_VERIFY_FAILED "unable to get issuer certificate" (issue #7).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import ssl
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,6 +29,42 @@ CHUNK = 8 << 20
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 Progress = Callable[[int, int], None]
+_CTX: Optional[ssl.SSLContext] = None
+
+
+def _ca_bundle() -> Optional[str]:
+    for mod in ("certifi", "pip._vendor.certifi"):
+        try:
+            where = __import__(mod, fromlist=["where"]).where()
+        except Exception:
+            continue
+        if where and Path(where).is_file():
+            return where
+    return None
+
+
+def ssl_context() -> ssl.SSLContext:
+    """System roots (corporate / antivirus CAs stay trusted) + the certifi bundle (roots Windows has not fetched yet)."""
+    global _CTX
+    if _CTX is None:
+        ctx = ssl.create_default_context()
+        ca = _ca_bundle()
+        if ca:
+            try:
+                ctx.load_verify_locations(cafile=ca)
+            except (OSError, ssl.SSLError):
+                pass
+        _CTX = ctx
+    return _CTX
+
+
+def urlopen(req: Any, timeout: float = 60) -> Any:
+    """urllib.request.urlopen with `ssl_context()` – use it for every HTTPS request MatteDesk makes."""
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
+
+
+def _opener(*handlers: Any) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_context()), *handlers)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -39,7 +79,7 @@ def hf_sha256(url: str, token: Optional[str] = None, opener: Any = None) -> Opti
     hdr = {"User-Agent": UA}
     if token:
         hdr["Authorization"] = f"Bearer {token}"
-    op = opener or urllib.request.build_opener(_NoRedirect)
+    op = opener or _opener(_NoRedirect)
     try:
         r = op.open(urllib.request.Request(url, headers=hdr, method="HEAD"), timeout=30)
         headers = r.headers
@@ -59,7 +99,7 @@ def github_asset(repo: str, name: str, tag: str = "latest", api_get: Optional[Ca
     if api_get is None:
         def api_get(u: str) -> Dict[str, Any]:
             req = urllib.request.Request(u, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urlopen(req, timeout=30) as r:
                 return json.loads(r.read().decode("utf-8"))
     rel = api_get(api)
     for a in rel.get("assets") or []:
@@ -81,7 +121,7 @@ def sha256_file(p: Path) -> str:
 
 def download(url: str, dst: Path, sha256: Optional[str] = None, token: Optional[str] = None,
              progress: Optional[Progress] = None, verify_server_hash: bool = True,
-             urlopen: Callable[..., Any] = urllib.request.urlopen) -> Path:
+             urlopen: Callable[..., Any] = urlopen) -> Path:
     """Download `url` to `dst` with resume and checksum. `sha256=None` -> the server's hash when it publishes one."""
     dst = Path(dst)
     tmp = dst.with_name(dst.name + ".part")

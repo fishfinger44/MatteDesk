@@ -106,19 +106,25 @@ class ObjectStore:
             raise FileNotFoundError(f"brak obiektu {name}")
         trash = self.root.parent / "trash" / "objects" / f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
         trash.parent.mkdir(parents=True, exist_ok=True)
+        gone = self._read(d / "object.json")
         shutil.move(str(d), str(trash))
+        for g in self.list(groups=True):   # a group entity (engine/groups.py): a deleted member leaves it
+            if g.get("kind") == "group" and name in (g.get("members") or []):
+                self.update(g["name"], members=[m for m in g["members"] if m != name])
+        if gone.get("kind") == "group":    # a deleted group: its members become standalone
+            for m in gone.get("members") or []:
+                if (self.dir(m) / "object.json").exists():
+                    self.update(m, group=None, group_source=None, group_on=None, group_seam_px=None)
         for i, o in enumerate(self.list()):
             deps = [x for x in o["tool"].get("depends_on", []) if x != name]
-            orphan = o.get("part_of") == name     # parts of a deleted object become standalone objects
-            if o.get("depth_order") != i or deps != o["tool"].get("depends_on", []) or orphan:
-                extra = {"part_of": None} if orphan else {}
-                self.update(o["name"], depth_order=i, tool={"depends_on": deps}, **extra)
+            if o.get("depth_order") != i or deps != o["tool"].get("depends_on", []):
+                self.update(o["name"], depth_order=i, tool={"depends_on": deps})
         return trash
 
     def rename(self, old: str, new: str) -> int:
         """Rename an object (user request 2026-10-16): move objects/<old> to objects/<new>, then replace every JSON
         string that IS the old name (exact match, never a substring – prompts stay) in all objects' files: its own
-        name, part_of / depends_on of other objects, groups in run.json, front objects (holdouts) in zones.
+        name, group / members / depends_on of other objects, groups in run.json, front objects (holdouts) in zones.
         Returns the number of JSON files rewritten. Exported files keep their old names on disk."""
         src, dst = self.dir(old), self.dir(new)
         if not (src / "object.json").exists():
@@ -151,12 +157,15 @@ class ObjectStore:
                 n += 1
         return n
 
-    def list(self) -> List[Dict[str, Any]]:
+    def list(self, groups: bool = False) -> List[Dict[str, Any]]:
+        """Objects in depth order. Group entities (`kind: group`, engine/groups.py) only with `groups=True`."""
         out = []
         for d in sorted(self.root.iterdir()) if self.root.exists() else []:
             p = d / "object.json"
             if p.exists():
                 o = self._read(p)
+                if o.get("kind") == "group" and not groups:
+                    continue
                 out.append(o if isinstance(o.get("band"), dict) else self.get(d.name))
         return sorted(out, key=lambda o: o.get("depth_order", 0))
 

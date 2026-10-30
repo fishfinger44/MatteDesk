@@ -89,6 +89,13 @@
   // zone params edited on the card (user decision 2026-10-15): temporal smoothing of the ViTMatte alpha + finish levels.
   // Shown value = the zone's param, else the engine default (what the server uses when the key is absent).
   const TEMPORAL = [['none', 'brak'], ['median', 'mediana'], ['flow', 'mediana po przepływie'], ['flow_mean', 'średnia po przepływie (czerń/biel przed)']];
+  // help of each smoothing mode: speed / flicker measured 2026-10-28 (local_results/ab_zone_smooth/, sh060 + CLIP2_A)
+  const TEMPORAL_HELP = {
+    none: 'Brak – najszybciej (~0 s/kl.), migotanie bez zmian. Kiedy: strefa jest prawie samo 0 / 1 (twardy obrys) albo szybki podgląd.',
+    median: 'Mediana – szybka (~0,3 s/kl.), ale przy ruchu prawie nie zmniejsza migotania (CLIP2_A: bez zmian) – działa tylko tam, gdzie nic się nie rusza. Kiedy: statyczna kamera i nieruchomy obiekt.',
+    flow: 'Mediana po przepływie – najwolniejsza (~2,8 s/kl.), migotanie −36 % (CLIP2_A). Zostawiona dla zgodności: średnia po przepływie jest szybsza i spokojniejsza.',
+    flow_mean: 'Średnia po przepływie – POLECANA do włosów: najmniej migotania (CLIP2_A −44 % z ×2, −47 % z ×1), ~0,5 s/kl. z ×1, ~1,5 s/kl. z ×2. Najpierw czerń / biel w każdej klatce, potem średnia ważona z ± promień klatek dopasowanych przepływem – śmieć z jednej klatki nie rozmazuje się na sąsiednie.',
+  };
   const PARAM_DEF = { temporal: 'median', temporal_radius: 2, temporal_scale: 1, alpha_black: 0, alpha_white: 1, alpha_blur_px: 0,
     fg_erode_px: 2, force_core_erode_px: 0, alpha_black_after: 0, region: 'draw', outline_out_px: 40, exclude_objects: [], track: 'rigid',
     vitmatte_model: 'base', model_px: 1008, unknown_value: 0.5 };
@@ -204,15 +211,16 @@
           <div class="zp-band" id="z4BandRow"><button type="button" class="btn btn-ghost btn-xs" id="z4BandTool" style="display:none" title="Dodawanie punktów kontrolnych pasa (Esc = koniec): klik na obrazie przy obrysie = nowy punkt; dwa wąsy – żółty = pas na zewnątrz (w tło), niebieski = do środka (w obiekt); przeciągnij koniec wąsa = grubość w tej klatce (klucz), przeciągnij punkt = jego położenie (klucz); 0 / 0 = przerwa w pasie (np. skóra, dłoń). Między kluczami grubość się animuje, punkty śledzi CoTracker3. PPM na punkcie = usuń klucz tej klatki (ostatni klucz usuwa punkt)">＋ Dodaj punkt pasa</button>
             <button type="button" class="btn btn-ghost btn-xs" id="z4BandClear" title="Usuń wszystkie punkty bieżącej klatki kluczowej pasa (= usuń klatkę kluczową)">🗑 Usuń wszystkie punkty (ta klatka)</button>
             <span class="zp-hint" id="z4BandInfo"></span><div class="band-mode" id="z4BandMode"></div></div>
-          <label class="zone-slider" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="0" max="120" step="1" title="Jak daleko poza obrys rdzenia SAM 3.1 liczy ViTMatte (px plate'u) – ten sam pas co w etapach 3 / 4 / 7. Podgląd przy przeciąganiu: przerywane linie = krawędzie pasa ViTMatte"><b id="z4OutV"></b></label>
-          <label class="zone-slider">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="40" step="1" title="Ile px w głąb rdzenia SAM 3.1 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px – ten sam pas co w etapach 3 / 4 / 7. Podgląd przy przeciąganiu: przerywane linie = krawędzie pasa, o którym decyduje ViTMatte (w środku pewne 1). 0–2 = twardy obrys SAM 3.1"><b id="z4InsetV"></b></label>
+          <label class="zone-slider band-out-row" id="z4OutRow">Pas na zewnątrz <input type="range" id="z4Out" min="0" max="120" step="1" title="Jak daleko poza obrys rdzenia SAM 3.1 liczy ViTMatte (px plate'u) – ten sam pas co w etapach 3 / 4 / 7. Podgląd przy przeciąganiu: przerywane linie = krawędzie pasa ViTMatte"><b id="z4OutV"></b></label>
+          <label class="zone-slider band-in-row">Wcięcie w rdzeń <input type="range" id="z4Inset" min="0" max="40" step="1" title="Ile px w głąb rdzenia SAM 3.1 oddajemy ViTMatte: pewny środek trimapy i miejsce, gdzie alfa = 1, to rdzeń zwężony o tyle px – ten sam pas co w etapach 3 / 4 / 7. Podgląd przy przeciąganiu: przerywane linie = krawędzie pasa, o którym decyduje ViTMatte (w środku pewne 1). 0–2 = twardy obrys SAM 3.1"><b id="z4InsetV"></b></label>
           <label class="zone-slider">Wtopienie wcięcia <input type="range" id="z4Feather" min="0" max="40" step="1" title="Na ilu px wynik ViTMatte przenika się z bazą (rdzeniem) przy granicach obszaru strefy – miękkie wtopienie wcięcia zamiast twardego przejścia. Działa na żywo w podglądzie (bez modelu) i przy „Zastosuj”. Domyślnie 8 px"><b id="z4FeatherV"></b></label>
-          <label class="zone-slider" id="z4OutFeatherRow">Wtopienie krawędzi zewn. <input type="range" id="z4OutFeather" min="0" max="80" step="1" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa (od strony tła) wynik strefy przechodzi w bazę – cieńsza przerywana linia na podglądzie. 0 = twarde cięcie (jak w etapach 3 / 4 / 7). Nie przelicza modelu – tylko nakładanie"><b id="z4OutFeatherV"></b></label>
+          <label class="zone-slider band-outf-row" id="z4OutFeatherRow">Wtopienie krawędzi zewn. <input type="range" id="z4OutFeather" min="0" max="80" step="1" title="Na ilu px od ZEWNĘTRZNEJ krawędzi pasa (od strony tła) wynik strefy przechodzi w bazę – cieńsza przerywana linia na podglądzie. 0 = twarde cięcie (jak w etapach 3 / 4 / 7). Nie przelicza modelu – tylko nakładanie"><b id="z4OutFeatherV"></b></label>
           <div class="zp-excl" id="z4ExclRow"><span class="muted" title="Maski innych policzonych obiektów (alpha aktywnej wersji, bez niej rdzeń) wycinane z pasa ViTMatte – zostaje tam wynik bazowy. Dla części tego samego obiektu (twarz, szyja). Obiekt z przodu (dłoń) lepiej ustawić w kolejności przed tym obiektem: holdout = alfa 0 pod nim, a ViTMatte liczy włosy aż do jego krawędzi (CLIP2_A v069 vs v067)">Wyklucz obiekty</span><div id="z4Excl" class="zp-excl-list"></div></div></div>
         <div class="zone-tune-sec" id="z4TempSec"><span class="zp-sub">Wygładzanie w czasie</span>
-          <label>Tryb<select id="z4Temporal" class="form-input" title="Wygładzanie alfy ViTMatte w czasie (cała strefa, przy „Zastosuj”). Średnia po przepływie: najpierw czerń / biel w każdej klatce, potem średnia ważona z ±promień klatek dopasowanych przepływem – śmieć z jednej klatki nie rozmazuje się na sąsiednie (CLIP2_A: −16 % / −18 % migotania)">${TEMPORAL.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></label>
-          <label class="zone-slider">Promień <input type="range" id="z4TRadius" min="1" max="6" step="1" title="Ile klatek w każdą stronę bierze wygładzanie (więcej = spokojniej, ale wolniej i większe ryzyko smużenia przy szybkim ruchu)"><b id="z4TRadiusV"></b></label>
-          <label class="chk"><input type="checkbox" id="z4TScale" title="Wygładzanie na kadrze powiększonym ×2 (cienkie kosmyki są szersze, przepływ trzyma się ich lepiej); do wyniku wraca tylko poprawka"> ×2</label></div>
+          <label>Tryb<select id="z4Temporal" class="form-input" title="Wygładzanie alfy w czasie (cała strefa, przy „Zastosuj”). Czas na strefie ~4 Mpx (sh060, 4K; mała strefa to ułamek), od najszybszego: brak ~0 s/kl. → mediana ~0,3 → średnia po przepływie ×1 ~0,5 → średnia ×2 ~1,5 → mediana po przepływie ~2,8 s/kl. Najmniej migotania: średnia po przepływie (CLIP2_A −44…−52 % z promieniem 3…5); mediana przy ruchu prawie nic nie daje. Szczegóły: pozycje listy i opis pod polem.">${TEMPORAL.map(([v, l]) => `<option value="${v}" title="${esc(TEMPORAL_HELP[v] || '')}">${l}</option>`).join('')}</select></label>
+          <div class="zp-hint" id="z4TempHint"></div>
+          <label class="zone-slider">Promień <input type="range" id="z4TRadius" min="1" max="6" step="1" title="Ile klatek w każdą stronę bierze wygładzanie. Więcej = spokojniej, ale wolniej i większe ryzyko smużenia przy szybkim ruchu. Średnia po przepływie na CLIP2_A: promień 2 −40 %, 3 −44 %, 5 −52 % migotania; promień 5 ≈ 1,5× czasu promienia 3. Kiedy: 3 domyślnie, 5 przy wolnym ruchu i mocnym migotaniu, 2 przy szybkim ruchu."><b id="z4TRadiusV"></b></label>
+          <label class="chk"><input type="checkbox" id="z4TScale" title="Wygładzanie na kadrze powiększonym ×2 (do wyniku wraca tylko poprawka). Od 2026-10-28 przepływ liczy się w rozdzielczości plate'u, więc ×1 wyszło tak samo spokojne (CLIP2_A −47 % vs −44 %) i ~3× szybsze (sh060 0,5 vs 1,5 s/kl.). Kiedy ×2: bardzo cienkie, pojedyncze kosmyki; w pozostałych przypadkach wystarczy ×1."> ×2</label></div>
         <div class="zone-tune-sec" id="z4EngSec"><span class="zp-sub">Silnik strefy</span>
           <label>Silnik<select id="zpEngine" class="form-input" title="Czym liczona jest alfa w strefie. ViTMatte = najlepsze pojedyncze kosmyki (ustawienia jak węzeł ViTMatte w Nuke'u poniżej); MatAnyone2 = spójniejsze w czasie przy rozmyciu / ruchu"><option value="vitmatte">ViTMatte</option><option value="matanyone">MatAnyone2</option><option value="auto">auto (dobór per fragment)</option><option value="clean">clean (clean plate)</option><option value="chroma">chroma</option><option value="knn">knn</option></select></label>
           <div class="zp-hint" id="zpEngHint"></div></div>
@@ -286,12 +294,11 @@
     }).join('');
   }
 
-  // group members of the selected object (parent + parts) and which of them are sure foreground of zone z
-  // (params.sure_fg; absent = the old rule: the parts are sure, the parent is matted)
+  // members of the selected group entity (PLAN_GROUP_COMPOSE) and which of them are sure foreground of zone z
+  // (params.sure_fg; absent = the members in front of the backmost one)
   function groupMembers() {
-    const all = S().objects || []; const me = all.find((o) => o.name === obj()); if (!me) return [];
-    const g = me.part_of || me.name;
-    const ms = all.filter((o) => o.name === g || o.part_of === g);
+    const all = S().objects || []; const me = all.find((o) => o.name === obj()); if (!me || me.kind !== 'group') return [];
+    const ms = all.filter((o) => o.group === me.name);
     return ms.length > 1 ? ms : [];
   }
   function sureFg(z, ms) {   // default = pipeline.group_sure_default: the members in front of the backmost one
@@ -299,13 +306,13 @@
     if (Array.isArray(sf)) return new Set(sf);
     const back = Math.max(...ms.map((o) => +o.depth_order || 0));
     const front = ms.filter((o) => (+o.depth_order || 0) < back).map((o) => o.name);
-    return new Set(front.length ? front : ms.filter((o) => o.part_of).map((o) => o.name));
+    return new Set(front);
   }
   function renderGrp(z) {
     const box = $('z4Grp'); if (!box) return;
     const ms = groupMembers(); const sure = sureFg(z, ms);
     box.innerHTML = ms.map((o) => `<label class="chk" title="${sure.has(o.name) ? 'pewny pierwszy plan – strefa go nie liczy' : 'krawędź liczy silnik strefy'}">
-      <input type="checkbox" data-sf="${esc(o.name)}" ${sure.has(o.name) ? 'checked' : ''}> ${o.part_of ? '↳ ' : ''}${esc(o.name)}</label>`).join('');
+      <input type="checkbox" data-sf="${esc(o.name)}" ${sure.has(o.name) ? 'checked' : ''}> ↳ ${esc(o.name)}</label>`).join('');
   }
   function renderList() {
     const box = $('st4Zones'); if (!box) return;
@@ -449,6 +456,7 @@
     if (out) renderExcl(z);
     const busy = (id) => document.activeElement === $(id);
     if (!busy('z4Temporal')) $('z4Temporal').value = pval(z, 'temporal');
+    $('z4TempHint').textContent = TEMPORAL_HELP[$('z4Temporal').value] || '';
     const set = (id, k, fmt) => { if (!busy(id)) $(id).value = pval(z, k); $(`${id}V`).textContent = fmt(+$(id).value); };
     set('z4TRadius', 'temporal_radius', (v) => `${v}`);
     if (!busy('z4Inset')) $('z4Inset').value = Math.max(+pval(z, 'force_core_erode_px'), +pval(z, 'fg_erode_px'));
@@ -729,9 +737,7 @@
   }
   // stage 5 opens on the band of the chosen base mask (user decision 2026-10-21): the whole-outline zone is created by
   // itself – no preview, no undo entry, no key on the lane; keys come only from band points
-  // a part (part_of) is matted with its parent's group: no zone of its own by itself
-  const wantsAutoZone = () => { const me = (S().objects || []).find((x) => x.name === obj());
-    return !!obj() && !(me && me.part_of) && !(Z.autoFailed || {})[obj()] && !Z.list.some((x) => x.criterion === 'matte'); };
+  const wantsAutoZone = () => !!obj() && !(Z.autoFailed || {})[obj()] && !Z.list.some((x) => x.criterion === 'matte');
   async function ensureOutlineZone() {
     const o = obj();
     if (!o || Z.autoBusy || Z.loadedObj !== o || !wantsAutoZone()) return;
@@ -1547,6 +1553,7 @@
       const z = activeMatte(); const h = $('z4Holdout').checked;
       if (z) patchZone(z.zone_id, { holdout: h }, h ? 'z holdoutem' : 'bez holdoutu (żółta flaga QA)'); else Z.holdout = h;
     });
+    $('z4Temporal').addEventListener('change', () => { $('z4TempHint').textContent = TEMPORAL_HELP[$('z4Temporal').value] || ''; });
     $('z4Temporal').addEventListener('change', () => patchTune({ temporal: $('z4Temporal').value }, `wygładzanie: ${$('z4Temporal').selectedOptions[0].textContent}`));
     [['z4TRadius', 'temporal_radius', (v) => `${v}`, 'promień'], ['z4Black', 'alpha_black', (v) => v.toFixed(2), 'czerń'],
      ['z4BlackAfter', 'alpha_black_after', (v) => v.toFixed(2), 'czerń po wygładzaniu'],

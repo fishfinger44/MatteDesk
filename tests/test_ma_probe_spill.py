@@ -144,3 +144,23 @@ def test_reader_off_for_mock_client_and_env(monkeypatch):
     assert refine._comfy_shared_reader(object()) is None                       # no port (mock client)
     monkeypatch.setenv("MD_SHARED_PROBE", "0")
     assert refine._comfy_shared_reader(types.SimpleNamespace(port=8001)) is None
+
+
+def test_shared_staging_without_vram_pressure_is_not_a_spill():
+    """2026-10-29: Comfy's pinned staging buffers grew "Shared Usage" by 1.7 GB while SAM 3.1 took 143 frames with
+    VRAM 4.7 / 12 GB – no spill. Only readings with the card (nearly) full count; VRAM unknown = the reading itself."""
+    from engine.sysinfo import SPILL_FREE_MB, spill_view
+    free = [{"mem_total_mb": 12288, "mem_used_mb": 4700}]
+    full = [{"mem_total_mb": 12288, "mem_used_mb": 12288 - SPILL_FREE_MB + 100}]
+    st = {}
+    s = SpillSampler(iter([spill_view(v, st, g) for v, g in ((1.0, free), (2.7, free), (1.2, free))]).__next__, interval_s=60)
+    with s:
+        s._sample(); s._sample()
+    assert s.spill_gb == 0.0
+    st = {}
+    vals = [spill_view(1.0, st, free), spill_view(3.4, st, full)]
+    s = SpillSampler(iter(vals + [3.4]).__next__, interval_s=60)
+    with s:
+        s._sample()
+    assert abs(s.spill_gb - 2.4) < 1e-9
+    assert spill_view(2.0, {}, []) == 2.0          # nvidia-smi missing: the reading itself

@@ -192,12 +192,12 @@ def test_project_summary_numbered_objects_prompts_as_typed_plates():
     a = report.secrets_of(LOCAL_CFG, st, ["Woman_01", "suknia"], app_dir=Path("C:/Programs/MatteDesk"), env=ENV)
     objs = [{"name": "Woman_01", "detect": {"type": "text", "prompts": ["Woman_01", "woman"]}, "depth_order": 0,
              "edge_mode": "auto", "tool": {"status": "core ready"}},
-            {"name": "suknia", "detect": {"type": "points"}, "part_of": "Woman_01", "depth_order": 1}]
+            {"name": "suknia", "detect": {"type": "points"}, "group": "Woman_01", "depth_order": 1}]
     pr = report.project_summary(objs, {"Woman_01": ["woman", "hair E:/tajne/x.png"], "suknia": ["dress"]},
                                 st["manifest"]["plates"], a)
     o1, o2 = pr["objects"]
     assert o1["id"] == "<obj1>" and o1["prompts"] == ["Woman_01", "woman", "hair <path>"] and o1["status"] == "core ready"
-    assert o2["id"] == "<obj2>" and o2["part_of"] == "<obj1>" and o2["prompts"] == ["dress"]
+    assert o2["id"] == "<obj2>" and o2["group"] == "<obj1>" and o2["prompts"] == ["dress"]
     assert pr["plates"] == ["beauty", "backlit", "<plate1>"]
     assert a.text("błąd w NikeLogoPass dla suknia") == "błąd w <plate1> dla <obj2>"
     pkg = report.build_package({"what": "Woman_01 gubi włosy na F21"}, version="0.34", anon=a, project=pr)

@@ -39,6 +39,7 @@ DEFAULTS: Dict[str, Any] = {
     "sam3_checkpoint": "sam3.1_multiplex_fp16.safetensors",
     "align_device": "auto",       # plate alignment: auto (GPU in ComfyUI's Python when it runs) | gpu | cpu
     "mb_device": "auto",          # motion blur of the alpha (the same GPU worker): auto | gpu | cpu
+    "gpu_idle_release_s": 180,    # engine/gpu_manager: our GPU workers unused this long are closed (0 = never)
 }
 
 PATH_KEYS = ("comfy_dir", "models_dir", "comfy_python", "ffmpeg_path", "git_path", "depth_workflow", "ltx_alpha_workflow")

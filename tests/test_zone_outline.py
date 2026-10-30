@@ -212,8 +212,9 @@ def test_zone_feather_px():
 
 def test_zone_core_view_is_the_group_core(tmp_path, monkeypatch):
     """User report 2026-10-21: the stage-5 band preview of a group (head + hand) went round the hand inside the hair –
-    it used the object's own core. view=zone_core = the core the zone is computed on: a group's members joined with the
-    seam (pipeline.preview_core, as stages 3 / 4); not a group -> the object's core."""
+    it used the object's own core. view=zone_core = the core the zone is computed on: for a group entity its
+    composition (members with the seam, PLAN_GROUP_COMPOSE); an object -> its own core (members included)."""
+    from engine import groups
     from test_zone_matte import _api_project
     app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
     own = api.get(f"/api/object/obj/frame/{start}?view=core")
@@ -221,15 +222,17 @@ def test_zone_core_view_is_the_group_core(tmp_path, monkeypatch):
     assert alone.status_code == 200 and alone.content == own.content
     store = pipe.store
     store.create("hand", ["hand"], depth_order=1)
-    store.update("hand", part_of="obj")
     cd = store.dir("hand") / "core"; cd.mkdir(parents=True)
     ys, xs = np.where(pipe.load_core("obj", [start])[start])
     m = np.zeros((shot.h, shot.w), np.uint8)
     m[int(ys.min()):int(ys.max()) + 1, int(xs.max()) + 1:min(shot.w, int(xs.max()) + 20)] = 255   # touching on the right
     for f in frames:
         cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
-    grp = api.get(f"/api/object/obj/frame/{start}?view=zone_core")
-    assert grp.status_code == 200
+    groups.create_group(store, "grp", ["obj", "hand"])
+    member = api.get(f"/api/object/obj/frame/{start}?view=zone_core")
+    assert member.content == own.content                               # a member alone: its own core
+    grp = api.get(f"/api/object/grp/frame/{start}?view=zone_core")
+    assert grp.status_code == 200, grp.text
     g = cv2.imdecode(np.frombuffer(grp.content, np.uint8), cv2.IMREAD_GRAYSCALE) > 127
     o = cv2.imdecode(np.frombuffer(own.content, np.uint8), cv2.IMREAD_GRAYSCALE) > 127
     assert g.sum() > o.sum() and (g & o).sum() >= 0.98 * o.sum()      # the object + the hand, one piece

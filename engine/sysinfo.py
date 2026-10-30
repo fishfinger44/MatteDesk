@@ -173,8 +173,27 @@ def comfy_shared_reader(client: Any) -> Optional[Callable[[], Optional[float]]]:
         v = gpu_shared_gb(state["pid"]) if state["pid"] else None
         if v is None:
             state["pid"] = None
-        return v
+            return v
+        return spill_view(v, state)
     return read
+
+
+# The "Shared Usage" counter also holds the pinned staging buffers Comfy sends frames / offloaded weights through (seen
+# 2026-10-29: ~1 GB at idle, +1.7 GB while SAM 3.1 took 143 frames, VRAM 4.7 / 12 GB) – that is not a spill. WDDM moves
+# memory to system RAM only when the card is full, so a reading counts only while free VRAM is below this.
+SPILL_FREE_MB = 1024
+
+
+def spill_view(shared_gb: float, state: Dict[str, Any], gpus: Optional[List[Dict[str, Any]]] = None) -> float:
+    """The shared reading as the spill samplers should see it: with free VRAM left on the card (> SPILL_FREE_MB on every
+    GPU nvidia-smi lists) the lowest reading seen without pressure (= no spill against the sampler's base); under
+    pressure (or VRAM unknown) the reading itself."""
+    gpus = gpu_info() if gpus is None else gpus
+    calm = bool(gpus) and all((g.get("mem_total_mb") or 0) - (g.get("mem_used_mb") or 0) > SPILL_FREE_MB for g in gpus)
+    if not calm:
+        return shared_gb
+    state["calm"] = shared_gb if state.get("calm") is None else min(state["calm"], shared_gb)
+    return state["calm"]
 
 
 class SpillSampler:

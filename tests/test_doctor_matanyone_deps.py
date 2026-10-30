@@ -72,3 +72,27 @@ def test_missing_packages_keep_install_not_restart(tmp_path, monkeypatch):
     it = {i.name: i for i in doc.run_all_checks().items}["ComfyUI-MatAnyone2"]
     assert it.status == "error" and it.action == "install_matanyone2_node"
     assert "ZRESTARTUJ" not in it.message and not (it.details or {}).get("needs_restart")
+
+
+def test_failure_cause_keeps_pips_real_error_2026_10_29():
+    """Issue 10: install.py's pip exited with code 2 (pip's own exception) and the Doctor's window showed only
+    `CalledProcessError` - the `ERROR:` lines and an exception whose name does not end in "Error" were filtered out,
+    and the output was cut to 800 characters."""
+    out = ("Collecting matanyone2\n  Cloning https://github.com/pq-yang/MatAnyone2.git\n"
+           "ERROR: Exception:\nTraceback (most recent call last):\n  File \"pip/_internal/cli/base_command.py\", line 1\n"
+           "    raise InvalidVersion(v)\n    ~~~~~~^^^\n"
+           "pip._vendor.packaging.version.InvalidVersion: Invalid version: '0.0.0-dev'\n"
+           + "x\n" * 900 +
+           "Traceback (most recent call last):\n  File \"install.py\", line 8, in <module>\n"
+           "subprocess.CalledProcessError: Command '[...]' returned non-zero exit status 2.\n")
+    cause = installer.failure_cause(out)
+    assert "ERROR: Exception:" in cause
+    assert any(l.startswith("pip._vendor.packaging.version.InvalidVersion") for l in cause)
+    assert any(l.startswith("subprocess.CalledProcessError") for l in cause)
+    assert not any(set(l) <= set("~^ ") or l.startswith(("File ", "raise ", "Traceback ")) for l in cause)
+    # the last non-empty line is always kept (an exception of any name), even without the "Error" word
+    assert installer.failure_cause("a\nb\nsomething odd happened") == ["something odd happened"]
+    # the Doctor's log keeps a long tail of the output and the step name goes to MatteDesk's log
+    log = ["X: install.py -> BŁĄD, kod 2"]
+    installer._log_failure(SimpleNamespace(returncode=2, stdout=out, stderr=""), log)
+    assert log[1].startswith("przyczyna:") and "InvalidVersion" in log[1] and len(log[2]) > 800 and log[2].endswith("exit status 2.")

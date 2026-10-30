@@ -166,31 +166,33 @@ class GpuAligner:
              on_sift: Optional[Callable[[Dict[str, str]], Dict[str, Any]]] = None) -> Dict[str, Any]:
         """One request; on_sift(dump paths) -> SIFT models when the worker asks for them. A dead worker is restarted
         and the request repeated once; "Przerwij" (cancel_check raising) kills the worker."""
-        for attempt in (0, 1):
-            try:
-                if self._proc is None or self._proc.poll() is not None:
-                    self._start()
-                self._send(req)
-                resp = self._read(cancel_check)
-                while resp.get("need_sift"):
-                    models = on_sift(resp["dump"]) if on_sift else {}
-                    self._send({"op": "sift_models", "models": {k: np.asarray(v).tolist() for k, v in models.items()}})
+        from engine.gpu_manager import GPU
+        with GPU.use(self, "wyrównanie GPU", self._kill, cancel_check):
+            for attempt in (0, 1):
+                try:
+                    if self._proc is None or self._proc.poll() is not None:
+                        self._start()
+                    self._send(req)
                     resp = self._read(cancel_check)
-            except (_WorkerDied, BrokenPipeError, OSError) as e:
-                self._kill()
-                if attempt == 0:
-                    self.restarts += 1
-                    continue
-                raise GpuWorkerError(f"worker GPU zakończył się dwa razy: {e}") from None
-            except BaseException:
-                self._kill()                    # cancelled / timed out: never leave a busy worker behind
-                raise
-            if not resp.get("ok"):
-                raise GpuWorkerError(f"worker GPU: {resp.get('error')}")
-            self.device = resp.get("device") or self.device
-            self.gpu_seconds += float(resp.get("seconds") or 0.0)
-            return resp
-        raise GpuWorkerError("worker GPU: brak odpowiedzi")
+                    while resp.get("need_sift"):
+                        models = on_sift(resp["dump"]) if on_sift else {}
+                        self._send({"op": "sift_models", "models": {k: np.asarray(v).tolist() for k, v in models.items()}})
+                        resp = self._read(cancel_check)
+                except (_WorkerDied, BrokenPipeError, OSError) as e:
+                    self._kill()
+                    if attempt == 0:
+                        self.restarts += 1
+                        continue
+                    raise GpuWorkerError(f"worker GPU zakończył się dwa razy: {e}") from None
+                except BaseException:
+                    self._kill()                    # cancelled / timed out: never leave a busy worker behind
+                    raise
+                if not resp.get("ok"):
+                    raise GpuWorkerError(f"worker GPU: {resp.get('error')}")
+                self.device = resp.get("device") or self.device
+                self.gpu_seconds += float(resp.get("seconds") or 0.0)
+                return resp
+            raise GpuWorkerError("worker GPU: brak odpowiedzi")
 
     def close(self) -> None:
         p = self._proc
@@ -261,6 +263,8 @@ def open_aligner(python: Optional[Union[str, Path]] = None, env: Optional[Dict[s
 def close_aligner(g: Optional[GpuAligner]) -> None:
     if g is not None:
         g.close()
+        from engine.gpu_manager import GPU
+        GPU.forget(g)
         if g in _OPEN:
             _OPEN.remove(g)
 

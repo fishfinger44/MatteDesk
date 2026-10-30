@@ -30,7 +30,7 @@
     { key: 'FINAL_TOUCH', id: 'final_touch', label: 'Final Touch', hint: 'Ręczne poprawki alfy pędzlem, klatka po klatce, na wybranej wersji – przed eksportem',
       desc: '<b>Co robi:</b> ręczne, poklatkowe poprawki alfy pędzlem bitmapowym (Dodaj = biel, Usuń = czerń, Zmaż = powrót do bazy; miękkość wg twardości) na <b>bazie</b> – dowolnej policzonej wersji (domyślnie wynik ostatniego etapu). Korekty są warstwą obiektu: zmiana bazy w każdej chwili, korekty zostają. Eksport domyślnie bierze bazę + korekty. Bez śledzenia – każda klatka osobno. <b>Najlepsze do:</b> ostatnich poprawek, które dziś robisz poza programem – pojedyncze złe klatki, palce, kosmyki, dziury, wycieki.' },
     { key: 'EXPORT', id: 'export', label: 'Eksport', hint: 'Maski do Nuke’a (EXR / PNG / multi-EXR) z wybranego źródła, biblioteka, kolejka',
-      desc: '<b>Co robi:</b> zapisuje SAMĄ alfę (nigdy RGB) pełnych klatek do Nuke’a z wybranego źródła: rdzeń (1+2), MatAnyone2, VideoMaMa, ViTMatte, wersja z listy, LTX-2.5 albo Final Touch (baza + ręczne korekty – domyślne, gdy obiekt ma korekty); obiekty z przodu odejmowane od tych z tyłu, części składane w &lt;obiekt&gt;_full. <b>Dostępny</b> od razu po rdzeniu z etapu 1.' },
+      desc: '<b>Co robi:</b> zapisuje SAMĄ alfę (nigdy RGB) pełnych klatek do Nuke’a z wybranego źródła: rdzeń (1+2), MatAnyone2, VideoMaMa, ViTMatte, wersja z listy, LTX-2.5 albo Final Touch (baza + ręczne korekty – domyślne, gdy obiekt ma korekty); obiekty z przodu odejmowane od tych z tyłu; grupa 🔗 = jedna warstwa (wynik całości, Final Touch albo złożenie członków); eksport = wybrany obiekt albo grupa (grupa: opcjonalnie + osobno jej włączeni członkowie). <b>Dostępny</b> od razu po rdzeniu z etapu 1.' },
   ];
   STAGES.forEach((s, i) => { s.n = i; s.d = i; });
   const ST = Object.fromEntries(STAGES.map((s) => [s.key, s.n]));   // ST.SAM3, ST.BRUSH, … – never literal numbers
@@ -51,6 +51,9 @@
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
       const det = d.detail;
+      if (det && det.code === 'work_dir_missing' && Date.now() - (S.wdMissingAt || 0) > 15000) {   // project folder vanished: one toast, not one per request
+        S.wdMissingAt = Date.now(); toast(det.detail, 10000);
+      }
       const e = new Error(det && typeof det === 'object' ? (det.detail || JSON.stringify(det)) : (det || r.statusText));
       e.status = r.status; e.detail = det; throw e;
     }
@@ -183,6 +186,9 @@
     // (user report 2026-10-26: VideoMaMa → ViTMatte quickly); the new stage's A comes back through showRun
     if (n !== prevStage && S.viewRun) { S.viewRun = null; S.cmpMode = null; S.cmpDiff = null; }
     if (n !== ST.PLATES) S.lastObjStage = n;
+    // the stage a group was last shown on (user report 2026-10-30: back from a member – which opens on its source's
+    // stage – the group stayed on the member's stage)
+    if (n !== ST.PLATES && S.obj && isGroup(objByName(S.obj))) (S.groupStage = S.groupStage || {})[S.obj] = n;
     if (CLICK_TOOLS[S.tool] && CLICK_TOOLS[S.tool] !== n) S.tool = 'none';
     if (S.tool === 'brush_erase' && n !== ST.BRUSH && n !== ST.FINAL_TOUCH) S.tool = 'none';
     if (String(S.tool).startsWith('band_') && ![ST.VITMATTE, ...BAND_STAGES()].includes(n)) S.tool = 'none';
@@ -231,7 +237,7 @@
     // the edge stages only once they have a result of their own – a version or a „👁 Podgląd klatek” preview (user rule
     // 2026-10-26, „Alpha / Comp tylko gdy wynik istnieje”: an uncomputed LTX-2.5 stage showed the SAM 3.1 core as its cut-out)
     const sr = S.info.stage_runs || {};
-    if (coreOk && [ST.SAM3, ST.BRUSH, ST.FINAL_TOUCH].includes(S.stage)) return true;
+    if (coreOk && [ST.SAM3, ST.BRUSH, ST.FINAL_TOUCH, ST.EXPORT].includes(S.stage)) return true;   // Export: its source
     const own = { [ST.MATANYONE]: () => sr.matanyone, [ST.VIDEOMAMA]: () => sr.videomama, [ST.LTX]: () => sr.ltx,
                   [ST.VITMATTE]: () => vmRunFor(vmEngine()) }[S.stage];
     if (own) {
@@ -427,13 +433,22 @@
   const overlayKey = (kind, f) => {
     const ver = kind === 'alpha' && S.viewRun ? S.viewRun : '';     // Z2: preview of another version (A/B, key B)
     const ex = kind === 'alpha' ? exportCtx() : '';
-    return `${S.obj}_${kind}${ver ? '@' + ver : ''}${ex ? '#x' : ''}_${f}`;
+    return `${S.obj}_${kind}${ver ? '@' + ver : ''}${ex ? '#x' : ''}${grpTok()}_${f}`;
   };
   const overlayUrl = (kind, f) => {
     const ver = kind === 'alpha' && S.viewRun ? S.viewRun : '';
     const ex = kind === 'alpha' ? exportCtx() : '';
-    return `/api/object/${S.obj}/frame/${f}?view=${kind}${ver ? '&v=' + ver : ''}${ex}`;
+    const t = grpTok();
+    return `/api/object/${S.obj}/frame/${f}?view=${kind}${ver ? '&v=' + ver : ''}${ex}${t ? '&g=' + encodeURIComponent(t) : ''}`;
   };
+  // the selected group's core layer = its composition: seam / „Do grupy z:” / members change it, so they are part of the
+  // overlay key (user report 2026-10-29: the seam slider changed nothing – the cached composition stayed on screen)
+  function grpTok() {
+    const o = objByName(S.obj); if (!isGroup(o)) return '';
+    const ms = ((o.group_info || {}).members || []).map((m) => `${m.member}:${m.source}:${m.run || ''}:${m.on === false ? 0 : 1}:${m.seam_own ? m.seam_px : ''}`).join(',');
+    return `~s${seamOf(S.obj)}h${hashStr(ms)}`;
+  }
+  const hashStr = (s) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
   function overlayFor(kind, f) {
     // kind: core | alpha | key | preview | zone_* … Returns Image (complete), 'missing', or null (loading)
     return loadOverlay(overlayKey(kind, f), overlayUrl(kind, f));
@@ -444,7 +459,7 @@
   const coreView = () => S.view === 'core' || (S.view === 'none' && (S.stage === ST.SAM3 || S.stage === ST.BRUSH));
   // Alpha / Comp in a stage with its own mask = exactly the mask of the stage (matteFor; user report 2026-10-22)
   const stageMaskView = () => !!(S.obj && !S.auxMode && !S.viewRun && (S.view === 'alpha' || S.view === 'comp')
-    && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH].includes(S.stage));
+    && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH, ST.EXPORT].includes(S.stage));
   function neededLayer() {   // the overlay layer the current view draws (null = none)
     if (!S.obj || S.auxMode) return null;
     if (S.view === 'alpha' || S.view === 'comp') return 'alpha';
@@ -463,6 +478,7 @@
     const whole = (src, v = '') => ({ key: wholeKey(sw, f, src, v, S.obj), url: wholeUrl(sw, f, src, v, S.obj) });
     if (stageMaskView()) {
       const has12 = S.info && S.info.has && S.info.has.core_fix;
+      if (S.stage === ST.EXPORT) return null;   // the chosen export source, made per frame (matteFor)
       if (S.stage === ST.SAM3) return sw ? whole('core') : ov(keyOf(f) ? 'key' : 'core');
       if (S.stage === ST.BRUSH) return sw ? whole(has12 ? 'core_fix' : 'core') : ov(coreKind(f));
       if (S.stage === ST.FINAL_TOUCH) return null;
@@ -554,12 +570,12 @@
   function overlayTile(kind, f, c) {
     const ver = kind === 'alpha' && S.viewRun ? S.viewRun : '';
     const ex = kind === 'alpha' ? exportCtx() : '';
-    const key = `${S.obj}_${kind}${ver ? '@' + ver : ''}${ex ? '#x' : ''}_tile_${c.x}_${c.y}_${c.w}_${c.h}_${f}`;
+    const key = `${S.obj}_${kind}${ver ? '@' + ver : ''}${ex ? '#x' : ''}${grpTok()}_tile_${c.x}_${c.y}_${c.w}_${c.h}_${f}`;
     if (!S.overlay[key]) {
       const tiles = Object.keys(S.overlay).filter((k) => k.includes('_tile_'));
       for (const k of tiles.slice(0, Math.max(0, tiles.length + 1 - TILE_OVERLAYS_MAX))) delete S.overlay[k];
     }
-    return loadOverlay(key, `/api/object/${S.obj}/frame/${f}/tile?view=${kind}&x=${c.x}&y=${c.y}&w=${c.w}&h=${c.h}${ver ? '&v=' + ver : ''}${ex}`);
+    return loadOverlay(key, `/api/object/${S.obj}/frame/${f}/tile?view=${kind}&x=${c.x}&y=${c.y}&w=${c.w}&h=${c.h}${ver ? '&v=' + ver : ''}${ex}${grpTok() ? '&g=' + encodeURIComponent(grpTok()) : ''}`);
   }
   // tiles of a mask for the active plate-tile region: the list of {chunk, img} when EVERY chunk is loaded, else null
   // (the proxy overlay is drawn meanwhile; the loads are started here)
@@ -576,17 +592,31 @@
   }
   // comp background (user decision 2026-10-22): the target background BG when the project has one, else green; V cycles
   const GREEN = '#00b140';
-  const BGS = ['bg', GREEN, '#000000', '#ffffff', '#767676', 'checker', 'pick'];
   const BG_LABEL = { bg: 'BG (tło docelowe)', [GREEN]: 'zielone', '#000000': 'czarne', '#ffffff': 'białe', '#767676': 'szare 18 %', checker: 'szachownica' };
   const hasBgPlate = () => !!(V() && V()._bgPattern);
-  const compBgName = () => (BGS[S.bg] === 'bg' && !hasBgPlate() ? GREEN : BGS[S.bg]);
-  function nextCompBg() {
-    let i = BGS[S.bg] === 'bg' && !hasBgPlate() ? BGS.indexOf(GREEN) : S.bg;
-    do { i = (i + 1) % BGS.length; } while (BGS[i] === 'bg' && !hasBgPlate());
-    S.bg = i;
-    const b = BGS[i];
-    return b === 'pick' ? S.pickColor : BG_LABEL[b] || b;
+  // the Comp view's background = the compare bar's choice (user decision 2026-10-30, one background everywhere): a colour /
+  // checker picked as the compare reference wins; otherwise the BG plate when the shot has one; otherwise the compare
+  // bar's colour / checker. The MergeMatte preview (static/mergematte.js) gets the same spec.
+  function compBgName() {
+    const c = V() && V().compare; if (!c) return GREEN;
+    const own = c.bg.checker ? 'checker' : c.bg.color;
+    return c.ref === '__color' ? own : hasBgPlate() ? 'bg' : own;
   }
+  const BG_CYCLE = [GREEN, '#000000', '#ffffff', '#767676', 'checker'];
+  function nextCompBg() {   // V: the next colour / checker of the compare bar (the same background as its picker)
+    const v = V(), c = v.compare.bg;
+    const cur = c.checker ? 'checker' : String(c.color).toLowerCase();
+    const n = BG_CYCLE[(BG_CYCLE.indexOf(cur) + 1) % BG_CYCLE.length];
+    if (n === 'checker') c.checker = true; else { c.checker = false; c.color = n; }
+    try { localStorage.setItem('md_cmp_bg', JSON.stringify(c)); } catch (e) { /* no storage */ }
+    if (v.syncCompareUi) v.syncCompareUi();
+    return (BG_LABEL[n] || n) + (compBgName() === 'bg' ? ' (teraz widać BG plate – kolor jako tło wybierz w porównaniu)' : '');
+  }
+  // the comp background as the MergeMatte preview names it ("#rrggbb" | "checker" | "bg")
+  const compBgSpec = () => compBgName();
+  // stage Final Touch, palette „MergeMatte” on: its preview over the Comp view too, not only over „Na tle” (user report
+  // 2026-10-30: sliders changed nothing in Comp) – static/mergematte.js decides whether it applies
+  const mmOver = (ctx, img) => { if (window.MD_MM && window.MD_MM.ready) window.MD_MM.drawOver(ctx, img, compBgSpec()); };
   function compCanvas(img, ov, key, f) {
     let bg = compBgName(), bgImg = null;
     if (bg === 'bg') {   // the BG frame of this frame; green until it arrives (or when it cannot be read)
@@ -597,20 +627,20 @@
         bg = GREEN;
       }
     }
-    const ck = `${key}_${bgImg ? 'bg' : bg}_${S.pickColor}`;
+    const ck = `${key}_${bgImg ? 'bg' : bg}`;
     if (S.compCache[ck]) return S.compCache[ck];
     const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
     const g = c.getContext('2d');
     if (bgImg) g.drawImage(bgImg, 0, 0, c.width, c.height);
     else if (bg === 'checker') { for (let y = 0; y < c.height; y += 16) for (let x = 0; x < c.width; x += 16) { g.fillStyle = ((x + y) / 16) % 2 ? '#999' : '#666'; g.fillRect(x, y, 16, 16); } }
-    else { g.fillStyle = bg === 'pick' ? S.pickColor : bg; g.fillRect(0, 0, c.width, c.height); }
+    else { g.fillStyle = bg; g.fillRect(0, 0, c.width, c.height); }
     const gc = window.mdGpu && mdGpu.comp(img, ov, c, c.width, c.height);   // same pixels on the GPU, else the loop below
     if (gc) { putComp(ck, gc); return gc; }
     const b = g.getImageData(0, 0, c.width, c.height);
     const t = document.createElement('canvas'); t.width = img.width; t.height = img.height;
     const tg = t.getContext('2d'); tg.drawImage(img, 0, 0); const p = tg.getImageData(0, 0, t.width, t.height);
     tg.clearRect(0, 0, t.width, t.height); tg.drawImage(ov, 0, 0, t.width, t.height); const a = tg.getImageData(0, 0, t.width, t.height);
-    for (let i = 0; i < b.data.length; i += 4) { const al = a.data[i] / 255; for (let k = 0; k < 3; k++) b.data[i + k] = p.data[i + k] * al + b.data[i + k] * (1 - al); }
+    window.mdLinComp(p.data, a.data, b.data);   // linear-light over, the same as the GPU shader (gpu_overlay.js)
     g.putImageData(b, 0, 0);
     putComp(ck, c);
     return c;
@@ -635,22 +665,32 @@
   function syncOverlayStyleUi() {
     const box = $('overlayStyle'); if (!box) return;
     const layer = overlayLayer();
-    if (layer === S._ovsUiLayer) return;
-    S._ovsUiLayer = layer;
+    const uk = layer ? `${layer}|${S.obj}|${layerColor(layer)}` : null;   // the colour follows the selected object
+    if (uk === S._ovsUiLayer) return;
+    S._ovsUiLayer = uk;
     box.classList.toggle('disabled', !layer);
     $('ovsLayer').textContent = layer ? OVS_LABEL[layer] : '—';
     ['ovsColor', 'ovsOpacity', 'ovsLine'].forEach((id) => { $(id).disabled = !layer; });
     if (!layer) { box.title = 'Brak nakładki w tym widoku (Rdzeń / Alpha albo etap 1 z kluczem)'; return; }
     const st = S.ovs[layer];
     box.title = `Wygląd nakładki: ${OVS_LABEL[layer]} – zapamiętany w przeglądarce`;
-    $('ovsColor').value = st.c; $('ovsOpacity').value = st.o; $('ovsOpacityVal').textContent = `${st.o}%`;
+    $('ovsColor').value = layerColor(layer); $('ovsOpacity').value = st.o; $('ovsOpacityVal').textContent = `${st.o}%`;
     $('ovsLine').textContent = st.line ? '◻' : '▣';
     $('ovsLine').title = st.line ? 'Sam kontur (kliknij: wypełnienie)' : 'Wypełnienie (kliknij: sam kontur)';
   }
+  // a colour picker dragged: many `input` events – the view redrawn at most once per screen frame (user report 2026-10-29)
+  let liveRaf = 0;
+  const liveRender = () => { if (!liveRaf) liveRaf = requestAnimationFrame(() => { liveRaf = 0; if (V()) V().render(); }); };
   function wireOverlayStyle() {
     if (!$('overlayStyle')) return;
     const cur = () => { const l = overlayLayer(); return l ? S.ovs[l] : null; };
-    $('ovsColor').addEventListener('input', (e) => { const st = cur(); if (!st) return; st.c = e.target.value; saveOvs(); V().render(); });
+    $('ovsColor').addEventListener('input', (e) => {
+      const l = overlayLayer(), st = cur(); if (!st) return;
+      if (S.obj && (l === 'core' || l === 'alpha')) otherStyle(objByName(S.obj) || { name: S.obj }).c = e.target.value;
+      else st.c = e.target.value;
+      liveRender();   // dragging through the picker: one redraw per screen frame; saved when it closes
+    });
+    $('ovsColor').addEventListener('change', () => { saveOvs(); saveOthersCfg(); renderOthersPanel(); V().render(); });
     $('ovsOpacity').addEventListener('input', (e) => {
       const st = cur(); if (!st) return; st.o = +e.target.value; $('ovsOpacityVal').textContent = `${st.o}%`; saveOvs(); V().render();
     });
@@ -695,22 +735,44 @@
     return c;
   }
   const alphaBw = () => S.view === 'alpha' && !!S.obj && !S.auxMode;
+  // core / alpha of the selected object = its own colour (palette row); the key layer keeps its own (pink)
+  const layerColor = (layer) => (S.obj && (layer === 'core' || layer === 'alpha') ? objColor(S.obj) : S.ovs[layer].c);
+  // brush strokes as ONE flat layer: drawn opaque on a scratch canvas with the view's transform, then laid over the view
+  // once with `alpha` – overlapping strokes no longer add up to a darker, "more opaque" look (user report 2026-10-30)
+  function flatDraw(ctx, alpha, fn) {
+    const c = ctx.canvas;
+    const off = S.flatCanvas || (S.flatCanvas = document.createElement('canvas'));
+    if (off.width !== c.width || off.height !== c.height) { off.width = c.width; off.height = c.height; }
+    const g = off.getContext('2d');
+    g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = 'source-over'; g.clearRect(0, 0, off.width, off.height);
+    g.setTransform(ctx.getTransform());
+    fn(g);
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = alpha; ctx.drawImage(off, 0, 0); ctx.restore();
+  }
+  function strokeOnto(g, st, k) {   // one brush stroke (fillStyle / strokeStyle set by the caller)
+    if (st.p.some((q) => q.length >= 3)) { drawVarStroke(g, st.p, k, st.radius_px); return; }   // Z23: radius per point (pen)
+    g.lineWidth = 2 * st.radius_px * k; g.lineCap = 'round'; g.lineJoin = 'round';
+    g.beginPath(); st.p.forEach((q, i) => (i ? g.lineTo(q[0] * k, q[1] * k) : g.moveTo(q[0] * k, q[1] * k)));
+    if (st.p.length === 1) g.lineTo(st.p[0][0] * k + 0.01, st.p[0][1] * k);
+    g.stroke();
+  }
   function drawTinted(ctx, ov, layer, cacheKey, w, h, x = 0, y = 0) {
     if (layer === 'alpha' && alphaBw()) { ctx.drawImage(bwCanvas(ov, cacheKey), x, y, w, h); return; }
     const st = S.ovs[layer];
+    const col = layerColor(layer);
     const prev = ctx.globalAlpha;
     ctx.globalAlpha = st.line ? Math.max(st.o, 60) / 100 : st.o / 100;   // an outline below 60 % is hard to see
-    try { ctx.drawImage(tintCanvas(ov, hexRgb(st.c), cacheKey, st.line), x, y, w, h); } finally { ctx.globalAlpha = prev; }
+    try { ctx.drawImage(tintCanvas(ov, hexRgb(col), cacheKey, st.line), x, y, w, h); } finally { ctx.globalAlpha = prev; }
   }
   // Z8: the mask layer at plate resolution on the plate-tile chunks (when all are loaded), else the proxy overlay `ov`
   function drawLayer(ctx, kind, ov, layer, f, img) {
     const T = S.view !== 'comp' ? tileOverlays(kind, f) : null;
     if (T) {
       const kp = T.reg.kp;
-      for (const { c, img: t } of T.tiles) drawTinted(ctx, t, layer, `${S.obj}_${kind}_tile_${c.x}_${c.y}_${c.w}_${c.h}_${f}`, c.w / kp, c.h / kp, c.x / kp, c.y / kp);
+      for (const { c, img: t } of T.tiles) drawTinted(ctx, t, layer, `${S.obj}_${kind}${grpTok()}_tile_${c.x}_${c.y}_${c.w}_${c.h}_${f}`, c.w / kp, c.h / kp, c.x / kp, c.y / kp);
       return;
     }
-    if (ov) drawTinted(ctx, ov, layer, `${S.obj}_${kind}${S.viewRun && kind === 'alpha' ? '@' + S.viewRun : ''}_${f}`, img.width, img.height);
+    if (ov) drawTinted(ctx, ov, layer, `${S.obj}_${kind}${S.viewRun && kind === 'alpha' ? '@' + S.viewRun : ''}${grpTok()}_${f}`, img.width, img.height);
   }
   // ---- other computed objects as extra overlay layers (user idea 2026-10-15): own colour, opacity, on/off per object;
   // alpha of the active version, else the core. Kept in localStorage per object name; drawn under the selected object.
@@ -720,75 +782,80 @@
     if (!S.othersCfg) {
       let saved = {};
       try { saved = JSON.parse(localStorage.getItem('md_other_layers') || '{}') || {}; } catch (e) { saved = {}; }
-      S.othersCfg = { on: saved.on !== false, open: saved.open !== false, per: saved.per || {}, pos: saved.pos || null };
+      S.othersCfg = { on: saved.on !== false, open: saved.open !== false, per: saved.per || {}, pos: saved.pos || null, fold: saved.fold || {} };
     }
     return S.othersCfg;
   }
   function saveOthersCfg() { try { localStorage.setItem('md_other_layers', JSON.stringify(S.othersCfg)); } catch (e) { /* storage blocked */ } }
   const otherKind = (o) => (o.has && o.has.final ? 'alpha' : 'core');
-  function otherObjs() {   // computed objects other than the selected one, depth order
-    return (S.objects || []).filter((o) => o.name !== S.obj && o.has && (o.has.final || o.has.core));
+  function otherObjs() {   // computed objects other than the selected one, depth order (a group = its members, drawn as themselves)
+    return (S.objects || []).filter((o) => o.name !== S.obj && !isGroup(o) && o.has && (o.has.final || o.has.core));
+  }
+  // a selected group shows only its own overlay (the composition), not its members (user request 2026-10-29)
+  function inSelGroup(name) {
+    const sel = objByName(S.obj);
+    return isGroup(sel) && ((sel.group_info || {}).members || []).some((m) => m.member === name);
+  }
+  const drawnOthers = () => otherObjs().filter((o) => !inSelGroup(o.name));
+  // a new object / group gets a colour no other one has (user request 2026-10-29): an unused one of OTHER_COLORS picked
+  // at random, then a random hue as far as possible from the hues in use
+  function freshColor(used) {
+    const free = OTHER_COLORS.filter((c) => !used.has(c) && !Object.values(OVS_DEFAULT).some((d) => d.c === c));
+    if (free.length) return free[Math.floor(Math.random() * free.length)];
+    const hue = (c) => { const [r, g, b] = hexRgb(c).map((x) => x / 255), mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+      if (!d) return -1; const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; return (h * 60 + 360) % 360; };
+    const hs = [...used].map(hue).filter((h) => h >= 0);
+    let best = Math.random() * 360, bestD = -1;
+    for (let i = 0; i < 36; i++) {
+      const h = Math.random() * 360, dd = hs.length ? Math.min(...hs.map((x) => Math.min(Math.abs(x - h), 360 - Math.abs(x - h)))) : 180;
+      if (dd > bestD) { bestD = dd; best = h; }
+    }
+    const f = (n) => { const k = (n + best / 30) % 12, a = 0.85 * Math.min(0.55, 1 - 0.55); return Math.round(255 * (0.55 - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))).toString(16).padStart(2, '0'); };
+    return `#${f(0)}${f(8)}${f(4)}`;
   }
   function otherStyle(o) {
     const cfg = othersCfg();
     if (!cfg.per[o.name]) {
       const used = new Set(Object.values(cfg.per).map((x) => x.c));
-      cfg.per[o.name] = { c: OTHER_COLORS.find((c) => !used.has(c)) || OTHER_COLORS[0], o: 40, vis: true };
+      cfg.per[o.name] = { c: freshColor(used), o: 40, vis: true };
       saveOthersCfg();   // the colour stays the same when the selection changes
     }
     return cfg.per[o.name];
   }
+  // the selected object / group is drawn in ITS colour (the one of its palette row), not one colour for every object
+  const objColor = (name) => otherStyle(objByName(name) || { name }).c;
   const othersVisibleIn = () => S.view === 'none' || S.view === 'core' || S.view === 'alpha';
   function otherOverlay(o, f) {   // same cache key / URL as overlayFor() when that object is selected (no version / export)
     const kind = otherKind(o);
     return loadOverlay(`${o.name}_${kind}_${f}`, `/api/object/${encodeURIComponent(o.name)}/frame/${f}?view=${kind}`);
   }
-  // Linked objects (parent + parts, user request 2026-10-15) are ONE layer in the view: the whole as the export assembles
-  // <parent>_full (GET …/frame/f?view=full – the contact seam filled with the parent's part_seam_px), in one colour /
-  // opacity (the parts inherit the parent's); the filled seam shows in the same colour. Selected group: its look.
+  // Groups (PLAN_GROUP_COMPOSE, user decisions 2026-10-29): a group is its own entry of the palette (kind "group",
+  // `group_info` = members, „Do grupy z:”, seam, whole results); members compute on their own and are drawn as
+  // themselves. Selecting the group opens its stages (the whole recompute, band, Final Touch) like an object.
   const objByName = (n) => (S.objects || []).find((x) => x.name === n);
-  function groupOf(name) {
+  const isGroup = (o) => !!(o && o.kind === 'group');
+  function groupOf(name) {   // the group entity of a member, or the group itself
     const o = objByName(name); if (!o) return null;
-    const p = o.part_of || o.name;
-    return (S.objects || []).some((x) => x.part_of === p) ? p : null;
+    return isGroup(o) ? o.name : (o.group || null);
   }
-  const selGroup = () => (S.obj ? groupOf(S.obj) : null);
+  const selGroup = () => null;   // no whole drawn for the selected object: it shows its own layers (a group: its own)
   function seamOf(p) {
-    const v = (objByName(p) || {}).part_seam_px;
+    const v = (objByName(p) || {}).seam_px;
     return v === undefined || v === null || !Number.isFinite(+v) ? 4 : Math.max(0, Math.min(40, Math.round(+v)));
   }
-  // src = the layer of the view (alpha | core | core_fix), v = the version shown (comparison) of the selected object only –
-  // otherwise the Rdzeń / maska 1+2 / Alpha views of a linked object were the same picture (bug 2026-10-15)
-  const wholeKey = (p, f, src = 'alpha', v = '', who = p) => `${p}_full_s${seamOf(p)}${src !== 'alpha' ? '_' + src : ''}${v ? '@' + who + ':' + v : ''}_${f}`;
-  const wholeUrl = (p, f, src = 'alpha', v = '', who = p) =>
-    `/api/object/${encodeURIComponent(v ? who : p)}/frame/${f}?view=full&s=${seamOf(p)}&src=${src}${v ? '&v=' + v : ''}`;
-  const wholeOverlay = (p, f, src = 'alpha', v = '', who = p) => loadOverlay(wholeKey(p, f, src, v, who), wholeUrl(p, f, src, v, who));
+  // the composition of a group (members' „Do grupy z:” alphas + seams) – GET /api/group/{g}/frame/{f}
+  const wholeKey = (p, f) => `${p}_grp_s${seamOf(p)}_${f}`;
+  const wholeUrl = (p, f) => `/api/group/${encodeURIComponent(p)}/frame/${f}?s=${seamOf(p)}`;
+  const wholeOverlay = (p, f) => loadOverlay(wholeKey(p, f), wholeUrl(p, f));
   // the whole of the selected group in the current view: core view = the core (stage 2: the mask 1+2), alpha = the version shown
   const selWholeSrc = () => (coreView() ? (S.stage === ST.BRUSH && S.info && S.info.has && S.info.has.core_fix ? 'core_fix' : 'core') : 'alpha');
   function ensureOthers(f) {
     const cfg = othersCfg(); if (!cfg.on || !othersVisibleIn()) return;
-    const sel = selGroup();
-    for (const o of otherObjs()) {
-      const g = groupOf(o.name);
-      if (g) { if (g !== sel && otherStyle(objByName(g) || o).vis) wholeOverlay(g, f); continue; }
-      if (otherStyle(o).vis) otherOverlay(o, f);
-    }
+    for (const o of drawnOthers()) if (otherStyle(o).vis) otherOverlay(o, f);
   }
   function drawOthers(ctx, img, f) {
     const cfg = othersCfg(); if (!cfg.on || !othersVisibleIn()) return;
-    const sel = selGroup(), done = new Set();
-    for (const o of otherObjs().slice().reverse()) {   // farthest first, the one closest to the camera on top
-      const g = groupOf(o.name);
-      if (g) {   // a linked group: drawn once, as its whole, in the parent's colour (the selected group: drawOverlay)
-        if (g === sel || done.has(g)) continue;
-        done.add(g);
-        const gs = otherStyle(objByName(g) || o); if (!gs.vis || gs.o <= 0) continue;
-        const ov = wholeOverlay(g, f); if (!ov || ov === 'missing') continue;
-        const pa = ctx.globalAlpha; ctx.globalAlpha = gs.o / 100;
-        try { ctx.drawImage(tintCanvas(ov, hexRgb(gs.c), wholeKey(g, f), false), 0, 0, img.width, img.height); }
-        finally { ctx.globalAlpha = pa; }
-        continue;
-      }
+    for (const o of drawnOthers().slice().reverse()) {   // farthest first, the one closest to the camera on top
       const st = otherStyle(o); if (!st.vis || st.o <= 0) continue;
       const ov = otherOverlay(o, f); if (!ov || ov === 'missing') continue;
       const pa = ctx.globalAlpha; ctx.globalAlpha = st.o / 100;
@@ -838,18 +905,49 @@
   const othersPos = { get: () => othersCfg().pos, set: (p) => { othersCfg().pos = p; saveOthersCfg(); } };
   function placeOthersPanel(box, w) { placeFloating(box, w, othersCfg().pos); }
   // Layers panel (user request 2026-10-15, "like Photoshop"): ALL objects in depth order (top = closest to the camera),
-  // the selected one highlighted. Click = select; drag onto the middle of a row = part of that object, onto its upper /
-  // lower edge = depth order; eye / colour / opacity = the mask of the other computed objects drawn under the selected one.
-  // seam of a linked group, under its last member: the gap between the parts' masks up to ~2 x this is filled (preview in
-  // the group's colour = what <parent>_full exports)
-  function seamRow(o, all, st) {
-    const g = groupOf(o.name); if (!g) return '';
-    const ms = all.filter((x) => x.name === g || x.part_of === g);
-    if (ms[ms.length - 1].name !== o.name) return '';
+  // the selected one highlighted, groups 🔗 with their members under them. Click = select; drag onto a group row = into
+  // the group, onto the middle of an object = a new group, onto the upper / lower edge = depth order; eye / colour /
+  // opacity = the mask of the other computed objects drawn under the selected one.
+  function seamRow(g) {   // under the last member of a group: the seam of its composition (↻ on its whole recompute)
     const sv = seamOf(g);
-    const col = g === selGroup() ? (S.ovs[S.view === 'alpha' ? 'alpha' : 'core'] || {}).c : (st && st.c);
-    return `<div class="ol-seam" data-p="${esc(g)}" title="Szew grupy „${esc(g)}”: szczelina między maskami połączonych obiektów do ~2 × tej wartości jest zalewana (zewnętrzny obrys bez zmian). Podgląd w kolorze grupy; ten sam szew ma eksport ${esc(g)}_full">
-        <span class="ol-seam-l"><i style="background:${col || '#888'}"></i>szew ${esc(g)}</span><input type="range" class="ol-seam-r" min="0" max="40" step="1" value="${sv}"><span class="ol-seam-v">${sv} px</span></div>`;
+    return `<div class="ol-seam" data-p="${esc(g)}" title="Szew grupy „${esc(g)}”: szczelina między maskami członków do ~2 × tej wartości jest zalewana w złożeniu grupy (zewnętrzny obrys bez zmian). Zmiana = ↻ na przeliczeniu całości">
+        <span class="ol-seam-l">⟷ szew</span><input type="range" class="ol-seam-r" min="0" max="40" step="1" value="${sv}"><span class="ol-seam-v">${sv} px</span></div>`;
+  }
+  const SRC_LABEL = { core: 'Core (maska 1+2)', matanyone: 'MatAnyone2', videomama: 'VideoMaMa', vitmatte: 'ViTMatte', ltx: 'LTX-2.5', version: 'wersja', final_touch: 'Final Touch' };
+  function memberInfo(o) {   // this member's entry in its group's payload (what it brings, what it can pick)
+    const g = objByName(o.group); const gi = g && g.group_info;
+    return gi ? (gi.members || []).find((m) => m.member === o.name) || null : null;
+  }
+  // stage 5 named after the engine of the member's result (BiRefNet / ViTMatte, server field `engine`)
+  function srcLabel(mi, source) {
+    const a = (mi.available || []).find((x) => x.source === source);
+    return source === 'vitmatte' && a && a.engine ? EDGE_ENGINE_LABEL[a.engine] || a.engine : SRC_LABEL[source] || source;
+  }
+  function srcSelect(o) {   // „Do grupy z:” – only the results computed for this object; ↻ = stale; no result = the reason
+    const mi = memberInfo(o); if (!mi) return '';
+    const opts = (mi.available || []).map((a) => `<option value="${a.source}" ${a.source === mi.source ? 'selected' : ''}>${srcLabel(mi, a.source)}${a.valid ? '' : ' ↻'}</option>`);
+    if (!(mi.available || []).some((a) => a.source === mi.source)) opts.unshift(`<option value="${esc(mi.source)}" selected>${srcLabel(mi, mi.source)}${mi.run ? ` ${esc(mi.run)}` : ' – brak'}</option>`);
+    const tip = mi.why ? `${mi.why}` : `Do złożenia grupy „${o.group}” idzie ${srcLabel(mi, mi.source)}${mi.run && mi.run !== 'core' ? ` (${mi.run})` : ''}`;
+    return `<select class="ol-src ${mi.run ? (mi.valid ? '' : 'stale') : 'missing'}" title="Do grupy z: ${esc(tip)}">${opts.join('')}</select>`;
+  }
+  // a group folded in the palette (▸): its members and seam hidden (user request 2026-10-29), kept in md_other_layers
+  const grpFolded = (g) => !!(othersCfg().fold || {})[g];
+  // a member's own seam reach (user decision 2026-10-29: hair small, a dress large) next to „Do grupy z:” – dimmed while
+  // it follows the group's seam; double click = back to the group's seam
+  function memberSeam(o) {
+    const mi = memberInfo(o); if (!mi) return '';
+    const v = mi.seam_px != null ? mi.seam_px : seamOf(o.group);
+    return `<span class="ol-mseam${mi.seam_own ? '' : ' inherit'}" title="Zasięg szwu ${esc(o.name)}: ${v} px${mi.seam_own ? '' : ' (jak szew grupy)'} – szczelina między nim a innym członkiem jest zalewana do ~(jego zasięg + zasięg sąsiada) px; mały dla włosów (prześwity przy twarzy zostają), duży dla sukni (zamyka szczelinę na styku). Dwuklik = jak szew grupy. Zmiana = ↻ na przeliczeniu całości"><input type="range" class="ol-mseam-r" min="0" max="40" step="1" value="${v}" title="Zasięg szwu ${esc(o.name)} (px)"><b>${v}</b></span>`;
+  }
+  // depth order of the palette with every group's members right under it (a member at another depth stays in its group)
+  function paletteOrder(all) {
+    const out = [], seen = new Set();
+    for (const o of all) {
+      if (seen.has(o.name) || (o.group && objByName(o.group))) continue;
+      out.push(o); seen.add(o.name);
+      if (isGroup(o) && !grpFolded(o.name)) for (const m of ((o.group_info || {}).members || [])) { const mo = objByName(m.member); if (mo) { out.push(mo); seen.add(mo.name); } }
+    }
+    return out;
   }
   function renderOthersPanel() {
     const w = $('canvasWrapper'); if (!w) return;
@@ -864,62 +962,151 @@
     box.style.display = '';
     const cfg = othersCfg();
     const computed = new Set(otherObjs().map((o) => o.name));
-    const grpHas = (g) => all.some((x) => (x.name === g || x.part_of === g) && computed.has(x.name));
     box.innerHTML = `<div class="ol-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)">
         <span class="ol-grip">⠿</span>
-        <span class="ol-title">Obiekty (${all.length})</span>
+        <span class="ol-title">Obiekty (${all.filter((o) => !isGroup(o)).length})</span>
         <label class="ol-all" title="Pokaż maski innych policzonych obiektów (pod maską wybranego obiektu; w widoku Comp ukryte)">
           <input type="checkbox" id="olAll" ${cfg.on ? 'checked' : ''} title="Włącz / wyłącz maski innych obiektów na podglądzie"> maski innych</label>
         <button type="button" class="ol-btn" id="olNew" title="Nowy obiekt">＋</button>
+        <button type="button" class="ol-btn" id="olNewGrp" title="Nowa grupa – potem przeciągnij do niej obiekty (albo przeciągnij obiekt na środek innego)">🔗</button>
         <button type="button" class="ol-fold" id="olFold" title="${cfg.open ? 'Zwiń listę' : 'Rozwiń listę'}">${cfg.open ? '▾' : '▸'}</button>
-      </div>` + (cfg.open ? all.map((o) => {
-        const cur = o.name === S.obj, g = groupOf(o.name);
-        const has = g ? grpHas(g) : computed.has(o.name);
-        const st = has ? otherStyle(g ? (objByName(g) || o) : o) : null;
-        const inherit = !!(g && o.name !== g);      // a part: colour / opacity of its parent (one layer)
-        const selIn = !!(g && g === selGroup());    // the selected group: drawn in the top bar's look
+      </div>` + (cfg.open ? paletteOrder(all).map((o) => {
+        const cur = o.name === S.obj;
+        // a member of a group: switched on / off in the group's composition for now (user decision 2026-10-29); the
+        // export takes the selected object / group (stage Eksport), not checkboxes
+        const mOn = o.group ? (memberInfo(o) || {}).on !== false : true;
+        const exp = o.group && !isGroup(o)
+          ? `<input type="checkbox" class="ol-on" ${mOn ? 'checked' : ''} title="${mOn ? 'W złożeniu grupy' : 'Wyłączony z grupy'} „${esc(o.group)}” – odznacz, żeby na chwilę wyjąć obiekt z alphy grupy (i jej podglądu); zostaje członkiem">`
+          : '<span></span>';
+        if (isGroup(o)) {   // the group entry: its stages open on click; seam under its last member; 🗑 = ungroup
+          const gi = o.group_info || {}, n = (gi.members || []).length;
+          const whole = (gi.whole_results || []).length ? ` · całość: ${gi.whole_results.join(', ')}` : '';
+          const fold = grpFolded(o.name);
+          return `<div class="ol-row grp grp-head ${cur ? 'cur' : ''}" data-o="${esc(o.name)}" data-group="1" title="Grupa „${esc(o.name)}”: klik = jej etapy (przeliczenie całości, pas, Final Touch) · przeciągnij obiekt na ten wiersz = dodaj do grupy">
+            <button type="button" class="ol-gfold" title="${fold ? 'Rozwiń grupę (pokaż członków)' : 'Zwiń grupę (ukryj członków)'}">${fold ? '▸' : '▾'}</button>${exp}<input type="color" class="ol-color" value="${otherStyle(o).c}" title="Kolor nakładki grupy „${esc(o.name)}” (gdy grupa jest wybrana)"><span class="ol-name">🔗 ${esc(o.name)}</span><span class="ol-status">członkowie: ${n}${esc(whole)}</span>
+            <button type="button" class="ol-del" title="Rozgrupuj „${esc(o.name)}” (członkowie zostają z wynikami; wynik całości → kosz projektu)">🗑</button></div>` + (n && !fold ? '' : seamRow(o.name));
+        }
+        const g = o.group || null;
+        const has = computed.has(o.name);
+        const st = has ? otherStyle(o) : null;
+        const inherit = false, selIn = false;
         const kind = has && otherKind(o) === 'core' ? ' <i>(rdzeń)</i>' : '';
-        const name = `<span class="ol-name">${o.part_of ? '<span class="ol-sub">↳</span> ' : ''}${o.depth_order}. ${esc(o.name)}${kind}</span>`;
-        const offRow = has && !cur && !selIn && !(st.vis && cfg.on);
+        const name = `<span class="ol-name">${g ? '<span class="ol-sub">↳</span> ' : ''}${o.depth_order}. ${esc(o.name)}${kind}</span>`;
+        const offRow = has && !cur && !selIn && (!(st.vis && cfg.on) || inSelGroup(o.name));
         const own = has && !cur && !inherit && !selIn;   // its own eye / colour / opacity
         const tail = own
           ? `<input type="range" class="ol-op" min="0" max="100" step="5" value="${st.o}" title="Krycie maski ${esc(o.name)}${g ? ' i jego części' : ''}"><span class="ol-val">${st.o}%</span>`
           : `<span class="ol-status" title="${cur ? 'Wybrany obiekt – wygląd nakładki (całej grupy) ustawiasz w górnym pasku' : inherit ? `Część „${esc(g)}” – kolor i krycie jak „${esc(g)}”` : selIn ? 'Grupa wybranego obiektu – wygląd z górnego paska' : 'Brak policzonego wyniku'}">${cur ? esc((o.tool && o.tool.status) || 'wybrany') : inherit ? `jak „${esc(g)}”` : selIn ? 'grupa wybranego' : 'brak wyniku'}</span>`;
         const eye = own
           ? `<button type="button" class="ol-eye" title="Pokaż / ukryj maskę obiektu ${esc(o.name)}${g ? ' z częściami' : ''}">${st.vis ? '👁' : '◌'}</button><input type="color" class="ol-color" value="${st.c}" title="Kolor maski ${esc(o.name)}${g ? ' i jego części' : ''}">`
-          : cur ? `<button type="button" class="ol-eye ol-eye-sel" title="Pokaż / ukryj maskę wybranego obiektu na podglądzie (narzędzia – punkty, pędzel, strefy – zostają)">${S.hideSel ? '◌' : '👁'}</button>` + '<span></span>'
+          : cur ? `<button type="button" class="ol-eye ol-eye-sel" title="Pokaż / ukryj maskę wybranego obiektu na podglądzie (narzędzia – punkty, pędzel, strefy – zostają)">${S.hideSel ? '◌' : '👁'}</button>` +
+            `<input type="color" class="ol-color ol-color-sel" value="${otherStyle(o).c}" title="Kolor nakładki ${esc(o.name)} (wybrany obiekt też jest rysowany w swoim kolorze)">`
           : `<span class="ol-eye ol-eye-off" title="${inherit ? `Kolor jak „${esc(g)}”` : 'Brak wyniku – nie ma czego pokazać'}"></span>` +
             (inherit && has && !selIn ? `<span class="ol-swatch" style="background:${st.c}" title="Kolor jak „${esc(g)}”"></span>` : '<span></span>');
         // group look (user request 2026-10-23): the main object left, its parts indented under it with a guide line
-        const gcls = g ? (o.name === g ? 'grp grp-main' : 'grp grp-part') : '';
-        return `<div class="ol-row ${cur ? 'cur' : ''} ${gcls} ${offRow ? 'off' : ''}" data-o="${esc(o.name)}" draggable="true"
-            title="Klik = wybierz obiekt · przeciągnij na środek innego = jego część · na górną / dolną krawędź = kolejność głębi (0 = najbliżej kamery)">
-          <span class="ol-drag">⋮⋮</span>${eye}${name}${tail}<button type="button" class="ol-del" title="Usuń obiekt ${esc(o.name)} (z potwierdzeniem)">🗑</button>
-        </div>` + seamRow(o, all, st);
+        const gcls = g ? 'grp grp-part' : '';
+        const gi = g ? (objByName(g) || {}).group_info : null;
+        const lastOf = !!(gi && (gi.members || []).slice(-1)[0] && gi.members.slice(-1)[0].member === o.name);
+        return `<div class="ol-row ${cur ? 'cur' : ''} ${gcls} ${offRow ? 'off' : ''} ${mOn ? '' : 'grp-off'}" data-o="${esc(o.name)}" draggable="true"
+            title="Klik = wybierz obiekt · przeciągnij na środek innego = nowa grupa z nim, na wiersz grupy 🔗 = do grupy${g ? ', poza listę = odłącz z grupy' : ''} · na górną / dolną krawędź = kolejność głębi (0 = najbliżej kamery)">
+          <span class="ol-drag">⋮⋮</span>${exp}${eye}${name}${g ? srcSelect(o) + memberSeam(o) : ''}${tail}<button type="button" class="ol-del" title="Usuń obiekt ${esc(o.name)} (z potwierdzeniem)">🗑</button>
+        </div>` + (lastOf ? seamRow(g) : '');
       }).join('') : '');
     placeOthersPanel(box, w);
     const redraw = () => { saveOthersCfg(); V() && V().render(); };
     $('olAll').addEventListener('change', (e) => { cfg.on = e.target.checked; renderOthersPanel(); redraw(); });
     $('olFold').addEventListener('click', () => { cfg.open = !cfg.open; renderOthersPanel(); saveOthersCfg(); });
     $('olNew').addEventListener('click', () => newObjectDialog());
-    box.querySelectorAll('.ol-row').forEach((row) => {
+    $('olNewGrp').addEventListener('click', async () => {
+      const name = await groupNameDialog(S.obj && !isGroup(objByName(S.obj)) && !(objByName(S.obj) || {}).group ? `${S.obj}_grp` : 'grupa');
+      if (name) await makeGroup(name, S.obj && !isGroup(objByName(S.obj)) && !(objByName(S.obj) || {}).group ? [S.obj] : []);
+    });
+    box.querySelectorAll('.ol-on').forEach((cb) => {
+      cb.addEventListener('mousedown', (e) => e.stopPropagation());
+      cb.addEventListener('click', (e) => e.stopPropagation());
+      cb.addEventListener('change', () => run('olOn', async () => {
+        const n = cb.closest('.ol-row').dataset.o, o = objByName(n);
+        await api('PUT', `/api/group/${encodeURIComponent(o.group)}/members/${encodeURIComponent(n)}/on`, { on: cb.checked });
+        await refreshList(S.obj);   // the group's payload (members on) is in its overlay key: the composition reloads
+        status(`„${n}” ${cb.checked ? 'z powrotem w' : 'wyłączony z'} grupy „${o.group}” – alpha grupy bez / z nim; przeliczenie całości (jeśli jest) ↻`, 'ok');
+        if (V()) { preloadOverlays(V().currentFrame, 0); V().render(); }
+      }));
+    });
+    box.querySelectorAll('.ol-src').forEach((sel) => {
+      sel.addEventListener('mousedown', (e) => e.stopPropagation());
+      sel.addEventListener('click', (e) => e.stopPropagation());
+      sel.addEventListener('change', () => run('olSrc', async () => {
+        const n = sel.closest('.ol-row').dataset.o, o = objByName(n);
+        await api('PUT', `/api/group/${encodeURIComponent(o.group)}/members/${encodeURIComponent(n)}/source`, { source: sel.value });
+        await refreshList(S.obj);
+        status(`„${n}” do grupy „${o.group}” z: ${memberInfo(o) ? srcLabel(memberInfo(o), sel.value) : SRC_LABEL[sel.value] || sel.value} – przeliczenie całości grupy (jeśli jest) ↻`, 'ok');
+        // the member and the stage of its new source come up, so the preview shows the mask the group takes
+        // the group itself selected: it stays selected, its composition reloads (the member's source is in the overlay
+        // key, grpTok) – user request 2026-10-29
+        if (S.obj === o.group) { if (V()) preloadOverlays(V().currentFrame, 0); }
+        else if (n !== S.obj) await selectObject(n);
+        else {
+          const ss = sourceStage(n);
+          if (ss != null && ss !== S.stage) setStage(ss, { keepView: true });
+          if (ss != null && ss !== ST.SAM3 && ss !== ST.BRUSH && (S.view === 'none' || S.view === 'core') && viewAllowed('alpha')) setView('alpha', true, false);
+        }
+        if (V()) V().render();
+      }));
+    });
+    box.querySelectorAll('.ol-row[data-group]').forEach((row) => {
+      const g = row.dataset.o;
+      row.addEventListener('click', (e) => { if (!e.target.closest('input, button, select')) selectObject(g); });
+      row.querySelector('.ol-del').addEventListener('click', (e) => { e.stopPropagation(); ungroupDialog(g); });
+      row.querySelector('.ol-gfold').addEventListener('click', (e) => {
+        e.stopPropagation(); cfg.fold = cfg.fold || {}; cfg.fold[g] = !cfg.fold[g]; saveOthersCfg(); renderOthersPanel();
+      });
+      const gc = row.querySelector('.ol-color');
+      gc.addEventListener('click', (e) => e.stopPropagation());
+      gc.addEventListener('input', (e) => { otherStyle(objByName(g)).c = e.target.value; liveRender(); });
+      gc.addEventListener('change', redraw);
+      const nm = row.querySelector('.ol-name');   // double click = rename, like an object (user request 2026-10-29)
+      nm.title = 'Dwuklik: zmień nazwę grupy';
+      nm.addEventListener('dblclick', (e) => { e.stopPropagation(); renameInline(nm, g); });
+    });
+    box.querySelectorAll('.ol-row:not([data-group])').forEach((row) => {
       const o = all.find((x) => x.name === row.dataset.o);
       const selEye = row.querySelector('button.ol-eye-sel');   // the selected object's own mask on / off (user request 2026-10-17)
       if (selEye) selEye.addEventListener('click', (e) => { e.stopPropagation(); S.hideSel = !S.hideSel; renderOthersPanel(); V() && V().render(); });
+      const selCol = row.querySelector('.ol-color-sel');
+      if (selCol) {
+        selCol.addEventListener('click', (e) => e.stopPropagation());
+        selCol.addEventListener('input', (e) => { otherStyle(o).c = e.target.value; liveRender(); });
+        selCol.addEventListener('change', redraw);
+      }
       const eye = row.querySelector('button.ol-eye:not(.ol-eye-sel)');
       if (eye) {
         const st = otherStyle(o);
         eye.addEventListener('click', (e) => { e.stopPropagation(); st.vis = !st.vis; renderOthersPanel(); redraw(); });
-        row.querySelector('.ol-color').addEventListener('input', (e) => { st.c = e.target.value; redraw(); });
+        row.querySelector('.ol-color').addEventListener('input', (e) => { st.c = e.target.value; liveRender(); });
+        row.querySelector('.ol-color').addEventListener('change', redraw);
         const op = row.querySelector('.ol-op');
         if (op) op.addEventListener('input', (e) => { st.o = +e.target.value; row.querySelector('.ol-val').textContent = `${st.o}%`; redraw(); });
       }
       row.querySelector('.ol-del').addEventListener('click', (e) => { e.stopPropagation(); deleteObjectDialog(o.name); });
       // controls inside the row must not start a drag of the row (slider, colour)
-      row.addEventListener('mousedown', (e) => { row.draggable = !e.target.closest('input, button'); });
-      row.addEventListener('click', (e) => { if (!e.target.closest('input, button')) selectObject(o.name); });
+      row.addEventListener('mousedown', (e) => { row.draggable = !e.target.closest('input, button, select'); });
+      row.addEventListener('click', (e) => { if (!e.target.closest('input, button, select')) selectObject(o.name); });
       const nm = row.querySelector('.ol-name');
       if (nm) { nm.title = 'Dwuklik: zmień nazwę obiektu'; nm.addEventListener('dblclick', (e) => { e.stopPropagation(); renameInline(nm, o.name); }); }
+    });
+    box.querySelectorAll('.ol-mseam').forEach((w) => {
+      const r = w.querySelector('.ol-mseam-r'), lab = w.querySelector('b');
+      const n = w.closest('.ol-row').dataset.o, o = objByName(n);
+      for (const ev of ['mousedown', 'click', 'dblclick']) w.addEventListener(ev, (e) => e.stopPropagation());
+      r.addEventListener('input', () => { lab.textContent = r.value; });
+      const save = (v) => run('olMSeam', async () => {
+        await api('PUT', `/api/group/${encodeURIComponent(o.group)}/members/${encodeURIComponent(n)}/seam`, { seam_px: v });
+        await refreshList(S.obj);   // the group's payload is in its overlay key: the composition reloads
+        status(`Szew „${n}” w grupie „${o.group}”: ${v == null ? 'jak szew grupy' : v + ' px'} – złożenie grupy; przeliczenie całości (jeśli jest) ↻`, 'ok');
+        if (V()) { preloadOverlays(V().currentFrame, 0); V().render(); }
+      });
+      r.addEventListener('change', () => save(+r.value));
+      w.addEventListener('dblclick', () => save(null));
     });
     box.querySelectorAll('.ol-seam').forEach((row) => {
       const p = row.dataset.p, r = row.querySelector('.ol-seam-r'), lab = row.querySelector('.ol-seam-v');
@@ -928,9 +1115,9 @@
       r.addEventListener('change', async () => {
         const v = +r.value;
         try {
-          await api('PUT', `/api/object/${encodeURIComponent(p)}/settings`, { part_seam_px: v });
-          const po = objByName(p); if (po) po.part_seam_px = v;
-          status(`Szew grupy „${p}”: ${v} px (podgląd i eksport ${p}_full)`, 'ok');
+          await api('PUT', `/api/group/${encodeURIComponent(p)}`, { seam_px: v });
+          const po = objByName(p); if (po) po.seam_px = v;
+          status(`Szew grupy „${p}”: ${v} px – złożenie grupy; przeliczenie całości (jeśli jest) ↻`, 'ok');
         } catch (er) { status(`Szew NIE zapisany: ${er.message}`, 'err'); r.value = seamOf(p); lab.textContent = `${seamOf(p)} px`; }
         if (V()) { preloadOverlays(V().currentFrame, 0); V().render(); }
       });
@@ -980,7 +1167,7 @@
         const m = matteFor(f);
         if (!m) noteTxt = S.matteNote || `Brak maski etapu w klatce ${f}`;
         else if (m !== 'loading') {
-          if (S.view === 'comp') ctx.drawImage(compCanvas(img, m.img, `stg_${m.key}`, f), 0, 0);
+          if (S.view === 'comp') { ctx.drawImage(compCanvas(img, m.img, `stg_${m.key}`, f), 0, 0); mmOver(ctx, img); }
           else drawTinted(ctx, m.img, 'alpha', `stg_${m.key}`, img.width, img.height);
         }
       } else if (sw) {   // linked objects: one layer (whole + filled seam) in the selected layer's colour
@@ -993,7 +1180,7 @@
         if (S.view === 'comp' || S.view === 'alpha') {
           const ov = overlayFor('alpha', f);
           if (ov === 'missing') noteTxt = `Brak wyniku w klatce ${f} – „▶ Przelicz MatAnyone2” (etap ${ST.MATANYONE}) albo „Przelicz finalnie” (etap ${ST.EXPERIMENTS})`;
-          else if (ov) { const vk = S.viewRun ? '@' + S.viewRun : ''; if (S.view === 'comp') ctx.drawImage(compCanvas(img, ov, `${S.obj}${vk}${exportCtx() ? '#x' : ''}_${f}`, f), 0, 0); else drawLayer(ctx, 'alpha', ov, 'alpha', f, img); }
+          else if (ov) { const vk = S.viewRun ? '@' + S.viewRun : ''; if (S.view === 'comp') { ctx.drawImage(compCanvas(img, ov, `${S.obj}${vk}${exportCtx() ? '#x' : ''}_${f}`, f), 0, 0); mmOver(ctx, img); } else drawLayer(ctx, 'alpha', ov, 'alpha', f, img); }
         } else if (coreView()) {
           const kf = keyOf(f);   // in a key frame the result IS the key – show it, not the old core
           const ck = coreKind(f);  // stage 2: the mask 1+2 when „Zastosuj poprawki” made it
@@ -1001,7 +1188,10 @@
           const ftRef = S.stage === ST.FINAL_TOUCH && window.MD_FT && window.MD_FT.ready ? window.MD_FT.matteRef(f) : null;
           const ftOv = ftRef ? ftLoad(ftRef, f) : null;
           if (ftOv && ftOv !== 'missing') drawTinted(ctx, ftOv.img, 'core', `core_${ftOv.key}`, img.width, img.height);
-          const ov = ftOv && ftOv !== 'missing' ? null : overlayFor(ck, f);
+          // stage 2: core + this frame's brush fix drawn in the browser at once (brush.js liveMatte, as Final Touch)
+          const b2 = !ftRef && S.stage === ST.BRUSH && window.MD_BRUSH && window.MD_BRUSH.ready ? window.MD_BRUSH.liveMatte(f) : null;
+          if (b2) drawTinted(ctx, b2.img, 'core', `core_${b2.key}`, img.width, img.height);
+          const ov = (ftOv && ftOv !== 'missing') || b2 ? null : overlayFor(ck, f);
           if (ov === 'missing') noteTxt = ck === 'core_fix' ? `Brak maski 1+2 w klatce ${f} – „▶▶ Zastosuj poprawki” (etap ${ST.BRUSH})`
             : `Brak rdzenia w klatce ${f} – „▶▶ Przelicz nieaktualne” (etap ${ST.SAM3})`;
           else if (ov) drawLayer(ctx, ck, ov, 'core', f, img);
@@ -1088,18 +1278,13 @@
         ctx.lineWidth = 1 / v.zoom; ctx.strokeStyle = '#ffcc33';
         for (const s of S.crops) if (s.first <= f && f <= s.last) ctx.strokeRect(s.crop[0] * k, s.crop[1] * k, s.crop[2] * k, s.crop[3] * k);
       }
-      for (const st of (S.strokes[f] || []).concat(S.drawing && S.drawing.f === f ? [S.drawing] : [])) {
-        const col = st.mode === 'add' ? 'rgba(80,255,120,0.6)' : st.mode === 'erase' ? 'rgba(203,213,225,0.55)' : 'rgba(255,60,90,0.6)';
-        if (st.p.some((q) => q.length >= 3)) {   // Z23: radius per point (pen pressure)
-          ctx.fillStyle = col;
-          drawVarStroke(ctx, st.p, k, st.radius_px);
-          continue;
-        }
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 2 * st.radius_px * k; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-        ctx.beginPath(); st.p.forEach((q, i) => i ? ctx.lineTo(q[0] * k, q[1] * k) : ctx.moveTo(q[0] * k, q[1] * k));
-        if (st.p.length === 1) ctx.lineTo(st.p[0][0] * k + 0.01, st.p[0][1] * k);
-        ctx.stroke();
+      // Final Touch with the GPU preview on screen: the alpha itself shows the strokes, no coloured paths over it
+      const ftGpu = S.stage === ST.FINAL_TOUCH && window.MD_FT && window.MD_FT.ready && window.MD_FT.gpuLive && window.MD_FT.gpuLive(f);
+      // one flat layer per colour (user report 2026-10-30: overlapping strokes looked darker, as if more opaque)
+      const pendSt = ftGpu ? [] : (S.strokes[f] || []).concat(S.drawing && S.drawing.f === f ? [S.drawing] : []);
+      for (const [mode, col, a] of [['add', '#50ff78', 0.6], ['remove', '#ff3c5a', 0.6], ['erase', '#cbd5e1', 0.55]]) {
+        const sts = pendSt.filter((st) => st.mode === mode);
+        if (sts.length) flatDraw(ctx, a, (g) => { g.fillStyle = g.strokeStyle = col; for (const st of sts) strokeOnto(g, st, k); });
       }
       for (const pg of (S.polys[f] || []).concat(S.poly && S.poly.f === f ? [S.poly] : [])) {
         ctx.strokeStyle = pg.mode === 'add' ? '#50ff78' : '#ff3c5a'; ctx.lineWidth = 1.5 / v.zoom;
@@ -1110,7 +1295,10 @@
         const c = S.resizing ? S.resizing.p : S.hover;   // Z23: brush reach before clicking / while resizing
         if (c) {
           ctx.save(); ctx.lineWidth = 1.5 / v.zoom; ctx.strokeStyle = S.tool === 'brush_add' ? '#50ff78' : S.tool === 'brush_erase' ? '#c4c4c8' : '#ff3c5a';
-          ctx.beginPath(); ctx.arc(c[0] * k, c[1] * k, S.radius * k, 0, 2 * Math.PI); ctx.stroke();
+          // a pen stroke: the circle = the radius of the current pressure (as the stroke paints), else the brush size
+          const lp = S.drawing && S.drawing.pen && !S.resizing ? S.drawing.p[S.drawing.p.length - 1] : null;
+          const rr = lp && lp.length >= 3 ? lp[2] : S.radius;
+          ctx.beginPath(); ctx.arc(c[0] * k, c[1] * k, rr * k, 0, 2 * Math.PI); ctx.stroke();
           if (S.resizing) { ctx.fillStyle = '#fff'; ctx.font = `${13 / v.zoom}px "IBM Plex Sans", sans-serif`; ctx.textAlign = 'center'; ctx.fillText(`${S.radius} px`, c[0] * k, c[1] * k); }
           ctx.restore();
         }
@@ -1244,6 +1432,31 @@
       }
     }
   }
+  // Alpha / Comp in the Export stage = the mask of the chosen export source (user request 2026-10-30): Final Touch (base
+  // + corrections), the mask 1+2, a stage result or a version from the list. Objects in front are NOT subtracted here
+  // (the export does that) – the palette says so.
+  function exportMatte(f, coreMatte, has12) {
+    const src = $('e6Source') ? $('e6Source').value : 'active';
+    const runs = (S.info && S.info.stage_runs) || {};
+    if (src === 'core') return coreMatte(has12 ? 'core_fix' : 'core');
+    if (src === 'final_touch') {
+      const ref = window.MD_FT && window.MD_FT.ready ? window.MD_FT.matteRef(f) : null;
+      if (!ref) { S.matteNote = 'Final Touch bez bazy – wybierz bazę w etapie Final Touch'; return null; }
+      const al = ftLoad(ref, f);
+      if (al && al !== 'missing') { S.matteNote = ''; return { img: al.img, key: al.key, kind: 'alpha', run: `eksport: Final Touch (${ref.run})` }; }
+      if (!al) return 'loading';
+      S.matteNote = `Baza Final Touch (${ref.run}) nie obejmuje klatki ${f}`;
+      return null;
+    }
+    const vr = src === 'version' ? ($('e6Run') && $('e6Run').value) : src === 'active' ? runs.active : runs[src];
+    if (!vr) { S.matteNote = 'Wybrane źródło eksportu nie ma wyniku'; return null; }
+    const key = `${S.obj}_alpha@${vr}_${f}`;
+    const al = loadOverlay(key, `/api/object/${S.obj}/frame/${f}?view=alpha&v=${encodeURIComponent(vr)}`);
+    if (al && al !== 'missing') { S.matteNote = ''; return { img: al, key, kind: 'alpha', run: `eksport: wersja ${vr}` }; }
+    if (!al) return 'loading';
+    S.matteNote = `Wersja ${vr} nie obejmuje klatki ${f}`;
+    return null;
+  }
   function matteFor(f) {
     if (!S.obj) return null;
     const coreMatte = (kind) => {
@@ -1261,16 +1474,23 @@
     };
     const has12 = S.info && S.info.has && S.info.has.core_fix;
     if (S.stage === ST.SAM3) return sw ? wholeMatte('core') : coreMatte(keyOf(f) ? 'key' : 'core');
-    if (S.stage === ST.BRUSH) return sw ? wholeMatte(has12 ? 'core_fix' : 'core') : coreMatte(coreKind(f));
+    if (S.stage === ST.BRUSH) {
+      const lm = !sw && window.MD_BRUSH && window.MD_BRUSH.ready ? window.MD_BRUSH.liveMatte(f) : null;   // live brush fix
+      if (lm) { S.matteNote = ''; return lm; }
+      return sw ? wholeMatte(has12 ? 'core_fix' : 'core') : coreMatte(coreKind(f));
+    }
     if (S.stage === ST.FINAL_TOUCH) {   // base + hand corrections of this frame (= the export source „Final Touch”)
       const ref = window.MD_FT && window.MD_FT.ready ? window.MD_FT.matteRef(f) : null;
       if (!ref) return coreMatte(has12 ? 'core_fix' : 'core');
       const al = ftLoad(ref, f);
+      const gpu = window.MD_FT.liveMatte ? window.MD_FT.liveMatte(f, ref, al) : null;   // the strokes drawn in the browser (ft_gpu.js) until the server's image has them
+      if (gpu) { S.matteNote = ''; return gpu; }
       if (al && al !== 'missing') { S.matteNote = ''; return { img: al.img, key: al.key, kind: 'alpha', run: `Final Touch (${ref.run})` }; }
       if (!al) return 'loading';
       S.matteNote = `Baza Final Touch (${ref.run}) nie obejmuje klatki ${f} – wybierz inną bazę albo przejdź do policzonych klatek`;
       return null;
     }
+    if (S.stage === ST.EXPORT) return exportMatte(f, coreMatte, has12);
     if (S.viewRun) {   // a version picked for viewing (comparison A / B, list of versions) wins over the stage's own result
       // and its previews (user report 2026-10-26: stage 3 kept showing A after switching to B)
       const vr = S.viewRun, key = `${S.obj}_alpha@${vr}_${f}`;
@@ -1344,6 +1564,7 @@
     if (!al) return 'loading';
     return coreMatte(keyOf(f) ? 'key' : 'core');
   }
+  if (window.MD_SLIDER_UNDO) window.MD_SLIDER_UNDO.ctx = () => `${S.obj || ''}|${S.stage}`;   // slider history per object + stage
   window.MD_OBJ = { get name() { return S.obj; }, reload: () => loadStages().then(() => renderKeysLane()), matteFor,
                     get matteNote() { return S.matteNote || ''; }, maskHidden: () => selMaskHidden(),
                     stagePreview: (stage, btn) => stagePreview(stage, btn) };   // static/life.js, app.js
@@ -1369,8 +1590,13 @@
         b.title = prev ? `Policz etap od nowa – nowa wersja zastąpi wynik etapu ${prev} (${prev} zostaje na liście wersji, można do niego wrócić)` : b.dataset.t0;
       }
     }
-    const ex = $('st5Export'); if (ex) ex.disabled = false;
-    const one = $('st5ExportOne'); if (one) { one.disabled = !S.obj || st('export') === 'locked'; one.title = one.disabled ? (stageState('export').why || 'najpierw rdzeń (etap 1)') : 'Tylko wybrany obiekt (liczony jak w pełnym eksporcie), z wybranego źródła'; }
+    const ex = $('st5Export');
+    if (ex) {   // the export = the selected object / group (user decision 2026-10-29)
+      ex.disabled = !S.obj || st('export') === 'locked';
+      ex.textContent = S.obj ? `⇪ Eksport: ${S.obj}` : '⇪ Eksport';
+      ex.title = ex.disabled ? (stageState('export').why || 'Wybierz obiekt albo grupę (najpierw rdzeń, etap 1)') : `Eksport maski „${S.obj}” z wybranego źródła (liczony w kontekście wszystkich obiektów: z przodu odejmowane od tych z tyłu)`;
+    }
+    const gm = $('e5MembersL'); if (gm) gm.style.display = isGroup(objByName(S.obj)) ? '' : 'none';
     const canCore = st('core') !== 'locked';
     for (const id of ['st3KeySave', 'st3KeyDel']) { const b = $(id); if (b) b.disabled = !S.obj; }
     const si = (S.info && S.info.stale_intervals) || [];
@@ -1400,6 +1626,10 @@
       try {
         await api('PUT', `/api/object/${encodeURIComponent(old)}/rename`, { new_name: n });
       } catch (er) { status(`Nie zmieniono nazwy: ${er.message}`, 'err'); span.innerHTML = keep; return; }
+      const cfg = othersCfg();   // the overlay colour / fold state go with the new name
+      if (cfg.per[old]) { cfg.per[n] = cfg.per[old]; delete cfg.per[old]; }
+      if (cfg.fold && old in cfg.fold) { cfg.fold[n] = cfg.fold[old]; delete cfg.fold[old]; }
+      saveOthersCfg();
       await refreshList(S.obj === old ? n : S.obj);
       status(`Zmieniono nazwę: „${old}” → „${n}” (wyeksportowane pliki zostają pod starą nazwą)`, 'ok');
     };
@@ -1467,6 +1697,77 @@
     check();
     nameEl.focus();
   }
+  // Groups (PLAN_GROUP_COMPOSE): name dialog, create, join, detach / ungroup with the warning about the whole result
+  function groupNameDialog(def) {
+    return new Promise((resolve) => {
+      if ($('grpNameModal')) { resolve(null); return; }
+      const bg = el(`<div class="md-modal-bg" id="grpNameModal">
+        <div class="md-modal" role="dialog" aria-labelledby="grpNameTitle">
+          <div class="md-modal-title" id="grpNameTitle">🔗 Nowa grupa</div>
+          <label class="md-field">Nazwa grupy <span class="muted">(litery bez polskich znaków, cyfry, _ i -)</span>
+            <input id="grpNameIn" class="form-input" maxlength="64" autocomplete="off" value="${esc(def || '')}" title="Nazwa grupy = nazwa folderu i masek grupy"></label>
+          <div class="muted md-modal-tip">Członkowie liczą swoje etapy sami; maska grupy = złożenie ich masek („Do grupy z:”) ze szwami. Grupę można też przeliczyć jako całość (jej etapy).</div>
+          <div class="md-modal-err" id="grpNameErr"></div>
+          <div class="md-modal-btns">
+            <button type="button" class="btn btn-secondary" id="grpNameCancel" title="Zamknij bez tworzenia grupy (Esc)">Anuluj</button>
+            <button type="button" class="btn btn-primary" id="grpNameOk" title="Utwórz grupę (Enter)">Utwórz grupę</button>
+          </div></div></div>`);
+      document.body.appendChild(bg);
+      const inp = $('grpNameIn'), err = $('grpNameErr'), ok = $('grpNameOk');
+      const close = (v) => { document.removeEventListener('keydown', onKey, true); bg.remove(); resolve(v); };
+      const check = () => {
+        const n = inp.value.trim();
+        const msg = !n ? '' : !OBJ_NAME_RE.test(n) ? 'Nazwa: tylko litery bez polskich znaków, cyfry, _ i - (bez spacji)'
+          : (S.objects || []).some((o) => o.name === n) ? `„${n}” już istnieje` : '';
+        err.textContent = msg; ok.disabled = !n || !!msg; return !ok.disabled;
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); close(null); }
+        else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); if (check()) close(inp.value.trim()); }
+        else e.stopPropagation();
+      };
+      document.addEventListener('keydown', onKey, true);
+      bg.addEventListener('mousedown', (e) => { if (e.target === bg) close(null); });
+      inp.addEventListener('input', check);
+      $('grpNameCancel').addEventListener('click', () => close(null));
+      ok.addEventListener('click', () => { if (check()) close(inp.value.trim()); });
+      check(); inp.focus(); inp.select();
+    });
+  }
+  const makeGroup = (name, members) => run('olGrp', async () => {
+    await api('POST', '/api/groups', { name, members });
+    await refreshList(S.obj);
+    status(`Grupa „${name}”${members.length ? ` z: ${members.join(', ')}` : ' (pusta – przeciągnij do niej obiekty)'} – złożenie ze szwami, członkowie liczą się sami`, 'ok');
+  });
+  const joinGroup = (g, name) => run('olGrp', async () => {
+    await api('POST', `/api/group/${encodeURIComponent(g)}/members`, { name });
+    await refreshList(S.obj);
+    status(`„${name}” w grupie „${g}” (Do grupy z: Core) – przeliczenie całości grupy (jeśli jest) ↻`, 'ok');
+  });
+  // the server answers 409 + needs_confirm when the group has a whole result: ask, then repeat with ?confirm=true
+  async function withWholeWarning(title, url) {
+    try { return await api('DELETE', url); }
+    catch (e) {
+      if (!(e.status === 409 && e.detail && e.detail.needs_confirm)) throw e;
+      if (!(await V().uiConfirm(e.detail.warning, { title, ok: 'Tak, do kosza', tone: 'error' }))) return null;
+      return api('DELETE', `${url}${url.includes('?') ? '&' : '?'}confirm=true`);
+    }
+  }
+  const detachMember = (g, name) => run('olGrp', async () => {
+    const d = await withWholeWarning(`Odłączyć „${name}” od „${g}”?`, `/api/group/${encodeURIComponent(g)}/members/${encodeURIComponent(name)}`);
+    if (!d) return;
+    await refreshList(S.obj);
+    status(`„${name}” odłączony od „${g}” – jego wyniki bez zmian${d.trash ? '; wynik całości grupy → kosz projektu' : ''}`, 'ok');
+  });
+  const ungroupDialog = (g) => run('olGrp', async () => {
+    const o = objByName(g);
+    if (!((o && o.group_info && o.group_info.whole_results || []).length) &&
+        !(await V().uiConfirm(`Grupa „${g}” zniknie z palety; jej członkowie zostają z własnymi wynikami.`, { title: `Rozgrupować „${g}”?`, ok: 'Rozgrupuj' }))) return;
+    const d = await withWholeWarning(`Rozgrupować „${g}”?`, `/api/group/${encodeURIComponent(g)}`);
+    if (!d) return;
+    await refreshList(S.obj === g ? undefined : S.obj);
+    status(`Rozgrupowano „${g}” – folder grupy → kosz projektu`, 'ok');
+  });
   // Delete an object (user request 2026-10-15): confirmation in the middle of the window with what goes where; the
   // exported masks only when ticked (both go to the project trash, recoverable by hand).
   async function deleteObjectDialog(name) {
@@ -1544,16 +1845,16 @@
     const d = await api('GET', '/api/objects');
     S.objects = d.objects;
     const sel = $('objSelect');
-    sel.innerHTML = d.objects.length ? d.objects.map((o) => `<option value="${esc(o.name)}">${o.depth_order}. ${o.part_of ? '↳ ' : ''}${esc(o.name)}${o.part_of ? ` (część ${esc(o.part_of)})` : ''}</option>`).join('')
+    sel.innerHTML = d.objects.length ? d.objects.map((o) => `<option value="${esc(o.name)}">${isGroup(o) ? `🔗 ${esc(o.name)} (grupa)` : `${o.depth_order}. ${o.group ? '↳ ' : ''}${esc(o.name)}${o.group ? ` (w grupie ${esc(o.group)})` : ''}`}</option>`).join('')
                                      : '<option value="">— brak obiektów —</option>';
     if (select) sel.value = select;
     S.obj = sel.value || null;
     await loadObject();
   }
   function renderOrder() { renderOthersPanel(); }   // the list of objects lives in the layers panel (2026-10-15)
-  // drag & drop of object rows (data-<key> = object name): onto the middle of a row = part of that object (like
-  // „Relacja” → „część obiektu”), onto its upper / lower edge = depth order (a part dropped away from its parent's
-  // family becomes a standalone object again)
+  // drag & drop of object rows (data-<key> = object name), PLAN_GROUP_COMPOSE: onto a group row 🔗 (or a member of it) =
+  // into that group; onto the middle of a standalone object = a new group of both; a member dropped outside the rows =
+  // detached (warning when the group has a whole result); onto the upper / lower edge of a row = depth order
   function wireObjDrag(box, rowSel, key) {
     let dragged = null;
     const byName = (n) => S.objects.find((o) => o.name === n);
@@ -1561,32 +1862,41 @@
       const r = row.getBoundingClientRect(), y = (e.clientY - r.top) / Math.max(1, r.height);
       return y < 0.28 ? 'before' : y > 0.72 ? 'after' : 'into';
     };
-    const canNest = (src, dst) => {   // one level of parts: the target is a main object, the dragged one has no parts
-      const s = byName(src), t = byName(dst);
-      if (!s || !t || src === dst) return '';
-      const parent = t.part_of || t.name;   // dropped on a part = part of its parent
-      if (parent === src) return '';
-      if (S.objects.some((o) => o.part_of === src)) return '';
-      return parent;
+    // what dropping `src` into `dst` does: {join: group} | {make: [dst, src]} | null
+    const intoAction = (src, dst) => {
+      const s_ = byName(src), t = byName(dst);
+      if (!s_ || !t || src === dst || isGroup(s_)) return null;
+      const g = isGroup(t) ? t.name : t.group;
+      if (g) return s_.group === g ? null : { join: g };
+      if (s_.group) return null;            // a member: first out of its group
+      return { make: [dst, src] };
     };
     const clearMarks = () => box.querySelectorAll(rowSel).forEach((r) => r.classList.remove('drop-before', 'drop-after', 'drop-into', 'drop-target'));
-    // a part dropped anywhere that is not a row (outside the panel, empty space) = detached from its object (user request
-    // 2026-10-15, like dragging a layer out of a group); Esc / a cancelled drag fires no drop -> nothing changes
-    const detachTo = (src) => run('st1PartOf', async () => {
-      await api('PUT', `/api/object/${src}/settings`, { part_of: '' });
-      await refreshList(S.obj);
-      status(`„${src}” odczepiony – jest znów samodzielnym obiektem`, 'ok');
-    });
     const outOver = (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'; };
-    const outDrop = (e) => { e.preventDefault(); const src = dragged; dragged = null; clearMarks(); if (src) detachTo(src); };
+    const outDrop = (e) => {
+      e.preventDefault(); const src = dragged; dragged = null; clearMarks();
+      const s_ = src && byName(src); if (s_ && s_.group) detachMember(s_.group, src);
+    };
     const outOff = () => { document.removeEventListener('dragover', outOver); document.removeEventListener('drop', outDrop); box.classList.remove('dragging-part'); };
+    if (!box.dataset.dragGuard) {   // a control in a row (slider, colour, select, checkbox) never drags the row – also one
+      // that stops its own mousedown (the member seam slider dragged the whole layer, user report 2026-10-29)
+      box.dataset.dragGuard = '1';
+      box.addEventListener('mousedown', (e) => {
+        const row = e.target.closest && e.target.closest(rowSel); if (!row || row.dataset.group) return;
+        row.draggable = !e.target.closest('input, button, select, label, .ol-mseam');
+      }, true);
+    }
     box.querySelectorAll(rowSel).forEach((row) => {
+      if (row.dataset.group) row.draggable = false;   // a group row is a drop target, not dragged
+      row.addEventListener('dragstart', (e) => {   // safety: a drag that began on a control is not a row drag
+        if (e.target !== row && e.target.closest && e.target.closest('input, button, select, .ol-mseam')) e.preventDefault();
+      });
       row.addEventListener('dragstart', (e) => {
         dragged = row.dataset[key]; e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', dragged); } catch (er) { /* old browsers */ }
-        const s = byName(dragged);
-        if (s && s.part_of) {
+        const s_ = byName(dragged);
+        if (s_ && s_.group) {
           document.addEventListener('dragover', outOver); document.addEventListener('drop', outDrop); box.classList.add('dragging-part');
-          status(`Upuść „${dragged}” poza warstwami, żeby odczepić go od „${s.part_of}”`);
+          status(`Upuść „${dragged}” poza warstwami, żeby odłączyć go od grupy „${s_.group}”`);
         }
       });
       row.addEventListener('dragend', () => { dragged = null; clearMarks(); outOff(); });
@@ -1595,34 +1905,30 @@
         e.stopPropagation();   // over a row: not "outside"
         if (dragged === row.dataset[key]) { e.preventDefault(); e.dataTransfer.dropEffect = 'none'; clearMarks(); return; }   // over itself: no-op
         e.preventDefault();
-        let z = zoneOf(row, e);
-        if (z === 'into' && !canNest(dragged, row.dataset[key])) z = e.clientY - row.getBoundingClientRect().top < row.offsetHeight / 2 ? 'before' : 'after';
-        clearMarks(); row.classList.add(`drop-${z}`);
+        let z = row.dataset.group ? 'into' : zoneOf(row, e);
+        if (z === 'into' && !intoAction(dragged, row.dataset[key])) z = row.dataset.group ? '' : (e.clientY - row.getBoundingClientRect().top < row.offsetHeight / 2 ? 'before' : 'after');
+        clearMarks(); if (z) row.classList.add(`drop-${z}`);
       });
       row.addEventListener('dragleave', () => row.classList.remove('drop-before', 'drop-after', 'drop-into'));
-      row.addEventListener('drop', (e) => {
+      row.addEventListener('drop', async (e) => {
         e.preventDefault(); e.stopPropagation();   // a row handles it (never the "outside = detach" drop)
-        const z = row.classList.contains('drop-into') ? 'into' : row.classList.contains('drop-after') ? 'after' : 'before';
-        const src = dragged, target = row.dataset[key]; dragged = null;
-        if (!src || src === target) return;
+        const z = row.classList.contains('drop-into') ? 'into' : row.classList.contains('drop-after') ? 'after' : row.classList.contains('drop-before') ? 'before' : '';
+        const src = dragged, target = row.dataset[key]; dragged = null; clearMarks();
+        if (!src || src === target || !z) return;
         if (z === 'into') {
-          const parent = canNest(src, target); if (!parent) return;
-          run('st1PartOf', async () => {
-            await api('PUT', `/api/object/${src}/settings`, { part_of: parent });
-            await refreshList(S.obj);
-            status(`„${src}” jest częścią „${parent}” – eksport: ${parent}_full + osobne maski części`, 'ok');
-          });
+          const act = intoAction(src, target); if (!act) return;
+          if (act.join) { joinGroup(act.join, src); return; }
+          const name = await groupNameDialog(`${target}_grp`);
+          if (name) makeGroup(name, act.make);
           return;
         }
-        const s = byName(src), t = byName(target);
-        const detach = !!(s && s.part_of && t && t.name !== s.part_of && t.part_of !== s.part_of);
-        const names = S.objects.map((o) => o.name).filter((n) => n !== src);
+        const objs = S.objects.filter((o) => !isGroup(o));
+        const names = objs.map((o) => o.name).filter((n) => n !== src);
         names.splice(names.indexOf(target) + (z === 'after' ? 1 : 0), 0, src);
         run('st1Order', async () => {
-          if (detach) await api('PUT', `/api/object/${src}/settings`, { part_of: '' });
           const d = await api('PUT', '/api/objects/order', { names });
           await refreshList(S.obj);
-          status(`${detach ? `„${src}” jest znów samodzielnym obiektem · ` : ''}Kolejność: ${names.join(' → ')}${d.to_recompute.length ? ` · do przeliczenia: ${d.to_recompute.join(', ')}` : ''}`, 'ok');
+          status(`Kolejność: ${names.join(' → ')}${d.to_recompute.length ? ` · do przeliczenia: ${d.to_recompute.join(', ')}` : ''}`, 'ok');
         });
       });
     });
@@ -1636,16 +1942,31 @@
     const sel = $('objSelect'); if (sel && sel.value !== name) sel.value = name;
     await loadObject();
     if (S.stage === ST.PLATES) return;
-    const cur = STAGES[S.stage];
-    let n = S.stage;
+    const back = isGroup(objByName(name)) && S.groupStage ? S.groupStage[name] : null;   // a group: its own last stage
+    const cur = STAGES[back != null ? back : S.stage];
+    let n = back != null ? back : S.stage;
     // Z14: the stage shown must exist for this object – a locked one jumps to its next stage (GET /stages -> next)
     if (cur && stepState(cur).state === 'locked' && S.info && S.info.next) {
       const nx = stageOfId(S.info.next);
-      if (nx && nx.n !== S.stage) { toast(`${S.obj}: etap „${cur.label}” jeszcze zablokowany – przechodzę do ${nx.n}. ${nx.label}`); n = nx.n; }
+      if (nx && nx.n !== n) { toast(`${S.obj}: etap „${cur.label}” jeszcze zablokowany – przechodzę do ${nx.n}. ${nx.label}`); n = nx.n; }
     }
+    const ss = sourceStage(name);   // a group member opens on the stage of its „Do grupy z:” mask (user request 2026-10-29)
+    if (ss != null) n = ss;
     setStage(n, { keepView: true });
-    const order = { comp: ['comp', 'alpha', 'core'], alpha: ['alpha', 'core'], core: ['core'] }[want] || [];
+    // a stage-3+ source: Plate / Core would show nothing / the core there – its Alpha is the mask the group takes
+    const w = ss != null && ss !== ST.SAM3 && ss !== ST.BRUSH && (want === 'none' || want === 'core') ? 'alpha' : want;
+    const order = { comp: ['comp', 'alpha', 'core'], alpha: ['alpha', 'core'], core: ['core'] }[w] || [];
     setView(order.find((v) => viewAllowed(v)) || 'none', true, false);
+  }
+  // the stage whose mask a group member brings into its group („Do grupy z:”), so the preview of the selected member
+  // is what the group uses (user request 2026-10-29); null = not a member / nothing to bring yet
+  const SOURCE_STAGE = { matanyone: 'MATANYONE', videomama: 'VIDEOMAMA', vitmatte: 'VITMATTE', ltx: 'LTX', version: 'EXPERIMENTS', final_touch: 'FINAL_TOUCH' };
+  function sourceStage(name) {
+    const o = objByName(name), mi = o && o.group ? memberInfo(o) : null;
+    if (!mi || !mi.run) return null;
+    if (mi.source === 'core') return S.info && S.info.has && S.info.has.core_fix ? ST.BRUSH : ST.SAM3;
+    const n = ST[SOURCE_STAGE[mi.source]];
+    return n == null ? null : n;
   }
   async function loadObject() {
     renderOrder();
@@ -1675,11 +1996,9 @@
     if (!me) return;
     $('st1Name').textContent = me.name;
     $('st1Prompt').value = (me.detect && me.detect.prompts || [])[0] || '';
-    const ps = $('st1PartOf');
-    const hasParts = S.objects.some((o) => o.part_of === me.name);
-    ps.innerHTML = '<option value="">samodzielny obiekt</option>' + S.objects.filter((o) => o.name !== me.name && !o.part_of).map((o) => `<option value="${esc(o.name)}">część obiektu: ${esc(o.name)}</option>`).join('');
-    ps.value = me.part_of || ''; ps.disabled = hasParts; ps.title = hasParts ? 'Ten obiekt ma własne części – jest obiektem głównym' : '';
-    $('st1Status').textContent = me.tool && me.tool.status ? `Stan: ${me.tool.status}` : '';
+    $('st1Status').textContent = isGroup(me)
+      ? `Grupa: etapy ${ST.SAM3} + ${ST.BRUSH} = złożenie członków (${((me.group_info || {}).members || []).map((m) => m.member).join(', ')}) ze szwami – punkty, klucze i pędzel na członkach; tu przeliczenie całości (etapy ${ST.MATANYONE}–${ST.LTX}), pas i Final Touch`
+      : me.tool && me.tool.status ? `Stan: ${me.tool.status}` : '';
   }
 
   async function loadCrops() {
@@ -1846,14 +2165,6 @@
     $('o4MaScaleL').style.display = d.modes.some((m) => m.mode === 'matanyone' && m.enabled) ? '' : 'none';
     $('o4Backlit').checked = o.use_backlit !== false;
     $('o4BacklitL').style.display = d.modes.some((m) => m.mode === 'backlit') ? '' : 'none';
-    const wh = wholeOf(S.obj);
-    $('st5ExportWhole').style.display = wh ? '' : 'none';
-    $('st5ExportWhole').textContent = wh ? `⇪ Całość (${wh}_full)` : '⇪ Całość';
-  }
-  function wholeOf(name) {
-    const me = S.objects.find((o) => o.name === name); if (!me) return null;
-    if (me.part_of) return me.part_of;
-    return S.objects.some((o) => o.part_of === name) ? name : null;
   }
 
   async function loadQA() {
@@ -2337,7 +2648,9 @@
   // share label, range and wording; a stage passes its element ids (kept: the wiring and the tests know them) and its model
   const bandRow = (kind, model, rangeId, numId, cls = '') => {
     const sl = window.MD_BANDPTS.slider(kind, model);
-    return `<label class="edge-px${cls ? ' ' + cls : ''}" title="${sl.title}">${sl.label} <input id="${rangeId}" ${sl.range}><input id="${numId}" ${sl.num}> px</label>`;
+    // the inset row: off with „cały rdzeń”; the outer band / outer feather rows: the feather hidden there while the band is 0
+    const c2 = [cls, { in: 'band-in-row', out: 'band-out-row', outFeather: 'band-outf-row' }[kind] || ''].filter(Boolean).join(' ');
+    return `<label class="edge-px${c2 ? ' ' + c2 : ''}" title="${sl.title}">${sl.label} <input id="${rangeId}" ${sl.range}><input id="${numId}" ${sl.num}> px</label>`;
   };
   // edge settings shared by stage MatAnyone and Eksperymenty: a floating palette over the view, left, like „Punkty SAM3”
   // (user request 2026-10-15), with a preview of the band before computing (GET edge_preview) that can be switched off
@@ -2590,14 +2903,26 @@
   // (+ Eksperymenty versions); Eksperymenty and Eksport everything. value 'stage' = option value is the stage key,
   // 'run' = the version id (Eksperymenty). avail(k) overrides "has a result" (Eksport: current results only);
   // keep = a saved value that stays selectable even without a result (its state is told next to the picker).
+  // the base „mask 1+2” of a group = the composition of its members (one base of the group, user decision 2026-10-29):
+  // every base / source picker and its caption names the group instead of stages 1 + 2
+  const coreLabel = () => (isGroup(objByName(S.obj)) ? `🔗 ${S.obj} – złożenie grupy` : `Maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH})`);
+  // engine of the stage 5 RESULT (its run.json edge_engine; a run computed with BiRefNet stays BiRefNet after an engine
+  // switch), else the stage's current engine – the name of the stage 5 base / source in every picker (user report 2026-10-30)
+  function edgeResultLabel() {
+    const sr = (S.info && S.info.stage_runs) || {};
+    const vb = (S.info && S.info.vitmatte_base) || 'matanyone';
+    const run = sr[`vitmatte@${vb}`] || sr.vitmatte;
+    const r = run && (S.runs || []).find((x) => x.run === run);
+    return EDGE_ENGINE_LABEL[(r && r.edge_engine) || edgeEngine()] || 'ViTMatte';
+  }
   function maskSources() {
     const sr = (S.info && S.info.stage_runs) || {};
     const vb = (S.info && S.info.vitmatte_base) || 'matanyone';
     return [
-      { k: 'core', label: `Maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH})`, run: sr.core_base || '', todo: `najpierw etapy ${ST.SAM3} + ${ST.BRUSH}` },
+      { k: 'core', label: coreLabel(), run: sr.core_base || '', todo: `najpierw etapy ${ST.SAM3} + ${ST.BRUSH}` },
       { k: 'matanyone', label: `MatAnyone2 (etap ${ST.MATANYONE})`, run: sr.matanyone || '', todo: `najpierw etap ${ST.MATANYONE} („▶ Przelicz MatAnyone2”)` },
       { k: 'videomama', label: `VideoMaMa (etap ${ST.VIDEOMAMA})`, run: sr.videomama || '', todo: `najpierw etap ${ST.VIDEOMAMA} („▶ Policz VideoMaMa”)` },
-      { k: 'vitmatte', label: `${EDGE_ENGINE_LABEL[edgeEngine()]} (etap ${ST.VITMATTE})`, run: sr[`vitmatte@${vb}`] || sr.vitmatte || '', todo: `najpierw etap ${ST.VITMATTE} („Zastosuj na ujęcie”)` },
+      { k: 'vitmatte', label: `${edgeResultLabel()} (etap ${ST.VITMATTE})`, run: sr[`vitmatte@${vb}`] || sr.vitmatte || '', todo: `najpierw etap ${ST.VITMATTE} („Zastosuj na ujęcie”)` },
       { k: 'ltx', label: `LTX-2.5 (etap ${ST.LTX})`, run: sr.ltx || '', todo: `najpierw etap ${ST.LTX} LTX-2.5` },
     ];
   }
@@ -2629,7 +2954,18 @@
     if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
     if ([...sel.options].some((o) => o.value === cur && !o.disabled)) sel.value = cur;
   }
+  const e6Pos = {
+    get: () => { try { return JSON.parse(localStorage.getItem('md_e6_palette') || 'null'); } catch (e) { return null; } },
+    set: (p) => { try { if (p) localStorage.setItem('md_e6_palette', JSON.stringify(p)); else localStorage.removeItem('md_e6_palette'); } catch (e) { /* storage blocked */ } },
+  };
+  function renderE6Palette() {
+    const box = $('e6Palette'); const w = $('canvasWrapper'); if (!box || !w) return;
+    const show = S.stage === ST.EXPORT && !!S.obj && !S.auxMode && !!(V() && V().projectLoaded);
+    box.style.display = show ? '' : 'none';
+    if (show) placeFloating(box, w, e6Pos.get());
+  }
   function renderExpPalette() {
+    renderE6Palette();   // the Export palette shows / hides with the same calls (stage change, object, project)
     const box = $('expPalette'); const w = $('canvasWrapper'); if (!box || !w) return;
     const show = S.stage === ST.EXPERIMENTS && !!S.obj && !S.auxMode && !!(V() && V().projectLoaded);
     box.style.display = show ? '' : 'none';
@@ -2901,10 +3237,9 @@
       ${descHtml('SAM3')}
       <div class="pane-section" id="st1ObjBox">
         <div class="row"><b id="st1Name"></b><button class="btn btn-ghost btn-xs" id="st1Delete" title="Usuń obiekt (folder do kosza projektu)">🗑 usuń</button></div>
-        <label title="Np. suknia Figure: część Figure. Eksport: cała postać bez szwu (<rodzic>_full) + osobne maski części">Relacja<select id="st1PartOf" class="form-input"></select></label>
         <div class="muted" id="st1Status"></div>
       </div>
-      <div class="muted pane-section">Lista obiektów (wybór, kolejność głębi, części) – w palecie „Obiekty” nad obrazem.</div>
+      <div class="muted pane-section">Lista obiektów (wybór, kolejność głębi, grupy 🔗, zaznaczenie do eksportu) – w palecie „Obiekty” nad obrazem.</div>
       <button class="btn btn-secondary" id="st1Create" title="Nowy obiekt do wycięcia – okno z nazwą i promptem">＋ Nowy obiekt</button>
       <div class="pane-section">
         <div class="sec-title">Punkty na klatce → klucz</div>
@@ -3027,6 +3362,7 @@
     add(ST.EXPORT, `<div class="stage-pane" data-stage="export">
       ${paneTitle('EXPORT')}
       ${descHtml('EXPORT')}
+      <div id="e6Main">
       <label title="Z którego etapu wziąć maskę. Rdzeń (1+2) = SAM 3.1 + poprawki pędzlem (twarda maska; nieaktualna maska 1+2 liczy się przy eksporcie); MatAnyone2 / ViTMatte = wynik etapu 3 / 4 (musi być aktualny); wersja z listy = dowolna wersja z etapu ${ST.EXPERIMENTS}; aktywna = jak dotąd (aktualny wynik finalny)">Źródło maski<select id="e6Source" class="form-input">
         <option value="core" title="Rdzeń SAM 3.1 + poprawki pędzlem z etapu ${ST.BRUSH} – twarda maska 0/1; dostępne zaraz po etapie ${ST.SAM3}">Rdzeń (1+2)</option>
         <option value="matanyone" title="Miękka krawędź MatAnyone2 z etapu ${ST.MATANYONE}">MatAnyone2 (etap ${ST.MATANYONE})</option>
@@ -3037,15 +3373,19 @@
         <option value="active" title="Aktywna wersja z aktualnym wynikiem finalnym (zachowanie sprzed 2026-10-15)">Aktywna wersja</option>
         <option value="final_touch" title="Baza + ręczne korekty z etapu ${ST.FINAL_TOUCH} (obiekt bez korekt = sama baza)">Final Touch (etap ${ST.FINAL_TOUCH})</option></select></label>
       <label id="e6RunL" style="display:none" title="Która wersja wybranego obiektu (tylko „⇪ Ten obiekt” / „⇪ Całość”; przy eksporcie wszystkich – aktywne wersje)">Wersja<select id="e6Run" class="form-input"></select></label>
-      <div class="muted" id="e6SrcInfo"></div>
+      <div class="muted pp-hint" id="e6SrcInfo"></div>
+      <div class="muted pp-hint">Alpha / Comp pokazują maskę tego źródła (bez odejmowania obiektów z przodu – to robi eksport).</div>
+      </div>
       <div class="muted">Pełne klatki z wycinków: <code>mattes/&lt;obiekt&gt;/</code> (alpha: EXR albo PNG 8-bit – wg formatu) + przy EXR multi-EXR ujęcia (<code>&lt;obiekt&gt;.alpha</code>, <code>union.alpha</code>) i <code>outputs.json</code>. Obiekty z przodu są odejmowane od tych z tyłu (z tego samego źródła, a gdy go nie mają – z niższego etapu).</div>
+      <div id="e6Main2">
       <div class="row"><label class="chk" title="Jeden plik EXR na klatkę z kanałami wszystkich obiektów"><input type="checkbox" id="e5Multi" checked> multi-EXR</label><label class="chk" title="Dodaj też rdzeń SAM 3.1 (twarda maska) do eksportu"><input type="checkbox" id="e5Core"> rdzeń</label><label class="chk" title="Dodaj kanał głębi"><input type="checkbox" id="e5Depth"> głębia</label></div>
       <label title="Format masek (project.json → export_format; manifest bez zmian). Auto: PNG 8-bit dla źródeł 8-bit (MP4 / PNG / JPG), EXR dla EXR. Multi-EXR tylko przy EXR">Format masek<select id="e5Format" class="form-input"><option value="auto">auto</option><option value="png">PNG 8-bit</option><option value="exr">EXR (half)</option></select></label>
       <label title="Katalog eksportu (project.json → export_dir; manifest bez zmian). Poza projektem – potwierdzenie">Katalog eksportu<input id="e5Dir" class="form-input" readonly></label>
       <div class="row"><button class="btn btn-secondary btn-sm" id="e5DirPick" title="Wybierz katalog eksportu">📁 Wybierz…</button><button class="btn btn-ghost btn-sm" id="e5DirDefault" title="Przywróć domyślny katalog &lt;work&gt;/matte_desk/export">domyślny</button><button class="btn btn-ghost btn-sm" id="e5NkOnly" title="Tylko skrypt Nuke'a (backdrop MASKI, anchory + stampy) dla istniejącego eksportu – bez ponownego zapisu EXR">tylko .nk</button></div>
       <label title="Które klatki eksportować. „całość” wymaga wyniku na całym ujęciu – inaczej okno z listą brakujących klatek (nic nie zapisuje się z dziurami). Zakres pracy = znaczniki [ ] na osi czasu (Shift+B / Shift+N, Alt+X = całe ujęcie)">Zakres eksportu<select id="e5Scope" class="form-input" title="całość = całe ujęcie (wymaga wyniku na wszystkich klatkach); work area = tylko zakres pracy z osi czasu"><option value="all">całość (całe ujęcie)</option><option value="work_area">work area (zakres pracy)</option></select></label>
-      <button class="btn btn-primary" id="st5Export" title="Eksport masek wszystkich obiektów z wybranego źródła (z przodu odejmowane od tych z tyłu)">⇪ Eksport wszystkich obiektów</button>
-      <div class="row"><button class="btn btn-secondary" id="st5ExportOne" title="Tylko wybrany obiekt (liczony jak w pełnym eksporcie), z wybranego źródła">⇪ Ten obiekt</button><button class="btn btn-secondary" id="st5ExportWhole" style="display:none" title="Cała postać złożona z części, bez szwu (&lt;obiekt&gt;_full), z wybranego źródła">⇪ Całość</button></div>
+      <label class="chk" id="e5MembersL" style="display:none" title="Przy eksporcie grupy zapisz też osobno maski jej członków włączonych w palecie Obiekty (checkbox przy członku)"><input type="checkbox" id="e5Members" title="Zapisz też osobno maski włączonych członków grupy"> + osobno członkowie grupy (włączeni)</label>
+      <button class="btn btn-primary" id="st5Export" style="width:100%" title="Eksport maski wybranego obiektu albo grupy z wybranego źródła (liczony w kontekście wszystkich obiektów: z przodu odejmowane od tych z tyłu)">⇪ Eksport</button>
+      </div>
       <div class="pane-section">
         <div class="sec-title">Biblioteka i kolejka</div>
         <div class="row"><button class="btn btn-secondary btn-sm" id="st5LibSave" title="Zapisuje nazwę, prompt, ustawienia krawędzi i miniatury">📚 Do biblioteki</button><button class="btn btn-secondary btn-sm" id="st5LibAdd" title="Utwórz obiekt z zapisanego w bibliotece (prompt + ustawienia)">📚 Z biblioteki</button></div>
@@ -3062,6 +3402,11 @@
     if (cw) { const lp = el(ltxPaletteHtml()); cw.appendChild(lp); makeFloating(lp, cw, '.pp-head', ltxPos); }
     if (cw) { const vp = el(vmmPaletteHtml()); cw.appendChild(vp); makeFloating(vp, cw, '.pp-head', vmmPos); }
     if (cw) { const xp = el(expPaletteHtml()); cw.appendChild(xp); makeFloating(xp, cw, '.pp-head', expPos); }
+    if (cw) {   // stage Export: its main controls moved (same ids / listeners) into a palette on the left (2026-10-30)
+      const ep = el(`<div class="pts-palette e6-palette" id="e6Palette" style="display:none"><div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> Eksport</div></div>`);
+      for (const id of ['e6Main', 'e6Main2']) { const n = $(id); if (n) ep.appendChild(n); }
+      cw.appendChild(ep); makeFloating(ep, cw, '.pp-head', e6Pos);
+    }
   }
   // stage MatAnyone / ViTMatte: which version is the result of the stage, is it current
   function renderStageInfo() {
@@ -3087,7 +3432,8 @@
       const res = runs.vitmatte ? ` · wynik ViTMatte: ${runs.vitmatte} ${vs.state === 'done' ? '✔' : '↻ ' + (vs.why || '')}` : '';
       if (base === 'core') {
         const cs = stageState('cotracker');
-        vb.textContent = `Baza: maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH}) ${cs.state === 'done' ? '✔' : '↻ najpierw „▶▶ Zastosuj poprawki” (etap ' + ST.BRUSH + ')'}` + res;
+        vb.textContent = isGroup(objByName(S.obj)) ? `Baza: ${coreLabel()}` + res
+          : `Baza: maska 1+2 (etapy ${ST.SAM3} + ${ST.BRUSH}) ${cs.state === 'done' ? '✔' : '↻ najpierw „▶▶ Zastosuj poprawki” (etap ' + ST.BRUSH + ')'}` + res;
       } else if (base === 'videomama') {
         const vs2 = stageState('videomama');
         vb.textContent = runs.videomama ? `Baza: ${runs.videomama} (VideoMaMa, etap ${ST.VIDEOMAMA}) ${vs2.state === 'done' ? '✔' : '↻ nieaktualna – ' + (vs2.why || 'najpierw przelicz etap ' + ST.VIDEOMAMA)}` + res
@@ -3445,11 +3791,6 @@
       e.preventDefault(); e.stopPropagation();
       if (S.obj && V()) computePoints(V().currentFrame);   // the request carries the field; the server saves it too
     });
-    $('st1PartOf').addEventListener('change', (e) => run('st1PartOf', async () => {
-      await api('PUT', `/api/object/${S.obj}/settings`, { part_of: e.target.value });
-      status(e.target.value ? `„${S.obj}” jest częścią „${e.target.value}” – eksport: ${e.target.value}_full + osobne maski części` : `„${S.obj}” jest samodzielnym obiektem`, 'ok');
-      await refreshList(S.obj);
-    }));
     $('st1PtsClear').addEventListener('click', () => clearPoints(V().currentFrame));
     $('st1PtsRedo').addEventListener('click', () => computePoints(V().currentFrame));
     $('st1CropsBox').addEventListener('toggle', () => { S.showCrops = $('st1CropsBox').open; renderCrops(); V().render(); });
@@ -3719,17 +4060,19 @@
 
     // stage 5
     const srcLabel = () => ($('e6Source') ? $('e6Source').selectedOptions[0].textContent.replace(/ \((brak|missing)\)$/, '') : '');
-    const exportSel = (names, btn) => run(btn, async () => {
-      const d = await api('POST', '/api/export', { objects: names, with_core: $('e5Core').checked, scope: $('e5Scope').value, ...exportBody(true) });
-      status(`Wyeksportowano: ${names.join(', ')} (F${d.frames[0]}–${d.frames[1]}, źródło: ${srcLabel()}${d.runs ? ` – ${Object.entries(d.runs).map(([n, r]) => `${n} ${r}`).join(', ')}` : ''})${d.warning ? '\n⚠ ' + d.warning : ''}`, 'ok');
-    });
     $('st5Export').addEventListener('click', () => run('st5Export', async () => {
-      const d = await api('POST', '/api/export', { multichannel: $('e5Multi').checked, with_core: $('e5Core').checked, with_depth: $('e5Depth').checked, scope: $('e5Scope').value, ...exportBody(false) });
+      // the export = the selected object / group; a group: + optionally its members switched on (user decision 2026-10-29)
+      if (!S.obj) { status('Wybierz obiekt albo grupę', 'warn'); return; }
+      const o = objByName(S.obj);
+      const sel = [S.obj].concat(isGroup(o) && $('e5Members').checked
+        ? ((o.group_info || {}).members || []).filter((m) => m.on !== false).map((m) => m.member) : []);
+      const d = await api('POST', '/api/export', { objects: sel, selection: true, multichannel: $('e5Multi').checked, with_core: $('e5Core').checked, with_depth: $('e5Depth').checked, scope: $('e5Scope').value, ...exportBody(false) });
       status(`Eksport F${d.frames[0]}–${d.frames[1]} (źródło: ${srcLabel()}): ${d.outputs.objects.map((o) => `${o.depth_order}. ${o.name} ${o.version} (QA ${o.qa_status})`).join(', ')}` +
         (d.warning ? `\n⚠ ${d.warning}` : '') +
         (d.contract_errors.length ? `\nKontrakt danych: ${d.contract_errors.join('; ')}` : '\noutputs.json zgodny z kontraktem'), d.contract_errors.length || d.warning ? 'warn' : 'ok');
     }));
-    $('e6Source').addEventListener('change', () => { S.exportSourceUser = true; renderExportSource(); });
+    $('e6Source').addEventListener('change', () => { S.exportSourceUser = true; renderExportSource(); updateViewTabs(); V().render(); });
+    $('e6Run').addEventListener('change', () => V().render());
     $('st4BaseSel').addEventListener('change', () => run('st4BaseSel', async () => {
       const v = $('st4BaseSel').value;
       await api('PUT', `/api/object/${S.obj}/settings`, { vitmatte_base: v });
@@ -3762,8 +4105,6 @@
     }));
     $('e5DirDefault').addEventListener('click', () => run('e5DirDefault', async () => { const d = await api('PUT', '/api/project/export_dir', { path: null }); await loadExportDir(); status(`Katalog eksportu: ${d.path} (domyślny)`, 'ok'); }));
     $('e5NkOnly').addEventListener('click', () => run('e5NkOnly', async () => { const d = await api('POST', '/api/export/nk'); status(`Skrypt Nuke'a: ${d.nk}`, 'ok'); }));
-    $('st5ExportOne').addEventListener('click', () => S.obj ? exportSel([S.obj], 'st5ExportOne') : status('Wybierz obiekt', 'warn'));
-    $('st5ExportWhole').addEventListener('click', () => { const wh = wholeOf(S.obj); if (wh) exportSel([`${wh}_full`], 'st5ExportWhole'); });
     $('st5LibSave').addEventListener('click', () => run('st5LibSave', async () => { const d = await api('POST', '/api/library', { object: S.obj }); status(`Zapisano w bibliotece: ${d.path}`, 'ok'); }));
     $('st5LibAdd').addEventListener('click', () => run('st5LibAdd', async () => {
       const d = await api('GET', '/api/library');
@@ -3921,6 +4262,7 @@
           const p = clampPlate(platePt(ev)); if (!p) continue;
           S.drawing.p.push(S.drawing.pen ? [p[0], p[1], penRadius(ev)] : p);
         }
+        S.hover = platePt(e);   // the brush circle follows the stroke (user report 2026-10-29: it stayed at the start)
         V().render(); return;
       }
       if (brushOn() && !S.altPan) { S.hover = platePt(e); if (!hoverRaf) hoverRaf = requestAnimationFrame(() => { hoverRaf = 0; V().render(); }); }
@@ -4021,6 +4363,8 @@
       } else if (e.code === 'Escape' && S.poly) { S.poly = null; V().render(); }
       else if (e.code === 'KeyZ' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
+        const su = window.MD_SLIDER_UNDO;   // a slider change newer than the last edit on the image goes first (static/slider_undo.js)
+        if (su && su.wants(e.shiftKey) && (e.shiftKey ? su.redo() : su.undo())) return;
         if (!e.shiftKey && (S.strokes[f] || []).length) { S.strokes[f].pop(); V().render(); return; }
         if (!e.shiftKey && (S.polys[f] || []).length) { S.polys[f].pop(); V().render(); return; }
         if (!e.shiftKey && S.stage === ST.VITMATTE && window.MD_ZONES && window.MD_ZONES.ready && await window.MD_ZONES.undo(f)) return;
@@ -4114,6 +4458,11 @@
     if (window.MD_ZONES) window.MD_ZONES.init(hooks);
     if (window.MD_BANDPTS) window.MD_BANDPTS.init(hooks);
     if (window.MD_BRUSH) window.MD_BRUSH.init(hooks);
+    hooks.grpTok = grpTok;
+    hooks.edgeResultLabel = edgeResultLabel;   // stage 5 base name in the Final Touch list (ViTMatte / BiRefNet)
+    hooks.compView = () => S.view === 'comp';   // the Comp view tab (MergeMatte preview, static/mergematte.js)
+    hooks.flatDraw = flatDraw;     // brush strokes as one flat layer (brush.js keys)
+    hooks.coreLabel = coreLabel;   // the „mask 1+2” base of a group = its composition (Final Touch base list)   // the selected group's composition token (overlay keys of Final Touch too)
     if (window.MD_FT) window.MD_FT.init(hooks);
     renderStageBar(); updateViewTabs(); updateDrawTools();
     setStage(ST.SAM3);

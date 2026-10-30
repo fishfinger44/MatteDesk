@@ -100,7 +100,19 @@ def test_final_touch_api_compose_and_export(proj):
     assert r.status_code == 200, r.text
     ma = r.json()["run"]
     d = api.get("/api/object/obj/final_touch").json()
-    assert d["base"] == {"source": "matanyone", "run": ma, "chosen": False, "why": ""}
+    assert d["base"] == {"source": "matanyone", "run": ma, "chosen": False, "stale": False, "why": ""}
+    # a stage-2 brush layer makes stage 3 stale: the default base STAYS its version, marked stale – it used to jump
+    # silently to the next current result (the mask 1+2) and the corrections landed on another alpha (2026-10-30)
+    z = api.post("/api/object/obj/zones/new", json={"mode": "add", "criterion": "all", "frame": start, "polygon": [],
+                                                     "strokes": [{"p": [[5, 5]], "radius_px": 3}],
+                                                     "params": {"source": "brush", "track": "rigid"}})
+    assert z.status_code == 200, z.text
+    d = api.get("/api/object/obj/final_touch").json()
+    assert d["base"]["source"] == "matanyone" and d["base"]["run"] == ma and d["base"]["stale"] is True and d["base"]["why"]
+    from engine.groups import ft_run
+    assert ft_run(pipe.store, "obj")[:2] == (f"ft:{ma}", False)          # the group's „Do grupy z: Final Touch” the same
+    assert api.delete(f"/api/object/obj/zones/{z.json()['zone']['zone_id']}").status_code == 200
+    assert api.get("/api/object/obj/final_touch").json()["base"]["stale"] is False
 
     # a hand correction in the start frame: remove the middle of the object, add a block on the background
     c = pipe.load_core("obj", [start])[start]
@@ -153,7 +165,7 @@ def test_final_touch_api_compose_and_export(proj):
 
     # base changed (DECYZJA: any version, changeable): the mask 1+2 – corrections stay and go on the new base
     r = api.put("/api/object/obj/final_touch", json={"source": "core"})
-    assert r.status_code == 200 and r.json()["base"] == {"source": "core", "run": "core", "chosen": True, "why": ""}
+    assert r.status_code == 200 and r.json()["base"] == {"source": "core", "run": "core", "chosen": True, "stale": False, "why": ""}
     out, mdir = _export_png(api, {"source": "final_touch"})
     assert out["runs"] == {"obj": "ft:core"}
     m = cv2.imread(str(mdir / f"obj_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
@@ -238,3 +250,79 @@ def test_layer_box_roi_equals_full_frame_arithmetic():
     x0, y0, x1, y1 = box
     out = got.copy(); out[y0:y1, x0:x1] = 0
     assert not out.any()
+    from engine.final_touch import layer_roi   # the box alone (live preview, 2026-10-28): the same values
+    rbox, rc = layer_roi(st, w, h)
+    assert rbox == box and np.array_equal(rc, got[y0:y1, x0:x1])
+    assert layer_roi(st[3:], w, h) == (None, None)
+
+
+# ------------------------------------------------------------------------------------------------ proxy preview (NEXT_STEPS 7c, 2026-10-28)
+@pytest.mark.parametrize("w,h", [(4096, 2731), (4448, 3096), (3840, 2160), (2048, 1152), (6000, 4000), (1000, 700)])
+@pytest.mark.parametrize("fmt", ["png", "exr"])
+def test_proxy_preview_equals_full_resize(monkeypatch, w, h, fmt):
+    """GET final_touch/frame: the cached base proxy + the column strip of the strokes' box (aligned to the INTER_AREA
+    blocks) = the old full-resolution compose + resize, bit for bit, at any plate size and export format."""
+    import app as app_module
+    from engine import final_touch as ft
+    rng = np.random.default_rng(w + h)
+    base = cv2.GaussianBlur((rng.random((h, w)) > 0.6).astype(np.float32), (0, 0), 2.0) * np.float32(1.02) - np.float32(0.01)
+    quant = (lambda a: a.astype(np.float16).astype(np.float32)) if fmt == "exr" else (lambda a: np.clip(a, 0, 1).astype(np.float32))
+    od = Path("/nonexistent")
+    frames = {"5": [ft.clean_stroke(s) for s in (
+        {"mode": "add", "radius_px": 30, "hardness": 0.6, "p": [[w * 0.3, h * 0.4], [w * 0.35, h * 0.5]]},
+        {"mode": "remove", "radius_px": 12, "hardness": 1.0, "p": [[w * 0.32, h * 0.45, 20], [w * 0.31, h * 0.6, 4]]},
+        {"mode": "erase", "radius_px": 9, "hardness": 0.0, "p": [[3, 3], [w - 1, 7]]},   # touches both borders
+    )]}
+    ent = {"base": base}
+    monkeypatch.setattr(app_module, "_export_quantize", quant)
+    monkeypatch.setattr(app_module, "_proxy_scale", lambda: min(1.0, 1920.0 / max(w, h)))
+    monkeypatch.setattr(app_module, "_ft_base_entry", lambda *a: ent)
+    for strokes in (frames["5"][:1], frames["5"][:2], frames["5"], []):
+        d = {"base": {}, "frames": {"5": strokes} if strokes else {}, "finish": dict(ft.FINISH_DEFAULT)}
+        monkeypatch.setattr(ft, "load", lambda _od, d=d: d)
+        pw, ph = app_module._ft_proxy_size(w, h)
+        if strokes:
+            full = quant(np.clip(base, 0, 1).astype(np.float32))
+            a = quant(ft.compose(base, ft.layer(strokes, w, h)))
+            c, box = ft.layer_box(strokes, w, h)
+            full[box[1]:box[3], box[0]:box[2]] = a[box[1]:box[3], box[0]:box[2]]
+        else:
+            full = quant(base)
+        want = app_module._alpha_u8(cv2.resize(full, (pw, ph), interpolation=cv2.INTER_AREA))
+        got = app_module._ft_frame_proxy(od, "v001", 5, w, h)
+        assert got.shape == want.shape and np.array_equal(got, want), (w, h, fmt, len(strokes), int((got != want).sum()))
+    assert np.array_equal(app_module._ft_frame_proxy(od, "v001", 5, w, h, base_only=True),
+                          app_module._alpha_u8(cv2.resize(quant(np.clip(base, 0, 1).astype(np.float32)), (pw, ph), interpolation=cv2.INTER_AREA)))
+
+
+def test_export_and_preview_bit_for_bit_after_the_proxy_cache(proj):
+    """NEXT_STEPS 7c: the cheaper preview must not touch the export – the PNG export of source „Final Touch” is still
+    u8(compose(base, layer)) at full resolution, the preview its INTER_AREA proxy, the base=1 preview the base alone."""
+    app_module, api, shot, pipe, frames, start = proj
+    from engine import final_touch as ft
+    from engine.export import run_alpha_loader
+    od = pipe.store.dir("obj")
+    r = api.post("/api/object/obj/finalize", json={"stage": "matanyone"})
+    assert r.status_code == 200, r.text
+    ma = r.json()["run"]
+    c = pipe.load_core("obj", [start])[start]
+    ys, xs = np.where(c)
+    cy, cx = int(np.median(ys)), int(np.median(xs))
+    strokes = [{"mode": "remove", "radius_px": 7, "hardness": 0.4, "p": [[cx - 5, cy], [cx + 6, cy + 3]]},
+               {"mode": "add", "radius_px": 6, "hardness": 0.7, "p": [[10, 10], [30, 14, 9]]},
+               {"mode": "erase", "radius_px": 3, "hardness": 0.0, "p": [[cx, cy]]}]
+    assert api.put(f"/api/object/obj/final_touch/frames/{start}", json={"strokes": strokes}).status_code == 200
+    w, h = shot.w, shot.h
+    base = run_alpha_loader(od, ma, w, h)(start)
+    want = (np.clip(ft.compose(base, ft.layer(ft.load(od)["frames"][str(start)], w, h)), 0, 1) * 255 + 0.5).astype(np.uint8)
+    _out, mdir = _export_png(api, {"source": "final_touch"})
+    assert np.array_equal(cv2.imread(str(mdir / f"obj_{start:04d}.png"), cv2.IMREAD_GRAYSCALE), want)
+    s = app_module._proxy_scale()
+    pw, ph = max(1, round(w * s)), max(1, round(h * s))
+    pv = api.get(f"/api/object/obj/final_touch/frame/{start}?b={ma}")
+    got = cv2.imdecode(np.frombuffer(pv.content, np.uint8), cv2.IMREAD_GRAYSCALE)
+    full = np.clip(ft.compose(base, ft.layer(ft.load(od)["frames"][str(start)], w, h)), 0, 1).astype(np.float32)
+    assert np.array_equal(got, app_module._alpha_u8(cv2.resize(full, (pw, ph), interpolation=cv2.INTER_AREA)))
+    bp = api.get(f"/api/object/obj/final_touch/frame/{start}?b={ma}&base=1")
+    gb = cv2.imdecode(np.frombuffer(bp.content, np.uint8), cv2.IMREAD_GRAYSCALE)
+    assert np.array_equal(gb, app_module._alpha_u8(cv2.resize(np.clip(base, 0, 1).astype(np.float32), (pw, ph), interpolation=cv2.INTER_AREA)))

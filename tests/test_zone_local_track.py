@@ -5,6 +5,7 @@ edge, tracked LOCALLY by CoTracker points (never on a hand that is a part of the
 part (one matte with the head) is cut out of the band and is sure foreground of the trimap; "Zmaż obszar" strokes."""
 
 import sys
+import pytest
 from pathlib import Path
 
 import cv2
@@ -83,10 +84,17 @@ def test_propagate_local_mode_skips_the_excluded_object():
     ys_l = np.where(regions[7][:, 30:100])[0].mean(); ys_r = np.where(regions[7][:, 200:270])[0].mean()
     ys0 = np.where(regions[4][:, 30:100])[0].mean()
     assert ys_l > ys0 + 4 and ys_r < ys0 - 4                                   # each side follows its own points
+    # `only` with the cached tracks (the previews after scrubbing, 2026-10-30): that frame alone = the full run
+    for f in frames:
+        r1, b1, _t, _i = propagate_regions(z, frames, cores, (H, W), transforms_cache=T, only=[f])
+        assert set(r1) == {f} and np.array_equal(r1[f], regions[f]) and np.array_equal(b1[f], bgs[f]), f
 
 
 def test_part_of_the_object_is_cut_out_of_the_band_and_is_foreground(tmp_path, monkeypatch):
+    """A ViTMatte zone on a group entity (PLAN_GROUP_COMPOSE step 4): the member in front (the hand on the head) is
+    sure foreground – cut out of the band, 255 in the trimap; the zone works on the group's composition."""
     import engine.vitmatte as vm
+    from engine import groups
     from test_zone_matte import _api_project
     from test_zone_vitmatte import MockRunner
     app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
@@ -97,34 +105,32 @@ def test_part_of_the_object_is_cut_out_of_the_band_and_is_foreground(tmp_path, m
     y_top, x_mid = int(ys.min()), int(np.median(xs))
     store = pipe.store
     store.create("hand", ["hand"], depth_order=0)
-    store.update("hand", part_of="obj")
     store.update("obj", depth_order=1)     # the hand lies ON the head: in front (2026-10-16: the front members are sure)
     cd = store.dir("hand") / "core"; cd.mkdir(parents=True)
     m = np.zeros((shot.h, shot.w), np.uint8)
     m[max(0, y_top - 40):y_top + 40, x_mid - 30:x_mid + 30] = 255     # the "hand" crosses the top edge of the object
     for f in frames:
         cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
+    groups.create_group(store, "grp", ["hand", "obj"])
     band = [{"p": [[int(xs.min()), y_top], [int(xs.max()), y_top]], "radius_px": 20}]
     body = {"mode": "add", "criterion": "matte", "frame": start, "polygon": [], "strokes": band, "matting": "vitmatte",
             "preset": "hair", "params": {"temporal": "none", "track": "local"}}
-    r = api.post(f"/api/object/obj/zones/new?preview_frame={start}", json=body)
+    r = api.post(f"/api/object/grp/zones/new?preview_frame={start}", json=body)
     assert r.status_code == 200, r.text
     zid = r.json()["zone"]["zone_id"]
-    z = next(x for x in __import__("engine.zones", fromlist=["load_zones"]).load_zones(store.dir("obj")) if x.zone_id == zid)
-    regs, _, info = pipe.zone_regions("obj", z, frames, pipe.load_core("obj", frames))
+    z = next(x for x in __import__("engine.zones", fromlist=["load_zones"]).load_zones(store.dir("grp")) if x.zone_id == zid)
+    regs, _, info = pipe.zone_regions("grp", z, frames, pipe.group_core("grp", frames))
     hand = m > 127
     assert info["fg_objects"] == ["hand"] and "hand" in info.get("point_exclude", [])
-    assert regs[start].any() and not (regs[start] & hand).any()                 # the part is out of the band
-    # the trimap the model saw: the hand is sure foreground (255) where it meets the band
-    tris = [c_ for c_ in runner.calls]
-    assert tris, "ViTMatte ran for the preview"
-    fg_fn, names = pipe.zone_fg("obj", z, [start])
+    assert regs[start].any() and not (regs[start] & hand).any()                 # the member in front is out of the band
+    assert runner.calls, "ViTMatte ran for the preview"
+    fg_fn, names = pipe.zone_fg("grp", z, [start])
     assert names == ["hand"] and fg_fn(start)[y_top, x_mid]
     # live finish in the UI (2026-10-16): the preview also writes the alpha before the finish and its area
     for v in ("zone_raw", "zone_area"):
-        rv = api.get(f"/api/object/obj/frame/{start}?view={v}")
+        rv = api.get(f"/api/object/grp/frame/{start}?view={v}")
         assert rv.status_code == 200, (v, rv.text)
-    area = cv2.imread(str(store.dir("obj") / "preview" / f"zarea_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
+    area = cv2.imread(str(store.dir("grp") / "preview" / f"zarea_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
     assert (area == 128).any() and set(np.unique(area)) <= {0, 128, 255}
 
 

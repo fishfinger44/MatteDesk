@@ -36,6 +36,7 @@
     <div class="jobTrack"><div class="jobFill" id="jmFill"></div></div>
     <div class="s" id="jmMeta"></div>
     <div class="s" id="jmSpill" style="display:none;margin-top:8px;padding:6px 8px;border-radius:6px;background:rgba(240,112,58,.18);color:#fde68a"></div>
+    <div class="s" id="jmErr" style="display:none;margin-top:8px;padding:6px 8px;border-radius:6px;background:rgba(239,68,68,.18);color:#fecaca"></div>
     <div class="jobDet" id="jmDet"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn btn-ghost" id="jmDetBtn" title="GPU / VRAM / RAM, co liczy Comfy, krok i ETA" style="margin-right:auto">Szczegóły ▾</button>
@@ -54,7 +55,17 @@
   toast.id = 'jobToast';
   const barDet = document.createElement('div');
   barDet.id = 'jobBarDet'; barDet.innerHTML = '<div class="jobDet" id="jobDet" style="display:block;margin:0"></div>';
-  document.body.append(modal, bar, toast, barDet);
+  // a computation that ended with an error (user report 2026-10-26: Comfy OOM in VideoMaMa / a failed frame preview were
+  // only a short bar line or small red text in the panel): a window that stays until "OK", full text + Comfy's raw message
+  const errModal = document.createElement('div');
+  errModal.id = 'jobErrModal';
+  errModal.style.cssText = 'position:fixed;inset:0;z-index:1001;display:none;align-items:center;justify-content:center;background:rgba(5,8,14,.55)';
+  errModal.innerHTML = `<div id="jobErrCard" style="width:min(560px,calc(100vw - 32px));padding:18px 20px;border-radius:12px;background:var(--bg-panel,#1f1f22);border:1px solid #ef4444;box-shadow:0 10px 40px rgba(0,0,0,.5);color:var(--text-main,#e6e6e8);font-size:13px">
+    <div style="font-size:15px;font-weight:600;color:#f87171;margin-bottom:6px" id="jeTitle"></div>
+    <div id="jeMsg" style="white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto"></div>
+    <div id="jeRaw" class="jobDet" style="display:none;margin-top:10px"></div>
+    <div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn btn-primary" id="jeOk">OK</button></div></div>`;
+  document.body.append(modal, bar, toast, barDet, errModal);
 
   // ---- "Szczegóły" (Z19): GET /api/jobs/details every second while open; open/closed remembered (localStorage, try/catch)
   let detOpen = false;
@@ -136,6 +147,28 @@
     toast.textContent = t; toast.style.display = 'block';
     clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.style.display = 'none'; }, 4000);
   }
+  // ---- error window: once per failed job (id), also for quiet jobs (frame previews)
+  const errShown = new Set();
+  const ERR_RECENT_S = 120;   // a failed job ended this long ago still gets the window (throttled background tab)
+  function showError(j) {
+    errShown.add(j.id);
+    const ci = j.comfy_info || {};
+    $('jeTitle').textContent = `✖ ${j.label} – błąd`;
+    const comfyErr = ci.error && ci.error !== j.error ? `\n\nComfyUI: ${ci.error}` : '';
+    $('jeMsg').textContent = `${j.error || 'liczenie przerwane błędem (bez opisu)'}${comfyErr}`;
+    const raw = ci.raw_error;
+    $('jeRaw').style.display = raw ? 'block' : 'none';
+    $('jeRaw').innerHTML = raw ? `<details><summary>surowy komunikat ComfyUI</summary><pre>${esc(JSON.stringify(raw, null, 1))}</pre></details>` : '';
+    errModal.style.display = 'flex';
+    $('jeOk').focus();
+  }
+  const closeError = () => { errModal.style.display = 'none'; };
+  $('jeOk').addEventListener('click', closeError);
+  document.addEventListener('keydown', (e) => {
+    if (errModal.style.display !== 'flex') return;
+    if (e.key === 'Escape' || e.key === 'Enter') closeError();
+    e.stopImmediatePropagation(); e.preventDefault();
+  }, true);
 
   async function cancel(btn) {
     if (!(await window.viewer.uiConfirm('Przerwać bieżące liczenie?\nSkończone klatki zostają, niedokończona wersja nie zostanie aktywowana.', { ok: 'Przerwij' }))) return;
@@ -150,7 +183,7 @@
   // Buttons that start a computation or switch the project: locked while something is being computed.
   const HEAVY = ['#p0Proxy', '#confirmOpenProjectBtn', '#p0Measure', '#p0Apply',
     '#btnMeasureClean', '#btnRunClean', '#btnRunCameraTrack', '#btnDepthRun', '#st1Detect', '#st2Crops',
-    '#st3Run', '#st3Rerun', '#st4Final', '#z4ApplyShot', '#z4CpAuto', '#st5Export', '#st5ExportOne', '#st5ExportWhole', '#st5QRun', '.doctor-install', '#btnSavePlate',
+    '#st3Run', '#st3Rerun', '#st4Final', '#z4ApplyShot', '#z4CpAuto', '#st5Export', '#st5QRun', '.doctor-install', '#btnSavePlate',
     // newer stage buttons and the floating palettes (2026-10-16: "Run MatAnyone" on the palette did nothing visible during VideoMaMa)
     '#st1All', '#ppAll', '#st3Ma', '#epCompute', '#vmRun', '#lx6Run', '#exAnalyze', '#exCompute', '#zpApply', '#b2Apply',
     // frame previews, SAM3 of one frame, motion blur, the Nuke script (user request 2026-10-22: everything that computes waits)
@@ -185,14 +218,20 @@
     if (!j.total) return '';
     return j.unit === 'pct' ? `postęp ${Math.round((100 * j.done) / j.total)} %` : `klatki ${j.done}/${j.total}`;
   }
+  // the GPU manager (engine/gpu_manager): a job waiting for the card shows who holds it instead of its step; work in
+  // the background without a job (band tracking) waiting for the card is added to the bar
+  let gpu = null;
+  const stepOf = (j) => (j.gpu_wait ? `czeka na GPU: ${j.gpu_wait}` : j.step);
+  const bgWait = () => ((gpu && gpu.waiting) || []).filter((w) => !w.job);
   function meta(j) {
-    return [count(j), j.comfy || '', mmss(j.elapsed_s)].filter(Boolean).join(' · ');
+    const bg = bgWait().map((w) => `w tle czeka na GPU: ${w.label}`);
+    return [count(j), j.comfy || '', ...bg, mmss(j.elapsed_s)].filter(Boolean).join(' · ');
   }
   function render(run) {
     const j = run.length ? run[run.length - 1] : null;
     if (j && j.quiet) {   // short job (SAM3 on one frame): small bar only, no blocking window
       $('jobDot').style.background = '#a855f7';
-      $('jobText').textContent = `${j.label}${j.step ? ' · ' + j.step : ''}`;
+      $('jobText').textContent = `${j.label}${stepOf(j) ? ' · ' + stepOf(j) : ''}`;
       fill($('jobFill'), j); $('jobMeta').textContent = meta(j);
       $('jobCancel').style.display = ''; $('jobExpand').style.display = 'none';
       modal.style.display = 'none'; bar.style.display = 'flex';
@@ -203,17 +242,21 @@
       const more = run.length > 1 ? ` (+${run.length - 1})` : '';
       // centred window
       $('jmTitle').textContent = j.label + more;
-      $('jmStep').textContent = j.step || 'start…';
+      $('jmStep').textContent = stepOf(j) || 'start…';
       fill($('jmFill'), j);
       $('jmMeta').textContent = meta(j);
       // GPU memory spilled to RAM (comfy_client.wait_for_prompt, user request 2026-10-26): the run goes on, many times slower
       const sp = (j.comfy_info || {}).spill_gb;
       $('jmSpill').style.display = sp ? '' : 'none';
       if (sp) $('jmSpill').textContent = `⚠ ${sp.toFixed(1)} GB pamięci GPU przelało się do RAM – liczenie będzie kilka razy wolniejsze (może też skończyć się brakiem pamięci). Rozważ „Przerwij” i mniejszą rozdzielczość / skalę / kadr albo krótszy zakres.`;
+      // Comfy already reported an error (OOM, crash) while the job still winds down: say it in the window, not only in "Szczegóły"
+      const ce = (j.comfy_info || {}).error;
+      $('jmErr').style.display = ce ? '' : 'none';
+      if (ce) $('jmErr').textContent = `✖ ${ce}`;
       $('jmCancel').disabled = stopping; $('jobCancel').disabled = stopping;
       // bar
       $('jobDot').style.background = stopping ? '#f0703a' : '#e8a33d';
-      $('jobText').textContent = `${j.label}${j.step ? ' · ' + j.step : ''}${more}`;
+      $('jobText').textContent = `${j.label}${stepOf(j) ? ' · ' + stepOf(j) : ''}${more}`;
       fill($('jobFill'), j);
       $('jobMeta').textContent = meta(j);
       $('jobCancel').style.display = ''; $('jobExpand').style.display = '';
@@ -227,9 +270,18 @@
 
   async function poll() {
     let jobs = [];
-    try { jobs = (await (await fetch('/api/jobs')).json()).jobs || []; } catch (e) { setTimeout(poll, 3000); return; }
+    try {
+      const r = await (await fetch('/api/jobs')).json();
+      jobs = r.jobs || []; gpu = r.gpu || null;
+    } catch (e) { setTimeout(poll, 3000); return; }
     const run = jobs.filter((j) => j.state === 'running');
     if (busy && !run.length) window.dispatchEvent(new CustomEvent('matte-job-finished', { detail: busy }));
+    const failed = jobs.filter((j) => j.state === 'error' && j.ended && !errShown.has(j.id)
+      && Date.now() / 1000 - j.ended < ERR_RECENT_S).sort((a, b) => b.ended - a.ended);
+    if (failed.length && errModal.style.display !== 'flex') {   // the newest one; older ones of the same burst are not queued
+      failed.forEach((j) => errShown.add(j.id));
+      showError(failed[0]);
+    }
     const wasBusy = !!busy;
     busy = run.length ? run[run.length - 1] : null;
     if (!!busy !== wasBusy) detPoll();
@@ -251,6 +303,13 @@
         $('jobCancel').style.display = 'none'; $('jobExpand').style.display = 'none';
         bar.style.display = 'flex';
         setTimeout(() => { lastShownEnd = last.ended; }, 6000);
+      } else if (bgWait().length) {   // nothing computes as a job, but background work waits for the card
+        const w = bgWait()[0];
+        $('jobDot').style.background = '#a855f7';
+        $('jobText').textContent = `${w.label} · czeka na GPU: ${w.for}`;
+        $('jobFill').classList.add('ind'); $('jobMeta').textContent = mmss(w.waited_s);
+        $('jobCancel').style.display = 'none'; $('jobExpand').style.display = 'none';
+        bar.style.display = 'flex';
       } else {
         bar.style.display = 'none';
       }

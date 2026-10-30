@@ -70,7 +70,7 @@ def _api(url: str) -> Dict[str, Any]:
     import json
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": dl.UA, "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with dl.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
 
 

@@ -86,10 +86,12 @@ def lama_inpaint_comfy(client: Any, io_dir: Path, img: np.ndarray, mask: np.ndar
     m = cv2.dilate(mask.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
     write_mask_png(job / "mask" / "m_0000.png", m)
     g = lama_graph(str(job / "frames"), str(job / "mask"), f"matte_desk/cleanplate_lama_{uuid.uuid4().hex[:8]}/cp", model_name)
-    sub = client.queue_prompt(g)
-    if not sub.get("success"):
-        raise RuntimeError(f"Comfy odrzucił graf LaMa: {sub.get('error')}")
-    res = client.wait_for_prompt(sub["prompt_id"], timeout_sec=600)
+    from engine.gpu_manager import comfy_lease
+    with comfy_lease(client, "LaMa"):
+        sub = client.queue_prompt(g)
+        if not sub.get("success"):
+            raise RuntimeError(f"Comfy odrzucił graf LaMa: {sub.get('error')}")
+        res = client.wait_for_prompt(sub["prompt_id"], timeout_sec=600)
     if not res.get("success"):
         raise RuntimeError(f"LaMa nie powiódł się: {res.get('error')}")
     outs = sorted(res.get("outputs", {}).get("6", {}).get("images", []), key=lambda i: i["filename"])

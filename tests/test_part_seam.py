@@ -1,6 +1,6 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Whole of an object made of parts: seam width `part_seam_px` (parent field) fills the contact gap between parts."""
+"""Composition of a group: seam width `seam_px` (group field) fills the contact gap between its members."""
 import numpy as np
 
 from engine.export import SEAM_PX_DEFAULT, seam_px, seamless_union
@@ -15,9 +15,9 @@ def _two_parts(gap):
 
 def test_seam_px_default_and_clamp():
     assert seam_px({}) == SEAM_PX_DEFAULT == 4
-    assert seam_px({"part_seam_px": 12}) == 12
-    assert seam_px({"part_seam_px": 999}) == 40 and seam_px({"part_seam_px": -3}) == 0
-    assert seam_px({"part_seam_px": "x"}) == SEAM_PX_DEFAULT
+    assert seam_px({"seam_px": 12}) == 12
+    assert seam_px({"seam_px": 999}) == 40 and seam_px({"seam_px": -3}) == 0
+    assert seam_px({"seam_px": "x"}) == SEAM_PX_DEFAULT
 
 
 def test_wider_seam_fills_wider_gap():

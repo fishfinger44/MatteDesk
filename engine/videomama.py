@@ -131,6 +131,8 @@ def settings_sig(s: Dict[str, Any]) -> str:
     d = {k: s.get(k) for k in ("base", "reach_px", "inset_px", "feather_px", "outer_feather_px", "max_side", "batch",
                                "overlap", "seed")}
     d.update(band_points=s.get("band_points") or [], band_ref=[s.get("band_ref_out"), s.get("band_ref_in")])
+    if s.get("whole_core"):   # „cały rdzeń” – only when on (results computed before keep their signature)
+        d["whole_core"] = True
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -170,8 +172,13 @@ def work_side(w: int, h: int, max_side: int) -> int:
 
 
 # ----------------------------------------------------------------------------- composition
+def inset_w(s: Dict[str, Any]) -> float:
+    """The inset width of the band geometry: inf with „Wcięcie: cały rdzeń” (engine/bandsys `whole`), else inset_px."""
+    return float("inf") if s.get("whole_core") else s["inset_px"]
+
+
 def compose(base: np.ndarray, vmm: np.ndarray, reach: float, inset: float, feather: float = 0.0,
-            outer_feather: float = 0.0, pts=None) -> np.ndarray:
+            outer_feather: float = 0.0, pts=None, in_unit: float = 0.0) -> np.ndarray:
     """Base (0..1, the mask 1+2 or the stage-3 alpha) + VideoMaMa matte -> the stage alpha through the one band of every
     stage (engine/bandsys.compose): VideoMaMa in the band `reach` px outside .. `inset` px inside the base edge, blended
     into the base over `feather` px from the inner band edge and `outer_feather` px from the outer one; band points
@@ -181,6 +188,9 @@ def compose(base: np.ndarray, vmm: np.ndarray, reach: float, inset: float, feath
     b = np.clip(base.astype(np.float32), 0, 1)
     v = np.clip(vmm.astype(np.float32), 0, 1)
     o, i = band_widths(b, reach, inset, pts)
+    if np.isinf(i).all():   # „cały rdzeń”: the points' inner whiskers shape the feather (in_unit = the inset slider)
+        from engine.bandsys import whole_feather
+        feather = whole_feather(b, feather, pts, in_unit)
     return band_compose(b, v, sdf_px(b), o, i, feather, outer_feather)
 
 
@@ -190,7 +200,7 @@ def band_u8(base: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
     from engine.bandsys import band_area, band_widths
     b = np.clip(base.astype(np.float32), 0, 1)
     d = sdf_px(b)
-    o, i = band_widths(b, s["reach_px"], s["inset_px"], pts)
+    o, i = band_widths(b, s["reach_px"], inset_w(s), pts)
     out = np.zeros(d.shape, np.uint8)
     out[band_area(d, o, i)] = 128
     out[d > np.asarray(i, np.float32)] = 255
@@ -243,10 +253,12 @@ class VideoMaMa:
         busy = self.client.busy_error()
         if busy:
             raise RuntimeError(busy)
-        sub = self.client.queue_prompt(g)
-        if not sub.get("success"):
-            raise RuntimeError(f"Comfy odrzucił graf VideoMaMa: {sub.get('error')}")
-        res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=2 * 3600)
+        from engine.gpu_manager import comfy_lease
+        with comfy_lease(self.client, "VideoMaMa"):
+            sub = self.client.queue_prompt(g)
+            if not sub.get("success"):
+                raise RuntimeError(f"Comfy odrzucił graf VideoMaMa: {sub.get('error')}")
+            res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=2 * 3600)
         if not res.get("success"):
             raise RuntimeError(f"VideoMaMa nie powiódł się: {res.get('error')}")
         return res

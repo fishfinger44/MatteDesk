@@ -487,12 +487,14 @@ def run_depth(client: Any, workflow: Union[str, Path, Dict[str, Any]], shot: str
     busy = client.busy_error()
     if busy:
         raise RuntimeError(busy)
-    from engine.gpu_release import before_stage
+    from engine.gpu_manager import before_stage
     before_stage("comfy", client, "DepthCrafter")
-    sub = client.queue_prompt(graph)
-    if not sub.get("success"):
-        raise RuntimeError(f"Comfy odrzucił graf: {sub.get('error')}")
-    res = client.wait_for_prompt(sub["prompt_id"], timeout_sec=timeout_s or max(600.0, cost["eta_s"] * 3))
+    from engine.gpu_manager import comfy_lease
+    with comfy_lease(client, "DepthCrafter"):
+        sub = client.queue_prompt(graph)
+        if not sub.get("success"):
+            raise RuntimeError(f"Comfy odrzucił graf: {sub.get('error')}")
+        res = client.wait_for_prompt(sub["prompt_id"], timeout_sec=timeout_s or max(600.0, cost["eta_s"] * 3))
     if not res.get("success"):
         raise RuntimeError(f"DepthCrafter nie powiódł się: {res.get('error')}")
 

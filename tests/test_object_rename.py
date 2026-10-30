@@ -12,7 +12,9 @@ def test_rename_moves_folder_and_exact_references(tmp_path):
     st = ObjectStore(tmp_path)
     st.create("Hands", prompts=["Hands in the foreground"])
     st.create("Head")
-    st.update("Head", part_of="Hands", tool={"depends_on": ["Hands"]})
+    st.update("Head", tool={"depends_on": ["Hands"]})
+    from engine.groups import create_group
+    create_group(st, "Body", ["Hands", "Head"])
     (st.dir("Hands") / "zones").mkdir(exist_ok=True)
     (st.dir("Hands") / "zones" / "z_01.json").write_text(json.dumps({"params": {"sure_fg": ["Hands", "HandsX"]}}), encoding="utf-8")
     n = st.rename("Hands", "dogs")
@@ -21,7 +23,8 @@ def test_rename_moves_folder_and_exact_references(tmp_path):
     d = st.get("dogs")
     assert d["name"] == "dogs" and d["detect"]["prompts"] == ["Hands in the foreground"]   # substring in a prompt kept
     h = st.get("Head")
-    assert h["part_of"] == "dogs" and h["tool"]["depends_on"] == ["dogs"]
+    assert h["tool"]["depends_on"] == ["dogs"] and st.get("dogs")["group"] == "Body"
+    assert st.get("Body")["members"] == ["dogs", "Head"]
     z = json.loads((st.dir("dogs") / "zones" / "z_01.json").read_text(encoding="utf-8"))
     assert z["params"]["sure_fg"] == ["dogs", "HandsX"]
 

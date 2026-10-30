@@ -93,8 +93,7 @@ def load_zones(obj_dir: Path) -> List[Zone]:
     d = obj_dir / "zones"
     try:
         obj = json.loads((obj_dir / "object.json").read_text(encoding="utf-8"))
-        root = (json.loads((obj_dir.parent / obj["part_of"] / "object.json").read_text(encoding="utf-8"))
-                if obj.get("part_of") else obj)
+        root = obj     # a group member has its own band (PLAN_GROUP_COMPOSE 2026-10-29)
     except (OSError, ValueError, KeyError):
         obj, root = None, None
     out = []
@@ -446,7 +445,8 @@ def _lerp_polygon(pa: np.ndarray, pb: np.ndarray, t: float) -> np.ndarray:
 def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarray], shape: Tuple[int, int],
                       tracker_frames_for: Optional[Callable[[Sequence[int]], Tuple[List[np.ndarray], float]]] = None,
                       tracker: Any = None, transforms_cache: Optional[Dict[str, Dict[int, Any]]] = None,
-                      point_exclude: Optional[Callable[[int], Optional[np.ndarray]]] = None
+                      point_exclude: Optional[Callable[[int], Optional[np.ndarray]]] = None,
+                      only: Optional[Sequence[int]] = None
                       ) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[str, Dict[int, Any]], Dict[str, Any]]:
     """Region and forced-BG mask of the zone in every frame from its keys (plan section 5):
     - before the first / after the last key: that key moved by follow_transforms (CoTracker3, fallback core bbox);
@@ -454,8 +454,19 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
       key a moved forward and key b moved backward; otherwise the union of the two moved drawings;
     - a key frame = exactly its drawing. "-" strokes: static (bg_static) = the nearest key's strokes as drawn, else moved
       with that key. `transforms_cache` (key frame -> transforms) avoids re-tracking (ZoneCache.put_transforms).
+    `only` (2026-10-30, the frame previews after scrubbing): regions / BG masks of these frames only – the tracking
+    and the transforms still span `frames` (same cache, same result in those frames, bit for bit); ~3.5 s -> well
+    under a second per previewed frame on a 50-frame work area.
     Returns (regions, bg_masks, transforms per key as {str(key): {f: M}}, info)."""
     frames = list(frames)
+    want = set(int(f) for f in only) if only is not None else None
+    need = (lambda f: True) if want is None else (lambda f: f in want)
+    _kz: Dict[int, Zone] = {}
+
+    def kz(k: int) -> Zone:   # key_zone once per key and call (a deep copy of the zone each time was ~30 ms)
+        if k not in _kz:
+            _kz[k] = key_zone(z, k)
+        return _kz[k]
     keys = zone_keys(z)
     kf = sorted(k for k in keys if k in frames) or [int(z.frame)]
     eye = np.eye(2, 3, dtype=np.float32)
@@ -467,7 +478,7 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
         have = (transforms_cache or {}).get(key) or tr.get(key) or {}
         missing = [f for f in sub if f not in have]
         if missing:
-            zk = key_zone(z, k)
+            zk = kz(k)
             sub_all = list(range(min(min(sub), k), max(max(sub), k) + 1))   # continuous: a key outside `sub` too
             tf = (lambda: tracker_frames_for(sub_all)) if (tracker_frames_for is not None and tracker is not None) else None
             got = follow_transforms(zk, sub_all, cores, tf, tracker,
@@ -484,11 +495,11 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
         return M.fallback if isinstance(M, LocalWarp) else M
 
     def bg_of(k: int, f: int, M: Optional[Any]) -> np.ndarray:
-        zk = key_zone(z, k)
+        zk = kz(k)
         return zone_bg_mask_at(zk, shape, None if z.bg_static else rigid(M))
 
     def region_of(k: int, M: Optional[Any]) -> np.ndarray:
-        zk = key_zone(z, k)
+        zk = kz(k)
         if isinstance(M, LocalWarp):
             return local_warp_mask(zone_mask_at(zk, shape, None), M)
         return zone_mask_at(zk, shape, M)
@@ -500,13 +511,15 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
     if head:
         T = transforms_of(first, head)
         for f in head:
+            if not need(f):
+                continue
             M = None if f == first else T.get(f, eye)
             regions[f] = region_of(first, M)
             bgs[f] = bg_of(first, f, M)
     if tail:
         T = transforms_of(last, tail)
         for f in tail:
-            if f in regions:
+            if f in regions or not need(f):
                 continue
             M = None if f == last else T.get(f, eye)
             regions[f] = region_of(last, M)
@@ -522,8 +535,10 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
         same_poly = (len(ka["polygon"]) >= 3 and len(ka["polygon"]) == len(kb["polygon"]) and not ka["strokes"]
                      and not kb["strokes"] and track_mode(z) != "local")
         for f in mid:
+            if not need(f):
+                continue
             if f in (a, b):
-                regions[f] = zone_mask_at(key_zone(z, f), shape, None)
+                regions[f] = zone_mask_at(kz(f), shape, None)
                 bgs[f] = bg_of(f, f, None)
                 continue
             Ma, Mb = Ta.get(f, eye), Tb.get(f, eye)
@@ -538,7 +553,7 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
                 rb = region_of(b, Mb).astype(np.float32)
                 regions[f] = ((1.0 - t) * ra + t * rb) >= 0.5
             else:
-                regions[f] = zone_mask_at(key_zone(z, a), shape, Ma) | zone_mask_at(key_zone(z, b), shape, Mb)
+                regions[f] = zone_mask_at(kz(a), shape, Ma) | zone_mask_at(kz(b), shape, Mb)
             near = a if t < 0.5 else b
             bgs[f] = bg_of(near, f, Ma if near == a else Mb)
     info = {"keys": kf, "tracked": tracked, "interpolated": any(len([f for f in frames if a < f < b]) for a, b in zip(kf[:-1], kf[1:]))}
@@ -616,6 +631,7 @@ class ZoneResult:
     # frame -> uint8 blend weight (255 = the zone) when a zone has its own outer-edge feather (outer_feather_px, 2026-10-21);
     # frames without one keep the distance feather of apply_soft_override (bit-identical)
     weights: Dict[int, np.ndarray] = field(default_factory=dict)
+    timings: Dict[str, float] = field(default_factory=dict)      # plan A6b: wall seconds of the shared composing
 
 
 MA_ZONE_TARGET_PX = 1008     # MatAnyone zone engine: crop side scaled up to this (<= MA_ZONE_MAX_UP x)
@@ -658,6 +674,19 @@ def band_is_unknown(z: "Zone") -> bool:
     forced to 1 there, so band points whose inner whisker reached deeper than the inset (background between the strands
     that SAM 3.1 took for hair) stayed 1 whatever the model said."""
     return z.criterion == "matte" and region_mode(z) == "outline"
+
+
+def zone_whole(z: "Zone") -> bool:
+    """„Wcięcie: cały rdzeń” of a whole-outline zone (params `whole_core`; shared: engine/objband.zone_params) – the band
+    covers the whole core, the inner band edge = the middle of the core (engine/bandsys `whole`, depth_deficit)."""
+    return band_is_unknown(z) and bool((z.params or {}).get("whole_core"))
+
+
+def zone_feather_at(z: "Zone", f: int) -> Any:
+    """The inset feather of a zone in frame f: with „cały rdzeń” and band points the map shaped by the points'
+    inner whiskers (set by outline_regions), else zone_feather_px."""
+    m = (getattr(z, "whole_feather", None) or {}).get(f) if zone_whole(z) else None
+    return zone_feather_px(z) if m is None else m
 
 
 def zone_force_core(z: "Zone", core: np.ndarray, region: np.ndarray, force_px: int) -> np.ndarray:
@@ -710,10 +739,12 @@ def _disk_k(r: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
 
-def outline_band(core: np.ndarray, out_px: int, in_px: int) -> np.ndarray:
-    """Pixels within out_px outside the core edge or within in_px inside it."""
+def outline_band(core: np.ndarray, out_px: int, in_px: int, whole: bool = False) -> np.ndarray:
+    """Pixels within out_px outside the core edge or within in_px inside it (`whole`: the whole core inside)."""
     c = core.astype(np.uint8)
     outer = cv2.dilate(c, _disk_k(out_px)).astype(bool) if out_px > 0 else core.astype(bool)
+    if whole:
+        return outer | core.astype(bool)
     inner = cv2.erode(c, _disk_k(in_px)).astype(bool) if in_px > 0 else core.astype(bool)
     return outer & ~inner
 
@@ -727,22 +758,45 @@ def outline_regions(z: "Zone", cores: Dict[int, np.ndarray], drawn: Dict[int, np
     p = z.params or {}
     out_px = int(p.get("outline_out_px", OUTLINE_OUT_PX))
     in_px = outline_in_px(p)
+    whole = zone_whole(z)   # „cały rdzeń”: the band covers the whole core
     grow = int(p.get("exclude_grow_px", EXCLUDE_GROW_PX))
     out: Dict[int, np.ndarray] = {}
-    for f, c in cores.items():
-        pts = band_at(f) if band_at is not None else None
+
+    def band(c, pts):
         if pts:
             from engine.bandmap import variable_band, width_maps
-            reg = variable_band(c, *width_maps(c, pts, out_px, in_px))
-        else:
-            reg = outline_band(c, out_px, in_px)
-        d = drawn.get(f)
-        if d is not None:
-            reg &= ~d.astype(bool)
-        m = exclude(f) if exclude is not None else None
-        if m is not None and m.any():
-            reg &= ~(cv2.dilate(m.astype(np.uint8), _disk_k(grow)).astype(bool) if grow > 0 else m.astype(bool))
-        out[f] = reg
+            om, im = width_maps(c, pts, out_px, 0 if whole else in_px)
+            return variable_band(c, om, np.full_like(im, np.inf) if whole else im)
+        return outline_band(c, out_px, in_px, whole)
+    # the band of each frame is independent and cv2 / numpy release the GIL: frames in a thread pool (plan
+    # docs/PLAN_EDGE_SPEED.md A6b, 2026-10-28 – 0.23 s/frame on a 4K sh060 frame); the same function per frame, so the
+    # same bits; `band_at` / `exclude` / the subtraction stay in this thread, in frame order
+    pts_of = {f: (band_at(f) if band_at is not None else None) for f in cores}
+    if whole:   # „cały rdzeń”: the inset feather of each frame shaped by the points' inner whiskers (zone_feather_at)
+        from engine.bandsys import whole_feather
+        z.whole_feather = {f: whole_feather(cores[f], zone_feather_px(z), pts_of[f], in_px) for f in cores if pts_of[f]}
+    if len(cores) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        from engine.qa import default_workers
+        pool = ThreadPoolExecutor(max_workers=min(len(cores), default_workers()))
+        futs = {f: pool.submit(band, c, pts_of[f]) for f, c in cores.items()}
+        get = lambda f: futs.pop(f).result()
+    else:
+        pool = None
+        get = lambda f: band(cores[f], pts_of[f])
+    try:
+        for f in cores:
+            reg = get(f)
+            d = drawn.get(f)
+            if d is not None:
+                reg &= ~d.astype(bool)
+            m = exclude(f) if exclude is not None else None
+            if m is not None and m.any():
+                reg &= ~(cv2.dilate(m.astype(np.uint8), _disk_k(grow)).astype(bool) if grow > 0 else m.astype(bool))
+            out[f] = reg
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
     return out
 
 
@@ -830,7 +884,17 @@ FINISH_KEYS = ("alpha_black", "alpha_white", "alpha_blur_px",   # zone alpha fin
 # flow confidence of temporal = flow_mean (experiment 2026-10-15; zone param -> refine.temporal_mean_flow kwarg), off by default
 TEMPORAL_CONF_PARAMS = (("temporal_fb_sigma", "fb_sigma", float), ("temporal_photo_sigma", "photo_sigma", float),
                         ("temporal_tex", "tex_k", float), ("temporal_conf_mode", "conf_mode", str),
-                        ("temporal_multiscale", "multiscale", int))
+                        ("temporal_multiscale", "multiscale", int),
+                        # plan docs/PLAN_EDGE_SPEED.md B2 (2026-10-28): DIS on grays shrunk by this factor (1 = as before)
+                        ("temporal_flow_scale", "flow_scale", float))
+# plan B1 (2026-10-28): z.params["temporal_crop"] – the smoothing works on the union bbox of the zone over the whole shot
+# ("union", as before) or on a crop of one size that follows the zone frame by frame ("follow")
+TEMPORAL_CROPS = ("union", "follow")
+# user decision 2026-10-28 after the A/B (local_results/ab_zone_smooth/RAPORT.md: the same result, sh060 1.9x faster,
+# CLIP2_A strands 11-13 % less flicker): `flow_mean` without these params in the zone = follow crop + the DIS flow at
+# the plate's resolution (temporal_flow_scale = 1 / temporal_scale); a zone that saves them keeps its own values
+FLOW_MEAN_CROP_DEFAULT = "follow"
+FOLLOW_CROP_MARGIN = 0.12            # "follow": the crop = the largest per-frame zone bbox + this share of it on each side
 HYBRID_BASES = ("", "matanyone")    # z.params["hybrid"] of the `vitmatte` engine (experiment 2026-10-15), "" = off
 
 
@@ -984,6 +1048,18 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
     run_model = lambda img_, tri_: (runner.run(img_, tri_, unknown_value) if abs(unknown_value - 0.5) > 1e-6
                                     else runner.run(img_, tri_))
 
+    # plan docs/PLAN_EDGE_SPEED.md A6: wall seconds per phase of the frame loop (stats "phases"); the model call is
+    # split further by the runner itself ("runner_phases": prepare / IPC / forward / finish)
+    from engine.vitmatte import prof_delta, prof_snapshot
+    ph: Dict[str, float] = {}
+
+    def tick(key: str, t0: float) -> float:
+        t1 = time.perf_counter()
+        ph[key] = ph.get(key, 0.0) + (t1 - t0)
+        return t1
+    prof0 = prof_snapshot(runner)
+    wall0 = time.perf_counter()
+
     def run_tiles(imgs_: list, tris_: list) -> list:
         """All tiles of a frame: one worker request when the runner has `run_many` (same forward per tile, batch 1 –
         the alphas are those of `run`), else one by one (mocks, in-process runners without it)."""
@@ -995,11 +1071,14 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
         if progress is not None:
             progress(i, len(todo))
         reg = regions[f]
+        tp = time.perf_counter()
         bgm = bg(f) if bg is not None else np.zeros((H, W), bool)
         hm = holdout(f) if (holdout is not None and z.holdout) else None
         forced = bgm | (hm if hm is not None else False)
+        tp = tick("masks", tp)
         if T:
             img_f = images(f)
+            tp = tick("decode", tp)
             pff = (probs[f].astype(np.float32) / (255.0 if probs[f].dtype == np.uint8 else 1.0)) if probs and f in probs else None
             n_soft += pff is not None
             acc = np.zeros((H, W), np.float32)
@@ -1020,12 +1099,16 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
                         tm.fg |= fs
                         tm.unknown &= ~fs
                     if not tm.unknown.any():
+                        tp = tick("trimap", tp)
                         continue
+                    tp = tick("trimap", tp)
                     img = cv2.resize(img_f[sl], (ss, ss), interpolation=cv2.INTER_LINEAR if ss > T else cv2.INTER_AREA)
                     tiles.append((sl, tx, ty, img, tm.as_u8()))
+                    tp = tick("tile_image", tp)
             t0 = time.time()
             outs = run_tiles([t_[3] for t_ in tiles], [t_[4] for t_ in tiles]) if tiles else []
             secs += time.time() - t0
+            tp = time.perf_counter()
             n_tiles += len(tiles)
             for (sl, tx, ty, _img, _tri), a_t in zip(tiles, outs):   # grid order: the same sums as tile by tile
                 a_t = cv2.resize(a_t.astype(np.float32), (T, T), interpolation=cv2.INTER_AREA if ss > T else cv2.INTER_LINEAR)
@@ -1039,11 +1122,13 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
             if hm is not None:
                 a[reg & hm & ~core[f]] = 0.0
             out[f] = a
+            tp = tick("assemble", tp)
             tfull = build_trimap(core[f], reg, forced, max(1, int(fg_erode_px)), prob=pff, band_unknown=band_unknown)
             if fg_sure is not None and f in fg_sure:
                 tfull.fg |= fg_sure[f]
                 tfull.unknown &= ~fg_sure[f]
             tris[f] = tfull.as_u8()
+            tick("trimap_full", tp)
             continue
         pf = rp(probs[f]) if probs and f in probs else None
         n_soft += pf is not None
@@ -1053,12 +1138,17 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
             fs = rs(fg_sure[f])
             tm.fg |= fs
             tm.unknown &= ~fs
-        img = extract_crop(images(f), seg)
+        tp = tick("trimap", tp)
+        img_f = images(f)
+        tp = tick("decode", tp)
+        img = extract_crop(img_f, seg)
         if ss != seg.side:
             img = cv2.resize(img, (ss, ss), interpolation=cv2.INTER_LINEAR if ss > seg.side else cv2.INTER_AREA)
+        tick("tile_image", tp)
         t0 = time.time()
         a_crop = run_model(img, tm.as_u8())
         secs += time.time() - t0
+        tp = time.perf_counter()
         a = paste_crop(a_crop, seg, W, H)
         a = np.where(reg, a, 0.0).astype(np.float32)
         a[reg & (force_core[f] if force_core is not None else (core[f] & ~reg if band_unknown else core[f]))] = 1.0
@@ -1066,25 +1156,68 @@ def vitmatte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], r
         if hm is not None:
             a[reg & hm & ~core[f]] = 0.0
         out[f] = a
+        tp = tick("assemble", tp)
         t8 = cv2.resize(tm.as_u8(), (seg.side, seg.side), interpolation=cv2.INTER_NEAREST) if ss != seg.side else tm.as_u8()
         tris[f] = paste_crop(t8.astype(np.float32), seg, W, H).astype(np.uint8)
+        tick("trimap_full", tp)
     if progress is not None:
         progress(len(todo), len(todo))
+    ph["model"] = secs
+    wall = time.perf_counter() - wall0
+    ph["other"] = max(0.0, wall - sum(ph.values()))      # progress callbacks (cancel check), loop overhead
     from engine.vitmatte import runner_info
     stats = {"frames": len(out), "engine": "vitmatte", "preset": z.preset, "crop": list(seg.crop), "side": seg.side,
              "scale": round(scale, 3), "model_px": ss, "unknown_value": unknown_value, "soft_trimap_frames": int(n_soft),
              **({"tile_px": T, "tiles": n_tiles, "tiles_per_frame": round(n_tiles / max(1, len(out)), 1)} if T else {}),
              "seconds": round(secs, 1),
              "sec_per_frame": round(secs / max(1, len(out)), 3), **runner_info(runner),
+             "wall_seconds": round(wall, 1), "phases": {k: round(v, 2) for k, v in ph.items()},
+             "runner_phases": prof_delta(runner, prof0),
              "bbox": [seg.crop[0], seg.crop[1], seg.crop[0] + seg.side, seg.crop[1] + seg.side]}
     return out, tris, stats
+
+
+def follow_crops(regions: Dict[int, np.ndarray], fl: Sequence[int],
+                 margin: float = FOLLOW_CROP_MARGIN) -> Dict[int, Tuple[int, int, int, int]]:
+    """Plan B1 (2026-10-28): per frame a crop (y0, y1, x0, x1) of ONE size for all frames – the largest per-frame bbox of
+    the zone region + `margin` of it on each side (capped by the frame) – centred on that frame's region bbox and pushed
+    inside the frame. The smoothing then aligns neighbours inside crops that follow the object (a pan does not grow
+    the area as the union bbox of the whole shot does); DIS measures the motion between the crops directly."""
+    H, W = regions[fl[0]].shape
+    boxes = {}
+    for f in fl:
+        ys, xs = np.where(regions[f])
+        if len(ys):
+            boxes[f] = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
+    if not boxes:
+        return {f: (0, H, 0, W) for f in fl}
+    bh = max(b[1] - b[0] for b in boxes.values())
+    bw = max(b[3] - b[2] for b in boxes.values())
+    ch = min(H, bh + 2 * int(round(margin * bh)))
+    cw = min(W, bw + 2 * int(round(margin * bw)))
+    u = (min(b[0] for b in boxes.values()), max(b[1] for b in boxes.values()),
+         min(b[2] for b in boxes.values()), max(b[3] for b in boxes.values()))
+    if ch * cw >= (u[1] - u[0]) * (u[3] - u[2]):
+        # the zone hardly moves: the union bbox is not larger than the following crop -> the union (= "union" mode)
+        return {f: u for f in fl}
+    out: Dict[int, Tuple[int, int, int, int]] = {}
+    last = next(iter(boxes.values()))
+    for f in fl:
+        b = boxes.get(f, last)
+        last = b
+        cy, cx = (b[0] + b[1]) // 2, (b[2] + b[3]) // 2
+        y0 = min(max(0, cy - ch // 2), H - ch)
+        x0 = min(max(0, cx - cw // 2), W - cw)
+        out[f] = (y0, y0 + ch, x0, x0 + cw)
+    return out
 
 
 def smooth_zone_alphas(alphas: Dict[int, np.ndarray], fl: Sequence[int], bbox: Tuple[int, int, int, int],
                        regions: Dict[int, np.ndarray], force: Dict[int, np.ndarray], temporal: str, t_radius: int,
                        t_scale: float, t_conf: Dict[str, Any], fin: Dict[str, Any], images: Callable[[int], np.ndarray],
                        fg_sure: Optional[Dict[int, np.ndarray]] = None,
-                       progress: Optional[Callable[[int, int], None]] = None) -> None:
+                       progress: Optional[Callable[[int, int], None]] = None,
+                       crops: Optional[Dict[int, Tuple[int, int, int, int]]] = None) -> None:
     """Temporal smoothing of a ViTMatte zone IN PLACE (alphas[f] replaced for f in `fl`): the crops of the union bbox
     (y0, y1, x0, x1) – parts of the object forced to 1 (`fg_sure`), flow_mean: levels first – smoothed by
     refine.temporal_median / temporal_median_flow / temporal_mean_flow (`temporal`), on the bbox stack up-scaled
@@ -1094,11 +1227,13 @@ def smooth_zone_alphas(alphas: Dict[int, np.ndarray], fl: Sequence[int], bbox: T
     smoother's window first asks for it and dropped once the window has moved on – four full stacks (41 GB on a 4K
     shot) became ~2 r + 1 frames; the smoother hands the frames back one by one (`emit`) and reports `progress` per
     frame (cancel). Every value is computed by the same calls on the same inputs as the former stack code, so the
-    result is bit-identical (tests/test_zone_smooth_window.py)."""
+    result is bit-identical (tests/test_zone_smooth_window.py). `crops` (plan B1, follow_crops): a crop per frame, all of
+    one size, instead of the one `bbox` – frame i is smoothed in ITS crop, the neighbours are read in theirs."""
     if temporal == "none" or len(fl) < 3:
         return
     from engine.refine import temporal_mean_flow, temporal_median, temporal_median_flow
-    y0, y1, x0, x1 = bbox
+    box_of = (lambda i: crops[fl[i]]) if crops else (lambda i: bbox)
+    y0, y1, x0, x1 = box_of(0)
     bh, bw = y1 - y0, x1 - x0
     up = t_scale > 1.0
     up_size = (int(round(bw * t_scale)), int(round(bh * t_scale)))
@@ -1109,6 +1244,7 @@ def smooth_zone_alphas(alphas: Dict[int, np.ndarray], fl: Sequence[int], bbox: T
         b = base.get(i)
         if b is None:
             f = fl[i]
+            y0, y1, x0, x1 = box_of(i)
             b = alphas[f][y0:y1, x0:x1]
             if fg_sure and f in fg_sure:
                 # parts of the object are foreground (1) for the smoothing: a hand moving over the hair must not pull
@@ -1135,6 +1271,7 @@ def smooth_zone_alphas(alphas: Dict[int, np.ndarray], fl: Sequence[int], bbox: T
             return self.get(i)
 
     def gray_i(i: int) -> np.ndarray:
+        y0, y1, x0, x1 = box_of(i)
         g = cv2.cvtColor(np.clip(images(fl[i])[y0:y1, x0:x1], 0, 1).astype(np.float32), cv2.COLOR_BGR2GRAY)
         return cv2.resize(g, up_size, interpolation=cv2.INTER_LINEAR) if up else g
 
@@ -1146,6 +1283,7 @@ def smooth_zone_alphas(alphas: Dict[int, np.ndarray], fl: Sequence[int], bbox: T
             delta = cv2.resize(sm - up_i(i), (bw, bh), interpolation=cv2.INTER_AREA)
             sm = np.clip(base_i(i) + delta, 0.0, 1.0).astype(np.float32)
         a = alphas[f].copy()
+        y0, y1, x0, x1 = box_of(i)
         a[y0:y1, x0:x1] = sm
         a[~regions[f]] = 0.0
         a[regions[f] & force[f]] = 1.0
@@ -1205,6 +1343,11 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     # flow confidence of flow_mean + hybrid with MatAnyone (experiment 2026-10-15): smoothing / blending only -> popped
     # before the hash (the raw per-frame cache is shared); absent = bit-identical to before
     t_conf = {kw: cast(params.pop(pk)) for pk, kw, cast in TEMPORAL_CONF_PARAMS if pk in params}
+    t_crop = str(params.pop("temporal_crop", FLOW_MEAN_CROP_DEFAULT if temporal == "flow_mean" else "union") or "union")
+    if temporal == "flow_mean" and "flow_scale" not in t_conf and t_scale > 1.0:
+        t_conf["flow_scale"] = 1.0 / t_scale         # B2: the flow at the plate's resolution, brought up to the stack
+    if t_crop not in TEMPORAL_CROPS:
+        raise ValueError(f"vitmatte: temporal_crop musi być jednym z {TEMPORAL_CROPS}, jest {t_crop!r}")
     hybrid = str(params.pop("hybrid", "") or "")
     if hybrid not in HYBRID_BASES:
         raise ValueError(f"vitmatte: hybrid musi być jednym z {HYBRID_BASES}, jest {hybrid!r}")
@@ -1250,7 +1393,10 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
             import hashlib
             e.append("p:" + hashlib.sha1(np.ascontiguousarray(probs[f]).tobytes()).hexdigest()[:16])
         return e
+    tq = time.perf_counter()
     hashes = {f: frame_hash(zsig, core[f], psig(f), regions[f], extra=extra(f)) for f in frames if regions[f].any()}
+    seq_ph = {"hash": time.perf_counter() - tq}          # plan A6, next to the model loop's phases
+    tq = time.perf_counter()
     alphas: Dict[int, np.ndarray] = {}
     todo = []
     for f, h in hashes.items():
@@ -1259,6 +1405,7 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
             alphas[f] = got
         else:
             todo.append(f)
+    seq_ph["cache_get"] = time.perf_counter() - tq
     st: Dict[str, Any] = {"frames": 0, "engine": "vitmatte", "preset": z.preset, "crop": list(seg.crop), "side": seg.side,
                           "seconds": 0.0, **runner_info(runner)}
     if todo:
@@ -1266,6 +1413,7 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
                                    fg_erode_px=fg_erode_px, model_px=model_px, unknown_value=unknown_value, probs=probs,
                                    force_core=force if (force_px > 0 or band_unk) else None, tile_px=vitmatte_tile_px(params),
                                    fg_sure=fg_sure, band_unknown=band_unk)
+        tq = time.perf_counter()
         for f, a in new.items():
             if cache is not None:
                 cache.put(hashes[f], f, a, regions[f])
@@ -1273,6 +1421,7 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
                 if back is not None:
                     a = back
             alphas[f] = a
+        seq_ph["cache_put"] = time.perf_counter() - tq
     elif progress is not None:
         progress(len(frames), len(frames))
     if not alphas:
@@ -1282,7 +1431,8 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
     t0 = time.time()
     smooth_zone_alphas(alphas, fl, (y0, y1, x0, x1), regions, force, temporal, t_radius, t_scale, t_conf, fin, images,
-                       fg_sure=fg_sure, progress=progress_smooth)
+                       fg_sure=fg_sure, progress=progress_smooth,
+                       crops=follow_crops(regions, fl) if t_crop == "follow" else None)
     # flow_mean applied the levels before the smoothing: only the blur is left for the finish
     levels_done = temporal == "flow_mean" and len(fl) >= 3
     fin_after = ({k: v for k, v in fin.items() if k not in ("alpha_black", "alpha_white")} if levels_done else dict(fin))
@@ -1322,6 +1472,7 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
              "temporal_scale": t_scale,
              "temporal_seconds": round(time.time() - t0, 1), "finish": fin,
              "cached": len(alphas) - len(todo), "computed": len(todo), "bbox": [x0, y0, x1, y1]}
+    stats["phases"] = {**(st.get("phases") or {}), **{k: round(v, 2) for k, v in seq_ph.items()}}
     if t_conf:
         stats["temporal_conf"] = t_conf
     stats.update(hyb_stats)
@@ -1533,6 +1684,7 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                 raise ValueError(f"strefa {z.zone_id}: tryb Usuń dla kryterium „matte” jeszcze nieobsługiwany")
             cb = (lambda d, t: progress(f"Strefa {z.zone_id} ({z.preset}): matting", d, t)) if progress else None
             cb2 = (lambda d, t: progress(f"Strefa {z.zone_id} ({z.preset}): wygładzanie czasowe", d, t)) if progress else None
+            tz = time.perf_counter()
             alphas, zflags, zstats = _matte_zone(z, frames, core, images, regions, transforms.get(z.zone_id, {}),
                                                  removed, holdout, cb, clean, ma_run,
                                                  bg_masks=(bg_by_zone or {}).get(z.zone_id),
@@ -1547,9 +1699,11 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                 prev = soft.get(f)
                 merged = np.where(area, a, prev[0] if prev else 0.0).astype(np.float32)
                 soft[f] = (merged, area | (prev[1] if prev else np.zeros_like(area)))
-                feathers.setdefault(f, []).append((area, zone_feather_px(z), fo, region_mode(z) == "outline"))
+                feathers.setdefault(f, []).append((area, zone_feather_at(z, f), fo, region_mode(z) == "outline", zone_whole(z)))
             for f, fl in zflags.items():
                 result.flags.setdefault(f, []).extend(fl)
+            if isinstance(zstats.get("phases"), dict):     # plan A6b: the whole zone (model loop, smoothing, finish, merge)
+                zstats["phases"]["zone_total"] = round(time.perf_counter() - tz, 2)
             result.stats[z.zone_id] = zstats
             fz = zone_feather_px(z)
             result.feather_px = fz if result.feather_px is None else max(result.feather_px, fz)
@@ -1581,23 +1735,30 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
                 core[f] = core[f] & ~hit
                 removed[f] |= cv2.dilate(rm.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & reg
     # frames with an outer-edge feather: one weight map for the whole soft area (each zone its own feathers)
+    t_base = t_comp = 0.0
+    tc0 = time.perf_counter()
     for f, lst in feathers.items():
-        if not any(fo > 0 or ol for _a, _fi, fo, ol in lst):
+        if not any(fo > 0 or ol for _a, _fi, fo, ol, _wh in lst):
             continue
         w = np.zeros(soft[f][1].shape, np.float32)
         sa = soft[f][0]
-        for area, fi, fo, ol in lst:
+        for area, fi, fo, ol, wh in lst:
             if ol:
                 # whole outline (user rule 2026-10-22): both feathers blend the zone's matte into max(core, base) –
                 # white where the core is (the inner side, and an outer edge that lies on the core), the stage base
                 # where it is not (user decision 2026-10-22, later that day: the outer edge stays continuous with a soft
                 # base such as MatAnyone2 / VideoMaMa – with the mask 1+2 as base this is black, as before); the area
                 # then wins outright; the feathers = the one band system (engine/bandsys.compose_area, 2026-10-24)
-                from engine.bandsys import compose_area
+                from engine.bandsys import compose_area_crop
                 partner = cores[f].astype(np.float32)
+                tb = time.perf_counter()
                 if base_alpha is not None:
                     partner = np.maximum(partner, np.clip(base_alpha(f), 0.0, 1.0).astype(np.float32))
-                sa = compose_area(cores[f], sa, area, fi, fo, outside=sa, partner=partner)   # fo literal (2026-10-24)
+                tc = time.perf_counter()
+                t_base += tc - tb
+                # on the band's bbox only (bit-identical to compose_area, A6b 2026-10-28)
+                sa = compose_area_crop(cores[f], sa, area, fi, fo, outside=sa, partner=partner, whole=wh)   # fo literal (2026-10-24)
+                t_comp += time.perf_counter() - tc
                 w = np.where(area, 1.0, w)
                 continue
             from engine.bandsys import area_weight
@@ -1606,4 +1767,6 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
             w = np.where(area, zw, w)
         soft[f] = (sa, soft[f][1])
         result.weights[f] = (np.clip(w, 0, 1) * 255).round().astype(np.uint8)
+    result.timings = {"feather_total": time.perf_counter() - tc0, "feather_read_base": t_base,
+                      "feather_compose_area": t_comp}
     return result

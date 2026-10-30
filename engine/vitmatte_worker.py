@@ -102,10 +102,19 @@ def _serve(model_id):
             req = json.loads(line)
             if req.get("op") == "quit":
                 break
+            t0 = time.perf_counter()
             x = np.load(req["x"])
+            t1 = time.perf_counter()
+            load0 = m.load_seconds
             a = np.stack([m.forward(xi) for xi in x]) if x.ndim == 4 else m.forward(x)
+            t2 = time.perf_counter()
             np.save(req["out"], a)
-            resp = {"ok": True, "device": m.device, "load_seconds": round(m.load_seconds, 3)}
+            t3 = time.perf_counter()
+            # phases for the zone stats (plan A6); the one-time model load is reported apart, not as forward
+            loaded = m.load_seconds - load0
+            resp = {"ok": True, "device": m.device, "load_seconds": round(m.load_seconds, 3),
+                    "timings": {"read": round(t1 - t0, 4), "forward": round(t2 - t1 - loaded, 4),
+                                "load": round(loaded, 4), "write": round(t3 - t2, 4)}}
         except Exception as e:
             resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         proto.write(json.dumps(resp) + "\n")

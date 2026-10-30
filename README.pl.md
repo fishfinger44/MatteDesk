@@ -10,9 +10,9 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.42/MatteDesk-0.42-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.50/MatteDesk-0.50-setup.exe)
 
-Windows 10 / 11 · karta NVIDIA · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
+Windows 10 / 11 · karta NVIDIA (CUDA): **minimum 12 GB VRAM, zalecane 24 GB** (etap 7 LTX-2.5 wymaga 24 GB + 64 GB RAM) · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
 [English](README.md) · **Polski** · język interfejsu: domyślnie angielski, 🌐 przełącznik na polski w nagłówku
 
@@ -23,6 +23,10 @@ Wersja: plik [`VERSION`](VERSION) (widoczna też w lewym górnym rogu UI) · his
 [![MatteDesk – 2-minutowe demo na YouTube](https://img.youtube.com/vi/GX3guDhhblk/maxresdefault.jpg)](https://youtu.be/GX3guDhhblk)
 
 https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
+
+https://github.com/user-attachments/assets/4e303a27-0d49-44b9-b08f-4dc59134b190
+
+**Nowe w 0.50 (55 s):** obiekty → grupa z nich → szew zamykający przerwy między członkami → suwaki Final Touch i comp MergeMatte (eksport do Nuke'a jako węzeł).
 
 ---
 

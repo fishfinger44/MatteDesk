@@ -77,6 +77,16 @@ def test_zone_panel_flow(tmp_path, monkeypatch):
     assert pv3["is_key"] is False
     reg = api.get(f"/api/object/obj/zones/{zid}/region/{mid}").json()
     assert reg["is_key"] is False and reg["area_px"] > 0 and reg["bbox"] is not None and len(reg["contours"]) >= 1
+    # no active version yet + a frame without a core (outside the work range): the region tracks only frames with a core
+    # (user report 2026-10-30: „brak rdzenia klatki 51 – najpierw policz ujęcie”)
+    off = next(f for f in frames if f not in (start, f2, mid))
+    cpath = app_module._objects().dir("obj") / "core" / f"c_{off:04d}.png"
+    cpath.rename(cpath.with_suffix(".bak"))
+    try:
+        r = api.get(f"/api/object/obj/zones/{zid}/region/{mid}")
+        assert r.status_code == 200, r.text
+    finally:
+        cpath.with_suffix(".bak").rename(cpath)
     assert api.get("/api/object/obj/zones").json()["status"][zid]["keys"] == sorted({start, f2})
     # 6. "Zastosuj": finalize once (version with alpha_base), apply -> new version, GET /runs carries the zone stats
     fz = api.post("/api/object/obj/finalize", json={"edge_mode": "core"})

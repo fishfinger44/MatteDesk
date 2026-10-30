@@ -122,21 +122,24 @@ def core_fix_sig(store: Any, name: str) -> str:
     return _sha({"core": cj, "zones": zone_dicts(od, ("brush",)), "stab": obj.get("core_stabilize", True)})
 
 
-def group_parts(store: Any, name: str) -> List[str]:
-    """Parts of `name` (objects with part_of == name), depth order – a parent with parts is a group computed as a whole
-    in stages 3 / 4 (user decision 2026-10-15: linked objects are computed with their seam)."""
-    return [o["name"] for o in sorted(store.list(), key=lambda o: o.get("depth_order", 0))
-            if o.get("part_of") == name and o["name"] != name]
+def group_members(store: Any, name: str) -> Optional[List[str]]:
+    """Members of the group entity `name` that make its composition (switched on, engine/groups.is_on) in depth
+    order, None for an object."""
+    obj = store.get(name)
+    if obj.get("kind") != "group":
+        return None
+    ms = [m for m in obj.get("members") or [] if (store.dir(m) / "object.json").exists()
+          and store.get(m).get("group_on", True) is not False]
+    return sorted(ms, key=lambda m: store.get(m).get("depth_order", 0)) or None
 
 
 def mask_sig(store: Any, name: str) -> str:
-    """Signature of the mask the edge pass starts from: the object's mask 1+2, or for a parent with parts the masks
-    1+2 of every member + the seam width (the whole of the group)."""
-    parts = group_parts(store, name)
-    if not parts:
-        return core_fix_sig(store, name)
-    return _sha({"members": [[m, core_fix_sig(store, m)] for m in [name] + parts],
-                 "seam": store.get(name).get("part_seam_px")})
+    """Signature of the mask the edge pass starts from: the object's mask 1+2; for a group entity its input – the
+    members, their „Do grupy z:” sources and the seam (engine/groups.group_sig)."""
+    if store.get(name).get("kind") == "group":
+        from engine.groups import group_sig
+        return group_sig(store, name)
+    return core_fix_sig(store, name)
 
 
 # px mode of the edge band (2026-10-16): part of the signature only when set – objects without it keep their signature
@@ -159,6 +162,10 @@ def settings_sig(obj: Dict[str, Any]) -> str:
             d[k] = s[k]
         else:
             d.pop(k, None)
+    if s.get("band_whole_core"):   # „Wcięcie: cały rdzeń” – only when on (older results keep their signature)
+        d["band_whole_core"] = True
+    else:
+        d.pop("band_whole_core", None)
     return _sha(d)
 
 
@@ -173,10 +180,9 @@ def matte_zone_dicts(od: Path) -> List[Dict[str, Any]]:
     zones = zone_dicts(od, ("matte",))
     obj = _read_json(Path(od) / "object.json")
     if obj and isinstance(obj.get("band"), dict):
-        root = _read_json(Path(od).parent / obj["part_of"] / "object.json") if obj.get("part_of") else obj
         out = []
         for z in zones:
-            p = zone_params(z, obj, root or {})
+            p = zone_params(z, obj, obj)
             out.append({**z, "params": p} if p != (z.get("params") or {}) else z)
         zones = out
     return zones
@@ -205,17 +211,6 @@ def stage_run(store: Any, name: str, stage: str, base: Optional[str] = None) -> 
     ViTMatte on 1+2). "vitmatte" = the zones on the base `base` (default: the object's vitmatte_base), current zones."""
     od = store.dir(name)
     obj = store.get(name)
-    if obj.get("part_of") and obj["part_of"] != name:
-        # a part: stages 3 / 4 compute its group as a whole on the parent – its result is the parent's (when the
-        # parent's version really is a group version with this part)
-        try:
-            prun, pok, pwhy = stage_run(store, obj["part_of"], stage, base)
-        except FileNotFoundError:
-            return None, False, ""
-        prj = _run_json(store.dir(obj["part_of"]), prun)
-        if prun and prj and name in (prj.get("group") or []):
-            return prun, pok, pwhy
-        return None, False, ""
     runs = (obj.get("tool") or {}).get("stage_runs") or {}
     if stage == "vitmatte":
         base = base or vitmatte_base(obj)
@@ -485,7 +480,12 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
     # stage 2 (CoTracker): brush corrections on the core -> core_fix/ (optional: no corrections = done)
     brush = zone_dicts(od, ("brush",))
     fix_exists, fix_ok = core_fix_state(store, name) if core_t else (False, False)
-    if not brush:
+    if not brush and fix_exists and not fix_ok:
+        # every layer deleted after „Zastosuj poprawki”: core_fix/ still holds the deleted fixes and the group composition /
+        # export „rdzeń (1+2)” read it – stale until rebuilt (user analysis 2026-10-30; the UI rebuilds it at once)
+        st["cotracker"] = "stale"
+        why["cotracker"] = "maska 1+2 na dysku ma usunięte poprawki – „▶▶ Zastosuj poprawki” przelicza ją na sam rdzeń SAM 3.1"
+    elif not brush:
         st["cotracker"] = "done"
         why["cotracker"] = "brak poprawek pędzlem – etap opcjonalny (maska = rdzeń SAM 3.1)"
     else:
@@ -543,6 +543,27 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
         cur_ok = (exp_ft or {}).get("corrections_sig") == corrections_sig(ft)
     st["export"] = "done" if cur_ok else ("stale" if exp_ver else "todo")
 
+    group_ready = False
+    if obj.get("kind") == "group":
+        # a group entity (PLAN_GROUP_COMPOSE): stages 1 + 2 = the composition of its members („Do grupy z:”) – nothing
+        # of its own to detect, crop or correct; ready when every member brings a result (stale ones marked, still used)
+        from engine.groups import member_run
+        ms = group_members(store, name) or []
+        runs = [member_run(store, m) for m in ms]
+        missing = [r for r in runs if not r["run"]]
+        stale_m = [r for r in runs if r["run"] and not r["valid"]]
+        group_ready = bool(ms) and not missing
+        for k in ("detect", "crops"):
+            st[k] = "done" if ms else "todo"
+            why[k] = "" if ms else "dodaj obiekty do grupy (paleta Obiekty)"
+        st["core"] = "done" if group_ready else "todo"
+        why["core"] = ("dodaj obiekty do grupy (paleta Obiekty)" if not ms else
+                       "; ".join(f"„{r['member']}” – {r['why']}" for r in missing) if missing else
+                       ("złożenie członków; nieaktualne źródła (↻): " + ", ".join(r["member"] for r in stale_m)) if stale_m
+                       else "złożenie członków (Do grupy z:) ze szwami")
+        st["cotracker"] = "done"
+        why["cotracker"] = "grupa: maska = złożenie członków (poprawki pędzlem robi się na członkach)"
+        cover = {k: {"coverage": [], "missing_shot": [], "scope": "all"} for k in ("core", "final")}
     # a stage is locked while a stage it needs (NEEDS, transitively) is not done
     needs = needs_of(obj)
 
@@ -576,7 +597,10 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
             "work_range": list(work_range) if work_range else None, "life": life,
             "next": nxt, "next_label": LABEL.get(nxt) if nxt else None,
             # results that exist on disk (possibly outdated) – the UI may still show them (view tabs Rdzeń / Alpha)
-            "has": {"core": core_t is not None, "final": bool(run and run_t), "core_fix": fix_exists},
+            # core_fix without brush layers: only a current one (stage 1's stabilised core); an old core_fix/ of deleted
+            # layers is not shown (user report 2026-10-30: the view kept the deleted fixes)
+            "has": {"core": core_t is not None or group_ready, "final": bool(run and run_t),
+                    "core_fix": fix_exists and (bool(brush) or fix_ok)},
             "stage_runs": {"matanyone": ma_run, "videomama": vv_run, "vitmatte": vm_run, "ltx": lx_run, "active": run,
                            # mask 1+2 written as a version (base picker of stage 6; the UI reads it as `core_base`)
                            "core_base": stage_run(store, name, "core_base")[0],
@@ -610,22 +634,6 @@ def blocked_for_export(store: Any, names: List[str], work_dir: Path, mplate: Opt
     bad = []
     for n in names:
         st = {s["id"]: s["state"] for s in object_stages(store, n, work_dir, mplate=mplate)["stages"]}
-        if st["final"] != "done" and not _in_group_run(store, n, work_dir, mplate):
+        if st["final"] != "done":
             bad.append(n)
     return bad
-
-
-def _in_group_run(store: Any, name: str, work_dir: Path, mplate: Optional[bool]) -> bool:
-    """A part whose parent's valid active version is a group version containing it (exported as its share)."""
-    par = store.get(name).get("part_of")
-    if not par or par == name:
-        return False
-    try:
-        prun = (store.get(par).get("tool") or {}).get("active_run")
-    except FileNotFoundError:
-        return False
-    prj = _run_json(store.dir(par), prun)
-    if not prj or name not in (prj.get("group") or []):
-        return False
-    pst = {s["id"]: s["state"] for s in object_stages(store, par, work_dir, mplate=mplate)["stages"]}
-    return pst["final"] == "done"

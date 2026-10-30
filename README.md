@@ -10,9 +10,9 @@ Repair the plates once. Generate alpha mattes for multiple objects – the tool 
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `Agent API + CLI` · `100% local, no cloud, no LLM required`
 
-[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.42/MatteDesk-0.42-setup.exe)
+[![Download for Windows](https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-installer-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.50/MatteDesk-0.50-setup.exe)
 
-Windows 10 / 11 · NVIDIA GPU · the button downloads the installer – all versions: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
+Windows 10 / 11 · NVIDIA GPU (CUDA): **12 GB VRAM minimum, 24 GB recommended** (stage 7 LTX-2.5 needs 24 GB + 64 GB RAM) · the button downloads the installer – all versions: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – the green **Code → Download ZIP** button gives the source code only (see [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
 **English** · [Polski](README.pl.md) · UI language: English by default, 🌐 switch to Polish in the header
 
@@ -23,6 +23,10 @@ Version: file [`VERSION`](VERSION) (also shown in the top-left corner of the UI)
 [![MatteDesk – 2-min demo on YouTube](https://img.youtube.com/vi/GX3guDhhblk/maxresdefault.jpg)](https://youtu.be/GX3guDhhblk)
 
 https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
+
+https://github.com/user-attachments/assets/4e303a27-0d49-44b9-b08f-4dc59134b190
+
+**New in 0.50 (55 s):** objects → a group made of them → the seam closing the gaps between members → Final Touch sliders and the MergeMatte comp (exported to Nuke as a node).
 
 ---
 

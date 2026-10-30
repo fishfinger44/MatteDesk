@@ -8,7 +8,9 @@
 //  - tint (mask colour, fill), line (outline, 4-neighbour edge of mask > 127), comp (plate over a background through the
 //    mask): WebGL shaders in integers. tint writes premultiplied round(rgb·a / 255) like putImageData does – an SVG
 //    colour-matrix filter read back the same but stored other premultiplied values (±1 in the view when zoomed);
-//    comp = round((P·A + G·(255 − A)) / 255) – the float form was off by 1 on ~0.005 % of the values
+//    comp = plate over background in LINEAR light like Nuke's Merge over (user decision 2026-10-30; was a display-sRGB
+//    mix, so the plain Comp and MergeMatte at its neutral defaults differed on soft hair): sRGB → linear, P·a + G·(1 − a),
+//    → sRGB, round; a = 0 / 255 give G / P exactly. CPU twin: mdLinComp (below), ±1 against the GPU on rare values
 //  - bw (Alpha view, opaque): Canvas 2D with an SVG feColorMatrix filter
 //  Sources go to WebGL through a 2D canvas: WebGL decodes a JPEG differently from Canvas 2D (off by 1 at alpha 1).
 (function () {
@@ -59,9 +61,12 @@
     + ' float e = (m(vec2(-1., 0.)) != v || m(vec2(1., 0.)) != v || m(vec2(0., -1.)) != v || m(vec2(0., 1.)) != v) ? 1. : 0.;\n'
     + ' gl_FragColor = vec4(rgb / 255. * e, e); }';
   const FS_COMP = 'precision highp float; varying vec2 uv; uniform sampler2D P, A, G;\n' + B8
+    + 'vec3 lin(vec3 c){ c /= 255.; return mix(c / 12.92, pow((c + .055) / 1.055, vec3(2.4)), step(vec3(.04045), c)); }\n'
+    + 'vec3 enc(vec3 l){ l = clamp(l, 0., 1.); return mix(l * 12.92, 1.055 * pow(l, vec3(1. / 2.4)) - .055, step(vec3(.0031308), l)); }\n'
     + 'void main(){ vec3 p = vec3(b8(texture2D(P, uv).r), b8(texture2D(P, uv).g), b8(texture2D(P, uv).b));\n'
     + ' vec3 g = vec3(b8(texture2D(G, uv).r), b8(texture2D(G, uv).g), b8(texture2D(G, uv).b)); float a = b8(texture2D(A, uv).r);\n'
-    + ' gl_FragColor = vec4(floor((p * a + g * (255. - a)) / 255. + .5) / 255., 1.); }';
+    + ' vec3 o = a >= 255. ? p : a <= 0. ? g : floor(enc(lin(p) * (a / 255.) + lin(g) * (1. - a / 255.)) * 255. + .5);\n'
+    + ' gl_FragColor = vec4(o / 255., 1.); }';
   let G = null;   // {cv, gl, tint, line, comp, tex[3], max} | false (no WebGL / lost)
   function gl() {
     if (off) return null;
@@ -129,6 +134,21 @@
     if (off) return null;
     return draw('comp', W, H, [at(plate, W, H), at(mask, W, H), bg]);
   }
+
+  // CPU twin of FS_COMP for the fallbacks (objects.js compCanvas, app.js bgComp): plate data P, alpha data A (R),
+  // background data B (overwritten with the comp), RGBA byte arrays of one size
+  const S2L = new Float64Array(256);
+  for (let i = 0; i < 256; i++) { const c = i / 255; S2L[i] = c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }
+  const enc8 = (l) => { l = l < 0 ? 0 : l > 1 ? 1 : l; return Math.floor((l <= 0.0031308 ? l * 12.92 : 1.055 * l ** (1 / 2.4) - 0.055) * 255 + 0.5); };
+  window.mdLinComp = function (P, A, B) {
+    for (let i = 0; i < B.length; i += 4) {
+      const a = A[i];
+      if (a === 0) continue;
+      if (a === 255) { B[i] = P[i]; B[i + 1] = P[i + 1]; B[i + 2] = P[i + 2]; continue; }
+      const t = a / 255;
+      for (let k = 0; k < 3; k++) B[i + k] = enc8(S2L[P[i + k]] * t + S2L[B[i + k]] * (1 - t));
+    }
+  };
 
   // setOff(true) = the CPU path from now on (A/B comparison of the two paths in one page; the caller clears its caches)
   window.mdGpu = { tint, bw, line, comp, get on() { return !off && !!gl(); }, setOff(v) { off = !!v; } };

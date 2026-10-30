@@ -82,3 +82,32 @@ def test_vitmatte_zone_tiles_use_run_many_in_grid_order(monkeypatch):
     a2, _, s2 = vitmatte_zone(z, frames, cores, regions, lambda f: img, Many(), tile_px=48, model_px=48)
     assert s1["tiles"] == s2["tiles"] > 3 and Many.requests == len(frames)     # one request per frame
     assert all(np.array_equal(a1[f], a2[f]) for f in frames)
+
+
+def test_phase_timings_a6():
+    """Plan A6 (2026-10-28): the worker reports its own phases, the runner splits a request into prepare / npy / worker
+    / ipc_wait / finish, and vitmatte_zone puts the frame-loop phases + the runner's delta into its stats."""
+    vm._CHECK_CACHE.clear()
+    r = vm.ComfyVitMatteRunner("hustvl/fake", python=sys.executable, env=FAKE_ENV, timeout_s=60)
+    imgs, tris = _tiles()
+    before = vm.prof_snapshot(r)
+    r.run_many(imgs, tris)
+    d = vm.prof_delta(r, before)
+    for k in ("prepare", "npy_write", "worker_read", "worker_forward", "worker_load", "worker_write", "ipc_wait",
+              "npy_read", "finish"):
+        assert k in d and d[k] >= 0.0 or k == "ipc_wait", (k, d)
+    r.close()
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from test_zone_vitmatte import MockRunner, _frames_scene
+    from engine.zones import Zone, vitmatte_zone, zone_mask_at
+    img, core, hair, region, frames = _frames_scene(3)
+    z = Zone("z_01", "add", "matte", 1, polygon=[[0, 0], [10, 0], [10, 10]], matting="vitmatte")
+    regions = {f: region for f in frames}
+    for tile in (0, 48):
+        _, _, st = vitmatte_zone(z, frames, {f: core for f in frames}, regions, lambda f: img, MockRunner(),
+                                 tile_px=tile, model_px=48)
+        ph = st["phases"]
+        assert {"masks", "decode", "trimap", "tile_image", "model", "assemble", "trimap_full", "other"} <= set(ph), ph
+        assert st["runner_phases"] == {}                      # mock without `prof`
+        assert abs(sum(ph.values()) - st["wall_seconds"]) < 0.2

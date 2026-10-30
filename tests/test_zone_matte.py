@@ -220,10 +220,10 @@ def test_pipeline_front_holdout_sources_and_missing(tmp_path, monkeypatch):
         cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
     fn, used = pipe.front_holdout("obj", frames)
     assert used == ["hand"] and fn(start)[150, 150] and not fn(start)[50, 50]
-    # a part of the same object is never a holdout of its parent
+    # a group member computes on its own (PLAN_GROUP_COMPOSE 2026-10-29): a legacy part in front is a holdout too
     store.update("hand", part_of="obj")
     fn, used = pipe.front_holdout("obj", frames)
-    assert used == [] and fn(start) is None
+    assert used == ["hand"]
 
 
 def test_api_matte_zone_preview_views_409_and_cli(tmp_path, monkeypatch):

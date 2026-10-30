@@ -94,12 +94,26 @@ def test_stage_layout_brush_matanyone_export(proj):
 
     # a change of the brush correction: the mask 1+2 and the MatAnyone result are stale; ViTMatte stays open (2026-10-17)
     # but its MatAnyone base is not current – it says so
+    # (2026-10-30: the only layer switched off = core_fix/ still holds its fix – stage 2 is stale, so ViTMatte, which
+    # waits for stage 2 (needs_of), says so; the UI rebuilds the mask 1+2 at once when no layer is left on)
     assert api.patch(f"/api/object/obj/zones/{zid}", json={"enabled": False}).status_code == 200
     st, d = _steps(api)
-    assert st["matanyone"] == "stale" and st["vitmatte"] == "todo" and st["export"] == "stale"
-    assert "MatAnyone" in next(s for s in d["steps"] if s["id"] == "vitmatte")["why"]
+    assert st["matanyone"] == "stale" and st["cotracker"] == "stale" and st["vitmatte"] == "locked" and st["export"] == "stale"
+    assert "CoTracker3" in next(s for s in d["steps"] if s["id"] == "vitmatte")["why"]
     r = api.post("/api/export", json={"objects": ["obj"], "source": "matanyone", "format": "png"})
     assert r.status_code == 409
+
+    # every brush layer deleted: the old core_fix/ on disk is not offered to the views (user report 2026-10-30: the view
+    # kept the deleted fixes) – the mask 1+2 is the SAM 3.1 core again
+    assert api.delete(f"/api/object/obj/zones/{zid}").status_code == 200
+    st, d = _steps(api)
+    assert st["cotracker"] == "stale" and not d["has"]["core_fix"]          # the group / export would read it: stale
+    r = api.post("/api/object/obj/core_fix")                                 # rebuilt = the (stabilised) SAM 3.1 core
+    assert r.status_code == 200, r.text
+    st, d = _steps(api)
+    assert st["cotracker"] == "done" and d["has"]["core_fix"]
+    m12 = cv2.imread(str(od / "core_fix" / f"c_{start:04d}.png"), cv2.IMREAD_GRAYSCALE) > 127
+    assert not m12[top - 10, xm]                                             # the deleted stroke is gone from the mask 1+2
 
 
 def test_vitmatte_requires_a_current_matanyone_base(proj):
@@ -195,42 +209,18 @@ def test_vitmatte_base_mask_1_2_and_the_comparison(proj):
     assert st["vitmatte"] == "todo" and d["stage_runs"]["vitmatte@core"] == vm
 
 
-def test_whole_of_a_group_follows_the_view_layer(proj):
-    """Bug 2026-10-15 (user: after MatAnyone the mask looked the same in SAM3 / CoTracker / MatAnyone): a linked object
-    is drawn as the whole of its group (view=full) – the whole must be built from the layer of the view (src core /
-    core_fix / alpha) and the version shown (v), not always from the active alpha."""
-    app_module, api, shot, pipe, frames, start = proj
-    store = pipe.store
-    store.create("hand", ["hand"], depth_order=1)
-    store.update("hand", part_of="obj")
-    cd = store.dir("hand") / "core"; cd.mkdir(parents=True)
-    m = np.zeros((shot.h, shot.w), np.uint8); m[20:60, 20:60] = 255
-    for f in frames:
-        cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
-    r = api.post("/api/object/obj/finalize", json={"stage": "matanyone"})
-    assert r.status_code == 200, r.text
-    run = r.json()["run"]
-    png = lambda q: cv2.imdecode(np.frombuffer(api.get(f"/api/object/obj/frame/{start}?view=full{q}").content, np.uint8), cv2.IMREAD_GRAYSCALE)
-    core, alpha = png("&src=core"), png("&src=alpha")
-    soft = lambda a: int(((a > 5) & (a < 250)).sum())
-    assert soft(alpha) > soft(core) + 10                     # the MatAnyone edge is soft, the core hard: different pictures
-    assert np.array_equal(png(""), alpha)                    # default = alpha (as before)
-    assert png("&src=core_fix").shape == core.shape          # no mask 1+2 yet: the core
-    assert api.get(f"/api/object/obj/frame/{start}?view=full&src=x").status_code == 400
-    assert np.array_equal(png(f"&src=alpha&v={run}"), alpha)  # the version shown of the selected object
-
-
 def test_group_is_computed_as_a_whole_with_its_seam(proj):
-    """User decision 2026-10-15: linked objects (parent + parts) are computed in stage 3 (and 4) as ONE whole – the
-    masks 1+2 joined with the parent's seam; a part asks -> its parent computes; the export splits the whole into shares
-    that sum to it exactly; the band preview of the palette (edge_preview) works before computing."""
-    from engine.export import FrameAlphas, group_split
+    """PLAN_GROUP_COMPOSE step 4 (user decisions 2026-10-15 / 2026-10-29): a group entity is computed in stage 3 as ONE
+    whole – its input is the composition of the members („Do grupy z:”, here Core) with the seam; the band preview of
+    the palette (edge_preview) works before computing; the members keep their own results (none is redirected)."""
+    from engine import groups
+    from engine.crop import CropSegment, extract_crop
+    from engine.stages import stage_run
     app_module, api, shot, pipe, frames, start = proj
     store = pipe.store
     c = pipe.load_core("obj", [start])[start]
     ys, xs = np.where(c)
     store.create("hand", ["hand"], depth_order=1)
-    store.update("hand", part_of="obj")
     cd = store.dir("hand") / "core"; cd.mkdir(parents=True)
     m = np.zeros((shot.h, shot.w), np.uint8)
     y0, x0 = int(ys.max()) - 4, int(np.median(xs)) - 10          # a "hand" under the object, a 3 px gap at the contact
@@ -238,57 +228,46 @@ def test_group_is_computed_as_a_whole_with_its_seam(proj):
     for f in frames:
         cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
     (cd / "core.json").write_text(json.dumps({"coverage": [[frames[0], frames[-1]]]}))
-    # the band preview (palette „Krawędź”): 255 = mask kept, 128 = band
-    r = api.get(f"/api/object/obj/edge_preview/{start}?band_scale=1.5&shift_px=1")
-    # the whole of the group; until the work-area batch is ready the fast stand-in (2026-10-24) – both „mask12+group”
-    assert r.status_code == 200 and r.headers["X-MD-Source"].startswith("mask12+group") and int(r.headers["X-MD-Band-Px"]) > 0
+    groups.create_group(store, "grp", ["obj", "hand"])
+    st = {s["id"]: s["state"] for s in api.get("/api/object/grp/stages").json()["stages"]}
+    assert st["core"] == "done" and st["matanyone"] == "todo"           # stages 1 + 2 of a group = its composition
+    # the band preview (palette „Krawędź”) of the group: 255 = mask kept, 128 = band, on the composition
+    r = api.get(f"/api/object/grp/edge_preview/{start}?band_scale=1.5&shift_px=1")
+    assert r.status_code == 200, r.text
+    assert r.headers["X-MD-Source"].startswith("mask12") and "group" in r.headers["X-MD-Source"]
+    assert int(r.headers["X-MD-Band-Px"]) > 0
     pv = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_GRAYSCALE)
     assert (pv == 128).any() and (pv == 255).any()
-    # the band is sized by the px sliders like every stage (2026-10-24: band_scale / the adaptive band are gone)
-    wide = int(api.get(f"/api/object/obj/edge_preview/{start}?band_out_px=30&band_in_px=8").headers["X-MD-Band-Px"])
-    narrow = int(api.get(f"/api/object/obj/edge_preview/{start}?band_out_px=6&band_in_px=2").headers["X-MD-Band-Px"])
+    wide = int(api.get(f"/api/object/grp/edge_preview/{start}?band_out_px=30&band_in_px=8").headers["X-MD-Band-Px"])
+    narrow = int(api.get(f"/api/object/grp/edge_preview/{start}?band_out_px=6&band_in_px=2").headers["X-MD-Band-Px"])
     assert wide > narrow
-    # stage 3 asked on the part: computed on the parent as the whole
-    r = api.post("/api/object/hand/finalize", json={"stage": "matanyone"})
+    # stage 3 on the group entity: the whole
+    r = api.post("/api/object/grp/finalize", json={"stage": "matanyone"})
     assert r.status_code == 200, r.text
     d = r.json()
-    assert d["object"] == "obj" and d["asked"] == "hand" and d["group"] == ["obj", "hand"]
+    assert d["object"] == "grp" and d["group"] == ["obj", "hand"]
     run = d["run"]
-    rj = json.loads((store.dir("obj") / "runs" / run / "run.json").read_text(encoding="utf-8"))
+    rj = json.loads((store.dir("grp") / "runs" / run / "run.json").read_text(encoding="utf-8"))
     assert rj["group"] == ["obj", "hand"] and rj["stage"] == "matanyone"
-    cr = cv2.imread(str(next((store.dir("obj") / "runs" / run / "core").rglob(f"c_{start:04d}.png"))), cv2.IMREAD_GRAYSCALE)
-    assert cr is not None
-    # the preview's mask = the core stage 3 handed to MatAnyone, in the same (group) crop (2026-10-16)
-    from engine.crop import CropSegment, extract_crop
-    _, info = pipe.edge_preview("obj", start)
+    assert stage_run(store, "grp", "matanyone")[:2] == (run, True)
+    cr = cv2.imread(str(next((store.dir("grp") / "runs" / run / "core").rglob(f"c_{start:04d}.png"))), cv2.IMREAD_GRAYSCALE)
+    # the preview's mask = the core stage 3 handed to MatAnyone2 = the composition (seam filled), in the group crop
+    _, info = pipe.edge_preview("grp", start)
     rseg = next(CropSegment.from_dict(x) for x in rj["segments_def"] if x["first"] <= start <= x["last"])
     assert list(info["seg"].crop) == list(rseg.crop)
     assert np.array_equal(extract_crop(info["core"].astype(np.float32), rseg) > 0.5, cr > 127)
-    # the part's stage 3 = the parent's group version (its own stage bar still needs its own SAM3 keys / core)
-    from engine.stages import stage_run
-    assert stage_run(store, "hand", "matanyone")[:2] == (run, True)
-    # export: the whole and the shares sum exactly; the hand's share is where its mask is
-    objs = [store.get("obj"), store.get("hand")]
-    fa = FrameAlphas(store.root.parent, objs, shot.w, shot.h)
-    al = fa.frame(start)
-    assert np.allclose(al["obj"] + al["hand"], al["obj_full"], atol=1e-6)
-    assert al["hand"][y0 + 20, x0 + 10] > 0.5 and al["obj"][y0 + 20, x0 + 10] == 0
-    assert al["obj_full"][y0 + 5, x0 + 10] > 0.5                       # the 3 px gap is filled (seam) in the whole
-    # export through the API: the whole and the hand's share from the group version (source MatAnyone)
-    r = api.post("/api/export", json={"objects": ["obj_full", "hand"], "source": "matanyone", "format": "png"})
-    assert r.status_code == 200, r.text
-    assert r.json()["runs"] == {"obj": run, "hand": run}
-    ex = Path(r.json()["outputs"]["export_dir"]) / "mattes"
-    hand_png = cv2.imread(str(ex / "hand" / f"hand_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
-    full_png = cv2.imread(str(ex / "obj_full" / f"obj_full_{start:04d}.png"), cv2.IMREAD_GRAYSCALE)
-    assert hand_png[y0 + 20, x0 + 10] > 127 and full_png[y0 + 5, x0 + 10] > 127
-    shares = group_split(np.ones((4, 6), np.float32), [np.eye(4, 6, dtype=bool), None])
-    assert np.array_equal(shares[0], np.ones((4, 6))) and not shares[1].any()
-    # stage 4 on a part refused (zones of a group live on its parent)
-    z = api.post("/api/object/hand/zones/new", json={"mode": "add", "criterion": "all", "frame": start,
-                                                      "polygon": [[1, 1], [9, 1], [9, 9]], "strokes": [], "params": {"source": "brush"}})
-    r = api.post(f"/api/object/hand/zones/{z.json()['zone']['zone_id']}/apply?stage=vitmatte")
-    assert r.status_code == 409 and "obiekcie głównym" in r.json()["detail"]
+    comp = groups.group_alpha_loader(store, "grp", shot.w, shot.h)(start)
+    assert comp[y0 + 5, x0 + 10] == 1.0                                # the 3 px gap is filled (seam) in the input
+    # the members are not redirected: no stage-3 result of their own
+    assert stage_run(store, "hand", "matanyone")[0] is None and stage_run(store, "obj", "matanyone")[0] is None
+    # a change of the composition (a member's source) -> the whole is stale (↻)
+    groups.set_seam(store, "grp", 9)
+    assert stage_run(store, "grp", "matanyone")[:2] == (run, False)
+    # detaching a member with a whole result: warning first, then the whole goes to the trash
+    r = groups.remove_member(store, "grp", "hand")
+    assert r.get("needs_confirm") and "matanyone" in r["whole_stages"]
+    assert groups.remove_member(store, "grp", "hand", confirm=True)["trash"]
+    assert stage_run(store, "grp", "matanyone")[0] is None
 
 
 def test_experiments_core_base_made_on_pick(proj):

@@ -36,7 +36,8 @@ PRESETS = ("hair", "fibres", "smoke", "motion", "thin")
 def preset_defaults(preset: str) -> Tuple[str, Dict[str, Any]]:
     """Default zone engine and params of a preset (defaults.json -> localmatte.presets.<preset>.matting / .params;
     user decision 2026-10-14: hair = vitmatte + flow r3 x2; 2026-10-15 (CLIP2_A v038): hair = vitmatte + flow_mean r5 x2,
-    black 0.1, white 0.9, binary trimap; other presets = matanyone, no params)."""
+    black 0.1, white 0.9, binary trimap; 2026-10-28: smoothing x1 (plate-res flow, A/B local_results/ab_zone_smooth/);
+    other presets = matanyone, no params)."""
     import json
     from pathlib import Path
     try:
@@ -142,6 +143,11 @@ def build_trimap(core: np.ndarray, region: np.ndarray, forced_bg: np.ndarray, fg
         uncertain = np.zeros_like(core)
     if band_unknown:
         fg &= ~region
+        if not fg.any() and core.any() and not (core & ~region).any():
+            # „Wcięcie: cały rdzeń” (2026-10-29): the band covers the whole core – its middle (the ridge of depth) is
+            # the sure FG seed ViTMatte needs (the composition keeps the inset feather around it, engine/bandsys `whole`)
+            from engine.bandsys import core_middle
+            fg = core_middle(core)
     forced = forced_bg.astype(bool) & ~core          # forced BG never touches the core (semantic errors = SAM3 key)
     # the eroded 2 px rim of the core is unknown everywhere (also outside the region): never a BG seed next to FG
     unknown = (region | core | uncertain) & ~fg & ~forced

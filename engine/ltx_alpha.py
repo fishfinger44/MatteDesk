@@ -134,7 +134,14 @@ def settings_sig(s: Dict[str, Any]) -> str:
     d = {k: s.get(k) for k in SETTING_KEYS if k not in BAND_KEYS or s.get("combine") == "band"}
     if d.get("mask_source", "core") == "core":   # the default: absent from the signature (older runs stay current)
         d.pop("mask_source", None)
+    if s.get("whole_core") and s.get("combine") == "band":   # „cały rdzeń” – only when on
+        d["whole_core"] = True
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def inset_w(s: Dict[str, Any]) -> float:
+    """The inset width of the band geometry: inf with „Wcięcie: cały rdzeń” (engine/bandsys `whole`), else core_erode_px."""
+    return float("inf") if s.get("whole_core") else s["core_erode_px"]
 
 
 def band_u8(mask: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
@@ -144,7 +151,7 @@ def band_u8(mask: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
         return np.full(mask.shape, 128, np.uint8)
     from engine.bandsys import band_area, band_widths
     d = sdf_px(mask)
-    o, i = band_widths(mask, s["region_px"], s["core_erode_px"], pts)
+    o, i = band_widths(mask, s["region_px"], inset_w(s), pts)
     out = np.zeros(mask.shape, np.uint8)
     out[band_area(d, o, i)] = 128
     out[d > np.asarray(i, np.float32)] = 255
@@ -277,8 +284,12 @@ def finish(alpha: np.ndarray, core: np.ndarray, s: Dict[str, Any], pts=None) -> 
         return a
     from engine.bandsys import band_widths, compose
     c = (np.asarray(core) > 0.5).astype(np.float32)
-    o, i = band_widths(c, s["region_px"], s["core_erode_px"], pts)
-    return compose(c, a, sdf_px(core), o, i, s.get("feather_px", 0.0), s["region_soft_px"])
+    o, i = band_widths(c, s["region_px"], inset_w(s), pts)
+    fe = s.get("feather_px", 0.0)
+    if s.get("whole_core"):   # „cały rdzeń”: the points' inner whiskers shape the feather
+        from engine.bandsys import whole_feather
+        fe = whole_feather(c, fe, pts, s["core_erode_px"])
+    return compose(c, a, sdf_px(core), o, i, fe, s["region_soft_px"])
 
 
 # ----------------------------------------------------------------------------- Comfy graph
@@ -354,10 +365,12 @@ class AlphaGen:
         busy = self.client.busy_error()
         if busy:
             raise RuntimeError(busy)
-        sub = self.client.queue_prompt(g)
-        if not sub.get("success"):
-            raise RuntimeError(f"Comfy odrzucił graf LTX-2.5 Alpha-Gen: {sub.get('error')}")
-        res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=4 * 3600)
+        from engine.gpu_manager import comfy_lease
+        with comfy_lease(self.client, "LTX-2.5 Alpha-Gen"):
+            sub = self.client.queue_prompt(g)
+            if not sub.get("success"):
+                raise RuntimeError(f"Comfy odrzucił graf LTX-2.5 Alpha-Gen: {sub.get('error')}")
+            res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=4 * 3600)
         if not res.get("success"):
             raise RuntimeError(f"LTX-2.5 Alpha-Gen nie powiódł się: {res.get('error')}")
         return res

@@ -41,3 +41,6 @@ build/
 dist/
 logs/
 .testmondata*
+
+# README comparison renders (tools/readme_compare) – only the chosen panels go to docs/img/compare
+_readme_compare/

@@ -163,10 +163,11 @@ def test_e3_real_figure_iou_vs_v5():
     # v5 = Figure + nest. User decision 2026-10-12: two objects (figure in front, nest behind) -> compare their union.
     from engine.exr_io import read_exr
     from engine.export import run_alpha_loader
-    # default: figure + objects that are its parts (part_of = figure, e.g. the dress / "nest")
+    # default: figure + the other members of its group (e.g. the dress / "nest"; parts -> groups, PLAN_GROUP_COMPOSE)
     objs_dir = REAL_WORK / "matte_desk" / "objects"
     parts = [d.name for d in objs_dir.iterdir() if (d / "object.json").exists()
-             and json.loads((d / "object.json").read_text(encoding="utf-8")).get("part_of") == "figure"] if objs_dir.exists() else []
+             and d.name != "figure" and (json.loads((d / "object.json").read_text(encoding="utf-8")).get("group") or 0)
+             == (json.loads((objs_dir / "figure" / "object.json").read_text(encoding="utf-8")).get("group") or 1)] if objs_dir.exists() else []
     names = os.environ.get("MATTE_DESK_E3_OBJECTS", ",".join(["figure"] + parts)).split(",")
     v5 = REAL_WORK / "render" / "comfy_mattes" / "figure_alpha_v5"
     proj = json.loads((REAL_WORK / "matte_desk" / "project.json").read_text(encoding="utf-8"))

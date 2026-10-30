@@ -92,3 +92,26 @@ def test_hf_sha256_from_redirect_headers():
             raise urllib.error.HTTPError(req.full_url, 302, "Found", h, None)
     assert dl.hf_sha256("https://huggingface.co/a/b/resolve/main/w.bin", opener=Opener()) == SHA
     assert dl.hf_sha256("https://github.com/x/y.bin", opener=Opener()) is None
+
+
+def test_ssl_context_adds_certifi_to_system_roots(monkeypatch):
+    """Issue #7: Windows store without the issuer root -> CERTIFICATE_VERIFY_FAILED; the context also loads certifi."""
+    import ssl
+    loaded = []
+    real = ssl.SSLContext.load_verify_locations
+    monkeypatch.setattr(dl, "_CTX", None)
+    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations",
+                        lambda self, *a, **k: (loaded.append(k.get("cafile")), real(self, *a, **k))[1])
+    ctx = dl.ssl_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    assert dl._ca_bundle() in loaded and dl._ca_bundle().endswith(".pem")
+    assert dl.ssl_context() is ctx                                  # built once
+
+
+def test_default_urlopen_passes_context(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(dl.urllib.request, "urlopen", lambda req, timeout=0, context=None: seen.update(ctx=context))
+    dl.urlopen("https://x/", timeout=5)
+    assert seen["ctx"] is dl.ssl_context()
+    import inspect
+    assert inspect.signature(dl.download).parameters["urlopen"].default is dl.urlopen

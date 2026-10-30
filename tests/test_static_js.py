@@ -525,3 +525,86 @@ def test_top_view_tab_rules_2026_10_26():
     for name in ("objects.js", "brush.js", "zones.js"):
         src = (STATIC / name).read_text(encoding="utf-8")
         assert not re.search(r"loadStages\(\);\s*(H\.)?setView\('(alpha|core)'\)", src), name
+
+
+def test_job_error_window_2026_10_28():
+    """A computation that ends with an error gets a window that stays until "OK" (user report 2026-10-26: a Comfy OOM in
+    VideoMaMa / a failed frame preview were only a short bar line or small red text), once per job, quiet jobs too;
+    a Comfy error during the run is a red line in the progress window, not only in "Szczegóły"."""
+    js = (STATIC / "jobs.js").read_text(encoding="utf-8")
+    assert "errModal.id = 'jobErrModal';" in js and "function showError(j)" in js
+    poll = js[js.index("async function poll()"):]
+    assert "j.state === 'error' && j.ended && !errShown.has(j.id)" in poll
+    assert poll.index("showError(failed[0])") < poll.index("if (busy && busy.quiet)")   # before the quiet-job return
+    assert "ci.raw_error" in js[js.index("function showError(j)"):]
+    assert "$('jmErr').style.display = ce ? '' : 'none';" in js
+
+
+def test_slider_undo_2026_10_28():
+    """Ctrl+Z / Ctrl+Shift+Z for sliders (user report 2026-10-28): ONE history module for every range (+ paired number
+    field), replayed through the slider's own input / change handlers, per object + stage, newest action first."""
+    js = (STATIC / "slider_undo.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    assert html.index("/static/slider_undo.js") < html.index("/static/objects.js")
+    assert "el.dispatchEvent(new Event('input', { bubbles: true }));" in js and "el.dispatchEvent(new Event('change', { bubbles: true }));" in js
+    assert "if (applying || !tracked(el)) return;" in js   # a replayed change is not recorded again
+    assert "lastSliderAt >= lastCanvasAt" in js and "#canvasWrapper" in js
+    assert "window.MD_SLIDER_UNDO.ctx = () => `${S.obj || ''}|${S.stage}`" in obj
+    key_z = obj[obj.index("e.code === 'KeyZ' && (e.ctrlKey || e.metaKey)"):]
+    assert key_z.index("su.wants(e.shiftKey)") < key_z.index("S.strokes[f].pop()")
+    # no stage keeps its own slider history
+    for f in STATIC.glob("*.js"):
+        if f.name != "slider_undo.js":
+            assert "sliderHistory" not in f.read_text(encoding="utf-8"), f.name
+
+
+def test_group_member_opens_on_its_source_stage_2026_10_29():
+    """A selected group member shows the mask its group takes: selecting it (or changing „Do grupy z:”) switches to the
+    stage of that source (Core -> SAM 3.1 / CoTracker3, MatAnyone2 / VideoMaMa / ViTMatte / LTX-2.5 -> their stage)."""
+    src = (STATIC / "objects.js").read_text(encoding="utf-8")
+    fn = src[src.index("function sourceStage("):]
+    fn = fn[:fn.index("\n  }\n")]
+    for k in ("matanyone: 'MATANYONE'", "videomama: 'VIDEOMAMA'", "vitmatte: 'VITMATTE'", "ltx: 'LTX'"):
+        assert k in src
+    assert "ST.BRUSH : ST.SAM3" in fn
+    sel = src[src.index("async function selectObject("):]
+    sel = sel[:sel.index("\n  }\n")]
+    assert "sourceStage(name)" in sel
+    chg = src[src.index("sel.addEventListener('change', () => run('olSrc'"):]
+    assert "sourceStage(n)" in chg[:chg.index("}));")]
+    assert "if (S.obj === o.group)" in chg[:chg.index("}));")]   # the group stays selected, its composition reloads
+
+
+def test_comp_is_linear_light_2026_10_30():
+    """User decision 2026-10-30: the Comp view mixes plate and background in linear light like Nuke's Merge over (the
+    MergeMatte port at its neutral defaults gives the same pixels) – GPU shader and CPU fallbacks alike."""
+    gpu = (STATIC / "gpu_overlay.js").read_text(encoding="utf-8")
+    assert "vec3 lin(vec3 c)" in gpu and "enc(lin(p) * (a / 255.) + lin(g) * (1. - a / 255.))" in gpu
+    assert "window.mdLinComp = function (P, A, B)" in gpu
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "window.mdLinComp(p.data, a.data, b.data)" in obj and "window.mdLinComp(p.data, a.data, b.data)" in app
+    assert "b.data[i + k] = p.data[i + k] * al + b.data[i + k] * (1 - al)" not in obj   # the old display-sRGB mix
+    assert "cutout(" not in app
+
+
+def test_merge_matte_gpu_preview_2026_10_30():
+    """MergeMatte palette in real time (user request 2026-10-30): static/mm_gpu.js (WebGL2 port of the group, loaded before
+    mergematte.js) draws the preview; the server port stays the fallback (no WebGL2) and the zoomed-in refinement."""
+    assert HTML.index('<script src="/static/mm_gpu.js"></script>') < HTML.index('<script src="/static/mergematte.js"></script>')
+    gpu = (STATIC / "mm_gpu.js").read_text(encoding="utf-8")
+    assert "window.mdMmGpu = { render" in gpu and "EXT_color_buffer_float" in gpu and "0.4236" in gpu
+    mm = (STATIC / "mergematte.js").read_text(encoding="utf-8")
+    assert "function gpuOver(" in mm and "window.mdMmGpu.render(" in mm and "fetchPreview(f, reg, bg, key)" in mm
+
+
+def test_final_touch_finish_on_gpu_2026_10_30():
+    """Final Touch finishing live on the GPU (user request 2026-10-30): dragging erode / blur / levels draws base +
+    strokes -> mdMmGpu.finish in the browser; with motion blur (server flow) the server image once it is in."""
+    gpu = (STATIC / "mm_gpu.js").read_text(encoding="utf-8")
+    assert "function finish(alpha, fin, W, H, into)" in gpu and "window.mdMmGpu = { render, finish" in gpu
+    ft = (STATIC / "finaltouch.js").read_text(encoding="utf-8")
+    # motion blur (server flow): the GPU draws the rest without it only while dragging / until the server's frame is in
+    assert "function finishGpu(serverCur)" in ft and "(+n.mb_strength || 0) > 0) return !!F.liveFin || !serverCur" in ft
+    assert "F.liveFin = { ...(F.liveFin || {}), [k]: +s.value }" in ft and "window.mdMmGpu.finish(raw" in ft

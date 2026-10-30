@@ -71,6 +71,13 @@ def test_propagation_interpolates_between_keys_and_tracks_outside():
     r6 = regions2[6]
     assert r6[80, 55] and r6[80, 95] and not r6[80, 110]          # union of key a moved +20 px and key b moved -20 px
     assert all(bgs[f].dtype == bool for f in frames)
+    # `only` (the previews after scrubbing, 2026-10-30): one frame at a time = the full run, bit for bit, in every
+    # position (before / on / between / after the keys) and for both interpolation kinds
+    for zz, full in ((z, regions), (z2, regions2)):
+        _r, full_bg, _t, _i = propagate_regions(zz, frames, cores, (H, W))
+        for f in frames:
+            r1, b1, _t1, _i1 = propagate_regions(zz, frames, cores, (H, W), only=[f])
+            assert set(r1) == {f} and np.array_equal(r1[f], full[f]) and np.array_equal(b1[f], full_bg[f]), f
 
 
 def test_zone_cache_roundtrip_and_hashes(tmp_path):

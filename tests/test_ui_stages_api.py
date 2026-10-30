@@ -247,11 +247,6 @@ def test_depth_order_reorder(tmp_path, monkeypatch):
     assert tools["tree"]["final_valid"] is False and tools["tree"]["status"] == "do przeliczenia"
     for bad in (["chair", "puppet"], ["chair", "puppet", "tree", "tree"], ["chair", "puppet", "nope"]):
         assert api.put("/api/objects/order", json={"names": bad}).status_code == 400
-    # part before its parent -> 400
-    assert api.put("/api/object/tree/settings", json={"part_of": "puppet"}).status_code == 200
-    r = api.put("/api/objects/order", json={"names": ["tree", "chair", "puppet"]})
-    assert r.status_code == 400 and "rodzic" in r.json()["detail"]
-    assert order() == [("chair", 0), ("puppet", 1), ("tree", 2)]
     assert mf.read_bytes() == before
 
 

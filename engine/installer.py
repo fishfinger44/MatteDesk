@@ -15,6 +15,7 @@ After 1. Comfy must be restarted (Desktop: in the app).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -25,6 +26,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger("matte_desk.installer")
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 NODE_SRC = REPO_DIR / "handoff" / "comfy" / "custom_nodes"
@@ -54,6 +57,45 @@ def progress_end(ok: bool, error: str = "") -> None:
 def _step(text: str) -> None:
     if PROGRESS.get("active"):
         PROGRESS.update(step=text, file="", done=0, total=0)
+
+
+# how much of a failed step's output the Doctor's log (and the report package built from it) keeps
+FAIL_TAIL = 3000
+
+
+def failure_cause(out: str) -> List[str]:
+    """The lines of a failed pip / install.py / worker output that name the reason, oldest first (at most 4,
+    deduplicated): pip's `ERROR: ...` lines (any case), `...Error: ...` / `...Exception: ...` lines of a traceback,
+    and the last non-empty line – pip's exit code 2 is an exception of pip itself (e.g. `InvalidVersion: ...`) whose
+    name does not end in "Error"; the `~~~^^^` / `File ...` lines around it say nothing (issue 10, 2026-10-29)."""
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    tb_frame = lambda l: l.startswith(("File ", "raise ")) or set(l) <= set("~^ ")
+    cause, in_tb = [], False
+    for i, l in enumerate(lines):
+        if l.startswith("Traceback "):
+            in_tb = True
+        elif tb_frame(l):
+            continue
+        elif in_tb and tb_frame(lines[i - 1]):
+            cause.append(l)   # the line that ends a traceback = the exception, whatever its name
+            in_tb = False
+        elif re.search(r"(\w*Error|\w*Exception)\b|^error\b", l, re.IGNORECASE) or i == len(lines) - 1:
+            cause.append(l)
+    return list(dict.fromkeys(cause[-4:]))
+
+
+def _log_failure(r: Any, log: List[str]) -> None:
+    """A failed install step (log[-1] names it): its reason + output tail into the Doctor's log, the whole output
+    into MatteDesk's log (server.log). Until 2026-10-29 the Doctor's window – and the report package built from it –
+    kept 800 characters of the tail and a case-sensitive `Error` filter, which hid pip's real error (issue 10)."""
+    step = log[-1] if log else "?"
+    out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+    cause = failure_cause(out)
+    if cause:
+        log.append("przyczyna: " + " | ".join(cause))
+    if out:
+        log.append(out[-FAIL_TAIL:])
+    logger.error("%s\n%s", step, out[-20000:])
 
 
 def _file_bytes_normalized(p: Path) -> bytes:
@@ -136,7 +178,7 @@ def _pip_requirements(cfg: Dict[str, Any], name: str, pkg_dir: Path, run: Callab
     r = run([str(py), "-m", "pip", "install", "-r", str(req)], capture_output=True, text=True)
     log.append(f"{name}: zależności (pip install -r requirements.txt) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
     if r.returncode:
-        log.append((r.stderr or r.stdout or "")[-800:])
+        _log_failure(r, log)
     return r.returncode == 0
 
 
@@ -341,7 +383,7 @@ def install_git_node(cfg: Dict[str, Any], key: str, run: Callable[..., Any] = su
         r = run([git, "clone", "--depth", "1", url, str(dst)], capture_output=True, text=True)
         log.append(f"git clone {url} -> kod {r.returncode}")
         if r.returncode:
-            log.append((r.stderr or r.stdout or "")[-800:])
+            _log_failure(r, log)
             return {"success": False, "log": log}
     ok = _pip_requirements(cfg, name, dst, run, log)
     ok = _run_install_py(cfg, name, dst, run, log) and ok
@@ -365,12 +407,7 @@ def _run_install_py(cfg: Dict[str, Any], name: str, pkg_dir: Path, run: Callable
     r = run([str(py), str(script)], capture_output=True, text=True, cwd=str(pkg_dir), env=env)
     log.append(f"{name}: install.py -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
     if r.returncode:
-        out = (r.stdout or "") + "\n" + (r.stderr or "")
-        cause = [l.strip() for l in out.splitlines() if re.search(r"\w*Error\b|^\s*error:", l)
-                 and not l.strip().startswith(("File ", "raise "))]
-        if cause:   # the real reason (pip's build error) sits far above the traceback tail
-            log.append("przyczyna: " + " | ".join(dict.fromkeys(cause[-4:])))
-        log.append(out.strip()[-800:])
+        _log_failure(r, log)   # the real reason (pip's build error) sits far above the traceback tail
     return r.returncode == 0
 
 
@@ -507,7 +544,7 @@ def install_cotracker(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.
         r = run([py, "-m", "pip", "install", "--no-deps", COTRACKER_PIP], capture_output=True, text=True)
         log.append(f"pip install {COTRACKER_PIP} (Python ComfyUI) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
         if r.returncode:
-            log.append((r.stderr or r.stdout or "")[-800:])
+            _log_failure(r, log)
             return {"success": False, "log": log}
     try:   # the tracker caches "is cotracker importable" per interpreter
         from engine import tracking
@@ -545,14 +582,14 @@ def install_vitmatte(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.r
         r = run([py, "-m", "pip", "install", "transformers"], capture_output=True, text=True)
         log.append(f"pip install transformers (Python ComfyUI) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
         if r.returncode:
-            log.append((r.stderr or r.stdout or "")[-800:])
+            _log_failure(r, log)
             return {"success": False, "log": log}
     _step(f"wagi ViTMatte {mid} (~390 MB, cache Hugging Face)")
     r = run([py, "-I", str(vitmatte.WORKER), "--download", mid], capture_output=True, text=True)
     log.append(f"wagi ViTMatte {mid} -> {'pobrane' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
     vitmatte._CHECK_CACHE.clear()
     if r.returncode:
-        log.append((r.stderr or r.stdout or "")[-800:])
+        _log_failure(r, log)
         return {"success": False, "log": log}
     return {"success": True, "log": log, "model": mid}
 
@@ -575,7 +612,7 @@ def install_sapiens2(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.r
     r = run([py, "-I", str(sapiens2.WORKER), "--download", sapiens2.DEFAULT_MODEL], capture_output=True, text=True)
     log.append(f"wagi {sapiens2.DEFAULT_MODEL} -> {'pobrane' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
     if r.returncode:
-        log.append((r.stderr or r.stdout or "")[-800:])
+        _log_failure(r, log)
         return {"success": False, "log": log}
     from engine import vitmatte
     vitmatte._CHECK_CACHE.clear()
@@ -603,7 +640,7 @@ def install_birefnet(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.r
         r = run([py, "-m", "pip", "install", *missing], capture_output=True, text=True)
         log.append(f"pip install {' '.join(missing)} (Python ComfyUI) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
         if r.returncode:
-            log.append((r.stderr or r.stdout or "")[-800:])
+            _log_failure(r, log)
             return {"success": False, "log": log}
     else:
         log.append("timm / kornia / einops w Pythonie ComfyUI: już są")
@@ -612,7 +649,7 @@ def install_birefnet(cfg: Dict[str, Any], run: Callable[..., Any] = subprocess.r
         r = run([py, "-I", str(birefnet.WORKER), "--download", mid], capture_output=True, text=True)
         log.append(f"wagi {mid} -> {'pobrane' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
         if r.returncode:
-            log.append((r.stderr or r.stdout or "")[-800:])
+            _log_failure(r, log)
             return {"success": False, "log": log}
     from engine import vitmatte
     vitmatte._CHECK_CACHE.clear()

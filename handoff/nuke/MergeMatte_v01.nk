@@ -1,0 +1,920 @@
+set cut_paste_input [stack 0]
+version 15.0 v1
+push 0
+push $cut_paste_input
+Group {
+ inputs 2
+ name MergeMatte
+ tile_color 0x2f8f5fff
+ label "v01"
+ note_font_size 14
+ xpos 0
+ ypos 0
+ addUserKnob {20 mergematte l MergeMatte}
+ addUserKnob {26 t_alpha l "" +STARTLINE T "<b><u>Alpha</u></b>  (FG matte, before anything else)"}
+ addUserKnob {7 choke l "choke (+) / expand (-) \[px\]" t "FilterErode (gaussian) of the FG alpha" R -20 20}
+ choke 0
+ addUserKnob {7 soften l "soften \[px\]" t "Blur of the FG alpha after the choke" R 0 20}
+ soften 0
+ addUserKnob {26 t_decon l "" +STARTLINE T "<b><u>Decontaminate</u></b>  (interior colour replaces old-background colour in the edge)"}
+ addUserKnob {7 decon l "amount" R 0 1}
+ decon 1
+ addUserKnob {7 decon_spread l "spread \[px\]" t "how far the interior colour is spread into the edge" R 1 100}
+ decon_spread 30
+ addUserKnob {26 t_darken l "" +STARTLINE T "<b><u>Darken edge</u></b>  (bright FG edges go down to the BG level, only over a darker BG)"}
+ addUserKnob {7 darken l "amount" t "min(comp, BG) inside the edge band" R 0 1}
+ darken 1
+ addUserKnob {7 darken_width l "width \[px\]" R 0 30}
+ darken_width 8
+ addUserKnob {26 t_match l "" +STARTLINE T "<b><u>Match edge</u></b>  (grade the edge band to sit in the BG)"}
+ addUserKnob {7 match l "amount" R 0 1}
+ match 0
+ addUserKnob {7 match_exposure l "exposure \[stops\]" R -3 3}
+ match_exposure 0
+ addUserKnob {7 match_saturation l "saturation" R 0 2}
+ match_saturation 1
+ addUserKnob {7 match_width l "width \[px\]" R 0 30}
+ match_width 4
+ addUserKnob {26 t_wrap l "" +STARTLINE T "<b><u>Light wrap</u></b>  (BG light wraps over the FG edge)"}
+ addUserKnob {7 wrap l "wrap amount" t "all BG values wrap over the FG" R 0 1}
+ wrap 0.2
+ addUserKnob {7 wrap_size l "size \[px\]" t "wrap and flare share this size (x1, x2, x4, x8 blur stack)" R 0 20}
+ wrap_size 5
+ addUserKnob {7 flare l "flare amount" t "only the bright parts of the BG (luminance key) wrap over the FG" R 0 1}
+ flare 0
+ addUserKnob {7 flare_threshold l "flare threshold" t "BG luminance where the flare key starts" R 0 1}
+ flare_threshold 0.6
+ addUserKnob {7 flare_softness l "flare softness" t "key ramp width above the threshold" R 0 1}
+ flare_softness 0.2
+ addUserKnob {26 t_bleed l "" +STARTLINE T "<b><u>Bleed colour</u></b>  (BG hue replaces FG hue near the edge)"}
+ addUserKnob {7 bleed l "amount" R 0 1}
+ bleed 0
+ addUserKnob {7 bleed_size l "size \[px\]" R 0 10}
+ bleed_size 5
+ addUserKnob {26 t_edge l "" +STARTLINE T "<b><u>Edge blur</u></b>  (blurs the semi-transparent edge of the composite)"}
+ addUserKnob {7 edge_blur l "amount" R 0 10}
+ edge_blur 1
+ addUserKnob {26 div l "" +STARTLINE T ""}
+ addUserKnob {6 log l "Apply operations in Log (ACEScct)" +STARTLINE}
+ log true
+ addUserKnob {7 mix l "mix" R 0 1}
+ mix 1
+ addUserKnob {6 bypass l "Regular Over" t "bypass: plain Merge over (after Alpha / Log)" +STARTLINE}
+ bypass false
+ addUserKnob {41 bbox l "set bbox to" T fg_over_bg.bbox}
+}
+Input {
+ inputs 0
+ name BG
+ xpos 900
+ ypos 0
+}
+set NBG [stack 0]
+Input {
+ inputs 0
+ number 1
+ name FG
+ xpos 0
+ ypos 0
+}
+set NFG [stack 0]
+push $NFG
+Unpremult {
+ disable {{parent.choke==0 && parent.soften==0}}
+ name choke_unpremult
+ xpos 0
+ ypos 60
+}
+set Nchoke_unpremult [stack 0]
+push $Nchoke_unpremult
+FilterErode {
+ channels alpha
+ size {{parent.choke}}
+ filter gaussian
+ disable {{parent.choke==0 && parent.soften==0}}
+ name choke_erode
+ xpos 0
+ ypos 100
+}
+set Nchoke_erode [stack 0]
+push $Nchoke_erode
+Blur {
+ channels alpha
+ size {{parent.soften}}
+ disable {{parent.choke==0 && parent.soften==0}}
+ name choke_soften
+ xpos 0
+ ypos 140
+}
+set Nchoke_soften [stack 0]
+push $Nchoke_soften
+Premult {
+ disable {{parent.choke==0 && parent.soften==0}}
+ name choke_premult
+ xpos 0
+ ypos 180
+}
+set Nchoke_premult [stack 0]
+push $Nchoke_premult
+Unpremult {
+ disable {{1-parent.log}}
+ name fg_unpremult_log
+ xpos 0
+ ypos 260
+}
+set Nfg_unpremult_log [stack 0]
+push $Nfg_unpremult_log
+OCIOColorSpace {
+ in_colorspace "ACES - ACEScg"
+ out_colorspace "ACES - ACEScct"
+ disable {{1-parent.log}}
+ name fg_to_log
+ xpos 0
+ ypos 300
+}
+set Nfg_to_log [stack 0]
+push $Nfg_to_log
+Premult {
+ disable {{1-parent.log}}
+ name fg_premult_log
+ xpos 0
+ ypos 340
+}
+set Nfg_premult_log [stack 0]
+push $Nfg_premult_log
+Dot {
+ name Dot_fg
+ xpos 34
+ ypos 400
+}
+set NDot_fg [stack 0]
+push $NBG
+OCIOColorSpace {
+ in_colorspace "ACES - ACEScg"
+ out_colorspace "ACES - ACEScct"
+ disable {{1-parent.log}}
+ name bg_to_log
+ xpos 900
+ ypos 300
+}
+set Nbg_to_log [stack 0]
+push $Nbg_to_log
+Dot {
+ name Dot_bg
+ xpos 934
+ ypos 400
+}
+set NDot_bg [stack 0]
+push $NDot_fg
+push $NDot_bg
+Merge2 {
+ inputs 2
+ name regular_over
+ xpos 1200
+ ypos 460
+}
+set Nregular_over [stack 0]
+push $Nregular_over
+Dot {
+ name Dot_regular
+ xpos 1234
+ ypos 2280
+}
+set NDot_regular [stack 0]
+push $NDot_fg
+Unpremult {
+ name fg_unpremult
+ xpos 0
+ ypos 460
+}
+set Nfg_unpremult [stack 0]
+push $Nfg_unpremult
+Dot {
+ name Dot_decon
+ xpos 34
+ ypos 500
+}
+set NDot_decon [stack 0]
+push $NDot_decon
+Dot {
+ name Dot_decon_r
+ xpos -166
+ ypos 500
+}
+set NDot_decon_r [stack 0]
+push $NDot_decon
+Invert {
+ channels alpha
+ label "1 - alpha"
+ name decon_edge_mask
+ xpos -350
+ ypos 570
+}
+set Ndecon_edge_mask [stack 0]
+push $Ndecon_edge_mask
+Dot {
+ name Dot_decon_m
+ xpos -316
+ ypos 650
+}
+set NDot_decon_m [stack 0]
+push $NDot_decon_r
+Premult {
+ name decon_premult
+ xpos -200
+ ypos 530
+}
+set Ndecon_premult [stack 0]
+push $Ndecon_premult
+Blur {
+ channels rgba
+ size {{parent.decon_spread}}
+ name decon_spread
+ xpos -200
+ ypos 570
+}
+set Ndecon_spread [stack 0]
+push $Ndecon_spread
+Unpremult {
+ name decon_unpremult
+ xpos -200
+ ypos 610
+}
+set Ndecon_unpremult [stack 0]
+push $NDot_decon_m
+push $Ndecon_unpremult
+push $NDot_decon
+Keymix {
+ inputs 3
+ channels rgb
+ mix {{parent.decon}}
+ label "interior colour into edge"
+ disable {{parent.decon==0}}
+ name decon_mix
+ xpos 0
+ ypos 644
+}
+set Ndecon_mix [stack 0]
+push $Ndecon_mix
+Dot {
+ name Dot_fgd
+ xpos 34
+ ypos 720
+}
+set NDot_fgd [stack 0]
+push $NDot_fgd
+Dot {
+ name Dot_fgd_alpha
+ xpos -116
+ ypos 1520
+}
+set NDot_fgd_alpha [stack 0]
+push $NDot_fg
+push $NDot_bg
+Copy {
+ inputs 2
+ from0 rgba.alpha
+ to0 rgba.alpha
+ name bg_take_fg_alpha
+ xpos 600
+ ypos 460
+}
+set Nbg_take_fg_alpha [stack 0]
+push $Nbg_take_fg_alpha
+Invert {
+ channels alpha
+ name invert_alpha
+ xpos 600
+ ypos 700
+}
+set Ninvert_alpha [stack 0]
+push $Ninvert_alpha
+Premult {
+ name bg_outside_fg
+ xpos 600
+ ypos 740
+}
+set Nbg_outside_fg [stack 0]
+push $Nbg_outside_fg
+Dot {
+ name Dot_bgout
+ xpos 634
+ ypos 800
+}
+set NDot_bgout [stack 0]
+push $NDot_bg
+Keyer {
+ operation "luminance key"
+ range {{parent.flare_threshold} {parent.flare_threshold+parent.flare_softness} 1 1}
+ name flare_key
+ xpos 900
+ ypos 800
+}
+set Nflare_key [stack 0]
+push $Nflare_key
+Premult {
+ name flare_premult
+ xpos 900
+ ypos 840
+}
+set Nflare_premult [stack 0]
+push $NDot_bgout
+push $Nflare_premult
+Merge2 {
+ inputs 2
+ operation mask
+ name flare_outside_fg
+ xpos 900
+ ypos 880
+}
+set Nflare_outside_fg [stack 0]
+push $Nflare_outside_fg
+Dot {
+ name Dot_flare0
+ xpos 934
+ ypos 920
+}
+set NDot_flare0 [stack 0]
+push $NDot_flare0
+Blur {
+ size {{parent.wrap_size}}
+ name flare_blur1
+ xpos 900
+ ypos 960
+}
+set Nflare_blur1 [stack 0]
+push $NDot_flare0
+Blur {
+ size {{flare_blur1.size*2}}
+ name flare_blur2
+ xpos 1030
+ ypos 1000
+}
+set Nflare_blur2 [stack 0]
+push $NDot_flare0
+Blur {
+ size {{flare_blur2.size*2}}
+ name flare_blur3
+ xpos 1030
+ ypos 1040
+}
+set Nflare_blur3 [stack 0]
+push $NDot_flare0
+Blur {
+ size {{flare_blur3.size*2}}
+ name flare_blur4
+ xpos 1030
+ ypos 1080
+}
+set Nflare_blur4 [stack 0]
+push $Nflare_blur2
+push $Nflare_blur1
+Merge2 {
+ inputs 2
+ name flare_add2
+ xpos 900
+ ypos 1020
+}
+set Nflare_add2 [stack 0]
+push $Nflare_blur3
+push $Nflare_add2
+Merge2 {
+ inputs 2
+ name flare_add3
+ xpos 900
+ ypos 1060
+}
+set Nflare_add3 [stack 0]
+push $Nflare_blur4
+push $Nflare_add3
+Merge2 {
+ inputs 2
+ name flare_add4
+ xpos 900
+ ypos 1100
+}
+set Nflare_add4 [stack 0]
+push $Nflare_add4
+Grade {
+ channels all
+ white {{parent.flare}}
+ name flare_amount
+ xpos 900
+ ypos 1176
+}
+set Nflare_amount [stack 0]
+push $Nflare_amount
+Dot {
+ name Dot_flare
+ xpos 934
+ ypos 1470
+}
+set NDot_flare [stack 0]
+push $NDot_bgout
+Dot {
+ name Dot_bgout2
+ xpos 634
+ ypos 840
+}
+set NDot_bgout2 [stack 0]
+push $NDot_bgout2
+Blur {
+ size {{parent.wrap_size}}
+ name wrap_blur1
+ xpos 600
+ ypos 880
+}
+set Nwrap_blur1 [stack 0]
+push $NDot_bgout2
+Blur {
+ size {{wrap_blur1.size*2}}
+ name wrap_blur2
+ xpos 730
+ ypos 920
+}
+set Nwrap_blur2 [stack 0]
+push $NDot_bgout2
+Blur {
+ size {{wrap_blur2.size*2}}
+ name wrap_blur3
+ xpos 730
+ ypos 960
+}
+set Nwrap_blur3 [stack 0]
+push $NDot_bgout2
+Blur {
+ size {{wrap_blur3.size*2}}
+ name wrap_blur4
+ xpos 730
+ ypos 1000
+}
+set Nwrap_blur4 [stack 0]
+push $Nwrap_blur2
+push $Nwrap_blur1
+Merge2 {
+ inputs 2
+ name wrap_add2
+ xpos 600
+ ypos 940
+}
+set Nwrap_add2 [stack 0]
+push $Nwrap_blur3
+push $Nwrap_add2
+Merge2 {
+ inputs 2
+ name wrap_add3
+ xpos 600
+ ypos 980
+}
+set Nwrap_add3 [stack 0]
+push $Nwrap_blur4
+push $Nwrap_add3
+Merge2 {
+ inputs 2
+ name wrap_add4
+ xpos 600
+ ypos 1020
+}
+set Nwrap_add4 [stack 0]
+push $Nwrap_add4
+Grade {
+ channels all
+ white {{parent.wrap}}
+ name wrap_amount
+ xpos 600
+ ypos 1160
+}
+set Nwrap_amount [stack 0]
+push $Nwrap_amount
+Dot {
+ name Dot_wrap
+ xpos 634
+ ypos 1420
+}
+set NDot_wrap [stack 0]
+push $NDot_bgout
+Dot {
+ name Dot_bgout3
+ xpos 334
+ ypos 840
+}
+set NDot_bgout3 [stack 0]
+push $NDot_bgout3
+Blur {
+ size {{parent.bleed_size}}
+ name bleed_blur1
+ xpos 300
+ ypos 880
+}
+set Nbleed_blur1 [stack 0]
+push $NDot_bgout3
+Blur {
+ size {{bleed_blur1.size*2}}
+ name bleed_blur2
+ xpos 430
+ ypos 920
+}
+set Nbleed_blur2 [stack 0]
+push $NDot_bgout3
+Blur {
+ size {{bleed_blur2.size*2}}
+ name bleed_blur3
+ xpos 430
+ ypos 960
+}
+set Nbleed_blur3 [stack 0]
+push $NDot_bgout3
+Blur {
+ size {{bleed_blur3.size*2}}
+ name bleed_blur4
+ xpos 430
+ ypos 1000
+}
+set Nbleed_blur4 [stack 0]
+push $Nbleed_blur2
+push $Nbleed_blur1
+Merge2 {
+ inputs 2
+ name bleed_add2
+ xpos 300
+ ypos 940
+}
+set Nbleed_add2 [stack 0]
+push $Nbleed_blur3
+push $Nbleed_add2
+Merge2 {
+ inputs 2
+ name bleed_add3
+ xpos 300
+ ypos 980
+}
+set Nbleed_add3 [stack 0]
+push $Nbleed_blur4
+push $Nbleed_add3
+Merge2 {
+ inputs 2
+ name bleed_add4
+ xpos 300
+ ypos 1020
+}
+set Nbleed_add4 [stack 0]
+push $Nbleed_add4
+Clamp {
+ minimum 0.001
+ maximum 100
+ name bleed_clamp
+ xpos 300
+ ypos 1120
+}
+set Nbleed_clamp [stack 0]
+push $Nbleed_clamp
+Dot {
+ name Dot_bleed
+ xpos 334
+ ypos 1160
+}
+set NDot_bleed [stack 0]
+push $NDot_bleed
+Dot {
+ name Dot_bleed_mask
+ xpos 334
+ ypos 1360
+}
+set NDot_bleed_mask [stack 0]
+push $NDot_bleed
+Saturation {
+ saturation 0
+ name bleed_luma
+ xpos 420
+ ypos 1190
+}
+set Nbleed_luma [stack 0]
+push $Nbleed_luma
+push $NDot_bleed
+Merge2 {
+ inputs 2
+ operation divide
+ name bleed_chroma
+ xpos 300
+ ypos 1230
+}
+set Nbleed_chroma [stack 0]
+push $NDot_fgd
+Saturation {
+ saturation {{1-parent.bleed}}
+ name fg_desaturate
+ xpos 150
+ ypos 1230
+}
+set Nfg_desaturate [stack 0]
+push $Nbleed_chroma
+push $Nfg_desaturate
+Merge2 {
+ inputs 2
+ operation multiply
+ mix {{parent.bleed}}
+ name bleed_apply
+ xpos 150
+ ypos 1280
+}
+set Nbleed_apply [stack 0]
+push $NDot_bleed_mask
+push $Nbleed_apply
+push $NDot_fgd
+Keymix {
+ inputs 3
+ name bleed_near_edge
+ xpos 0
+ ypos 1360
+}
+set Nbleed_near_edge [stack 0]
+push $NDot_wrap
+push $Nbleed_near_edge
+Merge2 {
+ inputs 2
+ name add_wrap
+ xpos 0
+ ypos 1420
+}
+set Nadd_wrap [stack 0]
+push $NDot_flare
+push $Nadd_wrap
+Merge2 {
+ inputs 2
+ name add_flare
+ xpos 0
+ ypos 1470
+}
+set Nadd_flare [stack 0]
+push $NDot_fgd_alpha
+push $Nadd_flare
+Copy {
+ inputs 2
+ from0 rgba.alpha
+ to0 rgba.alpha
+ name restore_fg_alpha
+ xpos 0
+ ypos 1520
+}
+set Nrestore_fg_alpha [stack 0]
+push $Nrestore_fg_alpha
+Premult {
+ name fg_premult
+ xpos 0
+ ypos 1560
+}
+set Nfg_premult [stack 0]
+push $NDot_bg
+Dot {
+ name Dot_bg2
+ xpos 934
+ ypos 1610
+}
+set NDot_bg2 [stack 0]
+push $Nfg_premult
+push $NDot_bg2
+Merge2 {
+ inputs 2
+ name fg_over_bg
+ xpos 0
+ ypos 1610
+}
+set Nfg_over_bg [stack 0]
+push $Nfg_over_bg
+Blur {
+ channels alpha
+ size {{parent.darken_width}}
+ name darken_band_blur
+ xpos 400
+ ypos 1650
+}
+set Ndarken_band_blur [stack 0]
+push $Ndarken_band_blur
+Dot {
+ name Dot_darken_band
+ xpos 434
+ ypos 1700
+}
+set NDot_darken_band [stack 0]
+push $NDot_darken_band
+push $Ndarken_band_blur
+Merge2 {
+ inputs 2
+ operation xor
+ name darken_band
+ xpos 400
+ ypos 1740
+}
+set Ndarken_band [stack 0]
+push $NDot_bg2
+Dot {
+ name Dot_bg3
+ xpos 934
+ ypos 1670
+}
+set NDot_bg3 [stack 0]
+push $NDot_bg3
+push $Nfg_over_bg
+Merge2 {
+ inputs 2
+ operation min
+ label "min(comp, bg)"
+ name darken_min
+ xpos 200
+ ypos 1670
+}
+set Ndarken_min [stack 0]
+push $Ndarken_band
+push $Ndarken_min
+push $Nfg_over_bg
+Keymix {
+ inputs 3
+ mix {{parent.darken}}
+ label "only in edge band"
+ disable {{parent.darken==0}}
+ name darken_mix
+ xpos 0
+ ypos 1760
+}
+set Ndarken_mix [stack 0]
+push $Ndarken_mix
+Dot {
+ name Dot_match
+ xpos 34
+ ypos 1800
+}
+set NDot_match [stack 0]
+push $NDot_match
+Dot {
+ name Dot_match_r
+ xpos 234
+ ypos 1800
+}
+set NDot_match_r [stack 0]
+push $NDot_match_r
+Blur {
+ channels alpha
+ size {{parent.match_width}}
+ name match_band_blur
+ xpos 400
+ ypos 1830
+}
+set Nmatch_band_blur [stack 0]
+push $Nmatch_band_blur
+Dot {
+ name Dot_match_b
+ xpos 434
+ ypos 1870
+}
+set NDot_match_b [stack 0]
+push $NDot_match_b
+push $Nmatch_band_blur
+Merge2 {
+ inputs 2
+ operation xor
+ name match_band
+ xpos 400
+ ypos 1910
+}
+set Nmatch_band [stack 0]
+push $Nmatch_band
+Dot {
+ name Dot_match_x
+ xpos 434
+ ypos 1956
+}
+set NDot_match_x [stack 0]
+push $NDot_match_r
+Grade {
+ multiply {{pow(2,parent.match_exposure)}}
+ name match_exposure
+ xpos 200
+ ypos 1830
+}
+set Nmatch_exposure [stack 0]
+push $Nmatch_exposure
+Saturation {
+ saturation {{parent.match_saturation}}
+ name match_saturation
+ xpos 200
+ ypos 1870
+}
+set Nmatch_saturation [stack 0]
+push $Nmatch_saturation
+Dot {
+ name Dot_match_s
+ xpos 234
+ ypos 1930
+}
+set NDot_match_s [stack 0]
+push $NDot_match_x
+push $NDot_match_s
+push $NDot_match
+Keymix {
+ inputs 3
+ channels rgb
+ mix {{parent.match}}
+ label "only in edge band"
+ disable {{parent.match==0}}
+ name match_mix
+ xpos 0
+ ypos 1950
+}
+set Nmatch_mix [stack 0]
+push $Nmatch_mix
+Dot {
+ name Dot_comp
+ xpos 34
+ ypos 2080
+}
+set NDot_comp [stack 0]
+push $NDot_comp
+Blur {
+ size 3
+ name edge_band_blur
+ xpos 200
+ ypos 2110
+}
+set Nedge_band_blur [stack 0]
+push $Nedge_band_blur
+Dot {
+ name Dot_edge_band
+ xpos 234
+ ypos 2150
+}
+set NDot_edge_band [stack 0]
+push $NDot_edge_band
+push $Nedge_band_blur
+Merge2 {
+ inputs 2
+ operation xor
+ name edge_band_xor
+ xpos 200
+ ypos 2190
+}
+set Nedge_band_xor [stack 0]
+push $Nedge_band_xor
+Grade {
+ channels rgba
+ whitepoint 0.9
+ white_clamp true
+ name edge_band_level
+ xpos 200
+ ypos 2230
+}
+set Nedge_band_level [stack 0]
+push $Nedge_band_level
+push $NDot_comp
+Blur {
+ inputs 1+1
+ size {{parent.edge_blur}}
+ name edge_blur
+ xpos 0
+ ypos 2230
+}
+set Nedge_blur [stack 0]
+push $NDot_regular
+push $Nedge_blur
+Switch {
+ inputs 2
+ which {{parent.bypass}}
+ name bypass_switch
+ xpos 0
+ ypos 2280
+}
+set Nbypass_switch [stack 0]
+push $NDot_bg2
+Dot {
+ name Dot_bg4
+ xpos 934
+ ypos 2330
+}
+set NDot_bg4 [stack 0]
+push $Nbypass_switch
+push $NDot_bg4
+Dissolve {
+ inputs 2
+ which {{parent.mix}}
+ name overall_mix
+ xpos 0
+ ypos 2330
+}
+set Noverall_mix [stack 0]
+push $Noverall_mix
+OCIOColorSpace {
+ in_colorspace "ACES - ACEScct"
+ out_colorspace "ACES - ACEScg"
+ disable {{1-parent.log}}
+ name from_log
+ xpos 0
+ ypos 2380
+}
+set Nfrom_log [stack 0]
+push $Nfrom_log
+Output {
+ name Output1
+ xpos 0
+ ypos 2440
+}
+set NOutput1 [stack 0]
+end_group

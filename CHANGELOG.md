@@ -1,5 +1,32 @@
 # MatteDesk – changelog
 
+## 0.50 – 2026-10-30
+- **New (testing): object groups.** Several objects (e.g. face, hair, dress, earrings) join one group – its own entry in the
+  Objects palette. Every member computes its stages on its own and brings the result it is set to ("Into group from":
+  Core / MatAnyone2 / VideoMaMa / ViTMatte–BiRefNet / LTX-2.5 / Final Touch / a version); the group's mask is the members'
+  composition with seams (seam reach per member) that close the gaps between them, a member is switched on / off with its
+  checkbox. A group runs stages 3 / 4 / 5 / 7 and Final Touch as a whole and exports as one layer; old "parts" are migrated
+  on project open. Picking a member opens the stage of its source, going back to the group returns to the group's stage.
+- **New: a first comp in Final Touch – MergeMatte, exported to Nuke as a node.** A palette with choke / soften,
+  decontaminate, darken and match edge, light wrap, flare, colour bleed, edge blur, log and mix, previewed live on the GPU in
+  the Comp view (~20–130 ms per 1080×1920 frame instead of ~4 s; within 1/255 of the Python port). Neutral defaults
+  (= a plain linear Merge over), a hair preset, typed values (arrows ±0.1 / ±0.01, up to 4× past the slider). "⧉ Nuke"
+  copies the node with the object's settings to the clipboard (+ an .nk file); the .nk export gets a MERGEMATTE backdrop per
+  object. The choke preview is approximate (Nuke's FilterErode is not matched 1:1 yet).
+- **Final Touch:** black / white / gamma / erode / blur live on the GPU (within 1/255 of the server); with motion blur on, the
+  preview skips it until the server's frame is in. The base never jumps silently any more – an out-of-date stage result stays
+  the base, marked ↻ with the reason. The base list names the stage 5 engine (BiRefNet / ViTMatte).
+- **Stage 2 (CoTracker3):** fix layers – any number of Add / Remove layers, strokes go to the active one, the timeline and the
+  image show its keys; the main functions in a palette on the left; the frame's mask (core + fix) shown live while painting;
+  "brush strokes" eye with opacity. Deleting the last key deletes the fix; deleting / switching off every layer rebuilds the
+  mask 1+2 to the core (the group and the "core (1+2)" export used to keep the deleted fixes). The fix area after scrubbing
+  the timeline ~6× faster (same result).
+- **Export:** the main controls in a palette on the left; Alpha / Comp show the mask of the chosen export source.
+- **Comp view** blends in linear light (like Nuke's Merge over); its background follows the compare bar (BG plate / colour /
+  checker). Brush strokes are drawn as one flat layer – overlaps no longer look darker.
+- "Inset: whole core" band option (the band covers the whole core – e.g. hair as its own object); the brush circle follows
+  the cursor with the pen-pressure radius; the Doctor shows pip's real error.
+
 ## 0.42 – 2026-10-26
 - **Version comparison for stages 3–7:** one A / B / difference panel (keys A / B / D, Q = band preview), a list of versions with
   a trash button each (moved to the project trash after showing the size; a version in use cannot be deleted and says why),

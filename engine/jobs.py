@@ -10,10 +10,16 @@ Comfy: the wait loop also sends /interrupt and removes our queued prompt (see co
 
 from __future__ import annotations
 
+import contextvars
 import itertools
 import threading
 import time
 from typing import Any, Dict, List, Optional
+
+
+# the job of the current request (app.long_job sets it; executor threads run in a copy of the request's context, so
+# they see it; plain threads started from a job do not – they are other work, e.g. a background band tracking)
+CURRENT_JOB: contextvars.ContextVar = contextvars.ContextVar("matte_desk_in_job", default=None)
 
 
 class JobCancelled(RuntimeError):
@@ -69,8 +75,20 @@ class Jobs:
             self._jobs[jid] = {"id": jid, "kind": kind, "label": label, "state": "running", "step": "",
                                "done": 0, "total": 0, "started": time.time(), "updated": time.time(), "comfy": None,
                                "comfy_info": None, "obj": obj, "quiet": bool(quiet), "unit": "frames",
-                               "gpu_spill_gb": None}
+                               "gpu_spill_gb": None, "gpu_wait": None}
             return jid
+
+    def current_id(self) -> Optional[int]:
+        """The job this thread works for: bound (`bind`) or the request's (CURRENT_JOB); None = not a job."""
+        return getattr(self._local, "jid", None) or CURRENT_JOB.get()
+
+    def set_gpu_wait(self, jid: int, holder: Optional[str]) -> None:
+        """Job `jid` waits for the GPU held by `holder` (engine/gpu_manager); None = no longer waiting."""
+        with self._lock:
+            j = self._jobs.get(jid)
+            if j and j["state"] == "running":
+                j["gpu_wait"] = holder
+                j["updated"] = time.time()
 
     def bind(self, jid: int) -> None:
         """Mark the current (worker) thread as running job `jid` (progress without an explicit id)."""

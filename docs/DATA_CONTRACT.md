@@ -45,8 +45,8 @@ Generated from `engine/contract.py` (`python -m engine.contract docs`) – the s
   - `date` (string, required)
   - `params_hash` (string, required)
   - `edge_mode` (string/null)
-- `mattes_all` (string) – multi-EXR: <obj>.alpha, union.alpha, [<parent>_full.alpha], [depth.disparity]
-- `groups` (object) – objects composed of parts (part_of): <parent> -> {matte: pattern of the whole without seams, members: [parent, parts...]}; the parts sum to the whole
+  - `members` (array) – a group entity (PLAN_GROUP_COMPOSE): its members – the matte is the group's whole (a stage computed on the whole, Final Touch, or the composition of the members with seams); one layer at its front-most member
+- `mattes_all` (string) – multi-EXR: <obj>.alpha (objects and groups), union.alpha, [depth.disparity]
 - `mattes_all_channels` (array) – multi-EXR layers in depth order (without `.alpha`)
 - `mattes_nk` (string) – Nuke script with the mask passes (MASKI backdrop, anchors + stamps) – File > Import Script
 - `export_dir` (string) – export folder (default `<work>/matte_desk/export`; chosen in project.json)
@@ -87,7 +87,13 @@ Generated from `engine/contract.py` (`python -m engine.contract docs`) – the s
 - `flags` (array)
 - `edge_mode` (enum, required) ∈ ['auto', 'backlit', 'matanyone', 'core', 'ltx']
 - `edge_mode_auto` (string)
-- `part_of` (string/null) – parent, when the object is a part of another one (e.g. Figure's dress)
+- `kind` (enum) ∈ ['group'] – a group entity (PLAN_GROUP_COMPOSE): no core of its own, its mask = the composition of `members`
+- `members` (array) – group: its objects (one group per object, no nesting)
+- `seam_px` (integer)
+- `group` (string/null) – object: the group it belongs to
+- `group_source` (object/null) – object in a group: „Do grupy z:” {source: core | matanyone | videomama | vitmatte | ltx | version | final_touch, run}
+- `group_on` (boolean) – object in a group: false = switched off for now (out of the group's composition), default true
+- `group_seam_px` (integer/null) – object in a group: its own seam reach px (null = the group's seam_px)
 - `band_scale` (number)
 - `shift_px` (number)
 - `band_out_px` (number)

@@ -198,10 +198,11 @@ def _tracks(h, path, qs, frames, tracker, tracker_frames, wait):
             raise Superseded(h)
 
     def compute():
+        from engine.gpu_manager import GPU
         try:
             if stale():
                 return                     # replaced before it started: nothing to compute
-            with _LOCK:
+            with _LOCK, GPU.work("śledzenie punktów pasa"):
                 if stale():
                     return
                 if _load(path) is None:

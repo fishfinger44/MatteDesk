@@ -30,7 +30,6 @@
     p0DepthOpen: 'Mapa głębi (DepthCrafter) do kolejności obiektów i ZDefocus',
     // stage 1 SAM3 (layout 2026-10-15: 1 SAM3 · 2 CoTracker · 3 MatAnyone · 4 ViTMatte · 5 Eksperymenty · 6 Eksport)
     st1Prompt: "Krótka nazwa obiektu po angielsku dla SAM 3.1, np. ‘felt puppet’ – używana przy ‘Wykryj kandydatów’",
-    st1PartOf: 'Obiekt jest częścią innego (np. suknia lalki): osobna maska, eksport sumuje części do całości',
     st1Create: 'Dodaj nowy obiekt do ujęcia',
     st1PtsClear: 'Usuń wszystkie punkty tej klatki (usuwa też jej klucz z punktów; Ctrl+Z cofa)',
     st1Detect: 'SAM 3.1 szuka obiektu z promptu na całej klatce i pokazuje kandydatów do wyboru',

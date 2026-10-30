@@ -28,7 +28,7 @@ import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +45,7 @@ from engine.segment import sdf
 SMOOTHING = {"weak": (1, 0.5), "normal": (2, 0.35), "strong": (4, 0.25)}   # (radius, motion_limit) – SPEC 1.2
 # fixed band half-widths per edge mode until the adaptive band (7.8 pkt 2, E5b); x band_scale
 BAND_PX = {"matanyone": 6.0, "core": 2.0, "backlit": 40.0, "ltx": 16.0}
+BAND_AHEAD: Optional[int] = None   # stage-3 band geometry: frames computed ahead in the pool (None = 2 x workers)
 VRAM_LIMIT_GB = 11.0
 SPILL_LIMIT_GB = 0.5   # GPU memory moved to system RAM during the probe (Windows WDDM) above this = scale too big
 TEST_BATCH = 9
@@ -230,11 +231,14 @@ class _FrameCache:
 class _FlowPool:
     """DIS flows between frame pairs, computed ahead in a thread pool (one DIS instance per thread) and cached until
     `drop_below`: pair (i, j) with a frame below the window of the current centre is never used again. Sequential
-    with workers <= 1 (identical values: DIS is deterministic for any thread count)."""
+    with workers <= 1 (identical values: DIS is deterministic for any thread count). `scale` < 1 (plan
+    docs/PLAN_EDGE_SPEED.md B2, 2026-10-28): the flow is measured on the grays shrunk by `scale` (INTER_AREA) and brought
+    back to full size (INTER_LINEAR, vectors / scale) – 1 = the full-size flow, bit-identical to before."""
 
-    def __init__(self, u8: Callable[[int], np.ndarray], preset: int, workers: int):
+    def __init__(self, u8: Callable[[int], np.ndarray], preset: int, workers: int, scale: float = 1.0):
         self.u8 = u8
         self.preset = preset
+        self.scale = float(scale)
         self.workers = int(workers)
         self.ex = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
         self._f: Dict[Tuple[int, int], Any] = {}
@@ -254,7 +258,14 @@ class _FlowPool:
 
     def _calc(self, i: int, j: int) -> np.ndarray:
         a = self.u8(i)
-        return self.dis(a.shape).calc(a, self.u8(j), None)
+        if self.scale == 1.0:
+            return self.dis(a.shape).calc(a, self.u8(j), None)
+        h, w = a.shape[:2]
+        sz = (max(8, int(round(w * self.scale))), max(8, int(round(h * self.scale))))
+        a_s = cv2.resize(a, sz, interpolation=cv2.INTER_AREA)
+        b_s = cv2.resize(self.u8(j), sz, interpolation=cv2.INTER_AREA)
+        fl = cv2.resize(self.dis(a_s.shape).calc(a_s, b_s, None), (w, h), interpolation=cv2.INTER_LINEAR)
+        return fl * np.array([w / sz[0], h / sz[1]], np.float32)
 
     def request(self, pairs: Sequence[Tuple[int, int]]) -> None:
         if self.ex is None:
@@ -463,7 +474,7 @@ def temporal_mean_flow(alphas: Sequence[np.ndarray], grays: Sequence[np.ndarray]
                        tol: float = 0.25, occl_px: float = 1.0,
                        preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
                        fb_sigma: float = 0.0, photo_sigma: float = 0.0, tex_k: float = 0.0, conf_mode: str = "drop",
-                       multiscale: int = 1,
+                       multiscale: int = 1, flow_scale: float = 1.0,
                        progress: Optional[Callable[[int, int], None]] = None,
                        emit: Optional[Callable[[int, np.ndarray], None]] = None,
                        workers: Optional[int] = None) -> Optional[np.ndarray]:
@@ -483,7 +494,9 @@ def temporal_mean_flow(alphas: Sequence[np.ndarray], grays: Sequence[np.ndarray]
     the lost weight is dropped (the other samples decide), "centre" = it goes to the frame's own value. multiscale 2 =
     the flow is also measured on the half-size grays (3: also quarter ...), per pixel the one with the smaller fwd/bwd
     error is used (also a confidence mode: with nothing else on, c = the binary fwd/bwd test).
-    Sliding window, flows and warps in a thread pool, `progress` / `emit` as temporal_median (2026-10-25)."""
+    Sliding window, flows and warps in a thread pool, `progress` / `emit` as temporal_median (2026-10-25).
+    `flow_scale` (plan B2, 2026-10-28): the DIS flows on grays shrunk by this factor, brought back up (_FlowPool);
+    1 = bit-identical to before."""
     n = len(alphas)
     if n < 3:
         return np.stack([np.asarray(alphas[i]).copy() for i in range(n)]) if emit is None else None
@@ -493,7 +506,7 @@ def temporal_mean_flow(alphas: Sequence[np.ndarray], grays: Sequence[np.ndarray]
     st = float(sigma_t) if sigma_t else max(0.5, float(radius))     # near-flat window: ~1.5x the median's efficiency
     A = _FrameCache(lambda i: np.asarray(alphas[i]))
     U = _u8_cache(grays)
-    F = _FlowPool(U, preset, flow_workers() if workers is None else int(workers))
+    F = _FlowPool(U, preset, flow_workers() if workers is None else int(workers), scale=flow_scale)
     h, w = np.asarray(alphas[0]).shape
     # half, quarter ... size grays (multiscale), per level a window cache
     pyr = [_FrameCache(lambda i, k=k: cv2.resize(U(i), (max(8, w >> k), max(8, h >> k)), interpolation=cv2.INTER_AREA))
@@ -928,10 +941,15 @@ class Finalizer:
         busy = self.client.busy_error()
         if busy:
             raise RuntimeError(busy)
-        sub = self.client.queue_prompt(g)
-        if not sub.get("success"):
-            raise RuntimeError(f"Comfy odrzucił graf MatAnyone2: {sub.get('error')}")
-        res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=7200)
+        from engine.gpu_manager import comfy_lease
+        t = time.perf_counter()
+        with comfy_lease(self.client, "MatAnyone2"):
+            sub = self.client.queue_prompt(g)
+            if not sub.get("success"):
+                raise RuntimeError(f"Comfy odrzucił graf MatAnyone2: {sub.get('error')}")
+            res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=7200)
+        if getattr(self, "timings", None) is not None:   # plan A6b: the Comfy prompt alone (lease wait included)
+            _tick(self.timings, "model_comfy", t)
         if not res.get("success"):
             raise RuntimeError(f"MatAnyone2 nie powiódł się: {res.get('error')}")
         return res
@@ -1124,12 +1142,24 @@ class Finalizer:
                  soft_feather: float = ZONE_FEATHER_PX,
                  soft_weights: Optional[Dict[int, np.ndarray]] = None,
                  keep_holes: Optional[Dict[int, np.ndarray]] = None,
-                 core_soft: Optional[Dict[int, np.ndarray]] = None
+                 core_soft: Optional[Dict[int, np.ndarray]] = None,
+                 timings: Optional[Dict[str, float]] = None
                  ) -> Tuple[Dict[int, np.ndarray], FinalizeReport]:
         """`exclude`: full-frame pixels removed by Remove zones (+2 px) – out of the edge band, never restored;
         `soft_override`: full-frame (alpha, area) of soft zones – applied last, wins over everything in its area;
         `core_soft`: SAM 3.1 probabilities (uint8, consistent with `core`) of the frames that have them – soft start of the
-        band in matanyone mode when the installed CoreCombine has core_mode (else binary as before, noted in the report)."""
+        band in matanyone mode when the installed CoreCombine has core_mode (else binary as before, noted in the report).
+        `timings` (plan docs/PLAN_EDGE_SPEED.md A6b, stage 3): filled with wall seconds per phase (model, band geometry,
+        feathers, median, hygiene, writes)."""
+        self.timings = timings if timings is not None else {}
+        try:
+            return self._finalize(obj, segs, frames, core, keys, start, run_dir, edge_mode, progress_cb, exclude,
+                                  soft_override, band_fn, soft_feather, soft_weights, keep_holes, core_soft, self.timings)
+        finally:
+            self.timings = None
+
+    def _finalize(self, obj, segs, frames, core, keys, start, run_dir, edge_mode, progress_cb, exclude, soft_override,
+                  band_fn, soft_feather, soft_weights, keep_holes, core_soft, tm: Dict[str, float]):
         t0 = time.time()
         frames = list(frames)
         smoothing = obj.get("temporal_smoothing", "normal")
@@ -1148,7 +1178,9 @@ class Finalizer:
             rep.ma_node = dict(self.ma_extra())
             if smode == "auto":
                 first_seg_frames = contiguous_chunks([f for f in frames if segs[0].first <= f <= segs[0].last])[0]
+                t = time.perf_counter()
                 scale = self.probe_scale(segs[0], first_seg_frames, core, keys, start, rep)
+                _tick(tm, "model_probe", t)
         rep.ma_scale = scale
         soft_in = core_soft if (edge_mode == "matanyone" and core_soft) else None
         if soft_in is not None and not self.soft_ok():
@@ -1164,6 +1196,7 @@ class Finalizer:
             # object life range: frames with a gap (object invisible) -> one video per contiguous piece (one piece =
             # the segment's frames, as before)
             chunks = contiguous_chunks(sf)
+            t_model = time.perf_counter()
             if edge_mode == "matanyone":
                 t_seg = time.time()
                 soft = {}
@@ -1189,6 +1222,7 @@ class Finalizer:
                     soft.update(self._ltx_segment(seg, ch, core))
             else:  # core: antialiased SAM3 core
                 soft = {f: antialiased_core(extract_crop(core[f].astype(np.float32), seg)) for f in sf}
+            _tick(tm, "model", t_model)   # the whole engine call (inputs for Comfy, the prompt "model_comfy", outputs)
             # band limit: outside the band the result is the core (MatAnyone cannot add/remove regions);
             # key frames: the same band as every frame (object option key_band_same, user decision 2026-10-15: the
             # spec's +-3 px on keys made the edge jump hard for one frame at every key – CLIP2_A F50 had half the soft
@@ -1199,50 +1233,81 @@ class Finalizer:
             # first needs it (the engine's crop is freed then), the finished frame is written at once – no per-segment
             # stacks (3 x 55 MB x frames on a 3728 px crop). Same per-frame calls as before and temporal_median streams
             # bit-identically, so the alphas are unchanged.
-            from engine.bandsys import compose_area
+            from engine.bandsys import compose_area_crop
             from engine.edge import band_feathers, hygiene
             fe, fo = band_feathers(obj)   # unset = the one defaults of every stage (2026-10-24)
+            from engine.edge import edge_settings
+            whole = bool(edge_settings(obj)["band"].whole_core)   # „cały rdzeń”: the inner band edge = the core's middle
             bands: Dict[int, np.ndarray] = {}
             done: Dict[int, np.ndarray] = {}
+
+            def geometry(f: int) -> Tuple[np.ndarray, float]:
+                t = time.perf_counter()
+                c = extract_crop(core[f].astype(np.float32), seg) > 0.5
+                narrow = f in keys and not key_same
+                bw = min(band_px, 3.0) if narrow else band_px
+                # adaptive band (7.8 pkt 2) for matanyone / core; backlit and LTX are limited by the core region
+                adaptive = band_fn is not None and not narrow and edge_mode in ("matanyone", "core")
+                b = band_fn(f, seg, c, bw) if adaptive else edge_band(c, bw)
+                if exclude and f in exclude:
+                    b &= ~(extract_crop(exclude[f].astype(np.float32), seg) > 0.5)
+                return b, time.perf_counter() - t
+            # the band of each frame is independent (sdf / band_area release the GIL; the band points of a run are a
+            # pure lookup in tracks resolved before) -> computed ahead in a thread pool (plan docs/PLAN_EDGE_SPEED.md
+            # section 11, 2026-10-29, as zones.outline_regions); the same call per frame -> the same bits.
+            # "band_geometry" = the wait on the critical path, "band_geometry_threads" = the sum in the threads.
+            from engine.qa import default_workers
+            ahead = BAND_AHEAD if BAND_AHEAD is not None else 2 * default_workers()
+            pool = ThreadPoolExecutor(max_workers=min(len(sf), default_workers())) if len(sf) > 1 else None
+            futs: Dict[int, Any] = {}
+            pos = {f: i for i, f in enumerate(sf)}
+            nxt = [0]
 
             def band_of(f: int) -> np.ndarray:
                 b = bands.get(f)
                 if b is None:
-                    c = extract_crop(core[f].astype(np.float32), seg) > 0.5
-                    narrow = f in keys and not key_same
-                    bw = min(band_px, 3.0) if narrow else band_px
-                    # adaptive band (7.8 pkt 2) for matanyone / core; backlit and LTX are limited by the core region
-                    adaptive = band_fn is not None and not narrow and edge_mode in ("matanyone", "core")
-                    b = band_fn(f, seg, c, bw) if adaptive else edge_band(c, bw)
-                    if exclude and f in exclude:
-                        b &= ~(extract_crop(exclude[f].astype(np.float32), seg) > 0.5)
+                    t = time.perf_counter()
+                    if pool is None:
+                        b, s = geometry(f)
+                    else:
+                        while nxt[0] < len(sf) and nxt[0] <= pos[f] + ahead:
+                            futs[sf[nxt[0]]] = pool.submit(geometry, sf[nxt[0]])
+                            nxt[0] += 1
+                        b, s = futs.pop(f).result()
+                    tm["band_geometry_threads"] = tm.get("band_geometry_threads", 0.0) + s
                     bands[f] = b
+                    _tick(tm, "band_geometry", t)
                 return b
 
             def res_i(i: int) -> np.ndarray:
                 f = sf[i]
-                c = extract_crop(core[f].astype(np.float32), seg) > 0.5
                 band = band_of(f)
+                t = time.perf_counter()
+                c = extract_crop(core[f].astype(np.float32), seg) > 0.5
                 sf_ = soft.pop(f)
                 if fe > 0 or fo > 0:
                     # one band system (engine/bandsys.py, 2026-10-22 / one implementation 2026-10-24): the inset feather
                     # from the inner band edge blends the core (1) into the edge result (user request 2026-10-17: no
                     # visible line at the inner band edge), the outer feather from the outer edge blends it into the
                     # core (0 there); they never overlap, the inset one keeps its length up to the band width
-                    return compose_area(c, sf_, band, fe, fo)
-                return np.where(band, sf_, c.astype(np.float32))
+                    # on the band's bbox (bit-identical to compose_area on the crop, tests/test_compose_area_crop.py)
+                    fmap = band_fn.feather(f, seg, c) if whole and getattr(band_fn, "feather", None) else None
+                    out = compose_area_crop(c, sf_, band, fe if fmap is None else fmap, fo, whole=whole)
+                else:
+                    out = np.where(band, sf_, c.astype(np.float32))
+                _tick(tm, "feather_compose", t)
+                return out
 
-            def emit(i: int, a: np.ndarray) -> None:
-                f = sf[i]
-                job_progress("Higiena i zapis alphy (EXR)", i + 1, len(sf))
+            def post(f: int, a: np.ndarray, band: np.ndarray) -> Tuple[np.ndarray, Dict[str, int], Dict[str, float]]:
+                st: Dict[str, float] = {}
+                t = time.perf_counter()
                 # (6) alpha hygiene (7.8 pkt 4)
                 c = extract_crop(core[f].astype(np.float32), seg) > 0.5
                 keep = None
                 if keep_holes and f in keep_holes:
                     keep = extract_crop(keep_holes[f].astype(np.float32), seg) > 0.5
-                a, hrep = hygiene(a, c, bands.pop(f), keep)
-                for k, v in hrep.items():
-                    rep.hygiene[k] = rep.hygiene.get(k, 0) + v
+                a, hrep = hygiene(a, c, band, keep)
+                t = _tick(st, "hygiene_threads", t)
                 # Soft zones LAST (PLAN_HAIR_TOOL 2 / 12, real test SH020 2026-10-13): the base alpha is computed exactly
                 # as without zones (edge mode, temporal median, hygiene – bit-identical outside the zone), then the zone's
                 # own alpha (already stabilized in time by the zone, strands connected to the core, islands kept) wins in
@@ -1257,10 +1322,46 @@ class Finalizer:
                     area = extract_crop(sarea.astype(np.float32), seg) > 0.5
                     sw = (extract_crop(soft_weights[f], seg) if soft_weights and f in soft_weights else None)
                     a = apply_soft_override(a, extract_crop(sa.astype(np.float32), seg), area, soft_feather, sw)
-                done[f] = a
+                    t = _tick(st, "soft_override_threads", t)
                 # write crop-only alpha + core (runs/v###/alpha/<seg>/a_####.exr)
                 write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+                t = _tick(st, "write_exr_threads", t)
                 cv2.imwrite(str(_mk(run_dir / "core" / seg.seg_id) / f"c_{f:04d}.png"), c.astype(np.uint8) * 255)
+                _tick(st, "write_core_png_threads", t)
+                return a, hrep, st
+
+            # hygiene, soft zones and the writes of a finished frame are independent of the other frames -> in the
+            # same pool, at most 2 x workers frames pending (memory); collected in frame order in the main thread
+            # (section 11, 2026-10-29: the same call per frame -> the same bits; "post_frames" = the wait)
+            pending: List[Tuple[int, Any]] = []
+
+            def collect(keep_n: int) -> None:
+                while len(pending) > keep_n:
+                    f, fut = pending.pop(0)
+                    t = time.perf_counter()
+                    a, hrep, st = fut.result()
+                    _tick(tm, "post_frames", t)
+                    for k, v in hrep.items():
+                        rep.hygiene[k] = rep.hygiene.get(k, 0) + v
+                    for k, v in st.items():
+                        tm[k] = tm.get(k, 0.0) + v
+                    done[f] = a
+
+            def emit(i: int, a: np.ndarray) -> None:
+                f = sf[i]
+                job_progress("Higiena i zapis alphy (EXR)", i + 1, len(sf))
+                band = bands.pop(f)
+                if pool is None:
+                    fut: Any = Future()
+                    fut.set_result(post(f, a, band))
+                else:
+                    fut = pool.submit(post, f, a, band)
+                pending.append((f, fut))
+                collect(2 * default_workers())
+
+            nested = ("band_geometry", "feather_compose", "post_frames")
+            before = sum(tm.get(k, 0.0) for k in nested)
+            t_med = time.perf_counter()
 
             class _Seq:
                 def __init__(self, get):
@@ -1271,13 +1372,23 @@ class Finalizer:
 
                 def __getitem__(self, i):
                     return self.get(i)
-            temporal_median(_Seq(res_i), radius, mlimit, _Seq(lambda i: band_of(sf[i])),
-                            progress=lambda d, t: job_progress("Mediana czasowa", d, t), emit=emit)
+            try:
+                temporal_median(_Seq(res_i), radius, mlimit, _Seq(lambda i: band_of(sf[i])),
+                                progress=lambda d, t: job_progress("Mediana czasowa", d, t), emit=emit)
+                collect(0)
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
+            # the median's own maths = its wall time minus the band / feather / hygiene / write calls it made
+            tm["median"] = tm.get("median", 0.0) + max(0.0, time.perf_counter() - t_med
+                                                       - (sum(tm.get(k, 0.0) for k in nested) - before))
             per_seg[seg.seg_id] = {f: done[f] for f in sf}
             if progress_cb:
                 progress_cb("Przelicz finalnie", n + 1, len(segs))
 
+        t = time.perf_counter()
         full = assemble_full(per_seg, segs, frames, self.w, self.h)
+        t = _tick(tm, "assemble_full", t)
         rep.seconds = round(time.time() - t0, 1)
         write_run_json(run_dir, {"schema": "matte_desk/run@1.0", **rep.to_dict(),
                                                       "frames": [int(frames[0]), int(frames[-1])],
@@ -1293,6 +1404,13 @@ class Finalizer:
 def _mk(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _tick(tm: Dict[str, float], key: str, t0: float) -> float:
+    """Adds the wall seconds since t0 to tm[key]; returns now (phase timings, plan A6b)."""
+    t1 = time.perf_counter()
+    tm[key] = tm.get(key, 0.0) + (t1 - t0)
+    return t1
 
 
 def apply_soft_override(base: np.ndarray, sa: np.ndarray, area: np.ndarray, feather_px: float = ZONE_FEATHER_PX,

@@ -10,7 +10,7 @@ SRC = (Path(__file__).resolve().parents[1] / "static" / "objects.js").read_text(
 
 def test_prompt_field_enter_recomputes_and_save_does_not_reload():
     i = SRC.index("$('st1Prompt').addEventListener('change'")
-    block = SRC[i:SRC.index("$('st1PartOf').addEventListener", i)]
+    block = SRC[i:SRC.index("$('st1PtsClear').addEventListener", i)]
     assert "refreshList" not in block and "run('st1Prompt'" not in block
     assert "$('st1Prompt').addEventListener('keydown'" in block and "computePoints(V().currentFrame)" in block
     assert "$('st1Prompt').addEventListener('input'" in block and "S.pointsDirty[V().currentFrame] = true" in block

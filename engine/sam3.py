@@ -167,10 +167,12 @@ class Sam3Runner:
         busy = self.client.busy_error()
         if busy:
             raise RuntimeError(busy)
-        sub = self.client.queue_prompt(graph)
-        if not sub.get("success"):
-            raise RuntimeError(f"Comfy odrzucił graf SAM 3.1: {sub.get('error')}")
-        res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=1800)
+        from engine.gpu_manager import comfy_lease
+        with comfy_lease(self.client, "SAM 3.1"):
+            sub = self.client.queue_prompt(graph)
+            if not sub.get("success"):
+                raise RuntimeError(f"Comfy odrzucił graf SAM 3.1: {sub.get('error')}")
+            res = self.client.wait_for_prompt(sub["prompt_id"], timeout_sec=1800)
         if not res.get("success"):
             raise RuntimeError(f"SAM 3.1 nie powiódł się: {res.get('error')}")
         result: Dict[str, List[np.ndarray]] = {}

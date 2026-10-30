@@ -9,10 +9,10 @@
   only when the format is EXR.
 - several objects: ML mattes -> MatteSubtractFront in depth_order (front first): back = clamp(back - max(front)).
   Never `max` on contacts.
-- parts of one object (object field `part_of`, e.g. Figure's dress `part_of: figure`): the whole (parent + parts) is one
-  seamless matte `<parent>_full` (internal contact gaps between the parts' cores filled); the first part in depth order
-  keeps its own alpha, the next ones get the rest: part = clamp(whole - earlier parts) -> parts sum to the whole exactly
-  (no gap, no overlap at the contact). Channel `<parent>_full.alpha` + folder `export/mattes/<parent>_full/`. (Physical mattes split by regions = backlit objects, MatteSplitByRegions in Comfy.)
+- a group (engine/groups.py, PLAN_GROUP_COMPOSE 2026-10-29) is one layer at its front-most member: its whole result,
+  its Final Touch or the composition of its members (`seamless_union` of their „Do grupy z:” alphas, contact seams
+  filled); it never cuts / is cut by its own members, which are exported with their own choice. (Physical mattes split
+  by regions = backlit objects, MatteSplitByRegions in Comfy.)
 - optional core / confidence (`<obj>_core/`, `<obj>_conf/`) for the 3D tool (visual hull).
 - outputs.json updated (objects: name, depth_order, paths, run version, QA status, date, params hash).
 No RGB is ever written (Z3).
@@ -24,7 +24,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -51,15 +51,21 @@ def core_fix_loader(obj_dir: Path, w: int, h: int) -> Callable[[int], np.ndarray
     return load
 
 
-def run_alpha_loader(obj_dir: Path, run: str, w: int, h: int, sub: str = "alpha") -> Callable[[int], np.ndarray]:
+def run_alpha_loader(obj_dir: Path, run: str, w: int, h: int, sub: str = "alpha",
+                     reader: Optional[Callable[[Path], np.ndarray]] = None) -> Callable[[int], np.ndarray]:
     """Full-frame alpha of a run version (crop segments pasted back, overlaps crossfaded). `sub="alpha_base"`: the
     version's base alpha (edge mode without zones, written when the version has zones). `run == CORE_RUN`: the
     mask 1+2 (core_fix_loader). `run == "ft:<base>"` (stage Final Touch): the base version + the object's hand
-    corrections (engine/final_touch.py)."""
+    corrections (engine/final_touch.py). `reader` (default read_alpha): how one segment's EXR is read – „Zastosuj”
+    passes a caching one, so its overlay does not decode the same base file again (A6b, 2026-10-28)."""
     from engine.final_touch import base_run, ft_loader, is_ft
     if is_ft(run):
-        return ft_loader(obj_dir, run_alpha_loader(obj_dir, base_run(run), w, h, sub))
+        return ft_loader(obj_dir, run_alpha_loader(obj_dir, base_run(run), w, h, sub, reader))
     if run == CORE_RUN:
+        if _is_group_dir(obj_dir):   # a group entity: "core" = its composition (engine/groups, PLAN_GROUP_COMPOSE)
+            from engine.groups import group_alpha_loader
+            from engine.objects import ObjectStore
+            return group_alpha_loader(ObjectStore(Path(obj_dir).parent.parent), Path(obj_dir).name, w, h)
         return core_fix_loader(obj_dir, w, h)
     rd = obj_dir / "runs" / run
     rj = json.loads((rd / "run.json").read_text(encoding="utf-8"))
@@ -71,9 +77,16 @@ def run_alpha_loader(obj_dir: Path, run: str, w: int, h: int, sub: str = "alpha"
         for s in cover:
             p = rd / sub / s.seg_id / f"a_{f:04d}.exr"
             if p.exists():
-                per[s.seg_id] = {f: read_alpha(p)}
+                per[s.seg_id] = {f: (reader or read_alpha)(p)}
         return assemble_full(per, [s for s in cover if s.seg_id in per], [f], w, h)[f]
     return load
+
+
+def _is_group_dir(obj_dir: Path) -> bool:
+    try:
+        return json.loads((Path(obj_dir) / "object.json").read_text(encoding="utf-8")).get("kind") == "group"
+    except (OSError, ValueError):
+        return False
 
 
 EXPORT_FORMATS = ("auto", "png", "exr")
@@ -89,45 +102,43 @@ def resolve_export_format(fmt: Optional[str], bit_depth: int) -> str:
     return f
 
 
-def part_groups(objs: Sequence[Dict[str, Any]]) -> Dict[str, List[str]]:
-    """parent -> [parent + its parts] in depth order (only parents that have parts present in `objs`)."""
-    by = {o["name"]: o for o in objs}
-    groups: Dict[str, List[str]] = {}
-    for o in objs:
-        p = o.get("part_of")
-        if p and p in by and p != o["name"]:
-            groups.setdefault(p, [p]).append(o["name"])
-    return {p: sorted(m, key=lambda n: by[n].get("depth_order", 0)) for p, m in groups.items()}
-
-
-SEAM_PX_DEFAULT = 4    # contact gap between the parts' cores filled in `<parent>_full` (object field `part_seam_px`)
+SEAM_PX_DEFAULT = 4    # contact gap between the members' cores filled in a group's composition (group field `seam_px`)
 SEAM_PX_MAX = 40
 
 
 def seam_px(obj: Optional[Dict[str, Any]]) -> int:
-    """Seam width of a whole made of parts: the parent's `part_seam_px` (0..SEAM_PX_MAX), default SEAM_PX_DEFAULT."""
+    """Seam width of a group's composition: its `seam_px` (0..SEAM_PX_MAX), default SEAM_PX_DEFAULT."""
     try:
-        v = int(round(float((obj or {}).get("part_seam_px", SEAM_PX_DEFAULT))))
+        v = int(round(float((obj or {}).get("seam_px", SEAM_PX_DEFAULT))))
     except (TypeError, ValueError):
         v = SEAM_PX_DEFAULT
     return max(0, min(SEAM_PX_MAX, v))
 
 
-def seamless_union(alphas: Sequence[np.ndarray], cores: Sequence[Optional[np.ndarray]], gap_px: int = 4) -> np.ndarray:
-    """Whole matte of an object made of parts: max of the parts' alphas, with the contact seams between the parts'
-    cores (up to `gap_px` apart) filled to 1. The outer contour is untouched (filling only where two parts meet)."""
+def seamless_union(alphas: Sequence[np.ndarray], cores: Sequence[Optional[np.ndarray]], gap_px: int = 4,
+                    gaps: Optional[Sequence[int]] = None) -> np.ndarray:
+    """Composition of a group: max of the members' alphas, with the contact seams between the members' cores filled
+    to 1. The outer contour is untouched (filling only where two members meet). `gaps` (one per core, user decision
+    2026-10-29): each member's seam reach – hair small, so the light gaps by the face stay open, a dress large, so the
+    slit at the contact closes; the pair i, j bridges where d_i + d_j <= g_i + g_j + 1, closed with max(g). None = every
+    member `gap_px` (bit for bit the single seam)."""
     u = np.max(np.stack([a.astype(np.float32) for a in alphas]), axis=0)
-    cs = [c.astype(bool) for c in cores if c is not None]
-    if len(cs) < 2 or gap_px <= 0:
+    gl = list(gaps) if gaps is not None else [gap_px] * len(cores)
+    pairs = [(c.astype(bool), max(0, int(g))) for c, g in zip(cores, gl) if c is not None]
+    cs = [c for c, _ in pairs]
+    gs = [g for _, g in pairs]
+    if len(cs) < 2 or max(gs) <= 0:
         return u
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gap_px + 1, 2 * gap_px + 1))
-    # the bridge between two parts: d_i + d_j <= 2 * gap_px + 1 (distance to each part's core) – the WHOLE gap up to
-    # ~2 x gap_px wide (was: only pixels within gap_px of both = a thin strip in the middle, holes along both edges)
+    gmax = max(gs)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gmax + 1, 2 * gmax + 1))
+    # the bridge between two parts: d_i + d_j <= g_i + g_j + 1 (distance to each part's core) – the WHOLE gap up to
+    # ~g_i + g_j wide (was: only pixels within gap_px of both = a thin strip in the middle, holes along both edges)
     dist = [cv2.distanceTransform((~c).astype(np.uint8), cv2.DIST_L2, 5) for c in cs]
     contact = np.zeros_like(cs[0])
     for i in range(len(cs)):
         for j in range(i + 1, len(cs)):
-            contact |= (dist[i] + dist[j]) <= 2 * gap_px + 1
+            if gs[i] + gs[j] > 0:
+                contact |= (dist[i] + dist[j]) <= gs[i] + gs[j] + 1
     closed = cv2.morphologyEx(np.logical_or.reduce(cs).astype(np.uint8), cv2.MORPH_CLOSE, k).astype(bool)
     u[closed & contact] = 1.0
     return u
@@ -153,25 +164,35 @@ def params_hash(obj: Dict[str, Any], run_json: Dict[str, Any]) -> str:
 
 class FrameAlphas:
     """Per-frame mattes exactly as `export_objects` writes them (plan step 7, faithful preview): front-to-back
-    subtraction by depth_order, wholes of objects with parts (`<parent>_full`) split into parts. `objects` = the context
-    (every object with a final result). The export and the stage-4/5 preview (`frame?view=alpha&export=1`, full-res
-    tiles) share this code, so what the viewer shows is the exported alpha of the version."""
+    subtraction by depth_order; a group entity is one layer at its front-most member that never cuts / is cut by its
+    own members. `objects` = the context (every object / group with a result). The export and the stage-4/5 preview
+    (`frame?view=alpha&export=1`, full-res tiles) share this code, so what the viewer shows is the exported alpha."""
 
     def __init__(self, work_dir: Path, objects: Sequence[Dict[str, Any]], w: int, h: int):
         self.work_dir = Path(work_dir)
-        # a group computed as a whole (stages 3 / 4 on a parent with parts, run.json "group", 2026-10-15): its parts
-        # take the parent's version – the whole – and get their share of it (group_split)
-        self.objs = with_group_runs(self.work_dir, sorted(objects, key=lambda o: o.get("depth_order", 0)))
-        self.group_run = {o["name"] for o in self.objs if group_of_run(self.work_dir, o)}
-        self.loaders = {o["name"]: run_alpha_loader(self.work_dir / "objects" / run_owner(o), o["tool"]["active_run"], w, h)
+        self.objs = sorted((self._group_layer(o) for o in objects), key=lambda o: o.get("depth_order", 0))
+        self.loaders = {o["name"]: run_alpha_loader(self.work_dir / "objects" / o["name"], o["tool"]["active_run"], w, h)
                         for o in self.objs}
-        self.groups = part_groups(self.objs)
-        self.member_of = {n: p for p, ms in self.groups.items() for n in ms}
         # object life range (engine/workarea.py): outside it the object's matte is empty (black frames, nothing
         # subtracted from the objects behind)
         from engine.workarea import object_life
         self.life = {o["name"]: object_life(o) for o in self.objs}
         self.w, self.h = w, h
+
+    def _group_layer(self, o: Dict[str, Any]) -> Dict[str, Any]:
+        """A group entity (engine/groups.py) in the context: its depth = its front-most member (copy of the dict)."""
+        if o.get("kind") != "group":
+            return o
+        from engine.groups import group_depth
+        from engine.objects import ObjectStore
+        d = group_depth(ObjectStore(self.work_dir), o["name"])
+        return {**o, "depth_order": d if d is not None else o.get("depth_order", 0)}
+
+    def _excluded(self, o: Dict[str, Any]) -> set:
+        """Layers `o` is never subtracted by: a group's own members, a member's own group."""
+        if o.get("kind") == "group":
+            return set(o.get("members") or [])
+        return {o["group"]} if o.get("group") else set()
 
     def visible(self, name: str, f: int) -> bool:
         from engine.workarea import is_visible
@@ -180,101 +201,16 @@ class FrameAlphas:
     def run_of(self, name: str) -> str:
         return next(x for x in self.objs if x["name"] == name)["tool"]["active_run"]
 
-    def core_of(self, name: str, f: int) -> Optional[np.ndarray]:
-        cp = self.work_dir / "objects" / name / "core" / f"c_{f:04d}.png"
-        m = cv2.imread(str(cp), cv2.IMREAD_GRAYSCALE) if cp.exists() else None
-        return None if m is None else m > 127
-
-    def mask12_of(self, name: str, f: int) -> Optional[np.ndarray]:
-        """Mask 1+2 of an object (core_fix/, else the SAM 3.1 core) – which part of a whole a pixel belongs to."""
-        for sub in ("core_fix", "core"):
-            m = cv2.imread(str(self.work_dir / "objects" / name / sub / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
-            if m is not None:
-                if m.shape != (self.h, self.w):
-                    m = cv2.resize(m, (self.w, self.h), interpolation=cv2.INTER_NEAREST)
-                return m > 127
-        return None
-
     def frame(self, f: int) -> Dict[str, np.ndarray]:
-        """{name: alpha} for every object of the context + `<parent>_full` for every group – the exported mattes of f."""
+        """{name: alpha} for every object / group of the context – the exported mattes of f."""
         alphas: Dict[str, np.ndarray] = {}
-        fronts: List[np.ndarray] = []
-        raws = {o["name"]: (self.loaders[o["name"]](f) if self.visible(o["name"], f)
-                            else np.zeros((self.h, self.w), np.float32)) for o in self.objs}
-        whole: Dict[str, np.ndarray] = {}      # parent -> remaining part of the whole (after earlier parts)
+        front_layers: List[tuple] = []         # (name, raw alpha) of every layer in front so far
         for o in self.objs:
-            raw = raws[o["name"]]
-            p = self.member_of.get(o["name"])
-            if p is None:
-                a = subtract_front(raw, fronts)
-            elif p in self.group_run:   # the whole was computed at once: parts = shares of it (they sum to the whole)
-                ms = self.groups[p]
-                if p not in whole:
-                    u = subtract_front(raws[p], fronts)
-                    alphas[f"{p}_full"] = u.copy()
-                    whole[p] = dict(zip(ms, group_split(u, [self.mask12_of(n, f) if self.visible(n, f) else None for n in ms])))
-                a = whole[p][o["name"]]
-                fronts.append(a)
-                alphas[o["name"]] = a
-                continue
-            else:
-                ms = self.groups[p]
-                if p not in whole:
-                    u = seamless_union([raws[n] for n in ms], [self.core_of(n, f) if self.visible(n, f) else None for n in ms],
-                                       gap_px=seam_px(next((x for x in self.objs if x["name"] == p), None)))
-                    whole[p] = subtract_front(u, fronts)
-                    alphas[f"{p}_full"] = whole[p].copy()
-                last = o["name"] == ms[-1]
-                a = whole[p] if last else np.minimum(subtract_front(raw, fronts), whole[p])
-                whole[p] = np.clip(whole[p] - a, 0.0, 1.0)
-            fronts.append(raw)
-            alphas[o["name"]] = a
+            raw = self.loaders[o["name"]](f) if self.visible(o["name"], f) else np.zeros((self.h, self.w), np.float32)
+            skip = self._excluded(o)
+            alphas[o["name"]] = subtract_front(raw, [a_ for n_, a_ in front_layers if n_ not in skip])
+            front_layers.append((o["name"], raw))
         return alphas
-
-
-def run_owner(o: Dict[str, Any]) -> str:
-    """Object whose runs/ hold the version of `o` (a part of a group takes its parent's group version)."""
-    return o.get("_run_owner") or o["name"]
-
-
-def group_of_run(work_dir: Path, o: Dict[str, Any]) -> Optional[List[str]]:
-    """Members of the group the object's version was computed for as a whole (run.json "group"), else None."""
-    run = (o.get("tool") or {}).get("active_run")
-    if not run:
-        return None
-    try:
-        from engine.final_touch import base_run
-        g = json.loads((Path(work_dir) / "objects" / run_owner(o) / "runs" / base_run(run) / "run.json").read_text(encoding="utf-8")).get("group")
-    except (OSError, ValueError):
-        return None
-    return list(g) if g else None
-
-
-def with_group_runs(work_dir: Path, objs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Parts of a group whose parent's version is a whole (run.json "group") take that version (copies of the dicts)."""
-    by = {o["name"]: o for o in objs}
-    out = []
-    for o in objs:
-        par = by.get(o.get("part_of") or "")
-        g = group_of_run(work_dir, par) if par else None
-        if g and o["name"] in g:
-            o = {**o, "_run_owner": par["name"], "tool": {**(o.get("tool") or {}), "active_run": par["tool"]["active_run"]}}
-        out.append(o)
-    return out
-
-
-def group_split(whole: np.ndarray, masks: Sequence[Optional[np.ndarray]]) -> List[np.ndarray]:
-    """Shares of a whole computed at once: every pixel goes to the member whose mask 1+2 is nearest (inside a mask:
-    that member; ties: the earlier = closer to the camera) -> the shares sum to the whole exactly, no gap, no overlap."""
-    whole = whole.astype(np.float32)
-    n = len(masks)
-    if n == 0:
-        return []
-    big = np.float32(1e9)
-    dist = np.stack([cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 5) if (m is not None and m.any())
-                     else np.full(whole.shape, big, np.float32) for m in masks])
-    lab = np.argmin(dist, axis=0)
-    return [np.where(lab == i, whole, 0.0).astype(np.float32) for i in range(n)]
 
 
 def frame_alphas(work_dir: Path, objects: Sequence[Dict[str, Any]], f: int, w: int, h: int) -> Dict[str, np.ndarray]:
@@ -286,14 +222,19 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
                    bit_depth: int = 16, multichannel: bool = True, depth_pattern: Optional[str] = None,
                    with_core: bool = False, progress_cb: Optional[Callable[[str, int, int], None]] = None,
                    write: Optional[Sequence[str]] = None, export_dir: Optional[Path] = None,
-                   export_format: str = "auto") -> Dict[str, Any]:
+                   export_format: str = "auto", selection: bool = False,
+                   merge_plate: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """Export objects (each must have an active run). Front-to-back subtraction by depth_order.
-    `objects` = the context (all objects with a final result) – mattes are always computed with every front object and
-    every part, so a single-object export equals the same object in a full export. `write` = names to write (object
-    names and/or "<parent>_full" for a whole made of parts); None = everything + the multi-EXR.
-    `export_format` auto / png / exr (resolve_export_format with `bit_depth`); the multi-EXR only for exr."""
+    `objects` = the context (all objects / groups with a result) – mattes are always computed with every front layer,
+    so a single-object export equals the same object in a full export. `write` = names to write (objects / groups);
+    None = everything + the multi-EXR.
+    `export_format` auto / png / exr (resolve_export_format with `bit_depth`); the multi-EXR only for exr.
+    `merge_plate` = (beauty pattern, colorspace) of the manifest: objects with MergeMatte on get the backdrop MERGEMATTE
+    in the .nk (their Final Touch settings in the group's knobs; PLAN_FINAL_TOUCH §11)."""
     want = None if write is None else set(write)
-    multichannel = multichannel and want is None   # a partial export never overwrites the shot's multi-EXR
+    # a partial export never overwrites the shot's multi-EXR; `selection` = `write` is what the palette Obiekty has checked
+    # (the full export of the shot, PLAN_GROUP_COMPOSE): the multi-EXR is written, with the written mattes as channels
+    multichannel = multichannel and (want is None or selection)
     work_dir = Path(work_dir)
     export_dir = Path(export_dir) if export_dir else work_dir / "export"   # Z29: chosen in project.json -> export_dir
     out_root = export_dir / "mattes"
@@ -302,7 +243,6 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
     fmt = resolve_export_format(export_format, bit_depth)
     png = fmt == "png"
     written: Dict[str, str] = {}
-    groups = fa.groups
 
     def write_matte(name: str, a: np.ndarray, f: int, run: str) -> str:
         d = out_root / name
@@ -314,13 +254,9 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
                            extra_attrs={"matteDesk/object": name.encode(), "matteDesk/run": run.encode()})
         return str(d / (f"{name}_####." + ("png" if png else "exr"))).replace("\\", "/")
 
-    group_written: Dict[str, str] = {}
     multi_channels: List[str] = []
     for i, f in enumerate(frames):
         alphas = fa.frame(f)
-        for p, ms in groups.items():
-            if want is None or f"{p}_full" in want:
-                group_written[p] = write_matte(f"{p}_full", alphas[f"{p}_full"], f, "+".join(fa.run_of(n) for n in ms))
         for o in objs:
             if want is not None and o["name"] not in want:
                 continue
@@ -334,6 +270,8 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
         if multichannel and not png:
             import Imath
             import OpenEXR
+            if want is not None:   # the palette's selection: its mattes only (the context objects cut, not written)
+                alphas = {n: a for n, a in alphas.items() if n in want}
             union = np.clip(sum(alphas.values()), 0.0, 1.0) if alphas else np.zeros((h, w), np.float32)
             hdr = OpenEXR.Header(w, h)
             half = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
@@ -366,7 +304,7 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
             continue
         from engine.final_touch import base_run, corrections_sig, is_ft, load as ft_load
         ver = o["tool"]["active_run"]
-        rd = work_dir / "objects" / run_owner(o) / "runs" / base_run(ver)
+        rd = work_dir / "objects" / o["name"] / "runs" / base_run(ver)
         if base_run(ver) == CORE_RUN:   # mask 1+2: no run.json / QA of its own
             cf = work_dir / "objects" / o["name"] / "core_fix" / "core_fix.json"
             rj = {"edge_mode": "core", "params": json.loads(cf.read_text(encoding="utf-8")) if cf.exists() else None}
@@ -379,21 +317,19 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
                         "version": o["tool"]["active_run"], "qa_status": "ok" if qa.get("gate_ok") else ("flags" if qa else "none"),
                         "date": datetime.now().isoformat(timespec="seconds"), "params_hash": params_hash(o, rj),
                         "edge_mode": rj.get("edge_mode"),
+                        **({"members": list(o.get("members") or [])} if o.get("kind") == "group" else {}),
                         # Final Touch: which base and which corrections (hash) – the export is reproducible (plan §3)
                         **({"final_touch": {"base": base_run(ver), "corrections_sig":
-                                            corrections_sig(ft_load(work_dir / "objects" / run_owner(o)))}} if is_ft(ver) else {})})
+                                            corrections_sig(ft_load(work_dir / "objects" / o["name"]))}} if is_ft(ver) else {})})
     data = load_outputs(work_dir)
     keep = [e for e in data.get("objects", []) if e["name"] not in written]
     update_outputs(work_dir, "objects", keep + entries)
+    remove_outputs(work_dir, "groups")   # the legacy `<parent>_full` wholes (parts -> groups, PLAN_GROUP_COMPOSE step 6)
     if want is None and png:   # full export as PNG: no multi-EXR of this export (drop a stale entry)
         remove_outputs(work_dir, "mattes_all", "mattes_all_channels")
     update_outputs(work_dir, "export_format", fmt)
     if multichannel and not png:
         update_outputs(work_dir, "mattes_all", str(out_root / "all" / f"{shot}_mattes_####.exr").replace("\\", "/"))
-    if group_written:
-        g = dict(data.get("groups", {}))
-        g.update({p: {"matte": group_written[p], "members": groups[p]} for p in group_written})
-        update_outputs(work_dir, "groups", g)
     if multichannel and not png and multi_channels:
         update_outputs(work_dir, "mattes_all_channels", multi_channels)
     update_outputs(work_dir, "shot", shot)
@@ -403,8 +339,11 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
     # Z29: Nuke script with the mattes (backdrop MASKI, Shuffle2 + anchor + copy stamp per channel)
     from engine.nuke_mattes import write_mattes_nk
     data = load_outputs(work_dir)
+    from engine.final_touch import merge_matte_export
+    merge = merge_matte_export(work_dir, [e["name"] for e in data.get("objects", [])], *merge_plate) if merge_plate else None
     nk = write_mattes_nk(export_dir / f"{shot}_mattes.nk", data, shot, int(frames[0]), int(frames[-1]), w, h,
-                         channels=data.get("mattes_all_channels") if data.get("mattes_all") else None)
+                         channels=data.get("mattes_all_channels") if data.get("mattes_all") else None,
+                         merge=merge)
     update_outputs(work_dir, "mattes_nk", str(nk).replace("\\", "/"))
     return load_outputs(work_dir)
 
@@ -413,10 +352,17 @@ def mark_dependents(store: Any, name: str) -> List[str]:
     """After a change of a front object, objects behind it that overlap get status 'do przeliczenia' (7.3) –
     nothing is recomputed silently."""
     objs = store.list()
-    me = next(o for o in objs if o["name"] == name)
+    me = store.get(name)
+    depth, mine = me.get("depth_order", 0), set()
+    if me.get("kind") == "group":   # a group entity: one layer at its front-most member, never its own members
+        from engine.groups import group_depth
+        mine = set(me.get("members") or [])
+        depth = group_depth(store, name)
+        if depth is None:
+            return []
     changed = []
     for o in objs:
-        if o.get("depth_order", 0) > me.get("depth_order", 0) and o["tool"].get("active_run"):
+        if o["name"] not in mine and o.get("depth_order", 0) > depth and o["tool"].get("active_run"):
             deps = set(o["tool"].get("depends_on", [])) | {name}
             store.update(o["name"], tool={"status": "do przeliczenia", "depends_on": sorted(deps), "final_valid": False})
             changed.append(o["name"])

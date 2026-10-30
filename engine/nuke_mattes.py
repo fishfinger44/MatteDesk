@@ -75,15 +75,24 @@ def _anchor(title: str, x: int, y: int, label: str) -> List[str]:
         " addUserKnob {22 reconnectStamps l reconnect -STARTLINE T stamps.anchorReconnectWired()}",
         ' addUserKnob {22 zoomNext l "zoom next" -STARTLINE T stamps.wiredZoomNext(nuke.thisNode().name())}',
         "}",
+        f"set {an} [stack 0]",   # stack variable of the anchor: wired stamps elsewhere in the script push it
+    ] + _wired(title, f"Stamp_copy_{n}", x, y + (Y_STAMP - Y_ANCHOR))
+
+
+def _wired(title: str, name: str, x: int, y: int) -> List[str]:
+    """Stamps v1.1 Wired Stamp (PostageStamp, hidden input) of the anchor of `title`; its input = the top of the stack."""
+    n = _nk_name(title)
+    an = f"Anchor_{n}"
+    return [
         "PostageStamp {",
-        f" name Stamp_copy_{n}",
+        f" name {name}",
         f" onCreate {_WIRED_ON_CREATE}",
         ' knobChanged "import stamps; stamps.wiredKnobChanged()"',
         f" autolabel {_AUTOLABEL}",
         f" label {_q(title)}",
         " tile_color 0x1000001",
         " note_font_size 20",
-        f" xpos {x}", f" ypos {y + (Y_STAMP - Y_ANCHOR)}",
+        f" xpos {x}", f" ypos {y}",
         " hide_input true",
         ' addUserKnob {20 wired_tab l "Wired Stamp"}',
         " addUserKnob {26 identifier -STARTLINE +HIDDEN T wired}",
@@ -101,13 +110,17 @@ def _anchor(title: str, x: int, y: int, label: str) -> List[str]:
         f" anchor {an}",
         ' addUserKnob {6 auto_reconnect_by_title l "auto-reconnect by title" +STARTLINE}',
         "}",
+    
     ]
 
 
 def mattes_nk(outputs: Dict[str, Any], shot: str, first: int, last: int, w: int, h: int,
-              date: Optional[str] = None, channels: Optional[Sequence[str]] = None) -> str:
+              date: Optional[str] = None, channels: Optional[Sequence[str]] = None,
+              merge: Optional[Dict[str, Any]] = None) -> str:
     """Script text from an outputs.json dict (objects[], groups{}, mattes_all). `channels` (multi-EXR layer names,
-    default: objects in depth order + <parent>_full + union [+ depth]) is what the multi-EXR really contains."""
+    default: objects in depth order + <parent>_full + union [+ depth]) is what the multi-EXR really contains.
+    `merge` = {"plate": pattern, "colorspace": manifest colorspace, "objects": {name: MergeMatte knobs}} adds the backdrop
+    MERGEMATTE under MASKI (plan PLAN_FINAL_TOUCH §11; `merge_matte_backdrop`)."""
     date = date or datetime.now().strftime("%Y-%m-%d %H:%M")
     objs = sorted(outputs.get("objects", []), key=lambda o: o.get("depth_order", 0))
     groups = outputs.get("groups", {}) or {}
@@ -184,7 +197,70 @@ def mattes_nk(outputs: Dict[str, Any], shot: str, first: int, last: int, w: int,
     bw, bh = max(xs) - min(xs) + 80 + 120, max(ys) - min(ys) + 40 + 170
     backdrop = ["BackdropNode {", " inputs 0", " name BD_MASKI", f' label "MASKI\\n{shot} · {date}"', " note_font_size 42",
                 " tile_color 0x4c4c4cff", f" xpos {bx}", f" ypos {by}", f" bdwidth {bw}", f" bdheight {bh}", "}"]
-    return "\n".join(head + backdrop + lines) + "\n"
+    tail: List[str] = []
+    if merge and merge.get("objects"):
+        tail = merge_matte_backdrop(merge, shot, first, last, w, h, date, x0=bx + 60, y0=by + bh + 200,
+                                    known=[o["name"] for o in objs] + list(channels or []))
+    return "\n".join(head + backdrop + lines + tail) + "\n"
+
+
+# Read colorspace of the plate in an ACES (aces_1.2) script: MergeMatte works in the ACEScg working space
+NUKE_ACES_CS = {"ACES2065-1": "ACES - ACES2065-1", "ACEScg": "ACES - ACEScg", "ACEScct": "ACES - ACEScct",
+                "sRGB": "Utility - sRGB - Texture", "srgb": "Utility - sRGB - Texture", "Rec709": "Utility - Rec.709 - Camera",
+                "rec709": "Utility - Rec.709 - Camera", "linear": "Utility - Linear - sRGB"}
+YM_READ, YM_DOT, YM_COPY, YM_PREMULT, YM_GROUP, YM_ANCHOR = 0, 130, 260, 330, 430, 560
+
+
+def merge_matte_backdrop(merge: Dict[str, Any], shot: str, first: int, last: int, w: int, h: int, date: str,
+                         x0: int = 0, y0: int = 600, known: Sequence[str] = ()) -> List[str]:
+    """Backdrop MERGEMATTE: the plate `Read` (manifest beauty, its colorspace) → chain of `Dot`s, per object
+    `Copy` alpha from a wired stamp of `Anchor_<obj>` (MASKI) → `Premult` → group `MergeMatte_<obj>` (engine/merge_matte_nk,
+    knobs = the object's Final Touch settings; input BG = a `Dot` labelled „BG – podłącz”) → anchor `FUSE_<obj>` + free stamp.
+    RGB always from the original plate, alpha = the exported matte; the export's alpha files are not changed."""
+    from engine.merge_matte_nk import group_nk
+    objs = [o for o in merge["objects"] if not known or o in known]
+    if not objs:
+        return []
+    fmt = f'"{w} {h} 0 0 {w} {h} 1 MatteDesk_{_nk_name(shot)}"'
+    cs = NUKE_ACES_CS.get(str(merge.get("colorspace") or ""))
+    rl = "plate (beauty)" + ("" if cs else f" · colorspace {merge.get('colorspace') or '?'} – ustaw ręcznie")
+    out = ["Read {", " inputs 0", f" file {_q(merge['plate'])}", f" format {fmt}", f" first {first}", f" last {last}",
+           f" origfirst {first}", f" origlast {last}", " origset true"] + ([f" colorspace {_q(cs)}"] if cs else []) + \
+          [" on_error black", f" name Read_{_nk_name(shot)}_plate", f" label {_q(rl)}", f" xpos {x0}", f" ypos {y0 + YM_READ}", "}"]
+    xy = [(x0, y0 + YM_READ)]
+    prev = None
+    col_w = COL_W * 2   # Copy + its stamp, the group's BG Dot: two node widths per column
+    for i, o in enumerate(objs):
+        n = _nk_name(o)
+        x = x0 + i * col_w
+        if prev:
+            out.append(f"push ${prev}")
+        dot = f"Dot_plate_{n}"
+        out += ["Dot {", f" name {dot}", f" xpos {x + 34}", f" ypos {y0 + YM_DOT}", "}", f"set {dot} [stack 0]"]
+        # Copy: input0 (B) = plate, input1 (A) = the matte stamp → push A first, then B (top of the stack = input0)
+        out.append(f"push $Anchor_{n}")
+        out += _wired(o, f"Stamp_matte_{n}", x + 140, y0 + YM_DOT + 40)
+        out.append(f"push ${dot}")
+        out += ["Copy {", " inputs 2", " from0 rgba.alpha", " to0 rgba.alpha", f" name Copy_alpha_{n}",
+                f" label {_q('alfa: MATTE_' + o)}", f" xpos {x}", f" ypos {y0 + YM_COPY}", "}"]
+        out += ["Premult {", f" name Premult_{n}", f" xpos {x}", f" ypos {y0 + YM_PREMULT}", "}"]
+        out.append(f"set FG_{n} [stack 0]")
+        # MergeMatte: input0 = BG, input1 = FG → push FG, then the BG Dot (no input)
+        out.append(f"push $FG_{n}")
+        out += ["Dot {", " inputs 0", f" name Dot_BG_{n}", ' label "BG – podłącz"', " note_font_size 16",
+                f" xpos {x + 174}", f" ypos {y0 + YM_GROUP - 50}", "}"]
+        out += group_nk(merge["objects"][o], name=f"MergeMatte_{n}", xpos=x, ypos=y0 + YM_GROUP,
+                        label=f"v01 · {o} · {date}").rstrip("\n").split("\n")
+        out += _anchor(f"FUSE_{o}", x, y0 + YM_ANCHOR, f"MergeMatte · {date}")
+        xy += [(x + 34, y0 + YM_DOT), (x + 140, y0 + YM_DOT + 40), (x, y0 + YM_COPY), (x, y0 + YM_PREMULT),
+               (x + 174, y0 + YM_GROUP - 50), (x, y0 + YM_GROUP), (x, y0 + YM_ANCHOR), (x, y0 + YM_ANCHOR + Y_STAMP - Y_ANCHOR)]
+        prev = dot
+    xs, ys = [p[0] for p in xy], [p[1] for p in xy]
+    bx, by = min(xs) - 60, min(ys) - 110
+    bw, bh = max(xs) - min(xs) + 80 + 120, max(ys) - min(ys) + 40 + 170
+    bd = ["BackdropNode {", " inputs 0", " name BD_MERGEMATTE", f' label "MERGEMATTE\\n{shot} · {date}\\nRGB z plate\'u, alfa z MASKI"',
+          " note_font_size 42", " tile_color 0x2f8f5fff", f" xpos {bx}", f" ypos {by}", f" bdwidth {bw}", f" bdheight {bh}", "}"]
+    return bd + out
 
 
 def nk_nodes(text: str) -> List[Dict[str, Any]]:
@@ -208,8 +284,8 @@ def nk_nodes(text: str) -> List[Dict[str, Any]]:
 
 
 def write_mattes_nk(path: Path, outputs: Dict[str, Any], shot: str, first: int, last: int, w: int, h: int,
-                    channels: Optional[Sequence[str]] = None) -> Path:
+                    channels: Optional[Sequence[str]] = None, merge: Optional[Dict[str, Any]] = None) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(mattes_nk(outputs, shot, first, last, w, h, channels=channels), encoding="utf-8")
+    path.write_text(mattes_nk(outputs, shot, first, last, w, h, channels=channels, merge=merge), encoding="utf-8")
     return path

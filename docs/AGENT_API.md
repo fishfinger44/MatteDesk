@@ -89,7 +89,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | Metoda | Ścieżka | Rodzaj | Opis |
 |---|---|---|---|
 | GET | `/api/version` | – | Running version + whether the server runs older code than on disk (the UI then asks for a restart). |
-| GET | `/api/jobs` | – | What is being computed now (status bar). |
+| GET | `/api/jobs` | – | What is being computed now (status bar) + who holds / waits for the GPU (engine/gpu_manager: a job waiting has `gpu_wait`; background work without a job – band  |
 | GET | `/api/jobs/details` | – | 'Szczegóły' of the running job (Z19): GPU (nvidia-smi; null without it), Comfy RAM / VRAM / queue (foreign prompts), our step with frames and ETA, Comfy state o |
 | POST | `/api/jobs/cancel` | – | 'Przerwij': stop the running job(s) at the next safe point; our Comfy prompt is removed / interrupted. |
 | GET | `/api/doctor` | – |  |
@@ -207,6 +207,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | DELETE | `/api/object/{name}/stage_band/{stage}` | object_edit | Band keys of ALL points of the stage in `frame` (?frame=N), or every band point (no frame = constant band). |
 | POST | `/api/object/{name}/stage_band/{stage}/copy` | object_edit | „Kopiuj klucze pasa z …” (user decision 2026-10-22): the band points of another owner (a stage-5 whole-outline zone or another stage) replace this band's; width |
 | GET | `/api/object/{name}/band` | – | The shared band of the object (its group): points, keys, reference and the mode of every band owner (stages 3 / 4 / 7, the whole-outline zones of stage 5) – sha |
+| PUT | `/api/object/{name}/band_whole` | object_edit | „Wcięcie: cały rdzeń” (user decision 2026-10-29): the band covers the whole core – the model replaces it everywhere, the inset feather keeps that much core arou |
 | GET | `/api/object/{name}/band/params` | – | The shared band as stored (what Ctrl+Z restores). |
 | PUT | `/api/object/{name}/band/params` | object_edit | The shared band exactly as given (Ctrl+Z of „odłącz” / „ustaw jako wspólny” / a band edit). |
 | DELETE | `/api/object/{name}/band` | object_edit | Keys of the shared band in `frame` (?frame=N), or the whole shared band (every stage on it = constant band). |
@@ -251,6 +252,16 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | GET | `/api/queue` | – |  |
 | POST | `/api/queue/run` | – |  |
 | PUT | `/api/object/{name}/interval_engine` | object_edit | Propagation engine of the key interval containing `frame` (7.2 pkt 7): SAM 3.1 or CoTracker3 points. |
+| POST | `/api/groups` | when_idle | New group entity (palette Obiekty): optionally with its first members (each joins with „Do grupy z:” = Core). |
+| POST | `/api/group/{group}/members` | when_idle | Drop an object into the group (palette): it joins with Core; the whole recompute becomes stale (↻). |
+| DELETE | `/api/group/{group}/members/{member}` | when_idle | Detach a member |
+| PUT | `/api/group/{group}/members/{member}/source` | when_idle | „Do grupy z:” of a member (core / matanyone / videomama / vitmatte / ltx / version / final_touch). |
+| PUT | `/api/group/{group}` | when_idle | Seam of the group (↻ on the whole recompute). |
+| PUT | `/api/group/{group}/members/{member}/seam` | when_idle | A member's own seam reach (user decision 2026-10-29: hair small, a dress large); null = the group's seam |
+| PUT | `/api/group/{group}/members/{member}/on` | when_idle | Palette checkbox of a member (user decision 2026-10-29): switched off = out of the group's composition (alpha, preview, whole recompute input – ↻), still a memb |
+| DELETE | `/api/group/{group}` | when_idle | Ungroup: members become standalone (results untouched), the group's folder -> project trash; with whole results and without ?confirm=1 -> 409 with the warning. |
+| GET | `/api/group/{group}` | – | The group entity: members in depth order with what each brings („Do grupy z:” – source, version, current or ↻, the reason when there is nothing), the seam and t |
+| GET | `/api/group/{group}/frame/{frame}` | – | Proxy PNG of the basic group matte (the composition of the members' chosen alphas with the seams, nothing computed; objects in front not subtracted) |
 | GET | `/api/objects` | – | Objects in depth order; `has` = results on disk (core / final alpha of the active version) – the UI shows the masks of the OTHER computed objects as extra overl |
 | PUT | `/api/objects/order` | when_idle | Depth order by drag & drop (spec 6 pkt 2, Z3): depth_order = index, atomically, no gaps / duplicates |
 | POST | `/api/object` | – |  |

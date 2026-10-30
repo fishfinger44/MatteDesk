@@ -12,7 +12,10 @@
   const S = () => H.S;
   const obj = () => H.S.obj;
   const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const F = { info: null, undo: [], rev: {}, timer: null, pending: null, busy: false, hardness: 0.6, showStrokes: true, obj: null };
+  const F = { info: null, undo: [], rev: {}, timer: null, pending: null, busy: false, hardness: 0.6, showStrokes: true, obj: null,
+              // GPU preview (ft_gpu.js, NEXT_STEPS 7a/b): strokes sent and not acknowledged, acknowledged per revision, the
+              // revision whose server image is awaited, the revision of each preview key, the last comparison
+              inflight: {}, acked: {}, awaiting: {}, keyRev: {}, gpuShown: {}, seq: 0, baseRev: 0, frameAt: { f: null, t: 0 }, cmp: null };
   const MODES = { add: { label: 'Dodaj', css: '#50ff78', col: [80, 255, 120] }, remove: { label: 'Usuń', css: '#ff3c5a', col: [255, 60, 90] },
                   erase: { label: 'Zmaż', css: '#c4c4c8', col: [200, 200, 210] } };
   const BASES = [['', 'domyślna – wynik ostatniego etapu'], ['core', 'Maska 1+2 (etapy 1 + 2)'], ['matanyone', 'MatAnyone2'],
@@ -71,7 +74,6 @@
         <input type="range" id="ftShowO" min="0" max="100" step="5" value="${F.strokesOpacity}" style="width:70px" title="Krycie podglądu kresek (%)"><span class="muted" id="ftShowOV">${F.strokesOpacity} %</span></div>
       <div class="pp-sec">
         <div class="zp-sub" title="Grading alfy – cała alfa, po kreskach pędzla; na żywo, bez przeliczania modeli; to samo idzie do eksportu">Grade</div>
-        <div class="muted pp-hint warn" id="ftHardHint" style="display:none">Baza „maska 1+2” jest twarda (tylko 0 i 1): czerń / biel / gamma zmieniają tylko półprzezroczystość, więc tu działają wyłącznie na miękkich kreskach pędzla. Na całej alfie działają erode, rozmycie i motion blur; czerń / biel / gamma – na bazie z miękką krawędzią (MatAnyone2, VideoMaMa, ViTMatte / BiRefNet, LTX-2.5).</div>
         ${FIN.filter(([k]) => GRADE.includes(k)).map(finRow).join('')}
         <button type="button" class="btn btn-ghost btn-xs" id="ftFinReset" title="Wyzeruj grade i motion blur (baza bez zmian)">↺ bez wykończenia</button>
       </div>
@@ -98,14 +100,19 @@
     box.style.display = show ? '' : 'none';
     if (show && H.placeFloating) H.placeFloating(box, $('canvasWrapper'), ftPos.get());
   }
-  function baseLabel(src) { return (BASES.find((b) => b[0] === src) || [src, src])[1]; }
-  function stageDone(src) { return !STAGE_OF[src] || ['done'].includes(H.stageState(STAGE_OF[src]).state); }
+  // the hooks name the group's composition (core) and the engine of the stage 5 result (ViTMatte / BiRefNet)
+  const liveLabel = (k) => (k === 'core' && H && H.coreLabel ? H.coreLabel() : k === 'vitmatte' && H && H.edgeResultLabel ? H.edgeResultLabel() : null);
+  function baseLabel(src) { return liveLabel(src) || (BASES.find((b) => b[0] === src) || [src, src])[1]; }
+  // a stage result that exists – current or stale (↻, still usable as the base: user decision 2026-10-30)
+  function stageDone(src) { return !STAGE_OF[src] || ['done', 'stale'].includes(H.stageState(STAGE_OF[src]).state); }
+  const stageStale = (src) => !!STAGE_OF[src] && H.stageState(STAGE_OF[src]).state === 'stale';
   function renderBase() {
     const sel = $('ftBase'); if (!sel || !F.info) return;
     const ch = F.info.base_choice || {}; const b = F.info.base || {};
-    const opts = BASES.map(([k, l]) => {
+    const opts = BASES.map(([k, l0]) => {
+      const l = liveLabel(k) || l0;   // a group: its composition; stage 5: its engine
       const ok = k === '' || k === 'version' ? true : stageDone(k);
-      const txt = k === '' && !ch.source && b.source ? `${l} (${baseLabel(b.source)})` : l;
+      const txt = (k === '' && !ch.source && b.source ? `${l} (${baseLabel(b.source)}${b.stale ? ' ↻' : ''})` : l) + (k && stageStale(k) ? ' ↻' : '');
       return `<option value="${k}"${ok || k === (ch.source || '') ? '' : ' disabled'}>${esc(window.mdT ? window.mdT(txt) : txt)}${ok ? '' : esc(window.mdT ? window.mdT(' – brak wyniku') : ' – brak wyniku')}</option>`;
     }).join('');
     if (sel.dataset.html !== opts) { sel.innerHTML = opts; sel.dataset.html = opts; }
@@ -117,16 +124,11 @@
       if (ch.run) $('ftRun').value = ch.run;
     }
     const info = $('ftBaseInfo');
-    info.textContent = b.run ? `Baza: ${b.run === 'core' ? 'maska 1+2' : `wersja ${b.run}`} (${baseLabel(b.source)}${b.chosen ? '' : ', domyślna'})` : (b.why || 'Brak bazy');
-    info.className = b.run ? 'muted' : 'muted warn';
-    // a hard base (mask 1+2 = 0 / 1 only): levels and gamma have no semi-transparency to act on (user report 2026-10-23
-    // "black / white sliders change nothing") – say so and dim them instead of leaving them looking broken
-    const hard = b.run === 'core';
-    $('ftHardHint').style.display = hard ? '' : 'none';
-    for (const k of ['black', 'white', 'gamma']) {
-      const row = document.querySelector(`#ftPalette [data-fin="${k}"]`);
-      if (row) row.closest('label').style.opacity = hard ? '.5' : '';
-    }
+    info.textContent = b.run ? `Baza: ${b.run === 'core' ? (H && H.coreLabel ? H.coreLabel() : 'maska 1+2') : `wersja ${b.run}`} (${baseLabel(b.source)}${b.chosen ? '' : ', domyślna'})`
+      + (b.stale ? ` ↻ nieaktualna – ${b.why} (korekty zostają na tej wersji; przelicz etap albo wybierz inną bazę)` : '') : (b.why || 'Brak bazy');
+    info.className = b.run && !b.stale ? 'muted' : 'muted warn';
+    // a hard base (mask 1+2 = 0 / 1) leaves black / white / gamma little to act on; no dimming or hint any more (user
+    // decision 2026-10-30: a group mixes hard and soft members, the compositor knows why they do nothing on 0 / 1)
   }
   function renderList() {
     const box = $('ftList'); if (!box) return;
@@ -146,6 +148,7 @@
     if (!obj()) { F.info = null; renderAll(); return; }
     try { F.info = await api('GET', `/api/object/${obj()}/final_touch`); } catch (e) { F.info = null; }
     renderAll();
+    if (window.MD_MM && window.MD_MM.ready) window.MD_MM.load();   // palette „MergeMatte” (static/mergematte.js) of the same object
   }
   function renderFinish() {
     const fin = { ...FIN_DEF, ...((F.info && F.info.finish) || {}) };
@@ -164,6 +167,7 @@
   async function putFinish(body, what) {
     try {
       F.info = await api('PUT', `/api/object/${obj()}/final_touch/finish`, body);
+      F.liveFin = null;   // saved: the GPU keeps drawing it until the server's image of the new finish is in (finishGpu)
       renderFinish(); H.loadStages().catch(() => {}); V().render();
       status(`Wykończenie: ${what} – podgląd i eksport biorą to od razu`, 'ok');
     } catch (e) { status(`Wykończenie NIE zapisane: ${e.message}`, 'err'); renderFinish(); }
@@ -173,15 +177,139 @@
     const same = F.obj === obj(); F.obj = obj();
     F.info = null; F.rev = {};
     if (!same) F.undo = [];
-    clearTimeout(F.timer); F.pending = null; renderLane();
+    clearTimeout(F.timer); F.pending = null;
+    F.inflight = {}; F.acked = {}; F.awaiting = {}; F.keyRev = {}; F.gpuShown = {}; F.baseRev = Date.now();
+    renderLane();
   }
   // the base + corrections image key of a frame (objects.js matteFor): changes with the base and with every edit of f
   function matteRef(f) {
     const b = F.info && F.info.base;
     if (!b || !b.run) return null;
-    return { key: `${obj()}_ft@${b.run}_${F.info.sig || '0'}_${F.rev[f] || 0}_${f}`,
-             url: `/api/object/${obj()}/final_touch/frame/${f}?b=${encodeURIComponent(b.run)}&c=${F.info.sig || '0'}.${F.rev[f] || 0}`,
+    // a group: its composition (members' „Do grupy z:”, on / off, seam) is in the key – the cached frames of another
+    // composition showed up mixed with the new ones (user report 2026-10-29)
+    const g = H && H.grpTok ? H.grpTok() : '';
+    const key = `${obj()}_ft@${b.run}_${F.info.sig || '0'}${g}_${F.rev[f] || 0}_${f}`;
+    F.keyRev[key] = F.rev[f] || 0;
+    return { key, url: `/api/object/${obj()}/final_touch/frame/${f}?b=${encodeURIComponent(b.run)}&c=${F.info.sig || '0'}.${F.rev[f] || 0}${g ? '&g=' + encodeURIComponent(g) : ''}`,
              run: b.run };
+  }
+
+  // ------------------------------------------------------------------------------------------------ GPU preview (ft_gpu.js)
+  // The result of a stroke is drawn in the browser at once (also while drawing); the server's image of the frame replaces
+  // it as soon as it arrives for the new strokes, after a comparison of the two (difference over CMP_LIMIT = the server's
+  // image + a warning). Whole-frame finishing (erode / blur / motion blur) cannot be drawn there: the GPU then lays only
+  // the strokes the server image does not hold yet over that image, without the comparison.
+  const CMP_LIMIT = 14;   // mean |GPU − server| in 1/255 over the touched pixels (synthetic strokes: ≤ 8, tests/test_ft_gpu.py)
+  const gpuOk = () => !!(window.mdFtGpu && window.mdFtGpu.on && V() && V().projectData && (S().view === 'alpha' || S().view === 'comp'));
+  const spatialFinish = () => { const f = (F.info && F.info.finish) || {}; return Math.abs(+f.erode_px || 0) >= 0.5 || (+f.blur_px || 0) > 0 || (+f.mb_strength || 0) > 0; };
+  const asStroke = (s) => ({ mode: s.mode, radius_px: s.radius_px, hardness: F.hardness, p: thin(s.p, s.radius_px) });
+  const unsent = (f) => (S().strokes[f] || []).map(asStroke);
+  const liveStroke = (f) => (S().drawing && S().drawing.f === f && S().drawing.p.length ? { mode: S().drawing.mode, radius_px: S().drawing.radius_px, hardness: F.hardness, p: S().drawing.p } : null);
+  function baseImg(f) {   // the base proxy of the frame (no strokes, no finish) – requested once the playhead rests on it
+    const b = F.info && F.info.base; if (!b || !b.run) return null;
+    const now = performance.now();
+    if (F.frameAt.f !== f) F.frameAt = { f, t: now };
+    const key = `${obj()}_ftbase@${b.run}_${F.baseRev}_${f}`;
+    if (!S().overlay[key] && now - F.frameAt.t < 250 && !liveStroke(f)) { setTimeout(() => V().render(), 260); return null; }
+    const im = H.loadOverlay(key, `/api/object/${obj()}/final_touch/frame/${f}?b=${encodeURIComponent(b.run)}&base=1&r=${F.baseRev}`);
+    return im && im !== 'missing' ? im : null;
+  }
+  function gpuJob(f, base, strokes, live) {
+    const pd = V().projectData;
+    const W = +pd.plate_w, Hh = +pd.plate_h, PW = base.naturalWidth || base.width, PH = base.naturalHeight || base.height;
+    const fin = (F.info && F.info.finish) || {};
+    return { W, H: Hh, PW, PH, baseSrc: base, strokes, live, key: `${obj()}_${f}_${PW}x${PH}`,
+             finish: spatialFinish() ? {} : { black: fin.black, white: fin.white, gamma: fin.gamma } };
+  }
+  // Finishing on the GPU (user request 2026-10-30, mm_gpu.js finish): while a finish slider is dragged (F.liveFin) or
+  // while erode / blur is set, the frame = base + strokes (ft_gpu, unfinished) -> levels / gamma / erode / blur in the
+  // browser, so nothing waits for the server. Motion blur sits between erode and blur and needs the server's flow: with
+  // mb_strength > 0 the server image stays (as before).
+  const finNow = () => ({ ...FIN_DEF, ...((F.info && F.info.finish) || {}), ...(F.liveFin || {}) });
+  function finishGpu(serverCur) {
+    if (!(window.mdMmGpu && window.mdMmGpu.on)) return false;
+    const n = finNow();
+    // motion blur needs the server (plate flow): while a slider is dragged and until the server's frame of this finish
+    // is in, the GPU draws the rest WITHOUT the motion blur (user report 2026-10-30: black / white waited on the server)
+    if ((+n.mb_strength || 0) > 0) return !!F.liveFin || !serverCur;
+    const levels = (+n.black || 0) > 0 || (n.white != null && +n.white < 1) || Math.abs((n.gamma != null ? +n.gamma : 1) - 1) > 1e-9;
+    return !!F.liveFin || Math.abs(+n.erode_px || 0) >= 0.5 || (+n.blur_px || 0) > 0 || (levels && !serverCur);
+  }
+  function finishedMatte(f, ref) {
+    const base = baseImg(f); if (!base) return null;
+    const live = liveStroke(f), strokes = strokesAt(f).concat(F.inflight[f] || [], unsent(f));
+    const n = finNow();
+    const key = `${obj()}_ftfin_${f}_${F.rev[f] || 0}_${F.baseRev}_${strokes.length}_${live ? live.p.length : 0}_${[n.black, n.white, n.gamma, n.erode_px, n.blur_px].join(',')}`;
+    if (F.finCache && F.finCache.key === key && F.finCache.base === base) return F.finCache.m;
+    const job = gpuJob(f, base, strokes, live); job.finish = {};
+    const raw = window.mdFtGpu.render(job); if (!raw) return null;
+    const k = raw.width / +V().projectData.plate_w;   // finish px are plate px; the preview is the proxy
+    const cv = window.mdMmGpu.finish(raw, { black: n.black, white: n.white, gamma: n.gamma, erode_px: n.erode_px * k, blur_px: n.blur_px * k },
+                                     raw.width, raw.height, F.finCache && F.finCache.m.img);
+    if (!cv) return null;
+    const m = { img: cv, key, kind: 'alpha', run: `Final Touch (${ref.run}, GPU${(+n.mb_strength || 0) > 0 ? ' – bez motion bluru, serwer liczy pełny' : ''})` };
+    F.finCache = { key, base, m };
+    return m;
+  }
+  // objects.js matteFor (stage Final Touch): the GPU image of the frame while it is newer than the server's | null
+  function liveMatte(f, ref, al) {
+    F.gpuShown[f] = false;
+    if (!inStage() || !gpuOk()) return null;
+    if (finishGpu(!!(al && al !== 'missing' && al.key === ref.key))) { const m = finishedMatte(f, ref); if (m) { F.gpuShown[f] = true; return m; } }
+    const live = liveStroke(f), pend = unsent(f), infl = F.inflight[f] || [];
+    const rev = F.rev[f] || 0, serverCur = !!(al && al !== 'missing' && al.key === ref.key);
+    if (!live && !pend.length && !infl.length) {
+      if (F.awaiting[f] == null) return null;
+      if (serverCur) { compareWithServer(f, al.img); return null; }
+    }
+    let base, strokes;
+    if (spatialFinish()) {   // over the server image: only what it does not hold yet
+      if (!al || al === 'missing') return null;
+      const imgRev = F.keyRev[al.key] ?? -1;
+      base = al.img;
+      strokes = (F.acked[f] || []).filter((x) => x.rev > imgRev).flatMap((x) => x.strokes).concat(infl, pend);
+    } else {
+      base = baseImg(f); if (!base) return null;
+      strokes = strokesAt(f).concat(infl, pend);
+    }
+    const cv = window.mdFtGpu.render(gpuJob(f, base, strokes, live));
+    if (!cv) return null;
+    F.gpuShown[f] = true;
+    return { img: cv, key: `${obj()}_ftgpu_${f}_${rev}_${++F.seq}`, kind: 'alpha', run: `Final Touch (${ref.run}, GPU)` };
+  }
+  // the server's image of the awaited revision arrived: GPU (same strokes) vs server inside the strokes' box
+  function compareWithServer(f, img) {
+    const want = F.awaiting[f]; delete F.awaiting[f];
+    F.acked[f] = (F.acked[f] || []).filter((x) => x.rev > want);
+    if (spatialFinish() || !strokesAt(f).length) return;
+    const base = baseImg(f); if (!base) return;
+    const job = gpuJob(f, base, strokesAt(f), null);
+    const cv = window.mdFtGpu.render(job); if (!cv) return;
+    const pb = boxOf(strokesAt(f), job); if (!pb) return;
+    const [x0, y0, x1, y1] = pb, w = x1 - x0, h = y1 - y0;
+    const read = (src) => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); g.drawImage(src, -x0, -y0, job.PW, job.PH); return g.getImageData(0, 0, w, h).data; };
+    const a = read(cv), s = read(img), b = read(base);
+    let sum = 0, n = 0, mx = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      if (a[i] === b[i] && s[i] === b[i]) continue;
+      const d = Math.abs(a[i] - s[i]); sum += d; n++; if (d > mx) mx = d;
+    }
+    const mean = n ? sum / n : 0;
+    F.cmp = { f, rev: want, mean: Math.round(mean * 100) / 100, max: mx, n, t: Date.now() };
+    if (mean > CMP_LIMIT) {
+      const msg = `F${f}: podgląd GPU różnił się od wyniku serwera (średnio ${mean.toFixed(1)}/255) – pokazany wynik serwera`;
+      status(msg, 'warn'); H.toast(msg, 5000);
+    }
+  }
+  function boxOf(strokes, job) {   // union proxy box of the strokes [x0, y0, x1, y1]
+    let bx = null;
+    for (const s of strokes) {
+      const P = window.mdFtGpu.prep(s), sx = job.W / job.PW, sy = job.H / job.PH;
+      const q = [Math.max(0, Math.floor(P.box[0] / sx)), Math.max(0, Math.floor(P.box[1] / sy)), Math.min(job.PW, Math.ceil((P.box[2] + 1) / sx)), Math.min(job.PH, Math.ceil((P.box[3] + 1) / sy))];
+      if (q[2] <= q[0] || q[3] <= q[1]) continue;
+      bx = bx ? [Math.min(bx[0], q[0]), Math.min(bx[1], q[1]), Math.max(bx[2], q[2]), Math.max(bx[3], q[3])] : q;
+    }
+    return bx;
   }
 
   // ------------------------------------------------------------------------------------------------ drawing -> frame strokes
@@ -192,29 +320,34 @@
     out.push(p[p.length - 1]);
     return out;
   }
-  function onDraw(f) {
-    clearTimeout(F.timer); F.pending = f;
-    F.timer = setTimeout(() => commit(f).catch(() => {}), 150);
-  }
+  // the stroke goes to the server at once (NEXT_STEPS 7b: no debounce – the view does not wait for it, ft_gpu.js draws
+  // the result); one request at a time, strokes drawn meanwhile go in the next one
+  function onDraw(f) { commit(f).catch(() => {}); }
   async function commit(f) {
-    clearTimeout(F.timer); F.pending = null;
-    if (F.busy) { F.pending = f; F.timer = setTimeout(() => commit(f).catch(() => {}), 200); return; }
+    clearTimeout(F.timer);
+    if (F.busy) { F.pending = f; return; }
+    F.pending = null;
     const drawn = S().strokes[f] || [];
     if (!drawn.length || !obj()) return;
     S().strokes[f] = [];
     const prev = strokesAt(f).slice();
-    const add = drawn.map((s) => ({ mode: s.mode, radius_px: s.radius_px, hardness: F.hardness, p: thin(s.p, s.radius_px) }));
-    F.busy = true;
+    const add = drawn.map(asStroke);
+    F.busy = true; F.inflight[f] = add;
     try {
       F.info = await api('PUT', `/api/object/${obj()}/final_touch/frames/${f}`, { strokes: prev.concat(add) });
       F.undo.push({ f, prev }); F.rev[f] = (F.rev[f] || 0) + 1;
+      (F.acked[f] = F.acked[f] || []).push({ rev: F.rev[f], strokes: add }); F.awaiting[f] = F.rev[f];
       status(`F${f}: korekta zapisana (${add.map((s) => MODES[s.mode].label).join(', ')}) – Ctrl+Z cofa`, 'ok');
       H.toast(`F${f}: ${add.map((s) => MODES[s.mode].label).join(', ')}`, 1500);   // the panel's status line is far below (user 2026-10-22)
       H.loadStages().catch(() => {});
     } catch (e) {
       S().strokes[f] = drawn.concat(S().strokes[f] || []);
       status(`Korekta F${f} NIE zapisana: ${e.message}`, 'err'); H.toast(`Korekta F${f} NIE zapisana: ${e.message}`, 6000);
-    } finally { F.busy = false; renderList(); V().render(); }
+    } finally {
+      F.busy = false; delete F.inflight[f]; renderList(); V().render();
+      const next = F.pending; F.pending = null;
+      if (next != null && (S().strokes[next] || []).length) commit(next).catch(() => {});
+    }
   }
   async function putFrame(f, strokes) {
     F.info = await api('PUT', `/api/object/${obj()}/final_touch/frames/${f}`, { strokes });
@@ -222,6 +355,7 @@
     H.loadStages().catch(() => {}); renderList(); V().render();
   }
   async function undo() {
+    await flush();
     const u = F.undo[F.undo.length - 1];
     if (!u || !obj()) return false;
     F.undo.pop();
@@ -250,6 +384,7 @@
 
   // ------------------------------------------------------------------------------------------------ overlays (inside pan / zoom)
   function draw(ctx, img, k, f) {
+    if (inStage() && /^brush/.test(S().tool || '') && !spatialFinish() && gpuOk()) baseImg(f);   // the GPU preview's base, before the first stroke
     if (!inStage() || !F.showStrokes || !strokesAt(f).length) return;
     // the correction layer of the frame from the server (green = add, red = remove, alpha = strength): what the strokes
     // really do after the eraser and the hardness – stroke outlines showed every disc of the path and never the eraser
@@ -291,7 +426,9 @@
   }
 
   // ------------------------------------------------------------------------------------------------ wiring
-  async function flush() { if (F.pending != null) await commit(F.pending); }
+  async function flush() {   // wait for the stroke in flight and the ones queued behind it
+    for (let i = 0; i < 200 && (F.busy || F.pending != null); i++) await new Promise((r) => setTimeout(r, 25));
+  }
   function wire() {
     $('ftHard').addEventListener('input', () => {
       F.hardness = +$('ftHard').value / 100; $('ftHardN').textContent = `${$('ftHard').value} %`;
@@ -307,7 +444,11 @@
     });
     document.querySelectorAll('#ftPalette [data-fin]').forEach((s) => {
       const k = s.dataset.fin; const lbl = FIN.find((x) => x[0] === k)[1];
-      s.addEventListener('input', () => { const v = document.querySelector(`#ftPalette [data-finv="${k}"]`); if (v) v.textContent = finFmt(k, s.value); });
+      s.addEventListener('input', () => {
+        const v = document.querySelector(`#ftPalette [data-finv="${k}"]`); if (v) v.textContent = finFmt(k, s.value);
+        F.liveFin = { ...(F.liveFin || {}), [k]: +s.value };   // drawn on the GPU while dragging (finishGpu)
+        V().render();
+      });
       s.addEventListener('change', () => H.run('ftPanel', () => putFinish({ [k]: +s.value }, `${lbl} ${finFmt(k, s.value)}`)));
     });
     $('ftFinReset').addEventListener('click', () => H.run('ftFinReset', () => putFinish({ ...FIN_DEF, mb_shutter_deg: undefined, mb_shutter_manifest: true }, 'wyzerowane')));
@@ -335,13 +476,15 @@
     const cw = $('canvasWrapper');
     if (cw) { const pal = H.el(paletteHtml()); cw.appendChild(pal); if (H.makeFloating) H.makeFloating(pal, cw, '.pp-head', ftPos); }
     wire();
+    if (window.MD_MM) window.MD_MM.init(hooks);   // palette „MergeMatte” on the right (PLAN_FINAL_TOUCH §11)
     window.MD_FT.ready = true;
   }
   window.MD_FT = {
-    init, load, reset, draw, onDraw, undo, flush, deleteKeysAt, renderLane, matteRef,
+    init, load, reset, draw, onDraw, undo, flush, deleteKeysAt, renderLane, matteRef, liveMatte,
+    gpuLive: (f) => !!F.gpuShown[f],
     hasKeyAt: (f) => strokesAt(f).length > 0,
     onShow() { load(); renderPalette(); },
-    onStage() { renderLane(); syncTools(); renderPalette(); },
+    onStage() { renderLane(); syncTools(); renderPalette(); if (window.MD_MM && window.MD_MM.ready) window.MD_MM.onStage(); },
     onStages() { renderBase(); },
     get state() { return F; },
   };

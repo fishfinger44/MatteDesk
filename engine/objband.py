@@ -118,6 +118,9 @@ ZONE_SLIDER_FIELDS = {"out_px": "outline_out_px", "in_px": "fg_erode_px", "inset
                       "outer_feather_px": "outer_feather_px"}
 ZONE_SLIDER_KEYS = ("outline_out_px", "fg_erode_px", "force_core_erode_px", "inset_feather_px", "outer_feather_px", "outline_in_px")
 INT_SLIDERS = {"ltx": ("in_px",), "zone": ("in_px",)}   # fields stored as ints (LTX core_erode_px, the zone's trimap inset)
+# „Wcięcie: cały rdzeń” (2026-10-29): the band covers the whole core (engine/bandsys `whole`); the shared band and the
+# zone params store it as `whole_core`, stage 3 on the object as `band_whole_core`, stages 4 / 7 in their dict
+WHOLE_FIELD = {"matanyone": "band_whole_core"}
 
 
 class BandSettings(dict):
@@ -129,18 +132,20 @@ class BandSettings(dict):
       owner_id   ZoneCache owner of the points' tracking (SHARED_OWNER | stage_<key> | <zone_id>)
       shared     the shared object band (tracked once per group on its main object)
       key        matanyone | videomama | ltx | zone:<id>
-      active     False = the stage has no band now (LTX-2.5 „surowy”): no points, no lines"""
+      active     False = the stage has no band now (LTX-2.5 „surowy”): no points, no lines
+      whole_core „Wcięcie: cały rdzeń” – the band covers the whole core (`in_w` = inf for the geometry; in_px stays the
+                 slider value)"""
     FIELDS = ("out_px", "in_px", "inset_feather_px", "outer_feather_px", "band_points", "band_ref_out", "band_ref_in",
-              "owner_id", "shared", "key", "active")
+              "owner_id", "shared", "key", "active", "whole_core")
 
     def __init__(self, out_px: float, in_px: float, inset_feather_px: float, outer_feather_px: float,
                  band_points: Optional[List[Dict[str, Any]]] = None, band_ref_out: Optional[float] = None,
                  band_ref_in: Optional[float] = None, owner_id: str = SHARED_OWNER, shared: bool = True, key: str = "",
-                 active: bool = True):
+                 active: bool = True, whole_core: bool = False):
         super().__init__(out_px=float(out_px), in_px=float(in_px), inset_feather_px=float(inset_feather_px),
                          outer_feather_px=float(outer_feather_px), band_points=list(band_points or []),
                          band_ref_out=band_ref_out, band_ref_in=band_ref_in, owner_id=owner_id, shared=bool(shared),
-                         key=key, active=bool(active))
+                         key=key, active=bool(active), whole_core=bool(whole_core))
 
     def __getattr__(self, k: str) -> Any:
         try:
@@ -154,6 +159,11 @@ class BandSettings(dict):
     @property
     def sliders(self) -> Tuple[float, float, float, float]:
         return self.out_px, self.in_px, self.inset_feather_px, self.outer_feather_px
+
+    @property
+    def in_w(self) -> float:
+        """The inset width for the band geometry (engine/bandsys.band_widths): inf with „cały rdzeń”."""
+        return float("inf") if self.get("whole_core") else self.in_px
 
     def slider_dict(self) -> Dict[str, float]:
         return dict(zip(SLIDERS, self.sliders))
@@ -224,7 +234,24 @@ def legacy_fields(key: str, s: BandSettings) -> Dict[str, Any]:
     d.update(s.points_params())
     if not key.startswith("zone:"):
         d["band_owner"] = s.owner_id
+    if s.get("whole_core"):   # only when on: results computed before the option keep their signatures
+        d[whole_field(key)] = True
     return d
+
+
+def whole_field(key: str) -> str:
+    """The owner's own field of „cały rdzeń” (`whole_core`; stage 3: `band_whole_core` on the object)."""
+    return WHOLE_FIELD.get(key, "whole_core")
+
+
+def _own_whole(obj: Optional[Dict[str, Any]], key: str, zone: Optional[Dict[str, Any]], own: Optional[Dict[str, Any]]) -> bool:
+    o = obj or {}
+    if own is not None and own.get(whole_field(key)) is not None:
+        return bool(own.get(whole_field(key)))
+    if key.startswith("zone:"):   # the stage dicts validated by their settings drop unknown keys: read the object
+        return bool(((zone or {}).get("params") or {}).get("whole_core"))
+    src = o if key == "matanyone" else (o.get(key) or {})
+    return bool(src.get(whole_field(key)))
 
 
 def _zone_dict(zone: Any) -> Optional[Dict[str, Any]]:
@@ -269,7 +296,14 @@ def band_for(obj: Optional[Dict[str, Any]], key: str, root: Optional[Dict[str, A
     else:
         p, owner = ({k: own.get(k) for k in KEYS} if own is not None else own_params(o, key)), f"stage_{key}"
     pts = band_points({"band_points": p.get("band_points")}) if p.get("band_points") else []
-    return BandSettings(out, inn, fi, fo, pts, p.get("band_ref_out"), p.get("band_ref_in"), owner, sh, key)
+    if overrides is not None and overrides.get("whole_core") is not None:
+        whole = bool(overrides["whole_core"])
+    elif sh and migrated(r):
+        whole = bool(((r.get("band") or {}).get("whole_core")))
+    else:
+        whole = _own_whole(o, key, zd, own)
+    return BandSettings(out, inn, fi, fo, pts, p.get("band_ref_out"), p.get("band_ref_in"), owner, sh, key,
+                        whole_core=whole)
 
 
 def save_sliders(store: Any, name: str, key: str, values: Optional[Dict[str, Any]], zone: Any = None) -> str:
@@ -281,7 +315,7 @@ def save_sliders(store: Any, name: str, key: str, values: Optional[Dict[str, Any
     if not vals:
         return ""
     obj = store.get(name)
-    root = obj.get("part_of") or name
+    root = name    # a group member has its own band (PLAN_GROUP_COMPOSE 2026-10-29)
     if mode(obj, key) == "shared" and sliders_migrated(store.get(root)):
         band = dict(store.get(root).get("band") or {})
         band.update({k: float(v) for k, v in vals.items()})
@@ -322,6 +356,44 @@ def save_sliders(store: Any, name: str, key: str, values: Optional[Dict[str, Any
     return "own"
 
 
+def save_whole(store: Any, name: str, key: str, on: bool, zone: Any = None) -> str:
+    """„Wcięcie: cały rdzeń” of a band owner (2026-10-29), saved like the sliders: the shared object band (every shared
+    stage follows, ↻) or the owner's own field (stage 3 on the object, stages 4 / 7 in their dict, a zone's params).
+    Returns "shared" | "own". Invalidates the final."""
+    obj = store.get(name)
+    on = bool(on)
+    if mode(obj, key) == "shared" and migrated(obj):
+        band = dict(obj.get("band") or {})
+        if on:
+            band["whole_core"] = True
+        else:
+            band.pop("whole_core", None)
+        store.update(name, band=band, tool={"final_valid": False})
+        return "shared"
+    f = whole_field(key)
+    if key.startswith("zone:"):
+        if zone is not None:
+            from engine.zones import save_zone
+            p = dict(zone.params or {})
+            if on:
+                p[f] = True
+            else:
+                p.pop(f, None)
+            zone.params = p
+            save_zone(store.dir(name), zone)
+    elif key == "matanyone":
+        store.update(name, **{f: (True if on else None)})
+    else:
+        st = dict(obj.get(key) or {})
+        if on:
+            st[f] = True
+        else:
+            st.pop(f, None)
+        store.update(name, **{key: st})
+    store.update(name, tool={"final_valid": False})
+    return "own"
+
+
 def zone_params(zone: Dict[str, Any], obj: Optional[Dict[str, Any]], root: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The params of a zone (raw dict) with the band it works with (`band_for`): shared – the band keys replaced by the
     object band of `root` (an empty object band = none, the constant band) and, once the sliders are migrated, the
@@ -339,7 +411,12 @@ def zone_params(zone: Dict[str, Any], obj: Optional[Dict[str, Any]], root: Optio
     if sliders_migrated(root) and p.get("region") == "outline":   # the shared sliders (2026-10-24): the band of a
         # whole-outline zone and its trimap inset follow them (a drawn zone has no band: its params stay its own)
         p.pop("outline_in_px", None)
+        p.pop("whole_core", None)
         p.update({k: v for k, v in b.legacy().items() if k not in KEYS})
+    elif p.get("region") == "outline":   # „cały rdzeń” of the shared band (also before the sliders' migration)
+        p.pop("whole_core", None)
+        if b.whole_core:
+            p["whole_core"] = True
     return p
 
 

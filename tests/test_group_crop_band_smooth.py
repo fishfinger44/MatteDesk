@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """2026-10-16 (user report CLIP2_A F58): group crops cover the parts' crops; band widths smoothed along the contour."""
 import numpy as np
+import pytest
 
 from engine import edge
 from engine.crop import CropSegment, group_segments, square_crop
@@ -71,10 +72,12 @@ def test_band_has_no_tabs_on_a_noisy_edge():
 
 
 def test_group_zone_sure_fg_per_member_and_whole_core(tmp_path, monkeypatch):
-    """2026-10-16 (CLIP2_A: parent „Hands”, part „Head” with the hair): params.sure_fg picks the sure members of a group
-    (parent included); absent = the old rule (parts sure); the zone previews work on the whole of the group."""
+    """2026-10-16 (CLIP2_A: „Hands” + „Head” with the hair), on the group entity (PLAN_GROUP_COMPOSE step 4):
+    params.sure_fg picks the sure members; absent = the members in front of the backmost one (all at one depth = none);
+    the zone previews of the group work on its composition; a member alone keeps its own core."""
     import json
     import cv2
+    from engine import groups
     from engine.pipeline import ObjectPipeline
     from engine.zones import Zone
     from test_zone_matte import _api_project
@@ -82,29 +85,29 @@ def test_group_zone_sure_fg_per_member_and_whole_core(tmp_path, monkeypatch):
     app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch)
     store = pipe.store
     store.create("head", ["head"], depth_order=1)
-    store.update("head", part_of="obj")
     cd = store.dir("head") / "core"; cd.mkdir(parents=True)
     m = np.zeros((shot.h, shot.w), np.uint8); m[5:25, 5:25] = 255
     for f in frames:
         cv2.imwrite(str(cd / f"c_{f:04d}.png"), m)
     (cd / "core.json").write_text(json.dumps({"coverage": [[frames[0], frames[-1]]]}))
+    groups.create_group(store, "grp", ["obj", "head"])
     z = Zone(zone_id="z_01", mode="add", frame=start, polygon=[[0, 0], [10, 0], [10, 10]], criterion="matte", matting="vitmatte")
-    fg, names = pipe.zone_fg("obj", z, [start])
+    fg, names = pipe.zone_fg("grp", z, [start])
     assert names == ["obj"]                    # default: the member in front (depth 0) is sure, the head (1) is matted
     store.update("head", depth_order=0)
-    assert pipe.zone_fg("obj", z, [start])[1] == ["head"]              # same depth: the old rule, the parts are sure
+    assert pipe.zone_fg("grp", z, [start]) == (None, [])               # one depth: no member is sure
     store.update("head", depth_order=1)
     z.params = {"sure_fg": ["obj"]}
-    fg, names = pipe.zone_fg("obj", z, [start])
-    assert names == ["obj"] and np.array_equal(fg(start), pipe.load_core("obj", [start])[start])   # own core, not a group version
+    fg, names = pipe.zone_fg("grp", z, [start])
+    assert names == ["obj"] and np.array_equal(fg(start), pipe.load_core("obj", [start])[start])   # own core
     z.params = {"sure_fg": []}
-    assert pipe.zone_fg("obj", z, [start]) == (None, [])
-    whole = pipe.preview_core("obj", [start])[start]
+    assert pipe.zone_fg("grp", z, [start]) == (None, [])
+    assert pipe.zone_fg("obj", Zone(zone_id="z_02", mode="add", frame=start, polygon=[[0, 0], [10, 0], [10, 10]],
+                                    criterion="matte", matting="vitmatte"), [start]) == (None, [])   # a member: no parts
+    whole = pipe.preview_core("grp", [start])[start]
     own = pipe.load_core("obj", [start])[start]
     assert whole[10, 10] and (whole | own).sum() == whole.sum() and whole.sum() > own.sum()
-    # a part alone: its own core in the fast stand-in (preview_core of ONE frame is the mask 1+2 since 2026-10-24 and
-    # needs the crops of a real run; the joining of a group is what this test checks)
-    assert np.array_equal(pipe._fast_core("head", [start])[start], m > 127)
+    assert np.array_equal(pipe._fast_core("head", [start])[start], m > 127)   # a member alone: its own core
 
 
 def test_band_px_mode_minimum_out_and_in_no_shift():

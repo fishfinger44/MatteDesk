@@ -117,8 +117,10 @@ class _CoTrackerWorker:
     def request(self, src: Path, dst: Path, cancel_check: Optional[Callable[[], None]] = None,
                 timeout_s: float = 3600.0) -> Dict[str, Any]:
         """Run one in.npz -> out.npz tracking; `cancel_check()` is polled every second and, if it raises, the worker
-        is killed (a running CoTracker3 forward cannot be interrupted any other way) and the exception propagates."""
-        with self.lock:
+        is killed (a running CoTracker3 forward cannot be interrupted any other way) and the exception propagates.
+        Runs under the GPU lease (engine/gpu_manager): another work on the card first, and a cancel while waiting."""
+        from engine.gpu_manager import GPU
+        with GPU.use(self, "CoTracker3", self.close, cancel_check), self.lock:
             self.busy = True
             try:
                 if self._proc is None or self._proc.poll() is not None:
@@ -197,8 +199,8 @@ def cotracker_worker(python: Union[str, Path], env: Optional[Dict[str, str]] = N
 
 
 def close_workers(idle_only: bool = False) -> None:
-    """Stop the served workers (frees their GPU memory; the next request starts a new one). `idle_only`
-    (engine/gpu_release before a Comfy stage): a worker answering a request right now is left running."""
+    """Stop the served workers (frees their GPU memory; the next request starts a new one; at exit). `idle_only`:
+    a worker answering a request right now is left running."""
     with _WORKERS_LOCK:
         ws = [(k, w) for k, w in _WORKERS.items() if not (idle_only and w.busy)]
         for k, _ in ws:
@@ -275,6 +277,11 @@ class CoTracker3Tracker:
 
     def _one_shot(self, src: Path, dst: Path, cancel_check: Optional[Callable[[], None]] = None) -> None:
         """A process per call (the pre-2026-10-25 path): kept for the bit-identity test against the served worker."""
+        from engine.gpu_manager import GPU
+        with GPU.use(("cotracker3-one-shot", id(self)), "CoTracker3", None, cancel_check):
+            self._one_shot_run(src, dst, cancel_check)
+
+    def _one_shot_run(self, src: Path, dst: Path, cancel_check: Optional[Callable[[], None]] = None) -> None:
         proc = subprocess.Popen([str(self.python), "-I", str(WORKER), str(src), str(dst)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
         t0 = time.time()
