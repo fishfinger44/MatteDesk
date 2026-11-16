@@ -34,7 +34,7 @@
         <ol class="cu-steps">
           <li>Wybierz obiekt poniżej (maska z Wycinania).</li>
           <li>W palecie <b>🧹 Inpaint</b> (po lewej): model, <b>Usuń / Zastąp</b>, opis.</li>
-          <li><b>▶ Policz</b> → plate „cleaned” (A/B) + łata RGBA do Nuke'a (Merge over).</li>
+          <li><b>▶ Policz Inpaint</b> → plate „cleaned” (A/B) + łata RGBA do Nuke'a (Merge over).</li>
           <li>Paleta <b>🧩 Złożenie</b> (po prawej): pas łaty, ochrona innych obiektów, ziarno – bez liczenia modelu.</li>
         </ol>
         <div class="cu-guide" id="cuGuide"></div>
@@ -80,11 +80,11 @@
         <select id="cuVaceSpeed" class="form-input" title="Szybko = LoRA Lightning: 4 kroki przy CFG 1 (ok. 5–10× szybciej, trochę mniej szczegółu); dokładnie = 20 kroków przy CFG 3,5"><option value="fast">szybko – 4 kroki</option><option value="quality">dokładnie – 20 kroków</option></select>
       </div>
       <div class="pp-hint warn" id="cuVaceNote" style="display:none"></div>
-      <label class="edge-px cu-gen" title="Zapas generowania: o ile px wokół usuwanego obiektu model wideo ma narysować nowy obraz (maska modelu = obiekt poszerzony o tyle, twardo, bez punktów pasa i wtopienia, także na chronione obiekty – złożenie przywraca je z ich alfą; silnik dokłada swój rozrost). Liczy się przed „▶ Policz” – po liczeniu zmienia go tylko nowe liczenie. Większy zapas = więcej materiału dla pasa łaty">Zapas generowania <input type="range" id="cuGenR" min="0" max="200" step="1" title="Zapas generowania (px) – zapis po puszczeniu"><input type="number" id="cuGen" class="form-input edge-num" min="0" max="300" step="1" title="Zapas generowania (px) – wpisz i Enter"></label>
+      <label class="edge-px cu-gen" title="Zapas generowania: o ile px wokół usuwanego obiektu model wideo ma narysować nowy obraz (maska modelu = obiekt poszerzony o tyle, twardo, bez punktów pasa i wtopienia, także na chronione obiekty – złożenie przywraca je z ich alfą; silnik dokłada swój rozrost). Liczy się przed „▶ Policz Inpaint” – po liczeniu zmienia go tylko nowe liczenie. Większy zapas = więcej materiału dla pasa łaty">Zapas generowania <input type="range" id="cuGenR" min="0" max="200" step="1" title="Zapas generowania (px) – zapis po puszczeniu"><input type="number" id="cuGen" class="form-input edge-num" min="0" max="300" step="1" title="Zapas generowania (px) – wpisz i Enter"></label>
       <div class="muted pp-hint cu-sources" id="cuSources"></div>
       <div class="pp-btns cu-run-row">
         <button type="button" class="btn btn-secondary btn-sm" id="cuPreview" title="Maska usuwania bieżącej klatki (czerwone = łata) – ta sama, której użyje „Policz”">👁 Maska klatki</button>
-        <button type="button" class="btn btn-primary btn-sm" id="cuRun" title="Czyszczenie na zakresie pracy (oś czasu) → nowa wersja w <work>/inpaint i plate „cleaned”">▶ Policz</button>
+        <button type="button" class="btn btn-primary btn-sm" id="cuRun" title="Czyszczenie na zakresie pracy (oś czasu) → nowa wersja w <work>/inpaint i plate „cleaned”">▶ Policz Inpaint</button>
       </div>
       <canvas id="cuMaskCv" style="display:none;width:100%;max-height:300px;object-fit:contain;margin-top:6px;border-radius:4px"></canvas>
     </div>`;
