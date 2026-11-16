@@ -21,8 +21,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engine import comfy_portable  # noqa: E402
-from engine.config import set_comfy_flavor, write_local  # noqa: E402
+from engine import comfy_portable
+from engine.config import set_comfy_flavor, write_local
 
 
 class Bar:

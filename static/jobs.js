@@ -10,24 +10,23 @@
   const css = document.createElement('style');
   css.textContent = `
     body.job-busy .job-locked{opacity:.45;cursor:not-allowed!important}
-    #jobModal{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:rgba(5,8,14,.55)}
+    #jobModal{position:fixed;inset:0;z-index:3000;display:none;align-items:center;justify-content:center;background:rgba(5,8,14,.55)}
     #jobCard{width:min(520px,calc(100vw - 32px));padding:18px 20px;border-radius:12px;background:var(--bg-panel,#1f1f22);
       border:1px solid var(--bg-hover,#303035);box-shadow:0 10px 40px rgba(0,0,0,.5);color:var(--text-main,#e6e6e8);font-size:13px}
     #jobCard .t{font-size:15px;font-weight:600;margin-bottom:4px} #jobCard .s{color:var(--text-muted,#9a9aa0);min-height:18px}
     .jobTrack{height:8px;background:var(--bg-hover,#303035);border-radius:4px;overflow:hidden;margin:12px 0 6px}
     .jobFill{height:100%;width:0;background:var(--accent-primary,#e8a33d);transition:width .3s}
     @keyframes jobInd{0%{margin-left:-30%}100%{margin-left:100%}} .jobFill.ind{width:30%!important;animation:jobInd 1.4s linear infinite}
-    #jobBar{position:fixed;left:50%;transform:translateX(-50%);width:min(900px,calc(100vw - 32px));z-index:900;display:none;
+    #jobBar{position:fixed;left:50%;transform:translateX(-50%);width:min(900px,calc(100vw - 32px));z-index:2990;display:none;
       align-items:center;gap:10px;padding:6px 12px;border-radius:8px;background:var(--bg-panel,#1f1f22);
       border:1px solid var(--bg-hover,#303035);box-shadow:0 4px 16px rgba(0,0,0,.4);color:var(--text-main,#e6e6e8);font-size:12px}
     .jobDet{margin-top:10px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,.03);font-size:12px;display:none}
     .jobDet .r{display:flex;align-items:center;gap:8px;margin:3px 0} .jobDet .l{width:64px;color:var(--text-muted,#9a9aa0)}
     .jobDet .jobTrack{flex:1;margin:0;height:6px} .jobDet .v{width:150px;text-align:right;color:var(--text-muted,#9a9aa0)}
     .jobDet .warn{color:#fbbf24} .jobDet .err{color:#f87171} .jobDet pre{white-space:pre-wrap;max-height:120px;overflow:auto;font-size:11px}
-    #jobBarDet{position:fixed;left:50%;transform:translateX(-50%);width:min(900px,calc(100vw - 32px));z-index:899;display:none;
-      background:var(--bg-panel,#1f1f22);border:1px solid var(--bg-hover,#303035);border-radius:8px}
-    #jobToast{position:fixed;left:50%;transform:translateX(-50%);z-index:950;display:none;padding:8px 14px;border-radius:8px;
-      background:#3b2a0a;border:1px solid #f0703a;color:#fde68a;font-size:12px;max-width:80vw}`;
+    #jobBarDet{position:fixed;left:50%;transform:translateX(-50%);width:min(900px,calc(100vw - 32px));z-index:2989;display:none;
+      background:var(--bg-panel,#1f1f22);border:1px solid var(--bg-hover,#303035);border-radius:8px}`;
+  // above the floating popups (anchor preview 2500, user 2026-11-15: the progress was hidden under it); dialogs (.md-dialog 25000) stay on top
   document.head.appendChild(css);
 
   const modal = document.createElement('div');
@@ -44,28 +43,16 @@
       <button class="btn" id="jmCancel" style="background:#7f1d1d;color:#fff">Przerwij</button></div></div>`;
   const bar = document.createElement('div');
   bar.id = 'jobBar';
-  bar.innerHTML = `<span id="jobDot" style="width:8px;height:8px;border-radius:50%;background:#e8a33d;flex:none"></span>
+  bar.innerHTML = `<span id="jobDot" style="width:8px;height:8px;border-radius:50%;background:var(--border-focus);flex:none"></span>
     <span id="jobText" style="flex:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
     <div class="jobTrack" style="flex:1;min-width:60px;height:6px;margin:0"><div class="jobFill" id="jobFill"></div></div>
     <span id="jobMeta" style="flex:none;color:var(--text-muted,#9a9aa0)"></span>
     <button class="btn" id="jobDetBtn" style="flex:none;padding:2px 8px;font-size:12px" title="GPU / VRAM / RAM, co liczy Comfy">Szczegóły ▾</button>
     <button class="btn" id="jobExpand" style="flex:none;padding:2px 8px;font-size:12px" title="Pokaż okno postępu">⤢</button>
     <button class="btn" id="jobCancel" style="flex:none;padding:2px 10px;font-size:12px">Przerwij</button>`;
-  const toast = document.createElement('div');
-  toast.id = 'jobToast';
   const barDet = document.createElement('div');
   barDet.id = 'jobBarDet'; barDet.innerHTML = '<div class="jobDet" id="jobDet" style="display:block;margin:0"></div>';
-  // a computation that ended with an error (user report 2026-10-26: Comfy OOM in VideoMaMa / a failed frame preview were
-  // only a short bar line or small red text in the panel): a window that stays until "OK", full text + Comfy's raw message
-  const errModal = document.createElement('div');
-  errModal.id = 'jobErrModal';
-  errModal.style.cssText = 'position:fixed;inset:0;z-index:1001;display:none;align-items:center;justify-content:center;background:rgba(5,8,14,.55)';
-  errModal.innerHTML = `<div id="jobErrCard" style="width:min(560px,calc(100vw - 32px));padding:18px 20px;border-radius:12px;background:var(--bg-panel,#1f1f22);border:1px solid #ef4444;box-shadow:0 10px 40px rgba(0,0,0,.5);color:var(--text-main,#e6e6e8);font-size:13px">
-    <div style="font-size:15px;font-weight:600;color:#f87171;margin-bottom:6px" id="jeTitle"></div>
-    <div id="jeMsg" style="white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto"></div>
-    <div id="jeRaw" class="jobDet" style="display:none;margin-top:10px"></div>
-    <div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn btn-primary" id="jeOk">OK</button></div></div>`;
-  document.body.append(modal, bar, toast, barDet, errModal);
+  document.body.append(modal, bar, barDet);
 
   // ---- "Szczegóły" (Z19): GET /api/jobs/details every second while open; open/closed remembered (localStorage, try/catch)
   let detOpen = false;
@@ -110,7 +97,7 @@
     clearTimeout(detTimer);
     if (!detOpen || !busy) { $('jmDet').style.display = 'none'; barDet.style.display = 'none'; return; }
     try {
-      const d = await (await fetch('/api/jobs/details')).json();
+      const d = await window.UI.api('GET', '/api/jobs/details');
       const html = detHtml(d);
       $('jmDet').innerHTML = html; $('jobDet').innerHTML = html;
     } catch (e) { /* backend gone */ }
@@ -139,36 +126,29 @@
     const h = foot ? foot.getBoundingClientRect().height : 0;
     bar.style.bottom = `${Math.round(h + 8)}px`;
     barDet.style.bottom = `${Math.round(h + 46)}px`;
-    toast.style.bottom = `${Math.round(h + 52)}px`;
   }
   window.addEventListener('resize', place);
   place();
-  function showToast(t) {
-    toast.textContent = t; toast.style.display = 'block';
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.style.display = 'none'; }, 4000);
-  }
+  const showToast = (t) => window.UI.toast(t, 4000);
   // ---- error window: once per failed job (id), also for quiet jobs (frame previews)
   const errShown = new Set();
   const ERR_RECENT_S = 120;   // a failed job ended this long ago still gets the window (throttled background tab)
+  // a computation that ended with an error (user report 2026-10-26: Comfy OOM in VideoMaMa / a failed frame preview were
+  // only a short bar line or small red text in the panel): a window that stays until "OK", full text + Comfy's raw message
+  let errOpen = false;
   function showError(j) {
     errShown.add(j.id);
     const ci = j.comfy_info || {};
-    $('jeTitle').textContent = `✖ ${j.label} – błąd`;
     const comfyErr = ci.error && ci.error !== j.error ? `\n\nComfyUI: ${ci.error}` : '';
-    $('jeMsg').textContent = `${j.error || 'liczenie przerwane błędem (bez opisu)'}${comfyErr}`;
     const raw = ci.raw_error;
-    $('jeRaw').style.display = raw ? 'block' : 'none';
-    $('jeRaw').innerHTML = raw ? `<details><summary>surowy komunikat ComfyUI</summary><pre>${esc(JSON.stringify(raw, null, 1))}</pre></details>` : '';
-    errModal.style.display = 'flex';
-    $('jeOk').focus();
+    errOpen = true;
+    window.UI.dialog({ title: `✖ ${j.label} – błąd`, tone: 'error',
+      html: `<div style="white-space:pre-wrap;word-break:break-word">${esc(j.error || 'liczenie przerwane błędem (bez opisu)')}${esc(comfyErr)}</div>` +
+        (raw ? `<div class="jobDet" style="display:block;margin-top:10px"><details><summary>surowy komunikat ComfyUI</summary><pre>${esc(JSON.stringify(raw, null, 1))}</pre></details></div>` : ''),
+    }).then(() => { errOpen = false; });
   }
-  const closeError = () => { errModal.style.display = 'none'; };
-  $('jeOk').addEventListener('click', closeError);
-  document.addEventListener('keydown', (e) => {
-    if (errModal.style.display !== 'flex') return;
-    if (e.key === 'Escape' || e.key === 'Enter') closeError();
-    e.stopImmediatePropagation(); e.preventDefault();
-  }, true);
+  // browser keys (F5, F12, Ctrl+L, Ctrl+R…) and Ctrl+Z of the sliders pass through the windows (audit 2026-11-02 #16)
+  const browserKey = (e) => e.ctrlKey || e.metaKey || e.altKey || /^F\d{1,2}$/.test(e.key);
 
   async function cancel(btn) {
     if (!(await window.viewer.uiConfirm('Przerwać bieżące liczenie?\nSkończone klatki zostają, niedokończona wersja nie zostanie aktywowana.', { ok: 'Przerwij' }))) return;
@@ -198,6 +178,7 @@
   document.addEventListener('keydown', (e) => {
     if (modal.style.display !== 'flex') return;
     if (e.key === 'Escape' && busy) { minimized[busy.id] = true; render([busy]); }
+    if (browserKey(e)) return;
     e.stopImmediatePropagation(); e.preventDefault();
   }, true);
   function markLocked() {
@@ -221,6 +202,7 @@
   // the GPU manager (engine/gpu_manager): a job waiting for the card shows who holds it instead of its step; work in
   // the background without a job (band tracking) waiting for the card is added to the bar
   let gpu = null;
+  const quietWarned = {};   // job id -> the warning already toasted (spill / Comfy error of a quiet job)
   const stepOf = (j) => (j.gpu_wait ? `czeka na GPU: ${j.gpu_wait}` : j.step);
   const bgWait = () => ((gpu && gpu.waiting) || []).filter((w) => !w.job);
   function meta(j) {
@@ -230,9 +212,14 @@
   function render(run) {
     const j = run.length ? run[run.length - 1] : null;
     if (j && j.quiet) {   // short job (SAM3 on one frame): small bar only, no blocking window
-      $('jobDot').style.background = '#a855f7';
+      // ... but a frame preview of a Comfy model can spill GPU memory into RAM or fail long before it ends (VideoMaMa
+      // 2048 px, 2026-10-26: ~9 min of silence): the bar turns red / amber and says it, once also as a toast
+      const ci = j.comfy_info || {};
+      const warn = ci.error ? `✖ ${ci.error}` : ci.spill_gb ? `⚠ ${ci.spill_gb.toFixed(1)} GB pamięci GPU przelało się do RAM – podgląd kilka razy wolniejszy; rozważ „Przerwij” i mniejszą rozdzielczość` : '';
+      $('jobDot').style.background = ci.error ? '#ef4444' : ci.spill_gb ? '#f0703a' : '#a855f7';
       $('jobText').textContent = `${j.label}${stepOf(j) ? ' · ' + stepOf(j) : ''}`;
-      fill($('jobFill'), j); $('jobMeta').textContent = meta(j);
+      fill($('jobFill'), j); $('jobMeta').textContent = warn || meta(j);
+      if (warn && quietWarned[j.id] !== warn) { quietWarned[j.id] = warn; window.UI.toast(`${j.label}: ${warn}`, 8000); }
       $('jobCancel').style.display = ''; $('jobExpand').style.display = 'none';
       modal.style.display = 'none'; bar.style.display = 'flex';
       return;
@@ -271,14 +258,14 @@
   async function poll() {
     let jobs = [];
     try {
-      const r = await (await fetch('/api/jobs')).json();
+      const r = await window.UI.api('GET', '/api/jobs');
       jobs = r.jobs || []; gpu = r.gpu || null;
     } catch (e) { setTimeout(poll, 3000); return; }
     const run = jobs.filter((j) => j.state === 'running');
     if (busy && !run.length) window.dispatchEvent(new CustomEvent('matte-job-finished', { detail: busy }));
     const failed = jobs.filter((j) => j.state === 'error' && j.ended && !errShown.has(j.id)
       && Date.now() / 1000 - j.ended < ERR_RECENT_S).sort((a, b) => b.ended - a.ended);
-    if (failed.length && errModal.style.display !== 'flex') {   // the newest one; older ones of the same burst are not queued
+    if (failed.length && !errOpen) {   // the newest one; older ones of the same burst are not queued
       failed.forEach((j) => errShown.add(j.id));
       showError(failed[0]);
     }

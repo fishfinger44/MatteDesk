@@ -171,3 +171,86 @@ def test_birefnet_stage_no_matanyone_zones(proj, env, monkeypatch):
     assert {z.zone_id: z for z in load_zones(d)}["z_02"].params["vitmatte_model"] == "birefnet_hr_matting"
     api.put("/api/object/obj/edge_engine", json={"engine": "vitmatte"})
     assert api.patch("/api/object/obj/zones/z_02", json={"matting": "matanyone"}).status_code == 200   # ViTMatte stage: allowed
+
+
+# --- Cleanup 3D engines (docs/PLAN_CLEANUP_3D.md, P3) -----------------------------------------------------------------
+@pytest.fixture
+def small_klein(monkeypatch):
+    monkeypatch.setattr(G, "KLEIN_FILES", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.KLEIN_FILES.items()})
+    monkeypatch.setattr(G, "KLEIN_LORA", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.KLEIN_LORA.items()})
+
+
+def test_cleanup3d_engines_reasons(env, small_klein):
+    tmp, cfg = env
+    md = Path(cfg["models_dir"])
+    e = G.cleanup3d_engines(cfg)
+    assert set(e) == {"lama", "qwen21_edit", "klein_restore"} and not e["lama"]["ok"] and not e["klein_restore"]["ok"]
+    assert e["lama"]["reason"].startswith("Brak modelu LaMa") and "Doktor → „Zainstaluj”" in e["lama"]["reason"]
+    r = e["klein_restore"]["reason"]
+    assert r.startswith("Brak modelu FLUX 3 Image Klein + LoRA Restore: ") and "(+2)" in r
+    assert "Doktor → „Zainstaluj FLUX 3 Image Klein” i „Zainstaluj LoRA Restore (FLUX 3 Image Klein)”" in r
+    assert len(e["klein_restore"]["missing"]) == 4
+    _touch(md / "inpaint" / "big-lama.pt")
+    for folder, fn, *_ in G.KLEIN_FILES.values():
+        _touch(md / folder / fn, 4)
+    e = G.cleanup3d_engines(cfg)
+    assert e["lama"] == {"ok": True, "reason": "", "missing": []}
+    assert not e["klein_restore"]["ok"] and e["klein_restore"]["missing"] == ["loras/flux-3-image-klein-restore.safetensors"]
+    assert e["klein_restore"]["reason"].startswith("Brak modelu LoRA Restore (FLUX 3 Image Klein): loras/")
+    assert "„Zainstaluj FLUX 3 Image Klein”" not in e["klein_restore"]["reason"]
+    folder, fn, *_ = G.KLEIN_LORA["lora"]
+    _touch(md / folder / fn, 4)
+    assert G.cleanup3d_engines(cfg)["klein_restore"] == {"ok": True, "reason": "", "missing": []}
+
+
+def test_cleanup3d_qwen21_gate(env, monkeypatch):
+    """Qwen-Image-2.1 (user 2026-11-10): three files of Comfy-Org/Qwen-Image-2.1 (the ones remove_test.py mode q21 ran)."""
+    tmp, cfg = env
+    md = Path(cfg["models_dir"])
+    assert {k: v[1] for k, v in G.QWEN21_FILES.items()} == {
+        "vae": "qwen_image_2.1_vae_bf16.safetensors", "text_encoder": "qwen3vl_8b_int8_convrot.safetensors",
+        "unet": "qwen_image_2.1_int8_convrot.safetensors"}
+    assert all(v[2] == "Comfy-Org/Qwen-Image-2.1" for v in G.QWEN21_FILES.values())
+    monkeypatch.setattr(G, "QWEN21_FILES", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.QWEN21_FILES.items()})
+    e = G.cleanup3d_engines(cfg)["qwen21_edit"]
+    assert not e["ok"] and len(e["missing"]) == 3 and "(+1)" in e["reason"]
+    assert e["reason"].startswith("Brak modelu Qwen-Image-2.1: ") and e["reason"].endswith(
+        "Doktor → „Zainstaluj Qwen-Image-2.1”")
+    rows = G.qwen21_status(md)
+    assert rows[0]["url"] == ("https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/"
+                              "qwen_image_2.1_vae_bf16.safetensors")
+    for folder, fn, *_ in G.QWEN21_FILES.values():
+        _touch(md / folder / fn, 4)
+    folder, fn, *_ = G.QWEN21_FILES["unet"]
+    _touch(md / folder / fn, 1)                                   # truncated = not there
+    assert G.cleanup3d_engines(cfg)["qwen21_edit"]["missing"] == [f"{folder}/{fn}"]
+    _touch(md / folder / fn, 4)
+    assert G.cleanup3d_engines(cfg)["qwen21_edit"] == {"ok": True, "reason": "", "missing": []}
+    assert "models_dir" in G.cleanup3d_engines({"comfy_dir": cfg["comfy_dir"]})["qwen21_edit"]["reason"]
+
+
+def test_cleanup3d_engines_truncated_file_and_no_models_dir(env, small_klein, monkeypatch):
+    tmp, cfg = env
+    md = Path(cfg["models_dir"])
+    for folder, fn, *_ in list(G.KLEIN_FILES.values()) + list(G.KLEIN_LORA.values()):
+        _touch(md / folder / fn, 4)
+    folder, fn, *_ = G.KLEIN_FILES["unet"]
+    _touch(md / folder / fn, 1)                                   # much smaller than expected = not there
+    assert G.cleanup3d_engines(cfg)["klein_restore"]["missing"] == [f"{folder}/{fn}"]
+    e = G.cleanup3d_engines({"comfy_dir": cfg["comfy_dir"]})
+    assert "models_dir" in e["lama"]["reason"] and "models_dir" in e["klein_restore"]["reason"]
+    monkeypatch.setenv("MD_MODEL_GATE", "0")
+    assert all(v["ok"] for v in G.cleanup3d_engines({}).values())
+    assert G.cleanup3d_solve({})["ok"]
+
+
+def test_cleanup3d_engines_match_contract_and_solve(env, monkeypatch):
+    from engine.cleanup3d.types import ENGINES
+    from engine import installer
+    tmp, cfg = env
+    assert set(G.cleanup3d_engines(cfg)) == set(ENGINES)
+    monkeypatch.setattr(installer, "COLMAP_DIR", tmp / "bin" / "colmap")
+    s = G.cleanup3d_solve(cfg)
+    assert not s["ok"] and s["reason"] == "Brak programu COLMAP (CUDA) – Doktor → „Zainstaluj COLMAP (CUDA)”"
+    _touch(tmp / "bin" / "colmap" / "bin" / "colmap.exe")
+    assert G.cleanup3d_solve(cfg)["ok"]

@@ -132,7 +132,7 @@ def test_skipped_sections_equal_the_group_formula():
 
 
 def test_nk_route_gives_pasteable_group_with_the_object_knobs(client):
-    """The palette's „⧉ Nuke” button (2026-10-30): clipboard text of the group with the stored knobs + a file copy."""
+    """The palette's „⇪ Export” button (2026-10-30, „⧉ Nuke” until 2026-11-16): clipboard text of the group with the stored knobs + a file copy."""
     client.put("/api/object/Hair 2/merge_matte", json={"knobs": {"darken": 0.25}})
     r = client.get("/api/object/Hair 2/merge_matte/nk").json()
     assert r["node"] == "MergeMatte_Hair_2"
@@ -158,3 +158,45 @@ def test_defaults_are_a_plain_over():
     for n, *_ in mmnk.KNOB_SPECS:   # every amount knob is 0 at its default
         if n in ("decon", "darken", "match", "wrap", "flare", "bleed", "edge_blur", "choke", "soften"):
             assert mmnk.KNOB_DEFAULTS[n] == 0, n
+
+
+# ---------------------------------------------------------------- „tło w krawędzi” (PLAN_FINAL_TOUCH §11 step 5, 2026-11-06)
+def _sky_edge():
+    """A dark object on a white sky with a soft edge: plate = α·F + (1 − α)·sky (display sRGB, the way the camera mixes)."""
+    yy, xx = np.mgrid[0:H, 0:W]
+    a = np.clip((40 - np.hypot(xx - 80, yy - 60)) / 12, 0, 1).astype(np.float32)
+    f = np.array([0.20, 0.12, 0.08], np.float32)
+    sky = np.array([0.95, 0.97, 1.0], np.float32)
+    return a[..., None] * f + (1 - a[..., None]) * sky, a, f, sky
+
+
+def test_edge_bg_zero_on_the_same_background_and_a_halo_on_a_dark_one():
+    plate, a, f, sky = _sky_edge()
+    # comp over the very sky it was shot on = the clean edge: nothing to measure
+    same = mm.edge_bg(plate, a, plate, sky)
+    assert same["band_px"] > 100 and abs(same["mean_abs"]) < 0.5 and abs(same["luma"]) < 0.5
+    # plain over a navy background: the sky carried by the soft edge = a bright halo
+    navy = mm.hex_srgb("#1b2a4a")
+    r = mm.edge_bg_region(plate, a, navy, mmnk.KNOB_DEFAULTS)
+    assert r["before"] == r["after"]                                  # neutral knobs = the plain Merge over
+    assert r["before"]["mean_abs"] > 10 and r["before"]["luma"] > 10  # % of full scale, brighter than clean
+    # decontaminate + darken (the hair preset) take most of it away
+    fixed = mm.edge_bg_region(plate, a, navy, {**mmnk.KNOB_DEFAULTS, "log_curve": "none", "decon": 1.0, "decon_spread": 30.0,
+                                                 "darken": 1.0, "darken_width": 10.0})["after"]
+    assert fixed["mean_abs"] < 0.6 * r["before"]["mean_abs"] and fixed["luma"] < 0.5 * r["before"]["luma"]
+    # no band / no interior: nothing to say
+    assert mm.edge_bg(plate, np.ones_like(a), plate, sky)["mean_abs"] is None
+
+
+def test_edge_bg_route(client):
+    plate, a, bgp = client.scene
+    d = client.get("/api/object/o/merge_matte/edge_bg/1?bg=%231b2a4a").json()
+    assert set(d) == {"before", "after", "scale"} and d["before"]["band_px"] > 0 and d["scale"] == 1.0
+    d2 = client.get("/api/object/o/merge_matte/edge_bg/1?x=40&y=20&w=80&h=80&bg=checker").json()
+    assert d2["before"]["band_px"] > 0
+    assert client.get("/api/object/o/merge_matte/edge_bg/1?bg=zz").status_code == 400
+
+
+def test_palette_has_the_edge_bg_button():
+    js = (Path(__file__).resolve().parent.parent / "static" / "mergematte.js").read_text(encoding="utf-8")
+    assert 'id="mmEdgeBg"' in js and "/merge_matte/edge_bg/" in js and "measureEdge()" in js

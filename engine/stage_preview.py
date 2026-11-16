@@ -52,7 +52,7 @@ def window(frames: Sequence[int], f: int, half: int) -> List[int]:
 
 def preview_sig(store: Any, name: str, stage: str) -> str:
     """What the preview depends on: the mask 1+2 and the stage settings (+ the base of ViTMatte / VideoMaMa)."""
-    from engine.stages import mask_sig, matte_sig, settings_sig, stage_run, vitmatte_base
+    from engine.stages import mask_sig, settings_sig, stage_run, vitmatte_base
     obj = store.get(name)
     parts: List[Any] = [stage, mask_sig(store, name)]
     if stage == "matanyone":

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")  # the venv of a fresh install has no torch (it lives in the ComfyUI Python)
 
 REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / "handoff" / "comfy" / "custom_nodes" / "ComfyUI-MatAnyone2-Keyframes"
@@ -377,7 +378,7 @@ def test_fixed_scale_skips_probe_and_logs_vram(tmp_path):
     D = refine_mod.ma_node_defaults()
     assert all(v["inputs"]["vram_release_frac"] == D["vram_release_frac"] and v["inputs"]["max_mem_frames"] == D["max_mem_frames"]
                for g in graphs for v in g.values() if v["class_type"] == "MatAnyone2RunKeyframes")
-    assert rep.vram_log and all("wybrana, bez próby" in s and "VRAM 11.5 GB" in s for s in rep.vram_log)
+    assert rep.vram_log and all("wybrana, bez próby" in s and "VRAM (szczyt karty) 11.5 GB" in s for s in rep.vram_log)   # format of 3d707b4 (peak sampled during the pass)
     run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert run["ma_scale_mode"] == "0.75" and run["params"]["ma_scale_mode"] == "0.75"
     # NEW_INFO = a 1.1.x node (no keyframe_anchor input): only the inputs that node has are sent and recorded
@@ -392,7 +393,12 @@ def test_auto_probes_from_full_scale_each_time(tmp_path):
     pipe.run_core("puppet", frames)
     pipe.store.update("puppet", ma_scale=0.5)                         # stored by an earlier fixed 0.5 run
     full, rep, run_dir = pipe.finalize("puppet", frames, edge_mode="matanyone")
-    assert rep.ma_scale_mode == "auto" and rep.ma_scale == 1.0 and len(rep.vram_log) == 1 and rep.ma_node == {}
+    assert rep.ma_scale_mode == "auto" and rep.ma_scale == 1.0 and rep.ma_node == {}
+    # 3d707b4: the trial at 1.0 (one line, it fits) + the full pass's peak of every segment
+    probe = [s for s in rep.vram_log if ": przebieg – " not in s]
+    passes = [s for s in rep.vram_log if ": przebieg – " in s]
+    assert len(probe) == 1 and probe[0].startswith("ma_scale 1.0: VRAM (szczyt karty)")
+    assert len(passes) == len(pipe.segments("puppet")) and all(s.startswith("ma_scale 1.0 s") for s in passes)
     assert all("vram_release_frac" not in v["inputs"] for g in _ma_graphs(client) for v in g.values()
                if v["class_type"] == "MatAnyone2RunKeyframes")
 

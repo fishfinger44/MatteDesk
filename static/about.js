@@ -5,6 +5,7 @@
   // Fill in before the public release; an empty link is hidden.
   const LINKS = {
     repo: 'https://github.com/fishfinger44/MatteDesk',
+    site: 'https://lech.dfstudio.eu/#tools',   // the author's page – tools and (later) the tutorials (2026-11-15)
     support: 'https://ko-fi.com/fishfinger',
   };
 
@@ -38,7 +39,7 @@
     upBtn.disabled = true;
     upStatus.textContent = 'Sprawdzam…';
     let u = null;
-    try { u = await (await fetch('/api/update?force=1')).json(); } catch (e) { u = null; }
+    try { u = await window.UI.api('GET', '/api/update?force=1'); } catch (e) { u = null; }
     upBtn.disabled = false;
     if (u && u.available) { show(false); window.viewer.checkUpdate(true, u); }
     const v = window.viewer;

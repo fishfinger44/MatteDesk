@@ -89,7 +89,8 @@ def test_ma_scale_steps_down_when_vram_high(tmp_path):
     shot, pipe, client, frames = _setup(tmp_path, n=12, vram_gb=11.5)
     pipe.run_core("puppet", frames)
     full, rep, run_dir = pipe.finalize("puppet", frames, edge_mode="matanyone")
-    assert rep.ma_scale == 0.5 and len(rep.vram_log) == 3
+    # 3 trials + the full pass's peak (2026-11-07: the pass is measured too, NEXT_STEPS MatAnyone2 pt 2)
+    assert rep.ma_scale == 0.5 and len(rep.vram_log) == 4 and "przebieg" in rep.vram_log[-1]
     assert min(iou(full[f] > 0.5, shot.masks[f] > 0.5) for f in frames) >= 0.9
 
 
@@ -201,3 +202,22 @@ def test_e3_real_figure_iou_vs_v5():
     print("objects", names, "IoU min", min(ious), "mean", np.mean(ious), "nest zone", zone is not None, "VRAM", vram)
     assert zone is not None, "paint matte_desk/qa/nest_zone.png (nest bottom) to finish the E3 criterion"
     assert min(ious) >= 0.95
+
+
+def test_probe_reads_the_peak_during_the_trial_not_after_2026_11_07():
+    """sh060 2026-11-07: the probe read VRAM after the trial, when Comfy's cache was already released – always ~0 GB.
+    The sampler keeps the peak seen while the block runs, even if the memory is gone at the end."""
+    import time as _t
+    from engine.refine import vram_peak_sampler
+
+    class C:
+        v = 1.0
+
+        def get_system_stats(self):
+            return {"devices": [{"vram_total": 24 * 2 ** 30, "vram_free": int((24 - self.v) * 2 ** 30)}]}
+    c = C()
+    with vram_peak_sampler(c) as pk:
+        c.v = 13.0
+        _t.sleep(1.2)
+        c.v = 0.5            # released before the block ends
+    assert abs(pk.peak - 13.0) < 0.01

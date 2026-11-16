@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 
 from app import app, STATE
 from engine.clean import DeflickerMetrics
+from synth import align_texture   # textured set: the alignment needs texture in the static area (NO_TEXTURE, 2026-11-03)
+
 
 
 @pytest.fixture
@@ -98,13 +100,13 @@ def test_api_plate_align_lifecycle(client, tmp_path):
 
     # Create dummy beauty and backlit frames
     for f in range(1, 4):
-        b_img = np.zeros((100, 100, 3), dtype=np.float32)
-        b_img[30:70, 30:70] = 1.0
+        b_img = align_texture(200, 200)   # >= 6 control points at the evaluator's 12 px grid (scale 0.5)
+        b_img[60:140, 60:140] = 1.0
         cv2.imwrite(str(plates_dir / f"b_{f:04d}.exr"), b_img)
 
         # Aux with 2px shift
-        a_img = np.zeros((100, 100, 3), dtype=np.float32)
-        a_img[32:72, 30:70] = 1.0
+        a_img = np.zeros_like(b_img)
+        a_img[2:] = b_img[:-2]
         cv2.imwrite(str(plates_dir / f"x2_{f:04d}.exr"), a_img)
 
     manifest_data = {
@@ -112,8 +114,8 @@ def test_api_plate_align_lifecycle(client, tmp_path):
         "fps": 24,
         "first": 1,
         "last": 3,
-        "plate_w": 100,
-        "plate_h": 100,
+        "plate_w": 200,
+        "plate_h": 200,
         "colorspace": "ACES2065-1",
         "plates": {
             "beauty": str(plates_dir / "b_####.exr"),

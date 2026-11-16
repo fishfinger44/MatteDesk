@@ -158,7 +158,8 @@ def test_api_project_json_auto_8bit_kill_switch_and_stale(tmp_path, monkeypatch)
     d = api.put("/api/project/mask_plate_denoise", json={"setting": "on"}).json()
     assert d["effective"] is True and d["stale_objects"] == [] and app_module._pipeline().use_mplate
     # global kill-switch (defaults.json mplate.enabled = false) wins over "on"
-    monkeypatch.setattr(app_module, "_mplate_global_enabled", lambda: False)
+    off = {**app_module.load_defaults(), "mplate": {"enabled": False}}            # one source: the API and the pipeline
+    monkeypatch.setattr(app_module, "load_defaults", lambda *a, **k: off)
     d = api.get("/api/project/mask_plate_denoise").json()
     assert d["setting"] == "on" and d["effective"] is False and not d["global_enabled"]
     assert app_module._pipeline().loader.mplate_dir is None

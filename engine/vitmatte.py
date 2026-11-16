@@ -22,9 +22,6 @@ Contract (same as the other zone engines): image crop (display BGR float 0..1) +
 from __future__ import annotations
 
 import atexit
-import json
-import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -32,6 +29,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+
+from engine.worker_proto import CHECK_CACHE, WorkerProcess, check_worker
 
 DEFAULT_MODEL = "hustvl/vitmatte-base-composition-1k"
 MODELS = {                      # zone params.vitmatte_model (Nuke node: "High detail" = large ~ our base)
@@ -52,7 +51,7 @@ PAD_MULTIPLE = 32          # ViTMatte (ViT-B/16 + window attention): input side 
 
 # run with -I: the worker sits in engine/, where engine/queue.py would shadow the stdlib `queue`
 WORKER = Path(__file__).resolve().parent / "vitmatte_worker.py"
-_CHECK_CACHE: Dict[str, Tuple[bool, str, List[str]]] = {}
+_CHECK_CACHE = CHECK_CACHE
 
 
 def prepare_input(img_bgr: np.ndarray, trimap_u8: np.ndarray, unknown_value: float = 0.5) -> np.ndarray:
@@ -131,7 +130,8 @@ class VitMatteRunner:
                 t0 = time.time()
                 if self.device is None:
                     self.device = "cuda" if torch.cuda.is_available() else "cpu"
-                m = VitMatteForImageMatting.from_pretrained(self.model_id).eval().to(self.device)
+                from engine.weights_find import resolve   # a folder already in ComfyUI's models, else HF
+                m = VitMatteForImageMatting.from_pretrained(resolve(self.model_id)).eval().to(self.device)
                 self._model = m
                 self.load_seconds = time.time() - t0
         return self._model
@@ -185,28 +185,26 @@ def check_worker_python(python: Optional[Union[str, Path]], model_ids: Optional[
                         env: Optional[Dict[str, str]] = None,
                         worker: Path = WORKER) -> Tuple[bool, str, List[str]]:
     """(ok, device or the reason, model ids already in the HF cache): can ComfyUI's Python run `worker`
-    (ViTMatte by default; engine/birefnet.py passes its own)? Cached per interpreter (the installer clears `_CHECK_CACHE`)."""
-    if not python or not Path(python).exists():
-        return False, "nie znaleziono Pythona ComfyUI (ustaw comfy_dir / comfy_python)", []
-    ids = list(model_ids or MODELS.values())
-    key = str(python) + "|" + str(worker) + "|" + ",".join(ids)
-    if key not in _CHECK_CACHE:
-        try:
-            r = subprocess.run([str(python), "-I", str(worker), "--check", *ids], capture_output=True, text=True,
-                               timeout=180, env=env)
-            out = (r.stdout or r.stderr or "").strip()
-            if r.returncode == 0 and out.startswith("ok"):
-                parts = out.split()
-                cached = next((p[len("cached="):] for p in parts if p.startswith("cached=")), "")
-                _CHECK_CACHE[key] = (True, parts[1] if len(parts) > 1 else "?", [c for c in cached.split(",") if c])
-            else:
-                _CHECK_CACHE[key] = (False, out[-300:] or f"kod {r.returncode}", [])
-        except Exception as e:
-            _CHECK_CACHE[key] = (False, str(e), [])
-    return _CHECK_CACHE[key]
+    (ViTMatte by default; engine/birefnet.py passes its own)?"""
+    ok, out = check_worker(python, worker, list(model_ids or MODELS.values()), env)
+    if not ok:
+        return False, out, []
+    parts = out.split()
+    cached = next((p[len("cached="):] for p in parts if p.startswith("cached=")), "")
+    return True, parts[1] if len(parts) > 1 else "?", [c for c in cached.split(",") if c]
 
 
-class ComfyVitMatteRunner:
+def job_cancel_check() -> None:
+    """„Przerwij” for a call waiting on a worker: raises JobCancelled when the running job was cancelled. Outside a
+    running job nothing: the cancel flag stays set until the next job starts and a pool thread can keep the id of a
+    finished job – a background call must not die of either."""
+    from engine.jobs import JOBS
+    jid = JOBS.current_id()
+    if jid and any(j["id"] == jid for j in JOBS.running()):
+        JOBS.check()
+
+
+class ComfyVitMatteRunner(WorkerProcess):
     """ViTMatte in ComfyUI's Python: one long-lived worker per model id (model loaded once), restarted if it dies.
     Same `run()` contract and attributes as `VitMatteRunner`."""
 
@@ -219,15 +217,10 @@ class ComfyVitMatteRunner:
 
     def __init__(self, model_id: str = DEFAULT_MODEL, python: Optional[Union[str, Path]] = None,
                  env: Optional[Dict[str, str]] = None, timeout_s: float = 600.0):
+        super().__init__(python if python else worker_python(), env, timeout_s)
         self.model_id = model_id
-        self.python = str(python) if python else (str(worker_python()) if worker_python() else "")
-        self.env = env
-        self.timeout_s = timeout_s
         self.device: Optional[str] = None
         self.load_seconds = 0.0
-        self._proc: Optional[subprocess.Popen] = None
-        self._dir: Optional[tempfile.TemporaryDirectory] = None
-        self._log = None
         self._lock = threading.Lock()
         self._n = 0
         # A6: prepare / npy_write / worker_read / worker_forward / worker_load / worker_write / ipc_wait (request wall
@@ -238,62 +231,23 @@ class ComfyVitMatteRunner:
         ok, why, _ = check_worker_python(self.python, [self.model_id], env=self.env, worker=self.worker)
         return (ok, "" if ok else f"{self.label} niedostępny w Pythonie ComfyUI: {why}")
 
-    def _start(self) -> None:
-        if self._dir is None:
-            self._dir = tempfile.TemporaryDirectory(prefix=self.tmp_prefix)
-        if self._log is None:
-            self._log = open(Path(self._dir.name) / "worker.log", "a+", encoding="utf-8", errors="replace")
-        self._proc = subprocess.Popen([self.python, "-I", str(self.worker), "--serve", self.model_id],
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True,
-                                      bufsize=1, env=self.env)
-
-    def _log_tail(self) -> str:
-        try:
-            self._log.flush()
-            self._log.seek(0)
-            return self._log.read()[-600:].strip()
-        except Exception:
-            return ""
-
-    def _request(self, x_path: Path, out_path: Path) -> Dict[str, Any]:
-        if self._proc is None or self._proc.poll() is not None:
-            if not self.python or not Path(self.python).exists():
-                raise RuntimeError(f"{self.label}: nie znaleziono Pythona ComfyUI (Doktor → „{self.doctor_item}”)")
-            self._start()
-        result: Dict[str, Any] = {}
-
-        def read():
-            result["line"] = self._proc.stdout.readline()
-
-        self._proc.stdin.write(json.dumps({"x": str(x_path), "out": str(out_path)}) + "\n")
-        self._proc.stdin.flush()
-        th = threading.Thread(target=read, daemon=True)
-        th.start()
-        th.join(self.timeout_s)
-        line = result.get("line")
-        if not line:
-            alive = self._proc.poll() is None
-            tail = self._log_tail()
-            self.close()
-            raise RuntimeError(f"{self.label} (Python ComfyUI) " +("nie odpowiedział w czasie" if alive else "zakończył się")
-                               + f": {tail}")
-        return json.loads(line)
+    def serve_args(self) -> Tuple[str, ...]:
+        from engine.weights_find import resolve   # a folder already in ComfyUI's models (2026-11-10), else the HF id
+        return ("--serve", resolve(self.model_id))
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         """(H', W', 4) -> (H', W') alpha; an (N, H', W', 4) stack -> (N, H', W') (every tile its own forward)."""
         from engine.gpu_manager import GPU
         with GPU.use(self, self.label, self.close), self._lock:
-            if self._dir is None:
-                self._dir = tempfile.TemporaryDirectory(prefix=self.tmp_prefix)
             self._n += 1
-            x_path = Path(self._dir.name) / f"x_{self._n}.npy"
-            out_path = Path(self._dir.name) / f"a_{self._n}.npy"
+            x_path = self.tmp_dir() / f"x_{self._n}.npy"
+            out_path = self.tmp_dir() / f"a_{self._n}.npy"
             t0 = time.perf_counter()
             np.save(x_path, np.ascontiguousarray(x, dtype=np.float32))
             prof_add(self, "npy_write", time.perf_counter() - t0)
             try:
                 t0 = time.perf_counter()
-                resp = self._request(x_path, out_path)
+                resp = self.request({"x": str(x_path), "out": str(out_path)}, job_cancel_check)
                 wall = time.perf_counter() - t0
                 if not resp.get("ok"):
                     raise RuntimeError(f"{self.label} (Python ComfyUI): {resp.get('error')}")
@@ -349,23 +303,6 @@ class ComfyVitMatteRunner:
         prof_add(self, "finish", time.perf_counter() - t0)
         return res
 
-    def close(self) -> None:
-        """Stop the worker (frees its GPU memory); the next `run` starts a new one."""
-        p, self._proc = self._proc, None
-        if p is not None and p.poll() is None:
-            try:
-                p.stdin.write(json.dumps({"op": "quit"}) + "\n")
-                p.stdin.flush()
-                p.wait(timeout=10)
-            except Exception:
-                p.kill()
-                p.wait()
-        log, self._log = self._log, None
-        if log is not None:
-            log.close()
-        d, self._dir = self._dir, None
-        if d is not None:
-            d.cleanup()
 
 
 _RUNNERS: Dict[str, Any] = {}
@@ -379,19 +316,32 @@ def get_runner(model_id: str = DEFAULT_MODEL) -> Any:
         if VitMatteRunner.available()[0]:
             r = VitMatteRunner(model_id)
         else:
-            r = ComfyVitMatteRunner(model_id)
-            ok, why = r.available()
-            if not ok:
-                raise RuntimeError(f"{why} – Doktor → „Model: ViTMatte” → Zainstaluj")
+            return pooled_comfy_runner(_RUNNERS, ComfyVitMatteRunner, model_id)
         _RUNNERS[model_id] = r
     return r
 
 
-def close_runners() -> None:
-    for r in list(_RUNNERS.values()):
+def pooled_comfy_runner(pool: Dict[str, Any], cls: Any, model_id: str) -> Any:
+    """The process-wide worker runner of `cls` per model id; RuntimeError naming the Doctor item when it cannot run."""
+    r = pool.get(model_id)
+    if r is None:
+        r = cls(model_id)
+        ok, why = r.available()
+        if not ok:
+            raise RuntimeError(f"{why} – Doktor → „{r.doctor_item}”")
+        pool[model_id] = r
+    return r
+
+
+def close_pool(pool: Dict[str, Any]) -> None:
+    for r in list(pool.values()):
         if hasattr(r, "close"):
             r.close()
-    _RUNNERS.clear()
+    pool.clear()
+
+
+def close_runners() -> None:
+    close_pool(_RUNNERS)
 
 
 atexit.register(close_runners)

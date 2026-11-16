@@ -166,6 +166,89 @@ def test_alphagen_run_batches_crossfade_padding(tmp_path):
     assert [b["frames"] for b in gen.log] == [list(b) for b in L.batches(40, 17, 4)]
 
 
+def _links_ok(g):
+    for nid, n in g.items():
+        for v in n["inputs"].values():
+            if isinstance(v, list):
+                assert v[0] in g, (nid, v)
+
+
+def test_graph_empty_prompt_file_load_and_save():
+    """2026-11-06: the empty prompt encoded once - load = no CLIPLoader / CLIPTextEncode (no Gemma), the conditioning
+    node feeds LTXVConditioning; save = the Gemma graph unchanged plus the save node on both encodes."""
+    base = L.alphagen_graph("C:/x/g_####.exr", 41, 800, 736, "p")
+    ld = L.alphagen_graph("C:/x/g_####.exr", 41, 800, 736, "p", cond_load="C:/m/ltx_conditioning/te.safetensors")
+    kinds = {v["class_type"] for v in ld.values()}
+    assert not kinds & {"CLIPLoader", "CLIPTextEncode", "ConditioningPairSave"}
+    nid = next(k for k, v in ld.items() if v["class_type"] == "ConditioningPairLoad")
+    cond = next(v["inputs"] for v in ld.values() if v["class_type"] == "LTXVConditioning")
+    assert cond["positive"] == [nid, 0] and cond["negative"] == [nid, 1] and cond["frame_rate"] == 24.0
+    _links_ok(ld)
+    assert {k: v for k, v in ld.items() if k not in ("32", "35", "36", "37", nid)} == \
+           {k: v for k, v in base.items() if k not in ("32", "35", "36", "37")}   # the rest of the recipe untouched
+    sv = L.alphagen_graph("C:/x/g_####.exr", 41, 800, 736, "p", cond_save="C:/m/c.safetensors")
+    save = next(v["inputs"] for v in sv.values() if v["class_type"] == "ConditioningPairSave")
+    by = {v["class_type"]: k for k, v in sv.items() if v["class_type"] == "CLIPTextEncode" and v["inputs"]["text"] == ""}
+    assert save["positive"] == [by["CLIPTextEncode"], 0] and save["path"] == "C:/m/c.safetensors"
+    assert {k: v for k, v in sv.items() if v["class_type"] != "ConditioningPairSave"} == base
+    _links_ok(sv)
+    assert L.cond_file(None) is None
+    assert L.cond_file(Path("C:/m")).name == Path(L.LTX_MODELS["text_encoder"][1]).stem + ".empty_prompt.safetensors"
+    assert L.cond_file(Path("C:/m"), "other.safetensors") != L.cond_file(Path("C:/m"))   # one file per encoder
+
+
+def test_alphagen_encodes_once_then_loads(tmp_path):
+    from mock_comfy import MockComfyClient
+    rec, saved = [], []
+    cond = tmp_path / "models" / L.COND_DIR / "te.empty_prompt.safetensors"
+
+    def save(graph):
+        p = next(v["inputs"]["path"] for v in graph.values() if v["class_type"] == "ConditioningPairSave")
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        Path(p).write_bytes(b"x")
+        saved.append(p)
+    cl = MockComfyClient(handlers={"SaveImageAdvanced": _alphagen_handler(tmp_path / "out", rec), "ConditioningPairSave": save})
+    cl.output_root = tmp_path / "out"
+    s = L.ltx_settings({"ltx": {"max_frames": 17, "overlap": 4}})
+    g = [np.full((64, 64, 3), 0.5, np.float32)] * 40
+    gen = L.AlphaGen(cl, tmp_path / "io", s, cond_path=cond)
+    gen.run("t", g, (64, 64))
+    assert [b["prompt"] for b in gen.log] == ["gemma+save"] + ["file"] * (len(gen.log) - 1)
+    assert saved == [cond.resolve().as_posix()]
+    kinds = [{v["class_type"] for v in gr.values()} for gr in cl.sent]
+    assert "CLIPLoader" in kinds[0] and all("CLIPLoader" not in k and "ConditioningPairLoad" in k for k in kinds[1:])
+    gen0 = L.AlphaGen(cl, tmp_path / "io", s)                                    # no file given = Gemma every batch
+    gen0.run("u", g[:9], (64, 64))
+    assert [b["prompt"] for b in gen0.log] == ["gemma"]
+
+
+def test_conditioning_pair_node_roundtrip(tmp_path):
+    """The PlateMatte node file: tensors back bit-identical (dtype too), plain / None entries kept, no pickle."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pm_cond", ROOT / "handoff" / "comfy" / "custom_nodes" / "ComfyUI-PlateMatte" / "conditioning.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    g = torch.Generator().manual_seed(0)
+    pos = [[torch.randn(1, 7, 64, generator=g), {"pooled_output": None, "unprocessed_ltxav_embeds": True,
+                                                  "attention_mask": torch.ones(1, 7, dtype=torch.int64)}]]
+    neg = [[torch.randn(1, 3, 64, generator=g).to(torch.bfloat16), {"pooled_output": torch.randn(1, 8, generator=g)}]]
+    p = str(tmp_path / "sub" / "c.safetensors")
+    mod.ConditioningPairSave().save(pos, neg, p)
+    lp, ln = mod.ConditioningPairLoad().load(p)
+    for a, b in ((pos, lp), (neg, ln)):
+        assert len(a) == len(b)
+        for (ta, ea), (tb, eb) in zip(a, b):
+            assert ta.dtype == tb.dtype and torch.equal(ta, tb)
+            assert set(ea) == set(eb)
+            for k, v in ea.items():
+                assert (torch.equal(v, eb[k]) and v.dtype == eb[k].dtype) if isinstance(v, torch.Tensor) else v == eb[k]
+    with pytest.raises(ValueError, match="cannot be saved"):
+        mod.save_pair(p, [[torch.zeros(1), {"x": object()}]], neg)
+
+
 def test_alphagen_busy_and_error(tmp_path):
     from mock_comfy import MockComfyClient
     g = [np.zeros((64, 64, 3), np.float32)] * 9
@@ -198,6 +281,32 @@ def test_models_status_and_installer_urls(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="Hugging Face"):
         installer.install_ltx({"models_dir": str(tmp_path / "x")})
     assert L.missing_nodes({n: {} for n in L.LTX_NODES}) == [] and "LTXVAddGuide" in L.missing_nodes({})
+
+
+def test_gemma_not_needed_once_the_empty_prompt_is_saved(tmp_path):
+    """2026-11-06 (CLIP2_A: file = Gemma bit for bit): with the conditioning file the stage, the gate and the installer
+    no longer ask for the 15.4 GB text encoder."""
+    from engine import installer, stage_models
+    md = tmp_path / "models"
+    assert {m["key"] for m in L.missing_models(md)} == set(L.LTX_MODELS)
+    assert any("gemma" in f for f in stage_models.CHECKS["ltx"]({"models_dir": str(md)}))
+    cf = L.cond_file(md)
+    cf.parent.mkdir(parents=True)
+    cf.write_bytes(b"x")
+    st = {m["key"]: m for m in L.models_status(md)}
+    assert st["text_encoder"]["needed"] is False and all(m["needed"] for k, m in st.items() if k != "text_encoder")
+    assert "text_encoder" not in {m["key"] for m in L.missing_models(md)}
+    assert not any("gemma" in f for f in stage_models.CHECKS["ltx"]({"models_dir": str(md)}))
+    got = []
+
+    def fake(url, dst):
+        got.append(url)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(dst, "wb") as f:
+            f.truncate(1)
+    res = installer.install_ltx({"models_dir": str(md)}, download=fake)
+    assert len(got) == 4 and not any("gemma" in u for u in got)
+    assert any("niepotrzebne" in line for line in res["log"])
 
 
 # ----------------------------------------------------------------------------- the stage through the API

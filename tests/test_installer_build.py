@@ -176,3 +176,10 @@ def test_replace_old_server(monkeypatch):
     assert la.replace_old_server(old, ask=lambda t, flags=0: asked.append(t) or 7, stopper=stopper) is False
     assert "0.3" in asked[0] and "0.31" in asked[0] and not stopped
     assert la.replace_old_server(old, ask=lambda *a, **k: 6, stopper=stopper) is True and stopped
+    # 2026-11-10: the installed copy (0.32) must not replace a newer running checkout (0.60), even a stale one
+    stopped.clear()
+    monkeypatch.setattr(la, "disk_version", lambda app_dir=None: "0.32")
+    newer = lambda p: {"version": "0.60", "stale": True} if p == "/api/version" else {"jobs": []}
+    assert la.replace_old_server(newer, ask=lambda *a, **k: pytest.fail("asked"), stopper=stopper) is False
+    assert not stopped
+    assert la.version_key("0.4") == (0, 40) < la.version_key("0.41") and la.version_key("v0.60") == (0, 60)

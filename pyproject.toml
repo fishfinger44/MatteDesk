@@ -1,6 +1,6 @@
 [project]
 name = "matte_desk"
-version = "0.1.0"
+dynamic = ["version"]        # the version lives in the VERSION file (CLAUDE.md, tools/bump_version.py)
 description = "Interaktywne narzędzie do wycinania (alpha) z korektą klatek - MatteDesk"
 requires-python = ">=3.11"
 

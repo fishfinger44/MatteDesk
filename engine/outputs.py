@@ -8,20 +8,19 @@ Groups) records it here. Writes are atomic; unknown keys written by other module
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Union
+
+from engine.jsonio import StateFileError, read_state, write_json  # noqa: F401 - StateFileError: its public name here too
 
 OUTPUTS_SCHEMA = "matte_desk/outputs@1.0"
 
 
 def load_outputs(work_dir: Union[str, Path]) -> Dict[str, Any]:
+    """The registry; missing = empty. A corrupt file raises `StateFileError` (never `{}` + overwrite, audit 2026-11-02 #3)."""
     p = Path(work_dir) / "outputs.json"
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
+    data: Dict[str, Any] = read_state(p) or {}
     data.setdefault("schema", OUTPUTS_SCHEMA)
     data.setdefault("objects", [])
     return data
@@ -47,7 +46,5 @@ def _save(work_dir: Union[str, Path], data: Dict[str, Any]) -> Dict[str, Any]:
     data["updated_at"] = datetime.now().isoformat(timespec="seconds")
     p = Path(work_dir) / "outputs.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)
+    write_json(p, data, indent=2, ensure_ascii=False)
     return data

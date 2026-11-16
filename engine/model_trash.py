@@ -78,15 +78,54 @@ def _sapiens2(cfg):
     return _hf([DEFAULT_MODEL])
 
 
-def _minimax(cfg):
-    from engine.installer import HF_FOLDERS
-    md = _md(cfg)
-    p = md / HF_FOLDERS["minimax_weights"][2] if md else None
-    return [p] if p and p.is_dir() else []
-
-
 def _lama(cfg):
     return _files(cfg, ["inpaint/big-lama.pt"])
+
+
+def _klein(cfg):
+    from engine.stage_models import klein_tables   # both variants (bf16 / int8): whichever is on disk
+    rel = {f"{folder}/{fn}" for t in klein_tables().values() for folder, fn, *_rest in t.values()}
+    return _files(cfg, sorted(rel))
+
+
+def _klein_lora(cfg):
+    from engine.stage_models import KLEIN_LORA
+    return _files(cfg, [f"{folder}/{fn}" for folder, fn, *_rest in KLEIN_LORA.values()])
+
+
+def _qwen21(cfg):
+    from engine.stage_models import QWEN21_FILES
+    return _files(cfg, [f"{folder}/{fn}" for folder, fn, *_rest in QWEN21_FILES.values()])
+
+
+def _prompt_assist(cfg):
+    from engine import prompt_assist as PA
+    return _files(cfg, [f"{folder}/{fn}" for folder, fn, *_rest in PA.FILES.values()])
+
+
+def _vace(cfg):
+    from engine import vace_fill as VF   # the two experts only: umt5 / wan_2.1_vae are shared with other Wan models
+    return _files(cfg, [f"diffusion_models/{VF.HIGH}", f"diffusion_models/{VF.LOW}"] +
+                  [f"loras/{fn}" for fn in VF.LIGHTNING.values()])   # its Lightning LoRAs go with it
+
+
+def _ltx_inpaint(cfg):
+    from engine import ltx_fill as LF   # only the IC-LoRA: the LTX-2.5 base files are stage 7's (own trash entry)
+    return _files(cfg, [f"{LF.LORA[0]}/{LF.LORA[1]}"])
+
+
+def _void(cfg):
+    from engine.cleanup3d import void_engine as VE   # native (Comfy-Org): void_pass1 + its VAE; t5xxl is shared
+    return _files(cfg, [f"diffusion_models/{VE.VOID_NATIVE_UNET}", f"vae/{VE.VOID_NATIVE_VAE}"])
+
+
+def _seedvr2(cfg):
+    from engine.cleanup3d import void_engine as VE   # both variants (3B / 7B) – whichever is on disk – + the VAE
+    sub = VE.SEEDVR2_MODELS_SUB
+    return _files(cfg, [f"{sub}/{fn}" for fn, _gb in VE.SEEDVR2_DITS.values()] + [f"{sub}/{VE.SEEDVR2_VAE}"])
+
+
+KLEIN_AFFECTS = "silnik „FLUX 3 Image Klein + LoRA Restore” w Czyszczeniu 3D (dogenerowanie klucza; zostaje LaMa)"
 
 
 # key -> (label in the Doctor, what stops working, paths(cfg)); the order = the Doctor's list
@@ -96,8 +135,19 @@ MODELS: Dict[str, tuple] = {
     "matanyone2": ("MatAnyone2", "etap 3 „MatAnyone2” (i silnik MatAnyone2 w Eksperymentach)", _matanyone2),
     "vitmatte": ("ViTMatte", "silnik ViTMatte w etapie 5 (zostaje BiRefNet_HR-matting / Lucida)", _vitmatte),
     "sapiens2": ("Sapiens2-seg-0.4B", "przycisk „Zaproponuj pas (Sapiens2)”", _sapiens2),
-    "minimax_weights": ("MiniMax-Remover", "nic (Inpainting jeszcze nieużywany)", _minimax),
-    "lama": ("LaMa (big-lama)", "nic (Inpainting jeszcze nieużywany)", _lama),
+    "lama": ("LaMa (big-lama)", "LaMa w trybie „🧹 Czyszczenie” i dziury clean plate'u auto (zostaje OpenCV)", _lama),
+    "flux3_klein": ("FLUX 3 Image Klein", KLEIN_AFFECTS, _klein),
+    "klein_restore_lora": ("LoRA Restore (FLUX 3 Image Klein)", KLEIN_AFFECTS, _klein_lora),
+    "qwen21": ("Qwen-Image-2.1", "silnik „Qwen-Image-2.1” w Czyszczeniu 3D (dogenerowanie klucza; zostają LaMa i "
+               "FLUX 3 Image Klein + LoRA Restore)", _qwen21),
+    # 2026-11-11 (user): the new Cleanup models – shared encoders / VAEs of other models stay
+    "vace": ("Wan 2.2 Fun VACE", "silnik „Wan 2.2 Fun VACE” w Inpaint (C1) – zostaje MiniMax-H3", _vace),
+    "ltx_inpaint": ("LoRA inpaintu LTX-2.5", "silnik „LTX-2.5” w Inpaint (C1) – zostają MiniMax-H3 / Wan 2.2 Fun VACE",
+                    _ltx_inpaint),
+    "void": ("VOID (natywny, Comfy-Org)", "„VOID – wypełnienie ujęcia” w Czyszczeniu 3D (koder t5xxl zostaje)", _void),
+    "seedvr2": ("SeedVR2", "„SeedVR2: podbij klucze karty” (Czyszczenie 3D) i „⤴ Upscale” wersji w Inpaint", _seedvr2),
+    "prompt_assist": ("Qwen3-VL-4B (asystent opisu)", "„✨ Popraw opis” w Inpaint (zostaje sprawdzanie opisu bez modelu)",
+                      _prompt_assist),
 }
 
 

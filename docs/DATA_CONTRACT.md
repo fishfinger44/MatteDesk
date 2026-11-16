@@ -46,6 +46,15 @@ Generated from `engine/contract.py` (`python -m engine.contract docs`) – the s
   - `params_hash` (string, required)
   - `edge_mode` (string/null)
   - `members` (array) – a group entity (PLAN_GROUP_COMPOSE): its members – the matte is the group's whole (a stage computed on the whole, Final Touch, or the composition of the members with seams); one layer at its front-most member
+  - `final_touch` (object) – exported from Final Touch: the base version and the hash of the corrections
+    - `base` (string)
+    - `corrections_sig` (string)
+    - `nuke` (object) – Final Touch in the .nk (engine/ft_nuke): mode bake | grade | paint; for grade / paint the column reads `base_matte` (base [+ strokes], not cut by the objects in front) and `front_matte` (max of the front layers) and rebuilds the matte with live nodes; `requested` + `why` = a node mode that fell back to bake
+      - `mode` (enum) ∈ ['bake', 'grade', 'paint']
+      - `requested` (string)
+      - `why` (string)
+      - `base_matte` (string)
+      - `front_matte` (string)
 - `mattes_all` (string) – multi-EXR: <obj>.alpha (objects and groups), union.alpha, [depth.disparity]
 - `mattes_all_channels` (array) – multi-EXR layers in depth order (without `.alpha`)
 - `mattes_nk` (string) – Nuke script with the mask passes (MASKI backdrop, anchors + stamps) – File > Import Script
@@ -165,3 +174,76 @@ Generated from `engine/contract.py` (`python -m engine.contract docs`) – the s
 - `export_pattern` (string, required)
 - `value_min` (number, required)
 - `value_max` (number, required)
+
+## `matte_desk/camera3d@1.0` – 3D camera of the shot (`<work>/inpaint/camera3d/cams.json`)
+
+- `schema` (string, required)
+- `width` (integer, required)
+- `height` (integer, required)
+- `K` (array, required) – 3x3 intrinsics, plate pixels (one focal for the shot)
+- `dist` (array, required) – OpenCV distortion (k1, k2, p1, p2)
+- `frames` (array, required)
+  - `frame` (integer, required)
+  - `R` (array, required) – 3x3, X_cam = R @ X_world + t (x right, y down, z forward)
+  - `t` (array, required)
+- `source` (string)
+- `report` (object) – reprojection px, key projection error, horizon, worst frames
+
+## `matte_desk/cards3d@1.0` – Cards of the Cleanup projection (`<work>/inpaint/cards.json`)
+
+- `schema` (string, required)
+- `cards` (array, required)
+  - `id` (string, required)
+  - `name` (string)
+  - `kind` (enum, required) ∈ ['plane', 'sky', 'depth']
+  - `plane` (object/null) – n . X + d = 0, n toward the cameras; null for the sky; for a depth card the approximate plane of its surface (previews, Nuke export)
+  - `adjust` (object) – dh along the normal, pitch / roll in degrees
+  - `extent` (array) – areas (closed Bezier curves / brush layers) drawn once in extent_frame; empty = the whole card
+  - `extent_frame` (integer/null)
+  - `seam_px` (number)
+  - `order` (integer)
+  - `color` (string)
+  - `key_mode` (enum) ∈ ['manual', 'every', 'auto', 'one']
+  - `key_every` (integer)
+  - `warps` (object) – key frame -> edge warps (src / dst curves)
+  - `key_auto` (object) – key_mode auto: threshold, min_gap, max_gap, max_keys (missing = defaults)
+  - `off` (boolean) – P16 timeline eye: true = the card is left out of the render, the previews and the Nuke export (default false)
+  - `solo` (boolean) – P16 timeline solo, like After Effects: when any card has solo true, only the soloed cards that are not off go into the render, the previews and the Nuke export; written only when true (default false)
+  - `depth` (object) – only kind depth (P18): the surface of the reference frame's depth map
+    - `frame` (integer, required) – reference plate frame (the depth map's frame)
+    - `source` (enum) ∈ ['computed', 'plate'] – computed = DepthCrafter of the tool (outputs.json depth), plate = the shot's depth plate
+    - `conv` (enum) ∈ ['disparity', 'z'] – disparity: 1/z = scale d + offset; z: z = scale d + offset (z = camera-z depth of the reference view)
+    - `scale` (number)
+    - `offset` (number)
+    - `mul` (number) – user slider „Skala głębi”: z = mul z0 + shift
+    - `shift` (number) – user slider „Przesunięcie” (scene units)
+    - `edge` (number) – relative depth jump inside a pixel quad that splits the surface (occlusion edge)
+    - `file` (string/null) – snapshot of the reference depth (.npy float32, plate size), relative to <work>/inpaint/
+    - `stamp` (string)
+    - `fit` (object) – fit to the camera: method points | planes | none, anchors, inliers, err_rel, z_median
+
+## `matte_desk/card_key@1.0` – Key of a card (`<work>/inpaint/keys/<card>/k_####/key.json`; versions `v###.png` / `.exr` next to it)
+
+- `schema` (string, required)
+- `card` (string, required)
+- `frame` (integer, required)
+- `versions` (array, required)
+  - `v` (string, required)
+  - `ext` (string)
+  - `source` (string)
+  - `date` (string)
+- `active` (string/null)
+- `canvas` (object/null) – the key's own pinhole view when larger than the plate frame: w, h, K
+
+## `matte_desk/key_areas@1.0` – Areas of a key to regenerate (`<work>/inpaint/keys/<card>/k_####/areas.json`)
+
+- `schema` (string, required)
+- `card` (string)
+- `frame` (integer)
+- `areas` (array, required)
+  - `id` (string, required)
+  - `kind` (enum, required) ∈ ['curve', 'brush']
+  - `op` (enum) ∈ ['add', 'remove']
+  - `curve` (object) – engine/curves.py JSON, closed
+  - `png` (string)
+  - `label` (string)

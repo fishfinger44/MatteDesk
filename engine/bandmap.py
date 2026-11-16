@@ -60,11 +60,12 @@ def widths_at(p: Dict[str, Any], f: int) -> Tuple[float, float]:
     return float(k["out"]), float(k["in"])
 
 
-def angle_at(p: Dict[str, Any], f: int) -> float:
+def angle_at(p: Dict[str, Any], f: int, max_deg: float = MAX_ANGLE_DEG) -> float:
     """Tilt of the point's whisker pair in frame f (degrees, key "ang", 0 = along the outline's normal): the pair turns
-    rigidly round the point, + = toward the direction of the contour's arc. Linear between keys, held outside."""
+    rigidly round the point, + = toward the direction of the contour's arc. Linear between keys, held outside.
+    `max_deg`: ±80 for the stages; the Cleanup C1 band turns the whisker all round (180, 2026-11-15)."""
     ks = _keys_sorted(p)
-    a = lambda k: max(-MAX_ANGLE_DEG, min(MAX_ANGLE_DEG, float(k.get("ang", 0.0) or 0.0)))
+    a = lambda k: max(-max_deg, min(max_deg, float(k.get("ang", 0.0) or 0.0)))
     if f <= ks[0][0]:
         return a(ks[0][1])
     if f >= ks[-1][0]:
@@ -91,7 +92,8 @@ def static_positions(points: Sequence[Dict[str, Any]], frames: Sequence[int]) ->
 
 
 def points_at(points: Sequence[Dict[str, Any]], f: int,
-              positions: Dict[str, Tuple[float, float, bool]], s_out: float = 1.0, s_in: float = 1.0) -> List[PointAt]:
+              positions: Dict[str, Tuple[float, float, bool]], s_out: float = 1.0, s_in: float = 1.0,
+              max_angle: float = MAX_ANGLE_DEG) -> List[PointAt]:
     """Visible points of frame f with their widths (an occluded point does not shape the band). `s_out` / `s_in`: the
     zone sliders' scale (zones.band_scales) – the points shape the band, the sliders size it."""
     out: List[PointAt] = []
@@ -101,7 +103,7 @@ def points_at(points: Sequence[Dict[str, Any]], f: int,
             continue
         o, i = widths_at(p, f)
         t = (pos[0], pos[1], max(0.0, min(MAX_WIDTH_PX, o * s_out)), max(0.0, min(MAX_WIDTH_PX, i * s_in)))
-        a = angle_at(p, f)
+        a = angle_at(p, f, max_angle)
         out.append(t + (a,) if a else t)
     return out
 

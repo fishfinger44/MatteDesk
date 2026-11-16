@@ -7,6 +7,6 @@ import os
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
 # Unicode paths (e.g. "październik") – cv2.imread/imwrite on Windows fail silently without this
-from engine.cv2_unicode import install as _install_cv2_unicode  # noqa: E402
+from engine.cv2_unicode import install as _install_cv2_unicode
 
 _install_cv2_unicode()

@@ -240,7 +240,7 @@ def test_cotracker_runs_in_comfy_python_through_the_worker(tmp_path, monkeypatch
         "    out[f'visible_{i}'] = np.ones((T, N), bool)\n"
         "np.savez(sys.argv[2], **out)\n", encoding="utf-8")
     monkeypatch.setattr(tracking, "WORKER", fake)
-    monkeypatch.setitem(tracking._CHECK_CACHE, sys.executable, (True, "cpu"))
+    monkeypatch.setattr(tracking, "check_worker", lambda *a, **k: (True, "ok cpu"))
     ckpt = tmp_path / "scaled_offline.pth"
     ckpt.write_bytes(b"w")
     # persistent=False: this fake worker speaks the one-shot argv protocol (the served loop is tested with the real
@@ -264,17 +264,20 @@ def test_pending_restart_survives_a_matte_desk_restart(monkeypatch, tmp_path):
     assert installer.pending_restart("http://x") == {} and not (tmp_path / "pending.json").exists()
 
 
-def test_install_minimax_weights_downloads_all_files(tmp_path):
+def test_install_hf_folder_downloads_all_files(tmp_path, monkeypatch):
+    """HF_FOLDERS (multi-file weights): every file lands in its folder (empty since MiniMax-Remover was dropped
+    2026-11-09 – the mechanism stays for the next such model)."""
     got = []
 
     def fake_download(url, dst):
         got.append(url)
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(b"x")
-    r = installer.install_model({"models_dir": str(tmp_path)}, "minimax_weights", download=fake_download)
-    assert r["success"] and len(got) == 5 and all("zibojia/minimax-remover" in u for u in got)
-    assert (tmp_path / "MiniMax-Remover" / "transformer" / "diffusion_pytorch_model.safetensors").exists()
-    assert (tmp_path / "MiniMax-Remover" / "vae" / "config.json").exists()
+    monkeypatch.setitem(installer.HF_FOLDERS, "demo_weights",
+                        ("org/demo", ["transformer/config.json", "vae/config.json"], "Demo"))
+    r = installer.install_model({"models_dir": str(tmp_path)}, "demo_weights", download=fake_download)
+    assert r["success"] and len(got) == 2 and all("org/demo" in u for u in got)
+    assert (tmp_path / "Demo" / "transformer" / "config.json").exists() and (tmp_path / "Demo" / "vae" / "config.json").exists()
 
 
 def test_node_packages_survive_public_export_unchanged():
@@ -310,3 +313,183 @@ def test_readme_download_button_points_at_current_setup():
         assert ep.SETUP_LINK.search(text), name
     out = ep.setup_link("x releases/download/v0.31/MatteDesk-0.31-setup.exe y", "0.4")
     assert out == "x releases/download/v0.4/MatteDesk-0.4-setup.exe y"
+
+
+# --- Cleanup 3D (docs/PLAN_CLEANUP_3D.md, P3): FLUX 3 Image Klein, LoRA Restore, COLMAP (CUDA) -----------------------
+@pytest.fixture
+def small_klein(monkeypatch):
+    from engine import stage_models as G
+    monkeypatch.setattr(G, "KLEIN_FILES", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.KLEIN_FILES.items()})
+    monkeypatch.setattr(G, "KLEIN_LORA", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.KLEIN_LORA.items()})
+
+
+def _fake_dl(got):
+    def dl(url, dst):
+        got.append((url, dst))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"w" * 8)
+    return dl
+
+
+def test_install_flux3_klein_downloads_three_files_once(tmp_path, small_klein):
+    got = []
+    cfg = {"models_dir": str(tmp_path / "models")}
+    res = installer.install_flux3_klein(cfg, download=_fake_dl(got))
+    base = "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy/resolve/main/"
+    assert res["success"] and [u for u, _ in got] == [base + "vae/flux2-vae.safetensors",
+                                                     base + "text_encoders/qwen3vl_4b_bf16.safetensors",
+                                                     base + "diffusion_models/flux3-image-klein-bf16.safetensors"]
+    assert [d.relative_to(tmp_path / "models").as_posix() for _, d in got] == [
+        "vae/flux2-vae.safetensors", "text_encoders/qwen3vl_4b_bf16.safetensors",
+        "diffusion_models/flux3-image-klein-bf16.safetensors"]
+    again = installer.install_flux3_klein(cfg, download=lambda *a: pytest.fail("must not download twice"))
+    assert sum("już jest" in l for l in again["log"]) == 3
+
+
+def test_install_flux3_klein_gated_messages(tmp_path, small_klein, monkeypatch):
+    import urllib.error
+    cfg = {"models_dir": str(tmp_path / "models")}
+    monkeypatch.setattr(installer, "hf_token", lambda: None)
+    with pytest.raises(RuntimeError) as e:
+        installer.install_flux3_klein(cfg)
+    assert "hf auth login" in str(e.value) and "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy" in str(e.value)
+    assert "„gated”" in str(e.value)
+
+    def denied(url, dst):   # what engine/download.py raises on 401 / 403 from huggingface.co
+        raise RuntimeError("Hugging Face odmówił dostępu (401/403): zaloguj się („hf auth login”) i kliknij "
+                           "„Agree and Access” na stronie modelu (repo gated).")
+    with pytest.raises(RuntimeError) as e:
+        installer.install_flux3_klein(cfg, download=denied)
+    msg = str(e.value)
+    assert "odmówił dostępu do FLUX 3 Image Klein" in msg and "zaakceptuj dostęp" in msg
+    assert "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy" in msg
+
+    def http403(url, dst):
+        raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+    with pytest.raises(RuntimeError, match="odmówił dostępu do FLUX 3 Image Klein"):
+        installer.install_flux3_klein(cfg, download=http403)
+    with pytest.raises(RuntimeError, match="models_dir"):
+        installer.install_flux3_klein({}, download=_fake_dl([]))
+
+
+def test_install_klein_restore_lora(tmp_path, small_klein):
+    got = []
+    res = installer.install_klein_restore_lora({"models_dir": str(tmp_path / "models")}, download=_fake_dl(got))
+    assert res["success"] and got[0][0] == ("https://huggingface.co/ausboss/FLUX-3-Image-Klein-Restore-LoRA/resolve/main/"
+                                            "flux-3-image-klein-restore.safetensors")
+    assert got[0][1] == tmp_path / "models" / "loras" / "flux-3-image-klein-restore.safetensors"
+
+
+def test_install_actions_table():
+    assert set(installer.INSTALL_ACTIONS) == {"flux3_klein", "klein_restore_lora", "qwen21", "colmap", "seedvr2", "void",
+                                              "vace", "vace_lightning", "comfy_update", "comfy_rollback",
+                                              "prompt_assist", "ltx_inpaint"}
+
+
+def test_install_qwen21_downloads_three_files_once(tmp_path, monkeypatch):
+    """Qwen-Image-2.1 (Cleanup 3D, 2026-11-10): Comfy-Org/Qwen-Image-2.1, resumable, present files skipped."""
+    import urllib.error
+    from engine import stage_models as G
+    monkeypatch.setattr(G, "QWEN21_FILES", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.QWEN21_FILES.items()})
+    got = []
+    cfg = {"models_dir": str(tmp_path / "models")}
+    res = installer.install_qwen21(cfg, download=_fake_dl(got))
+    base = "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/"
+    assert res["success"] and [u for u, _ in got] == [base + "vae/qwen_image_2.1_vae_bf16.safetensors",
+                                                     base + "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+                                                     base + "diffusion_models/qwen_image_2.1_int8_convrot.safetensors"]
+    assert [d.relative_to(tmp_path / "models").as_posix() for _, d in got] == [
+        "vae/qwen_image_2.1_vae_bf16.safetensors", "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+        "diffusion_models/qwen_image_2.1_int8_convrot.safetensors"]
+    again = installer.install_qwen21(cfg, download=lambda *a: pytest.fail("must not download twice"))
+    assert sum("już jest" in l for l in again["log"]) == 3
+    assert installer.INSTALL_ACTIONS["qwen21"] is installer.install_qwen21
+
+    def http403(url, dst):
+        raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+    with pytest.raises(RuntimeError, match="odmówił dostępu do Qwen-Image-2.1"):
+        installer.install_qwen21({"models_dir": str(tmp_path / "m2")}, download=http403)
+    with pytest.raises(RuntimeError, match="models_dir"):
+        installer.install_qwen21({}, download=_fake_dl([]))
+
+
+def _colmap_zip(path: Path, with_exe: bool = True) -> None:
+    import zipfile
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("COLMAP-4.2.1-windows-cuda/COLMAP.bat", "@echo off")
+        if with_exe:
+            z.writestr("COLMAP-4.2.1-windows-cuda/bin/colmap.exe", "MZ")
+        z.writestr("COLMAP-4.2.1-windows-cuda/lib/x.dll", "dll")
+
+
+def test_install_colmap_unpacks_with_checksum(tmp_path):
+    src = tmp_path / "src.zip"
+    _colmap_zip(src)
+    got = []
+
+    def dl(url, dst, sha):
+        got.append((url, sha))
+        dst.write_bytes(src.read_bytes())
+    root = tmp_path / "bin" / "colmap"
+    res = installer.install_colmap({}, download=dl, root=root)
+    assert got == [(installer.COLMAP_URL, installer.COLMAP_SHA256)]
+    assert installer.COLMAP_URL.endswith("/4.2.1/colmap-x64-windows-cuda.zip")
+    assert Path(res["path"]) == root / "bin" / "colmap.exe" and (root / "lib" / "x.dll").exists()
+    assert not (tmp_path / "bin" / installer.COLMAP_ASSET).exists() and not (tmp_path / "bin" / "colmap_unpack").exists()
+    again = installer.install_colmap({}, download=lambda *a: pytest.fail("already there"), root=root)
+    assert "już jest" in again["log"][0]
+    assert installer.colmap_exe({"colmap_path": str(src)}, root=tmp_path / "none") == src   # config path wins
+
+
+def test_install_colmap_without_exe_fails(tmp_path):
+    src = tmp_path / "src.zip"
+    _colmap_zip(src, with_exe=False)
+    with pytest.raises(RuntimeError, match="colmap.exe"):
+        installer.install_colmap({}, download=lambda url, dst, sha: dst.write_bytes(src.read_bytes()),
+                                 root=tmp_path / "bin" / "colmap")
+    assert not (tmp_path / "bin" / "colmap").exists()
+
+
+def test_doctor_offers_cleanup3d_installs(tmp_path, monkeypatch):
+    from doctor import EnvironmentDoctor
+    monkeypatch.setattr(installer, "COLMAP_DIR", tmp_path / "bin" / "colmap")
+    (tmp_path / "custom_nodes").mkdir()
+    doc = EnvironmentDoctor(simulation={"simulate_comfy_offline": True})
+    doc.config.update({"comfy_dir": str(tmp_path), "models_dir": str(tmp_path / "models"), "colmap_path": ""})
+    items = {it.name: it for it in doc.run_all_checks().items}
+    k, lo, col = items["Model: FLUX 3 Image Klein"], items["Model: LoRA Restore (FLUX 3 Image Klein)"], items["COLMAP (CUDA)"]
+    assert k.status == "warning" and k.action == "install_flux3_klein"
+    assert lo.status == "warning" and lo.action == "install_klein_restore_lora"
+    assert col.status == "info" and col.action == "install_colmap" and col.license == "BSD" and not col.license_limited
+    for it in (k, lo):
+        assert it.license.startswith("FLUX Kommunity License") and "5 mln USD" in it.license
+        assert it.license_limited and not it.license_nc
+        assert it.fix_suggestion.startswith("Wymagane teraz: NIE – tylko dogenerowanie klucza w trybie Czyszczenie")
+    assert any("black-forest-labs/flux-3-image-klein-comfy" in l for l in k.links)
+    assert any("ausboss/FLUX-3-Image-Klein-Restore-LoRA" in l for l in lo.links)
+    assert any("colmap/colmap/releases" in l for l in col.links)
+    v = items["Wersja ComfyUI (FLUX 3 Image Klein)"]
+    assert v.status == "info" and "nie odpowiada" in v.message
+
+
+def test_doctor_offers_qwen21_install(tmp_path, monkeypatch):
+    """The Doctor lists Qwen-Image-2.1 (optional, non-commercial licence, own install button, links)."""
+    from doctor import EnvironmentDoctor
+    monkeypatch.setattr(installer, "COLMAP_DIR", tmp_path / "bin" / "colmap")
+    (tmp_path / "custom_nodes").mkdir()
+    doc = EnvironmentDoctor(simulation={"simulate_comfy_offline": True})
+    doc.config.update({"comfy_dir": str(tmp_path), "models_dir": str(tmp_path / "models"), "colmap_path": ""})
+    q = {it.name: it for it in doc.run_all_checks().items}["Model: Qwen-Image-2.1"]
+    assert q.status == "warning" and q.action == "install_qwen21"
+    assert q.license.startswith("Qwen Research License") and q.license_nc and not q.license_limited
+    assert q.fix_suggestion.startswith("Wymagane teraz: NIE – tylko dogenerowanie klucza w trybie Czyszczenie")
+    assert "17,3 GB" in q.fix_suggestion and "diffusion_models/qwen_image_2.1_int8_convrot.safetensors" in q.message
+    assert any("huggingface.co/Comfy-Org/Qwen-Image-2.1" in l for l in q.links)
+    from engine import stage_models as G
+    md = tmp_path / "models"
+    for folder, fn, *_ in G.QWEN21_FILES.values():
+        (md / folder).mkdir(parents=True, exist_ok=True)
+        (md / folder / fn).write_bytes(b"x" * 4)
+    monkeypatch.setattr(G, "QWEN21_FILES", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.QWEN21_FILES.items()})
+    ok = doc.check_qwen21_model(md)
+    assert ok.status == "ok" and ok.fix_suggestion is None and "Qwen-Image-2.1 obecny" in ok.message

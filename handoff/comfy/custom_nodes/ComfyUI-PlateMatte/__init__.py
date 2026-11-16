@@ -9,6 +9,7 @@ from .select_color import MaskEdgeComponents, PlateForegroundHDR
 from .layers import PlateLoadMaskSeq, MatteSubtractFront, MaskMaxMerge, MaskTemporalMedian, MaskTemporalMedianMC, MaskRecoverFromGuide
 from .split import MatteSplitByRegions
 from .sam3_soft import SAM3_VideoTrackSoft
+from .conditioning import ConditioningPairSave, ConditioningPairLoad
 
 NODE_CLASS_MAPPINGS = {
     "PlateLoadEXR": PlateLoadEXR,
@@ -26,6 +27,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskTemporalMedianMC": MaskTemporalMedianMC,
     "MaskRecoverFromGuide": MaskRecoverFromGuide,
     "SAM3_VideoTrackSoft": SAM3_VideoTrackSoft,
+    "ConditioningPairSave": ConditioningPairSave,
+    "ConditioningPairLoad": ConditioningPairLoad,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PlateLoadEXR": "Plate Load EXR (scene-linear)",
@@ -43,4 +46,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskTemporalMedianMC": "Mask Temporal Median MC (rigid objects, camera-compensated)",
     "MaskRecoverFromGuide": "Mask Recover From Guide (clean-plate diff, connected parts only)",
     "SAM3_VideoTrackSoft": "SAM3 Video Track + soft masks (probabilities for core stabilisation)",
+    "ConditioningPairSave": "Conditioning Pair Save (encode a prompt once)",
+    "ConditioningPairLoad": "Conditioning Pair Load (no text encoder)",
 }

@@ -17,7 +17,7 @@ import contextlib
 import contextvars
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -81,6 +81,26 @@ def require_vhs(client: Any) -> None:
         raise MissingComfyNode(VHS_MISSING)
     if url:
         _VHS_OK.add(url)
+
+
+def missing_nodes(client: Any, names: List[str]) -> Optional[List[str]]:
+    """The node classes of `names` this ComfyUI does not register (/object_info answers {} for an unknown class);
+    None = ComfyUI not answering (no verdict). A model's files on disk are not enough: an older ComfyUI lacks the
+    nodes of a newer model (2026-11-10: Qwen-Image-2.1 needs TextEncodeQwenImage21, ComfyUI 0.33 has only the Edit
+    ones)."""
+    if client is None:
+        return None
+    out = []
+    for n in names:
+        try:
+            info = client.get_object_info(n)
+        except Exception:
+            return None
+        if info is None:
+            return None
+        if not info:
+            out.append(n)
+    return out
 
 
 def write_soft_png(path: Path, p: np.ndarray) -> None:

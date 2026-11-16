@@ -3,7 +3,7 @@
 """engine/groups.py - A group of objects as its own entity (docs/PLAN_GROUP_COMPOSE.md, user decisions 2026-10-29).
 
 Storage (variant A, accepted 2026-10-29): `objects/<group>/object.json` with `"kind": "group"` – so the group gets the
-object machinery for free (runs/, tool.stage_runs, active_run, band, final_touch/, trash, rename, version deletion):
+object machinery for free (runs/, tool.stage_runs, active_run, band, final_touch/, deletion, rename, version deletion):
   {"kind": "group", "name": "body", "members": ["head", "torso", "legs"], "seam_px": 4,
    "band": {...like an object...}, "tool": {"active_run": "", "stage_runs": {}}, "export_source": null}
 A member keeps its own object.json and gets:
@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from engine.export import SEAM_PX_DEFAULT, SEAM_PX_MAX
+from engine.jsonio import write_json
+from engine.lru import LockedLRU
 from engine.objects import ObjectStore
 
 GROUP_KIND = "group"
@@ -180,7 +182,8 @@ def add_member(s: StoreLike, group: str, name: str) -> Dict[str, Any]:
     o = _check_member(store, name, group)
     if name not in g["members"]:
         store.update(group, members=g["members"] + [name])
-    store.update(name, group=group, group_source=member_source(o) if o.get("group") == group else dict(DEFAULT_SOURCE))
+    # the object's own mask choice comes along (user 2026-11-15: an object outside a group picks its mask too)
+    store.update(name, group=group, group_source=member_source(o))
     return get_group(store, group)
 
 
@@ -195,45 +198,54 @@ def whole_results(s: StoreLike, group: str) -> List[str]:
     return out
 
 
-def trash_whole(s: StoreLike, group: str) -> Optional[Path]:
-    """The group's whole results -> <work>/trash/groups/<group>_<time>/ (runs/, final_touch/, previews; recoverable
-    by hand, like a deleted object). Version numbers are never reused (runs/.last_run). None = nothing to move."""
-    import shutil
-    import time
-    from engine.run_trash import LAST_RUN, last_run_number
+WHOLE_DIRS = ("runs", "final_touch", "stage_preview")   # what a group computed as a whole (on disk)
+
+
+def _whole_dirs(store: ObjectStore, group: str) -> List[Path]:
+    d = store.dir(group)
+    return [d / x for x in WHOLE_DIRS if (d / x).is_dir() and any((d / x).iterdir())]
+
+
+def delete_whole(s: StoreLike, group: str) -> Optional[int]:
+    """Delete the group's whole results from disk for good (runs/, final_touch/, previews – user decision 2026-11-13:
+    no project trash). Version numbers are never reused (runs/.last_run). Returns the bytes freed; None = nothing
+    to delete."""
+    from engine import deletion as DEL
+    from engine.run_delete import LAST_RUN, last_run_number
     store = _store(s)
     get_group(store, group)
     d = store.dir(group)
-    subs = [x for x in ("runs", "final_touch", "stage_preview") if (d / x).is_dir() and any((d / x).iterdir())]
+    subs = _whole_dirs(store, group)
     if not subs and not whole_results(store, group):
         return None
     n = last_run_number(d / "runs")
-    dest = store.root.parent / "trash" / "groups" / f"{group}_{time.strftime('%Y%m%d_%H%M%S')}"
-    dest.mkdir(parents=True, exist_ok=True)
-    for x in subs:
-        shutil.move(str(d / x), str(dest / x))
+    freed = DEL.remove(*subs, inside=d)
     (d / "runs").mkdir(exist_ok=True)
     if n:
         (d / "runs" / LAST_RUN).write_text(str(n), encoding="utf-8")
     store.update(group, tool={"stage_runs": {}, "active_run": "", "final_valid": False})
-    return dest
+    return freed
 
 
-def _whole_warning(store: ObjectStore, group: str, what: str) -> Optional[Dict[str, Any]]:
+def _whole_warning(store: ObjectStore, group: str, what: str, whole_group: bool = False) -> Optional[Dict[str, Any]]:
+    """The confirmation the UI shows before whole results are deleted for good; `bytes` = what it frees (the whole
+    group folder when `whole_group`)."""
+    from engine import deletion as DEL
     stages = whole_results(store, group)
     if not stages:
         return None
     label = {"matanyone": "MatAnyone2", "videomama": "VideoMaMa", "ltx": "LTX-2.5", "final_touch": "Final Touch"}
     names = ", ".join(label.get(k.split("@")[0], "ViTMatte" if k.startswith("vitmatte") else k) for k in stages)
-    return {"success": False, "needs_confirm": True, "whole_stages": stages,
-            "warning": f"{what}: wynik przeliczenia całości grupy „{group}” ({names}) zostanie przeniesiony do kosza "
-                       f"projektu. Członkowie zachowują swoje wyniki."}
+    size = DEL.size_of(store.dir(group)) if whole_group else sum(DEL.size_of(p) for p in _whole_dirs(store, group))
+    return {"success": False, "needs_confirm": True, "whole_stages": stages, "bytes": size,
+            "warning": f"{what}: wynik przeliczenia całości grupy „{group}” ({names}, {DEL.human(size)}) zostanie "
+                       f"usunięty z dysku na stałe – nie da się tego cofnąć. Członkowie zachowują swoje wyniki."}
 
 
 def remove_member(s: StoreLike, group: str, name: str, confirm: bool = False) -> Dict[str, Any]:
     """Detach a member; its own results stay untouched. When the group has whole results (a recompute of the whole or
     Final Touch): without `confirm` nothing happens and the warning comes back (needs_confirm, whole_stages); with
-    it they go to the project trash (trash_whole) – user decision 2026-10-29."""
+    it they are deleted from disk for good (delete_whole) – user decisions 2026-10-29 and 2026-11-13."""
     store = _store(s)
     g = get_group(store, group)
     if name not in (g.get("members") or []):
@@ -241,11 +253,11 @@ def remove_member(s: StoreLike, group: str, name: str, confirm: bool = False) ->
     w = _whole_warning(store, group, f"Odłączenie „{name}”")
     if w and not confirm:
         return w
-    trash = trash_whole(store, group) if w else None
+    freed = delete_whole(store, group) if w else None
     store.update(group, members=[m for m in get_group(store, group)["members"] if m != name])
-    if _exists(store, name):
-        store.update(name, group=None, group_source=None, group_on=None, group_seam_px=None)
-    return {"success": True, "trash": str(trash) if trash else None}
+    if _exists(store, name):   # its mask choice stays the object's (group_source, 2026-11-15)
+        store.update(name, group=None, group_on=None, group_seam_px=None)
+    return {"success": True, "whole_deleted": freed is not None, "freed_bytes": freed or 0}
 
 
 def set_member_source(s: StoreLike, group: str, name: str, source: Dict[str, Any]) -> Dict[str, Any]:
@@ -253,6 +265,22 @@ def set_member_source(s: StoreLike, group: str, name: str, source: Dict[str, Any
     store = _store(s)
     if name not in (get_group(store, group).get("members") or []):
         raise ValueError(f"„{name}” nie należy do grupy „{group}”")
+    return set_object_source(store, name, source)
+
+
+def has_own_source(obj: Dict[str, Any]) -> bool:
+    """The object picked its mask itself (group_source set – in a group or outside one, 2026-11-15)."""
+    src = obj.get("group_source")
+    return isinstance(src, dict) and src.get("source") in GROUP_SOURCES
+
+
+def set_object_source(s: StoreLike, name: str, source: Dict[str, Any]) -> Dict[str, Any]:
+    """The object's mask (user 2026-11-15): the same choice as „Do grupy z:”, for an object outside a group too – the
+    default of its group (when it joins one) and of Cleanup (removed / protected). {"source", "run" for "version"}."""
+    store = _store(s)
+    o = store.get(name)
+    if o.get("kind") == "group":
+        raise ValueError("grupa nie ma własnej maski – wybierz ją u członków")
     src = (source or {}).get("source")
     if src not in GROUP_SOURCES:
         raise ValueError(f"źródło musi być jednym z {GROUP_SOURCES}, jest {src!r}")
@@ -281,16 +309,16 @@ def set_seam(s: StoreLike, group: str, px: Any) -> int:
 
 def ungroup(s: StoreLike, group: str, confirm: bool = False) -> Dict[str, Any]:
     """Delete the group: members become standalone (their results untouched), the group's folder (with its whole
-    results) -> project trash. With whole results: the warning first, as remove_member."""
+    results) is deleted from disk for good. With whole results: the warning first, as remove_member."""
     store = _store(s)
-    w = _whole_warning(store, group, "Rozgrupowanie")
+    w = _whole_warning(store, group, "Rozgrupowanie", whole_group=True)
     if w and not confirm:
         return w
     for m in list(get_group(store, group).get("members") or []):
-        if _exists(store, m):
-            store.update(m, group=None, group_source=None, group_on=None, group_seam_px=None)
+        if _exists(store, m):   # its mask choice stays the object's (group_source, 2026-11-15)
+            store.update(m, group=None, group_on=None, group_seam_px=None)
     store.update(group, members=[])
-    return {"success": True, "trash": str(store.remove(group))}
+    return {"success": True, "freed_bytes": store.remove(group)}
 
 
 # ---------------------------------------------------------------- the composition (step 3)
@@ -366,8 +394,7 @@ class GroupSourceMissing(ValueError):
 # the last compositions (frame previews ask for the same frames again – Final Touch, the overlay, the zone base):
 # keyed by the group's signature (members, „Do grupy z:” sources and their mask 1+2, on / off, seam) and the members'
 # result files' mtimes, so any change of the input is a new entry; ~8 MB per 1080p frame
-_CACHE: "Dict[tuple, Any]" = {}
-_CACHE_MAX = 16
+_CACHE = LockedLRU(16)
 
 
 def _mtimes(store: ObjectStore, runs: List[Dict[str, Any]]) -> tuple:
@@ -419,14 +446,11 @@ def group_alpha_loader(s: StoreLike, group: str, w: int, h: int):
         k = ckey + (int(f),)
         hit = _CACHE.get(k)
         if hit is not None:
-            _CACHE[k] = _CACHE.pop(k)   # most recent last
             return hit.copy()
         vis = [is_visible(f, life) for life in lives]
         alphas = [ld(f) if v else np.zeros((h, w), np.float32) for ld, v in zip(loaders, vis)]
         out = seamless_union(alphas, [core(m, f) if v else None for m, v in zip(ms, vis)], gap_px=gap, gaps=gaps)
-        _CACHE[k] = out.copy()
-        while len(_CACHE) > _CACHE_MAX:
-            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE.put(k, out.copy())
         return out
     return load
 
@@ -521,7 +545,7 @@ def migrate_part_of(s: StoreLike) -> List[Dict[str, Any]]:
             rj = json.loads(p.read_text(encoding="utf-8"))
             if rj.get("core_fix_sig") == old_sig:
                 rj["core_fix_sig"] = new_sig
-                p.write_text(json.dumps(rj, indent=2, ensure_ascii=False), encoding="utf-8")
+                write_json(p, rj, indent=2, ensure_ascii=False)
         ptool = store.get(parent).get("tool") or {}
         sr = dict(ptool.get("stage_runs") or {})
         gsr = {k: v for k, v in sr.items() if v in moved}

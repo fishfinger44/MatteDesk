@@ -21,6 +21,8 @@ Thumbs.db
 doctor_report.json
 doctor_report_*.json
 INSTALL_*.md
+local_results/
+# (archive of measurements, kept on the station only, untracked 2026-11-02)
 log.txt
 
 # Overnight queue state (per machine)

@@ -8,7 +8,7 @@ overlaps the initial mask – like the real tracker, without text)."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -353,3 +353,126 @@ def ltx_handlers(colour=PUPPET_BGR, seen=None):
             cv2.imwrite(str(out), np.dstack([a, a, a, a]).astype(np.float32))
         return {}
     return {"LTXVAddGuide": run}
+
+
+# ----------------------------------------------------------------------------------- plate alignment (align_v2, 2026-11-03)
+
+@dataclass
+class AlignSynth:
+    """Synthetic beauty + clear plate pair with a KNOWN misalignment (the truth of the alignment metrics) and an
+    object crossing the whole frame on the beauty only."""
+    beauty_pattern: str
+    aux_pattern: str
+    first: int
+    last: int
+    w: int
+    h: int
+    masks: Dict[int, np.ndarray]        # object (bool) per frame, beauty only
+    ux: np.ndarray                       # total displacement aux(x) = bg(x - u(x)) without the per-frame jitter
+    uy: np.ndarray
+    matrix: np.ndarray                   # 3x3 forward aux -> beauty (OpenCV coords): what the global model should find
+    jitter: Dict[int, Tuple[float, float]]   # per frame (jx, jy) added to u (0, 0 = a locked camera)
+
+    rot_fields: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)   # rotation shake per frame
+
+    def truth(self, f: int) -> Tuple[np.ndarray, np.ndarray]:
+        """(ux, uy) of frame f: the source pixel of every output pixel x is x + u (see tests/test_align_compose)."""
+        if f in self.rot_fields:
+            return self.ux + self.rot_fields[f][0], self.uy + self.rot_fields[f][1]
+        jx, jy = self.jitter.get(f, (0.0, 0.0))
+        return self.ux + np.float32(jx), self.uy + np.float32(jy)
+
+    @property
+    def zone(self) -> np.ndarray:
+        """Where the object passed (union of its masks, grown 32 px) – the area a first-frame static mask misses."""
+        from engine.align_exclude import dilate
+        u = np.zeros((self.h, self.w), np.uint8)
+        for m in self.masks.values():
+            u |= m.astype(np.uint8)
+        return dilate(u, 32)
+
+    def write_object_cores(self, work: Path, name: str = "obj") -> Path:
+        """<work>/objects/<name>/core/c_####.png (+ object.json / core.json) = the object's SAM 3.1 core on every
+        frame, as the alignment's „wyklucz obiekty” reads it."""
+        import json as _json
+        od = Path(work) / "objects" / name
+        (od / "core").mkdir(parents=True, exist_ok=True)
+        (od / "object.json").write_text(_json.dumps({"name": name, "prompts": [name], "depth_order": 0, "tool": {}}),
+                                        encoding="utf-8")
+        for f, m in self.masks.items():
+            cv2.imwrite(str(od / "core" / f"c_{f:04d}.png"), m.astype(np.uint8) * 255)
+        (od / "core" / "core.json").write_text(_json.dumps({"frames": [self.first, self.last]}), encoding="utf-8")
+        return od
+
+
+def align_texture(h: int, w: int, seed: int = 3) -> np.ndarray:
+    """Set-like background with detail at two scales (64 px correlation patches must lock anywhere)."""
+    rng = np.random.default_rng(seed)
+    coarse = cv2.GaussianBlur(rng.random((h, w)).astype(np.float32), (0, 0), 6.0)
+    fine = cv2.GaussianBlur(rng.random((h, w)).astype(np.float32), (0, 0), 1.2)
+    t = 0.3 + 0.45 * (coarse - coarse.min()) / max(1e-6, coarse.max() - coarse.min()) + 0.35 * (fine - 0.5)
+    img = np.repeat(np.clip(t, 0.05, 0.95)[..., None], 3, axis=2).copy()
+    img[..., 0] *= 0.9
+    img[..., 2] *= 1.05
+    return np.clip(img, 0, 1).astype(np.float32)
+
+
+def make_align_shot(root: Path, n: int = 25, w: int = 960, h: int = 540, first: int = 1, shift=(3.2, -1.4),
+                    rot_deg: float = 0.25, scale: float = 1.0, local_amp: float = 0.0, jitter_px: float = 0.0,
+                    noise: float = 0.004, seed: int = 3, with_object: bool = True,
+                    rot_jitter_deg: float = 0.0) -> AlignSynth:
+    """Beauty = textured set + an object (puppet) walking across the WHOLE frame; clear plate = the same set with no
+    object, moved by a similarity about the centre (`shift`, `rot_deg`, `scale`) + an optional smooth local field
+    (`local_amp` px, one sine period across the plate) + per-frame random jitter (`jitter_px` translation,
+    `rot_jitter_deg` rotation about the centre; 0 = locked camera - the truth of frame f is `truth(f)`).
+    Independent sensor noise (`noise`) on both plates. Pseudo scene-linear EXR like make_shot."""
+    rng = np.random.default_rng(seed)
+    bg = align_texture(h, w, seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    # A: beauty coords -> aux coords (where the beauty content ended up on the clear plate)
+    A = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), rot_deg, scale)
+    A[0, 2] += shift[0]
+    A[1, 2] += shift[1]
+    A3 = np.vstack([A, [0.0, 0.0, 1.0]])
+    ux = (A[0, 0] * xx + A[0, 1] * yy + A[0, 2]) - xx
+    uy = (A[1, 0] * xx + A[1, 1] * yy + A[1, 2]) - yy
+    if local_amp:
+        ux = ux + local_amp * np.sin(2 * np.pi * xx / w) * np.cos(np.pi * yy / h)
+        uy = uy - local_amp * np.cos(np.pi * xx / w) * np.sin(2 * np.pi * yy / h)
+    bdir, adir = Path(root) / "beauty", Path(root) / "clean"
+    bdir.mkdir(parents=True, exist_ok=True)
+    adir.mkdir(parents=True, exist_ok=True)
+    masks, jitter, rot_fields = {}, {}, {}
+    for i in range(n):
+        f = first + i
+        t = i / max(1, n - 1)
+        jx, jy = (float(rng.normal(0, jitter_px)), float(rng.normal(0, jitter_px))) if jitter_px else (0.0, 0.0)
+        jitter[f] = (jx, jy)
+        ufx, ufy = ux + np.float32(jx), uy + np.float32(jy)
+        if rot_jitter_deg:
+            R = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), float(rng.normal(0, rot_jitter_deg)), 1.0)
+            ufx = ufx + ((R[0, 0] - 1) * xx + R[0, 1] * yy + R[0, 2])
+            ufy = ufy + (R[1, 0] * xx + (R[1, 1] - 1) * yy + R[1, 2])
+            rot_fields[f] = (ufx - ux, ufy - uy)
+        # aux(x) = bg(x - u(x)) (tests/test_align_compose convention): the aligned output x samples the aux at x + u
+        aux = cv2.remap(bg, xx - ufx, yy - ufy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        beauty = bg.copy()
+        if with_object:
+            s = 1.3 * max(0.45, min(1.0, h / 720.0))
+            cx = 0.06 * w + 0.88 * w * t                        # inside the frame on every frame, left -> right
+            cy = h * 0.55 + 0.08 * h * np.sin(5 * t)
+            a = puppet_mask(w, h, cx, cy, s)
+            beauty = beauty * (1 - a[..., None]) + PUPPET_BGR * a[..., None]
+            masks[f] = a > 0.5
+        else:
+            masks[f] = np.zeros((h, w), bool)
+        if noise:
+            beauty = beauty + rng.normal(0, noise, beauty.shape).astype(np.float32)
+            aux = aux + rng.normal(0, noise, aux.shape).astype(np.float32)
+        cv2.imwrite(str(bdir / f"b_{f:04d}.exr"), (np.clip(beauty, 0, None) ** 2.2 * 1.5).astype(np.float32))
+        cv2.imwrite(str(adir / f"c_{f:04d}.exr"), (np.clip(aux, 0, None) ** 2.2 * 1.5).astype(np.float32))
+    out = AlignSynth(str(bdir / "b_####.exr").replace("\\", "/"), str(adir / "c_####.exr").replace("\\", "/"),
+                     first, first + n - 1, w, h, masks, ux.astype(np.float32), uy.astype(np.float32),
+                     np.linalg.inv(A3), jitter)
+    out.rot_fields = rot_fields
+    return out

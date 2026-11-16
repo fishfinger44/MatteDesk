@@ -60,7 +60,7 @@ def test_stage_progression_and_staleness(tmp_path):
     assert st["final"] == "stale" and st["export"] != "done"
 
 
-def test_delete_object_moves_to_trash_and_marks_dependents(tmp_path, monkeypatch):
+def test_delete_object_is_permanent_and_marks_dependents(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     import app as app_module
     from engine.outputs import load_outputs, update_outputs
@@ -75,7 +75,7 @@ def test_delete_object_moves_to_trash_and_marks_dependents(tmp_path, monkeypatch
     r = api.delete("/api/object/front")
     assert r.status_code == 200, r.text
     d = r.json()
-    assert "trash" in d["trash"] and (tmp_path / "matte_desk" / "trash" / "objects").exists()
+    assert d["freed_bytes"] > 0 and "trash" not in d and not (work / "trash").exists()
     assert not (work / "objects" / "front").exists()
     assert d["marked_for_recompute"] == ["back"]
     assert [(o["name"], o["depth_order"]) for o in store.list()] == [("mid", 0), ("back", 1)]

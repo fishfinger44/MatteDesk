@@ -12,8 +12,10 @@
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/index.css">
+  <script src="/static/ui.js"></script>
   <script src="/static/i18n.js"></script>
   <script src="/static/range_fill.js"></script>
+  <script src="/static/slider_num.js"></script>
   <script src="/static/slider_undo.js"></script>
 </head>
 <body class="dark-theme">
@@ -176,7 +178,7 @@
           <button class="ctrl-btn" id="btnLastFrame" title="Ostatnia klatka (End)">⏭</button>
           <button class="ctrl-btn" id="btnPrevKey" title="Poprzedni klucz (Shift+←)">⇤🔑</button>
           <button class="ctrl-btn" id="btnNextKey" title="Następny klucz (Shift+→)">🔑⇥</button>
-          <button class="ctrl-btn" id="btnDelKey" title="Usuń klucz bieżącej klatki (Del / Backspace; dwuklik na znaczniku klucza) – klucz użytkownika z potwierdzeniem, Ctrl+Z cofa" disabled>🔑✕</button>
+          <button class="ctrl-btn" id="btnDelKey" title="Usuń klucz bieżącej klatki (Del / Backspace; dwuklik na znaczniku klucza) – klucz użytkownika z potwierdzeniem, Ctrl+Z cofa. W Czyszczeniu: kotwica tej klatki (z ostrzeżeniem)" disabled>🔑✕</button>
         </div>
 
         <div class="frame-counter-group">
@@ -571,6 +573,7 @@
           <p><b>Modele zewnętrzne</b> (SAM 3.1, MatAnyone2, CoTracker3, ViTMatte, DepthCrafter…) nie są częścią MatteDesk. Pobierasz je sam przez Doktora i obowiązują ich własne licencje – część z nich jest tylko do użytku niekomercyjnego. Lista: <code>THIRD_PARTY_LICENSES.md</code>.</p>
           <ul class="about-links">
             <li><a id="aboutLink_repo" class="btn btn-secondary about-link" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Kod źródłowy i zgłaszanie błędów</span></a></li>
+            <li><a id="aboutLink_site" class="btn btn-secondary about-link" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m10 8.5 5 3.5-5 3.5z"/></svg><span>Strona autora i tutoriale</span></a></li>
             <li><a id="aboutLink_support" class="btn about-link about-support" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20.5s-8-4.6-8-10.5a4.5 4.5 0 0 1 8-2.8A4.5 4.5 0 0 1 20 10c0 5.9-8 10.5-8 10.5z"/></svg><span>Wesprzyj projekt (dobrowolnie)</span></a></li>
           </ul>
         </div>
@@ -586,12 +589,14 @@
 
   <script src="/static/header_fit.js"></script>
   <script src="/static/gpu_overlay.js"></script>
+  <script src="/static/palette_fold.js"></script>
   <script src="/static/app.js"></script>
   <script src="/static/objects.js"></script>
   <script src="/static/workarea.js"></script>
   <script src="/static/life.js"></script>
   <script src="/static/zones.js"></script>
   <script src="/static/bandpoints.js"></script>
+  <script src="/static/brushcore.js"></script>
   <script src="/static/brush.js"></script>
   <script src="/static/ft_gpu.js"></script>
   <script src="/static/mm_gpu.js"></script>
@@ -601,6 +606,15 @@
   <script src="/static/depth.js"></script>
   <script src="/static/jobs.js"></script>
   <script src="/static/comfy_watch.js"></script>
+  <script src="/static/vramcheck.js"></script>
+  <script src="/static/pop_view.js"></script>
+  <script src="/static/cleanup.js"></script>
+  <script src="/static/cleanup_anchors.js"></script>
+  <script src="/static/cleanup_prompt.js"></script>
+  <script src="/static/cleanup3d.js"></script>
+  <script src="/static/curves.js"></script>
+  <script src="/static/cleanup3d_areas.js"></script>
+  <script src="/static/cleanup3d_horizon.js"></script>
   <script src="/static/tips.js"></script>
   <script src="/static/about.js"></script>
   <script src="/static/report.js"></script>

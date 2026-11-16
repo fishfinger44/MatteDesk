@@ -737,7 +737,7 @@
   }
   // stage 5 opens on the band of the chosen base mask (user decision 2026-10-21): the whole-outline zone is created by
   // itself – no preview, no undo entry, no key on the lane; keys come only from band points
-  const wantsAutoZone = () => !!obj() && !(Z.autoFailed || {})[obj()] && !Z.list.some((x) => x.criterion === 'matte');
+  const wantsAutoZone = () => !!obj() && !(Z.autoFailed || {})[obj()] && !(Z.autoWait || {})[obj()] && !Z.list.some((x) => x.criterion === 'matte');
   async function ensureOutlineZone() {
     const o = obj();
     if (!o || Z.autoBusy || Z.loadedObj !== o || !wantsAutoZone()) return;
@@ -752,14 +752,23 @@
       Z.active = d.zone.zone_id;
       await load(); H.loadStages().catch(() => {}); onFrame(); V().render();
     } catch (e) {
-      (Z.autoFailed = Z.autoFailed || {})[o] = true; renderPalette();
-      status(`Pas „cały obrys” nie powstał sam (${e.message || e}) – „＋ Strefa ViTMatte: cały obrys”`, 'warn');
+      // a 409 (a job on the object) or a network error passes: wait for retryOutlineZone, not a retry from this render
+      const passing = e.status == null || e.status === 409;
+      if (passing) (Z.autoWait = Z.autoWait || {})[o] = true; else (Z.autoFailed = Z.autoFailed || {})[o] = true;
+      renderPalette();
+      status(`Pas „cały obrys” nie powstał sam (${e.message || e}) – ${passing ? 'spróbuję ponownie po końcu zadania albo ' : ''}„＋ Strefa ViTMatte: cały obrys”`, 'warn');
     } finally { Z.autoBusy = false; }
+  }
+  function retryOutlineZone() {   // end of a job, entering the stage: the object that waits tries again
+    if (!(Z.autoWait || {})[obj()]) return;
+    delete Z.autoWait[obj()]; renderPalette();
   }
   function reset() {   // object (re)load: a different object forgets the active zone / undo / preview; the same one (after a job) keeps them
     const same = Z.obj === obj();
     Z.obj = obj();
     Z.list = []; Z.status = {}; Z.regionCache = {};
+    Z.loadedObj = null;   // no automatic zone until load() has the list (an empty one here is not „no zones”)
+    if (Z.autoWait) delete Z.autoWait[Z.obj];
     if (!same) { Z.active = null; Z.preview = null; Z.undo = []; Z.plan = null; Z.props = null; renderProps(); renderPlan(null); }
     clearTimeout(Z.pvTimer); clearTimeout(Z.drawTimer); Z.drawPending = null; renderLane();
   }
@@ -930,6 +939,7 @@
         // to the old settings, ask again for this frame (user report 2026-10-21: the band vanished after a slider)
         stale = Z.regionCache[z.zone_id] !== c;
         if (!stale) { c[f] = d; if (curFrame() === f) V().render(); }
+        if (!stale && d && d.outside && curFrame() === f) status(d.outside, 'warn');   // past the core: a note, not an error
         // the band on the quick stand-in mask 1+2 (the exact one comes from the background batch, 2026-10-24): asked
         // again once, when the mask is ready (MD_BANDPTS.watchMask12 polls the cheap status)
         if (!stale && d && d.approx && window.MD_BANDPTS && window.MD_BANDPTS.watchMask12) {
@@ -1664,6 +1674,7 @@
 
   function init(hooks) {
     H = hooks;
+    window.addEventListener('matte-job-finished', retryOutlineZone);
     const host = $('z4Panel'); if (!host) return;
     host.innerHTML = panelHtml();
     buildPalette();
@@ -1698,7 +1709,12 @@
     drawTools: DRAW_TOOLS,
     init, load, reset, draw, drawLoupe, renderLane, onFrame, wantsDraw, onDraw, undo, runDetailsHtml,
     onShow() { loadCleanplate().catch(() => {}); renderList(); onFrame(); },
-    onStage() { renderLane(); renderPalette(); },
+    onStage() {
+      const inStage = S().stage === H.ST.VITMATTE;
+      if (inStage && !Z.wasInStage) retryOutlineZone();
+      Z.wasInStage = inStage;
+      renderLane(); renderPalette();
+    },
     onStages() { syncForm(); },   // object stages reloaded (objects.js loadStages): lock of „Zastosuj” (needs stage 3)
     reload() { return load(); },  // zones changed on the server (stage 5 engine switch, objects.js)
     get state() { return Z; },

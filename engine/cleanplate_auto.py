@@ -200,7 +200,13 @@ def write_cleanplate(out_dir: Path, clean: np.ndarray, conf: np.ndarray, frames:
             shutil.copyfile(first, p)
     cv2.imwrite(str(out_dir / "confidence.png"), (np.clip(conf, 0, 1) * 255).astype(np.uint8))
     pattern = str(out_dir / "cp_####.png").replace("\\", "/")
-    (out_dir / "cleanplate_auto.json").write_text(json.dumps({**stats, "pattern": pattern, "first": frames[0],
+    extra: Dict[str, Any] = {}
+    try:   # align_v2 step 4: the aux plates (aligned / raw) of the project when this clean plate was built
+        from engine.align_state import current_state
+        extra["aux_plates"] = current_state(out_dir.parent)
+    except Exception:
+        pass
+    (out_dir / "cleanplate_auto.json").write_text(json.dumps({**stats, **extra, "pattern": pattern, "first": frames[0],
                                                               "last": frames[-1]}, indent=1, ensure_ascii=False),
                                                   encoding="utf-8")
     return pattern

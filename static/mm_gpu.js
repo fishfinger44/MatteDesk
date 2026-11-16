@@ -5,7 +5,8 @@
 // chain as engine/merge_matte.py, pass by pass and formula by formula: Blur = cv2 gaussian (sigma = size · 0.4236, kernel
 // radius 4 sigma, normalised, black outside the frame), FilterErode = cv2 erode / dilate with the elliptic element
 // (approximate in both – the Nuke FilterErode open item), Keymix / Merge over / xor / min / divide, Saturation (Rec 709),
-// luminance Keyer, ACEScct log, sRGB → ACEScg (Utility - sRGB - Texture). The server stays the truth (export / Nuke) and
+// luminance Keyer, the lin ↔ log curves of engine/log_curves.py (knob log_curve: ACEScct, Cineon, ARRI LogC3 / LogC4,
+// Sony S-Log3, video sRGB – `curve` = the knob's index, 0 = none), sRGB → ACEScg (Utility - sRGB - Texture). The server stays the truth (export / Nuke) and
 // the fallback: null = no WebGL2 / EXT_color_buffer_float here. Parity with the port: tools/mm_gpu_parity.py (max 1 / 255).
 // `finish` = the Final Touch finishing (levels, gamma, erode, blur; no motion blur) – parity with final_touch.finish_alpha
 // on 5 synthetic sets (2026-10-30): max 1 / 255.
@@ -13,6 +14,7 @@
 //   -> a W×H 2D canvas (display sRGB, opaque) | null
 (function () {
   const SIGMA = 0.4236;   // engine/merge_matte.py BLUR_SIGMA_PER_SIZE
+  const FE_A = 0.85, FE_B = 0.42;   // engine/merge_matte.py FE_SIGMA_PER_SIZE / FE_SIGMA_OFFSET (FilterErode gaussian)
   let G = null;           // {cv, gl, prog: {}, pool: {}, W, H} | false (not available)
 
   const VS = '#version 300 es\nvoid main(){ vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2. - 1., 0., 1.); }';
@@ -29,8 +31,25 @@ vec3 sat(vec3 c, float s){ float l = lum(c); return l + (c - l) * s; }
 vec3 s2l(vec3 c){ return mix(c / 12.92, pow((max(c, 0.) + .055) / 1.055, vec3(2.4)), vec3(greaterThan(c, vec3(.04045)))); }
 vec3 l2s(vec3 c){ return mix(12.92 * c, 1.055 * pow(max(c, 0.), vec3(1. / 2.4)) - .055, vec3(greaterThan(c, vec3(.0031308)))); }
 const mat3 S2AP1 = mat3(.6131, .0702, .0206, .3395, .9164, .1096, .0474, .0134, .8698);   // column-major = rows of the numpy matrix
-vec3 cct(vec3 x){ vec3 hi = (log2(max(x, 1e-10)) + 9.72) / 17.52; return mix(hi, 10.5402377416545 * x + .0729055341958355, vec3(lessThanEqual(x, vec3(.0078125)))); }
-vec3 icct(vec3 y){ vec3 hi = exp2(min(y, 10.) * 17.52 - 9.72); return mix(hi, (y - .0729055341958355) / 10.5402377416545, vec3(lessThanEqual(y, vec3(.155251141552511)))); }
+vec3 log10v(vec3 x){ return log(x) / 2.302585092994046; }
+// lin -> log of curve c (engine/log_curves.py, same constants; 0 = none): 1 ACEScct, 2 Cineon (Log2Lin 95 / 685 / 0.6),
+// 3 ARRI LogC3 EI 800, 4 ARRI LogC4, 5 Sony S-Log3, 6 video (sRGB OETF)
+vec3 l2g(vec3 x, int c){
+  if (c == 1) { vec3 hi = (log2(max(x, 1e-10)) + 9.72) / 17.52; return mix(hi, 10.5402377416545 * x + .0729055341958355, vec3(lessThanEqual(x, vec3(.0078125)))); }
+  if (c == 2) return (log10v(max(x / 1.0109156157307528 + .0107977516232771, 1e-10)) / .0033333333333333335 + 685.) / 1023.;
+  if (c == 3) { vec3 hi = .24719 * log10v(max(5.555556 * x + .052272, 1e-10)) + .385537; return mix(5.367655 * x + .092809, hi, vec3(greaterThan(x, vec3(.010591)))); }
+  if (c == 4) { vec3 hi = (log2(max(2231.8263090676883 * x + 64., 1e-10)) - 6.) / 14. * .9071358748778103 + .09286412512218964; return mix(hi, (x + .01805699611991131) / .1135972086105891, vec3(lessThan(x, vec3(-.01805699611991131)))); }
+  if (c == 5) { vec3 hi = (420. + log10v(max((x + .01) / .19, 1e-10)) * 261.5) / 1023.; return mix((x * 76.21029469289999 / .01125 + 95.) / 1023., hi, vec3(greaterThanEqual(x, vec3(.01125)))); }
+  if (c == 6) return l2s(x);
+  return x; }
+vec3 g2l(vec3 y, int c){
+  if (c == 1) { vec3 hi = exp2(min(y, 10.) * 17.52 - 9.72); return mix(hi, (y - .0729055341958355) / 10.5402377416545, vec3(lessThanEqual(y, vec3(.155251141552511)))); }
+  if (c == 2) return 1.0109156157307528 * (pow(vec3(10.), (1023. * y - 685.) * .0033333333333333335) - .0107977516232771);
+  if (c == 3) { vec3 hi = (pow(vec3(10.), (y - .385537) / .24719) - .052272) / 5.555556; return mix((y - .092809) / 5.367655, hi, vec3(greaterThan(y, vec3(.149657834105)))); }
+  if (c == 4) { vec3 hi = (exp2(14. * (y - .09286412512218964) / .9071358748778103 + 6.) - 64.) / 2231.8263090676883; return mix(hi, y * .1135972086105891 - .01805699611991131, vec3(lessThan(y, vec3(0.)))); }
+  if (c == 5) { vec3 hi = pow(vec3(10.), (y * 1023. - 420.) / 261.5) * .19 - .01; return mix((y * 1023. - 95.) * .01125 / 76.21029469289999, hi, vec3(greaterThanEqual(y, vec3(.16736099187966763)))); }
+  if (c == 6) return s2l(y);
+  return y; }
 `;
   const FS = {
     // straight FG: ACEScg plate colour where the 8-bit alpha > 0 (unpremult of a premultiplied 0 is 0), alpha
@@ -38,19 +57,33 @@ vec3 icct(vec3 y){ vec3 hi = exp2(min(y, 10.) * 17.52 - 9.72); return mix(hi, (y
 void main(){ ivec2 p = px(); vec2 uv = (vec2(p) + .5) / vec2(sz);
   float a = texture(A, uv).r; vec3 lin = S2AP1 * s2l(texture(P, uv).rgb);
   o = vec4(a > 0. ? lin : vec3(0.), a); }`,
-    // BG: colour / checker (cells in view px) / image, ACEScg, alpha 0; log = ACEScct
-    prepBg: `uniform sampler2D B; uniform int mode, logOn; uniform vec3 col; uniform float cell;
+    // BG: colour / checker (cells in view px) / image, ACEScg, alpha 0; log = the curve
+    prepBg: `uniform sampler2D B; uniform int mode, curve; uniform vec3 col; uniform float cell;
 void main(){ ivec2 p = px(); vec2 uv = (vec2(p) + .5) / vec2(sz); vec3 c;
   if (mode == 2) c = texture(B, uv).rgb;
   else if (mode == 1) c = (int(floor(float(p.x) / cell) + floor(float(p.y) / cell)) % 2 == 1) ? vec3(153. / 255.) : vec3(102. / 255.);
   else c = col;
-  vec3 l = S2AP1 * s2l(c); o = vec4(logOn == 1 ? cct(l) : l, 0.); }`,
-    // FilterErode: grayscale erode (choke > 0) / dilate of the alpha with the cv2 elliptic element of radius r
-    erode: `uniform sampler2D S; uniform int r, dil;
-void main(){ ivec2 p = px(); float m = dil == 1 ? -1e9 : 1e9;
-  for (int dy = -r; dy <= r; dy++) { int hw = int(round(sqrt(float(r * r - dy * dy))));
-    for (int dx = -hw; dx <= hw; dx++) { ivec2 q = p + ivec2(dx, dy);
-      if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;   // cv2: the border never wins
+  vec3 l = S2AP1 * s2l(c); o = vec4(l2g(l, curve), 0.); }`,
+    // FilterErode 1:1 (engine/merge_matte.filter_erode, 2026-11-06): dilate = max of a(q)·exp(−d²/2σ²), separable –
+    // two passes (dir); erode = 1 − dilate(1 − a): the first pass inverts (first = 1), the second inverts back.
+    // Outside the image never wins.
+    erode: `uniform sampler2D S; uniform int r, dil, first; uniform ivec2 dir; uniform float inv2s2;
+void main(){ ivec2 p = px(); float m = 0.;
+  for (int i = -r; i <= r; i++) { ivec2 q = p + dir * i;
+    if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;
+    float v = texelFetch(S, q, 0).a; if (first == 1 && dil == 0) v = 1. - v;
+    m = max(m, v * exp(-float(i * i) * inv2s2)); }
+  if (first == 0 && dil == 0) m = 1. - m;
+  o = vec4(0., 0., 0., m); }`,
+    // Final Touch erode / dilate = cv2.erode / cv2.dilate with the MORPH_ELLIPSE kernel of engine/final_touch.finish_alpha
+    // (min / max of .a over the disc, pixels outside the frame ignored). Not the MergeMatte „erode” above: that one is a
+    // separable weighted pass needing first / dir / inv2s2 – called without them it returned 1 − alpha for a positive
+    // erode (user report 2026-11-11: „erode psuje przy wartościach dodatnich”)
+    morph: `uniform sampler2D S; uniform int r, dil;
+void main(){ ivec2 p = px(); float m = dil == 1 ? 0. : 1.;
+  for (int dy = -r; dy <= r; dy++) { int dx = int(floor(sqrt(float(r * r - dy * dy)) + .5));
+    for (int x = -dx; x <= dx; x++) { ivec2 q = p + ivec2(x, dy);
+      if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;
       float v = texelFetch(S, q, 0).a; m = dil == 1 ? max(m, v) : min(m, v); } }
   o = vec4(0., 0., 0., m); }`,
     // Final Touch finishing (engine/final_touch.finish_alpha): levels (<= black -> 0, >= white -> 1) and gamma of the
@@ -75,11 +108,11 @@ void main(){ ivec2 p = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y)
 void main(){ ivec2 p = px(); vec4 acc = vec4(0.);
   for (int i = -r; i <= r; i++) acc += tf(S, p + dir * i) * exp(-float(i * i) * inv2s2);
   o = acc * norm; }`,
-    // straight FG + its new alpha (choke / soften) -> premultiplied FG; log: ACEScct of the straight colour
-    fg: `uniform sampler2D S, A; uniform int useA, logOn;
+    // straight FG + its new alpha (choke / soften) -> premultiplied FG; log: the curve of the straight colour
+    fg: `uniform sampler2D S, A; uniform int useA, curve;
 void main(){ ivec2 p = px(); vec4 s = texelFetch(S, p, 0); float a = useA == 1 ? texelFetch(A, p, 0).a : s.a;
   vec3 c = s.rgb;   // straight (0 where the plate alpha was 0)
-  if (logOn == 1) { vec4 f = vec4(c * a, a); f = unp(f); c = cct(f.rgb); }
+  if (curve != 0) { vec4 f = vec4(c * a, a); f = unp(f); c = l2g(f.rgb, curve); }
   o = vec4(c * a, a); }`,
     // Decontaminate: interior colour (premult -> Blur -> unpremult) keymixed into the edge by 1 - alpha; -> straight FGD
     decon: `uniform sampler2D F, SP; uniform float amt;
@@ -118,14 +151,14 @@ void main(){ ivec2 p = px(); vec4 c = texelFetch(C, p, 0); float bl = texelFetch
   if (kind == 0) { o = mix(c, min(c, texelFetch(B, p, 0)), m); return; }
   vec3 g = sat(c.rgb * gain, satv); o = vec4(mix(c.rgb, g, m), c.a); }`,
     // Edge blur where xor(Blur 3, Blur 3) / 0.9, bypass, mix, back from log, ACEScg -> display sRGB (rows flipped for the canvas)
-    final: `uniform sampler2D C, BL3, EB, F, B; uniform int bypass, logOn, eb; uniform float mixv;
+    final: `uniform sampler2D C, BL3, EB, F, B; uniform int bypass, curve, eb; uniform float mixv;
 void main(){ ivec2 p = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y));
   vec4 c = texelFetch(C, p, 0), b = texelFetch(B, p, 0), out_ = c;
   if (eb == 1) { float bl = texelFetch(BL3, p, 0).a; float m = clamp(2. * bl * (1. - bl) / .9, 0., 1.);
     out_ = texelFetch(EB, p, 0) * m + c * (1. - m); }
   if (bypass == 1) out_ = over(texelFetch(F, p, 0), b);
   out_ = b + (out_ - b) * mixv;
-  vec3 l = logOn == 1 ? icct(out_.rgb) : out_.rgb;
+  vec3 l = g2l(out_.rgb, curve);
   o = vec4(clamp(l2s(inverse(S2AP1) * l), 0., 1.), 1.); }`,
   };
 
@@ -204,7 +237,8 @@ void main(){ ivec2 p = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y)
     return pass('chain', { B1: b[0], B2: b[1], B3: b[2], B4: b[3] }, {}, tex(name));
   }
 
-  // k = MergeMatte knobs with the px knobs already in view px (the caller scales them like preview_region does)
+  // k = MergeMatte knobs with the px knobs already in view px (the caller scales them like preview_region does) and
+  // k.curve = the index of the resolved log curve (mergematte.js: `project` -> the plate profile; old `log` 1 = ACEScct)
   function render(o) {
     if (!init()) return null;
     const g = G, gl = g.gl, k = o.knobs;
@@ -212,20 +246,24 @@ void main(){ ivec2 p = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y)
     if (o.W > gl.getParameter(gl.MAX_TEXTURE_SIZE) || o.H > gl.getParameter(gl.MAX_TEXTURE_SIZE)) return null;
     g.W = o.W; g.H = o.H;
     if (g.cv.width !== o.W || g.cv.height !== o.H) { g.cv.width = o.W; g.cv.height = o.H; }
-    const logOn = k.log ? 1 : 0;
+    const curve = k.curve !== undefined ? (k.curve | 0) : (k.log ? 1 : 0);
     const P = upload('P', o.plate), A = upload('A', o.alpha);
     const bgm = o.bg.mode === 'image' && o.bg.img ? 2 : o.bg.mode === 'checker' ? 1 : 0;
     const Bi = bgm === 2 ? upload('B', o.bg.img) : P;
     const S0 = pass('prepFg', { P, A }, {}, tex('S0'));
-    const BG = pass('prepBg', { B: Bi }, { mode: { i: bgm }, logOn: { i: logOn }, col: o.bg.color || [0, 0, 0], cell: o.bg.cell || 16 }, tex('BG'));
+    const BG = pass('prepBg', { B: Bi }, { mode: { i: bgm }, curve: { i: curve }, col: o.bg.color || [0, 0, 0], cell: o.bg.cell || 16 }, tex('BG'));
     // Alpha: choke (FilterErode) + soften (Blur) of the alpha
     let Aeff = null;
     if (k.choke !== 0 || k.soften !== 0) {
-      const r = Math.round(Math.abs(k.choke));
-      Aeff = r > 0 ? pass('erode', { S: S0 }, { r: { i: r }, dil: { i: k.choke < 0 ? 1 : 0 } }, tex('ER')) : S0;
+      if (k.choke !== 0) {
+        const sg = FE_A * Math.abs(k.choke) + FE_B, r = Math.ceil(4 * sg);
+        const u = { r: { i: r }, dil: { i: k.choke < 0 ? 1 : 0 }, inv2s2: 1 / (2 * sg * sg) };
+        pass('erode', { S: S0 }, { ...u, first: { i: 1 }, dir: { i: [1, 0] } }, tex('ER_h'));
+        Aeff = pass('erode', { S: tex('ER_h') }, { ...u, first: { i: 0 }, dir: { i: [0, 1] } }, tex('ER'));
+      } else Aeff = S0;
       Aeff = blur(Aeff, k.soften, 'SO');
     }
-    const F = pass('fg', { S: S0, A: Aeff || S0 }, { useA: { i: Aeff ? 1 : 0 }, logOn: { i: logOn } }, tex('F'));
+    const F = pass('fg', { S: S0, A: Aeff || S0 }, { useA: { i: Aeff ? 1 : 0 }, curve: { i: curve } }, tex('F'));
     const SP = k.decon !== 0 ? blur(F, k.decon_spread, 'SP') : F;
     const D = pass('decon', { F, SP }, { amt: k.decon }, tex('D'));
     const need = k.bleed !== 0 || k.wrap !== 0;
@@ -249,7 +287,7 @@ void main(){ ivec2 p = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y)
     const eb = k.edge_blur > 0 ? 1 : 0;
     const BL3 = eb ? blur(C, 3.0, 'BL3') : C;
     const EB = eb ? blur(C, k.edge_blur, 'EB') : C;
-    pass('final', { C, BL3, EB, F, B: BG }, { bypass: { i: k.bypass ? 1 : 0 }, logOn: { i: logOn }, eb: { i: eb }, mixv: k.mix }, null);
+    pass('final', { C, BL3, EB, F, B: BG }, { bypass: { i: k.bypass ? 1 : 0 }, curve: { i: curve }, eb: { i: eb }, mixv: k.mix }, null);
     if (gl.isContextLost()) { G = false; return null; }
     const out = o.into && o.into.width === o.W && o.into.height === o.H ? o.into : document.createElement('canvas');
     out.width = o.W; out.height = o.H;
@@ -270,7 +308,7 @@ void main(){ ivec2 p = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y)
     const A = upload('FA', alpha);
     let T = pass('fin0', { A }, { black: +fin.black || 0, white: fin.white != null ? +fin.white : 1, gam: fin.gamma != null ? +fin.gamma : 1 }, tex('FN0'));
     const e = +fin.erode_px || 0;
-    if (Math.abs(e) >= 0.5) T = pass('erode', { S: T }, { r: { i: Math.round(Math.abs(e)) }, dil: { i: e < 0 ? 1 : 0 } }, tex('FN1'));
+    if (Math.abs(e) >= 0.5) T = pass('morph', { S: T }, { r: { i: Math.round(Math.abs(e)) }, dil: { i: e < 0 ? 1 : 0 } }, tex('FN1'));
     const bl = +fin.blur_px || 0;
     if (bl > 0) {
       const r = Math.round(bl * 3);

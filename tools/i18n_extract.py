@@ -212,7 +212,8 @@ def collect() -> dict[str, str]:
     h = _H(); h.feed((REPO / "static" / "index.html").read_text(encoding="utf-8"))
     for t in h.out:
         add(t, "index.html", split=False)   # parser text is already decoded: "&lt;plate&gt;" is text, not a tag
-    for f in [REPO / "app.py", REPO / "doctor.py", REPO / "comfy_client.py", *sorted((REPO / "engine").glob("*.py"))]:
+    for f in [REPO / "app.py", REPO / "doctor.py", REPO / "comfy_client.py", *sorted((REPO / "engine").glob("*.py")),
+              *sorted((REPO / "engine" / "cleanup3d").glob("*.py")), REPO / "api" / "cleanup3d.py"]:   # Cleanup 3D (2026-11-10)
         for s in py_strings(f.read_text(encoding="utf-8")):
             add(s, f.name)
     return found

@@ -48,7 +48,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
@@ -56,6 +56,7 @@ import numpy as np
 import scipy.interpolate as interp
 
 from engine import align_grid
+from engine.align_exclude import report_fields
 from engine.exr_io import imread_unchanged
 from engine.procpool import RamLimitError, available_ram_bytes, ram_workers, run_frames
 from engine.nuke_nk import (corner_pin_knobs, matrix_cv_to_nuke, scalar_knob, similarity_to_transform_knobs,
@@ -64,6 +65,8 @@ from engine.nuke_nk import (corner_pin_knobs, matrix_cv_to_nuke, scalar_knob, si
 logger = logging.getLogger("matte_desk.align")
 
 LOCAL_PATCH_PX = 128   # patch of the local model's correlation (plate px; anchors are measured at work scale = half of it)
+MIN_EVAL_POINTS = 6    # control points a global model's residual needs; fewer = no texture in the static area = no measurement
+NO_TEXTURE = "no_texture"   # frame status: the static area (after the exclusions) had no texture - nothing was measured
 
 
 def phase_correlate(a: np.ndarray, b: np.ndarray, win: Optional[np.ndarray] = None) -> Tuple[Tuple[float, float], float]:
@@ -111,6 +114,20 @@ class AlignmentReport:
     local_tracker_engine: str = ""  # tracker that actually ran for 1b ("cotracker3" / "lk_fallback"), "" if unused
     device: str = ""  # where it was computed: "cpu", "cuda" (engine.align_gpu) or "cuda+cpu" (GPU fell back mid-way)
     device_note: str = ""  # why not (only) the GPU: fallback reason, ComfyUI busy, ...
+    # align_v2 step 1 (2026-11-03): what the measurement excluded - objects (+ mask signatures, engine/stages.mask_sig),
+    # dilation px, box, user mask, how the local model's static mask was built ("all_anchors") and its share of the plate
+    exclusions: Dict[str, Any] = field(default_factory=dict)
+    # align_v2 step 2 (2026-11-03): „kamera zablokowana” - mode (auto / on / off), locked?, the shake / jitter measured
+    # on the per-frame global models, the locked global model, anchors of the median field, local residual before / after
+    camera_lock: Dict[str, Any] = field(default_factory=dict)
+    # align_v2 step 6a (2026-11-03, option `fullres_check`): the residual on full-resolution control points
+    # (engine/align_residual.py) at the anchor frames - after the global model ("global") and after the local model
+    # ("local"): {"frames": {f: stats}, "median", "p95", "max", "frac_ok"} each; the honest number next to the
+    # 21 px evaluator's residual_px
+    checks: Dict[str, Any] = field(default_factory=dict)
+    # user 2026-11-10: "tylko transform" - the local model (grid / STMap warp) was not allowed; a motion-control clear
+    # plate with a constant camera offset needs only the global Transform / CornerPin, the residual stays
+    global_only: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -138,10 +155,19 @@ class AlignmentReport:
         return cls(**data_copy)
 
 
-def stale_report_reason(data: Dict[str, Any]) -> str:
+def stale_report_reason(data: Dict[str, Any], work_dir: Optional[Path] = None) -> str:
     """Why a saved Align_<plate>.json must be measured again ("" = current). Same rules as `AlignmentReport.from_dict`,
-    which silently drops the local part of such reports (the preview then shows only the global model)."""
+    which silently drops the local part of such reports (the preview then shows only the global model).
+    With `work_dir`: also when a mask 1+2 the measurement excluded has changed since (align_v2 step 1)."""
     frames = data.get("frames", []) or []
+    ex = data.get("exclusions") or {}
+    if work_dir is not None and ex.get("object_sigs"):
+        from engine.align_exclude import object_sigs
+        now = object_sigs(Path(work_dir), list(ex["object_sigs"]))
+        changed = [n for n, s in ex["object_sigs"].items() if now.get(n) != s]
+        if changed:
+            return (f"Maski obiektów wykluczonych z pomiaru zmieniły się od pomiaru ({', '.join(changed)}) – "
+                    "zmierz ponownie, żeby wykluczyć aktualne maski.")
     if any("stmap_rel_path" in f for f in frames):
         return ("Stary pomiar (pełne STMapy sprzed siatki przesunięć) – dopasowanie lokalne pominięte, podgląd pokazuje sam "
                 "model globalny. Zmierz ponownie.")
@@ -167,7 +193,7 @@ class AlignmentFeatureExtractor:
     @staticmethod
     def extract(img: np.ndarray, mode: str = "backlit", scale: float = 0.5) -> np.ndarray:
         """Extract edge or luma feature map.
-        
+
         Args:
             img: Float32 (ACES/linear) or uint8 image, shape (H, W, C) or (H, W).
             mode: 'backlit' uses log-luma Sobel magnitude; 'cleanplate' uses exposure-normalized log-luma.
@@ -217,10 +243,11 @@ def compute_static_mask(
     mode: str = "backlit",
     scale: float = 0.5,
     user_mask: Optional[np.ndarray] = None,
-    exclude_box: Optional[Tuple[int, int, int, int]] = None
+    exclude_box: Optional[Tuple[int, int, int, int]] = None,
+    exclude_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Computes a binary mask where 1.0 = static background region, 0.0 = excluded moving foreground.
-    
+
     Args:
         beauty: Reference image.
         aux: Auxiliary image.
@@ -228,6 +255,9 @@ def compute_static_mask(
         scale: Resolution scale factor.
         user_mask: Optional user mask (1 = include, 0 = exclude).
         exclude_box: Optional box [x0, y0, x1, y1] to mask out (e.g. animated puppet area).
+        exclude_mask: Optional mask (plate size or already at `scale`; > 0.5 = exclude) - the objects' masks
+            dilated / a user mask (engine/align_exclude.py, 2026-11-03); applied BEFORE the clear-plate difference,
+            so the exposure normalisation and the threshold are estimated without the object.
     """
     h_orig, w_orig = beauty.shape[:2]
     h = int(round(h_orig * scale))
@@ -251,6 +281,13 @@ def compute_static_mask(
         sx1 = min(w, int(round(bx1 * scale)))
         sy1 = min(h, int(round(by1 * scale)))
         mask[sy0:sy1, sx0:sx1] = 0.0
+
+    # 2b. Known objects / user mask (align_v2 step 1)
+    if exclude_mask is not None:
+        ex = np.asarray(exclude_mask)
+        if ex.shape[:2] != (h, w):
+            ex = cv2.resize(ex.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+        mask[ex > 0.5] = 0.0
 
     # 3. Cleanplate difference masking: beauty - cleanplate highlights foreground object
     if mode == "cleanplate":
@@ -295,7 +332,7 @@ class GlobalAligner:
         static_mask: np.ndarray
     ) -> Tuple[float, float, float]:
         """Sub-pixel phase correlation.
-        
+
         Returns (dx, dy, response) at full plate scale.
         dx > 0 means aux feature is to the right of beauty.
         dy > 0 means aux feature is below beauty.
@@ -320,7 +357,7 @@ class GlobalAligner:
         params: Dict[str, Any]
     ) -> Tuple[float, float]:
         """Evaluates residual registration error in full plate pixels.
-        
+
         Returns (median_residual_px, max_residual_px).
         """
         h, w = feat_beauty.shape[:2]
@@ -349,8 +386,8 @@ class GlobalAligner:
         step = max(12, int(round(24 * self.scale)))
         gy, gx = np.mgrid[step // 2:h:step, step // 2:w:step]
         valid = edge_mask[gy, gx]
-        if not valid.any():
-            return 0.0, 0.0
+        if int(valid.sum()) < MIN_EVAL_POINTS:
+            return float("nan"), float("nan")     # no texture under the static area: NOT a 0 px residual
 
         pts = np.column_stack([gx[valid].ravel(), gy[valid].ravel()])
         residuals = []
@@ -365,10 +402,10 @@ class GlobalAligner:
                         res_px = math.hypot(p_dx, p_dy) / self.scale
                         residuals.append(res_px)
 
-        if not residuals:
-            # Fallback to feature pixel difference
-            diff = float(np.abs(feat_beauty[edge_mask] - warped_aux[edge_mask]).mean())
-            return diff, diff * 2.0
+        if len(residuals) < MIN_EVAL_POINTS:
+            # 2026-11-03: used to fall back to the feature difference (a few flat patches said "0.1 px" on an
+            # empty static area, _fotage_testy with every object excluded) - an unmeasured frame says so instead
+            return float("nan"), float("nan")
 
         res_arr = np.array(residuals, dtype=np.float32)
         med_err = float(np.median(res_arr))
@@ -559,7 +596,7 @@ class LocalPatchAligner:
         mode: str = "backlit"
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Measures local subpixel displacements at each grid point using patch correlation.
-        
+
         Returns (valid_points, displacements_dx_dy).
         """
         h, w = beauty.shape[:2]
@@ -639,6 +676,7 @@ class LocalPatchAligner:
             keep, info = np.ones(len(points), bool), {"n": len(points), "resp": 0, "clip": 0, "nbr": 0}
         self.last_reject = info
         self.last_n_rejected = int((~keep).sum())
+        self.last_fit_ok = False      # True only when a field was fitted (else the zero grid = the global model alone)
         n_all = len(points)
         points, displacements = points[keep], displacements[keep]
         n_pts = len(points)
@@ -672,6 +710,7 @@ class LocalPatchAligner:
         err_ho = np.hypot(pred_ho[:, 0] - holdout_disps[:, 0], pred_ho[:, 1] - holdout_disps[:, 1])
         # SPEC 1b gate: residual < 0.3 px on >= 90% of control points
         self.last_holdout_frac_ok = float(np.mean(err_ho < 0.3))
+        self.last_fit_ok = True
         ho_median = float(np.median(err_ho))
         ho_max = float(np.percentile(err_ho, 95))
 
@@ -699,14 +738,12 @@ class LocalPatchAligner:
         out_exr_path: Path
     ) -> None:
         """Generates Nuke-compliant float32 OpenEXR STMap.
-        
+
         Formula:
             u = (x + disp_x + 0.5) / plate_w
             v = (y_nuke + (-disp_y) + 0.5) / plate_h
             where y_nuke = plate_h - 1 - y
         """
-        import OpenEXR
-        import Imath
 
         h, w = disp_x.shape
         Y, X = np.indices((h, w), dtype=np.float32)
@@ -859,7 +896,11 @@ class LocalTemporalAligner:
         self.measure_patches: Optional[Callable[..., Tuple[np.ndarray, np.ndarray]]] = None
 
     def anchors(self, n: int) -> List[int]:
-        return sorted(set(range(0, n, self.anchor_every)) | {0, n - 1})
+        return self.anchors_of(n, self.anchor_every)
+
+    @staticmethod
+    def anchors_of(n: int, every: int) -> List[int]:
+        return sorted(set(range(0, n, every)) | {0, n - 1})
 
     def _track_segments(self, anchors: List[int], b_s: List[np.ndarray], a_s: List[np.ndarray],
                         q_b: np.ndarray, q_a: np.ndarray, owner: np.ndarray,
@@ -895,36 +936,74 @@ class LocalTemporalAligner:
     def work_size(self) -> Tuple[int, int]:
         return max(16, round(self.plate_w * self.s)), max(16, round(self.plate_h * self.s))
 
+    def grid_points(self, static_mask: Optional[np.ndarray]) -> np.ndarray:
+        """Grid points (work-scale px) every `grid_spacing` plate px on the static mask (plate or work size)."""
+        size = self.work_size()
+        if static_mask is None:
+            static_mask = np.ones((self.plate_h, self.plate_w), np.float32)
+        m = static_mask.astype(np.float32)
+        if (m.shape[1], m.shape[0]) != size:
+            m = cv2.resize(m, size, interpolation=cv2.INTER_NEAREST)
+        return self.patch.generate_grid_points(m, scale=self.s) * self.s
+
+    def anchor_offsets(self, b: np.ndarray, a: np.ndarray, grid: np.ndarray,
+                       anchor_mask: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Offsets of one anchor (work-scale px): the grid points inside `anchor_mask` (plate or work size, None =
+        all) measured by patch correlation (CPU, or the GPU twin `measure_patches`). (None, None) = under 4 points."""
+        size = self.work_size()
+        g = grid
+        if anchor_mask is not None:
+            am = np.asarray(anchor_mask).astype(np.float32)
+            if (am.shape[1], am.shape[0]) != size:
+                am = cv2.resize(am, size, interpolation=cv2.INTER_NEAREST)
+            gi = np.clip(np.round(grid).astype(int), 0, [size[0] - 1, size[1] - 1])
+            g = grid[am[gi[:, 1], gi[:, 0]] > 0.5]
+            if len(g) < 4:
+                return None, None
+        patch_px = max(16, int(round(LOCAL_PATCH_PX * self.s)) // 2 * 2)
+        measure = self.measure_patches or self.patch.measure_local_displacements
+        return measure(b, a, g, patch_size=patch_px, mode=self.mode)
+
     def measure(self, beauty_frames: List[np.ndarray], aux_frames: List[np.ndarray],
                 static_mask: Optional[np.ndarray] = None,
-                cancel_check: Optional[Callable[[], None]] = None) -> List[Tuple[np.ndarray, np.ndarray]]:
+                cancel_check: Optional[Callable[[], None]] = None,
+                anchor_masks: Optional[List[np.ndarray]] = None,
+                frame_exclude: Optional[Callable[[int], Optional[np.ndarray]]] = None
+                ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """Returns per frame (points_plate_px (N,2), displacements_plate_px (N,2)).
-        Frames may be full plate size or already at work size (`work_size()`, no copy then)."""
+        Frames may be full plate size or already at work size (`work_size()`, no copy then).
+        `static_mask` (plate or work size): where the grid points are. `anchor_masks` (align_v2 step 1, one per
+        anchor of `anchors(T)`, plate or work size, > 0.5 = measurable): an anchor measures only the grid points static
+        on ITS frame (the object / its shadow is elsewhere on other anchors), the tracker carries them; `frame_exclude(t)`
+        -> (plate_h, plate_w) bool of frame index t (True = excluded) drops a frame's points under the object there."""
         s = self.s
         T = len(beauty_frames)
         size = self.work_size()
 
-        def at_work(f: np.ndarray) -> np.ndarray:
-            return f if (f.shape[1], f.shape[0]) == size else cv2.resize(f, size, interpolation=cv2.INTER_AREA)
+        def at_work(f: np.ndarray, interp: int = cv2.INTER_AREA) -> np.ndarray:
+            return f if (f.shape[1], f.shape[0]) == size else cv2.resize(f, size, interpolation=interp)
 
         b_s = [at_work(f) for f in beauty_frames]
         a_s = [at_work(f) for f in aux_frames]
         if static_mask is None:
             static_mask = np.ones((self.plate_h, self.plate_w), np.float32)
-        mask_s = cv2.resize(static_mask.astype(np.float32), size, interpolation=cv2.INTER_NEAREST)
+        mask_s = at_work(static_mask.astype(np.float32), cv2.INTER_NEAREST)
 
         # grid every `grid_spacing` plate px, expressed in work-scale pixels
         grid = self.patch.generate_grid_points(mask_s, scale=s) * s
         patch_px = max(16, int(round(LOCAL_PATCH_PX * s)) // 2 * 2)
         anchors = self.anchors(T)
+        if anchor_masks is not None and len(anchor_masks) != len(anchors):
+            raise ValueError(f"anchor_masks: {len(anchor_masks)} masks for {len(anchors)} anchors")
 
         q_b, q_a, owner, gidx = [], [], [], []
         grid_key = {(round(float(p[0]), 3), round(float(p[1]), 3)): i for i, p in enumerate(grid)}
         for ai, a in enumerate(anchors):
             if cancel_check:
                 cancel_check()
-            measure = self.measure_patches or self.patch.measure_local_displacements
-            pts, d = measure(b_s[a], a_s[a], grid, patch_size=patch_px, mode=self.mode)
+            pts, d = self.anchor_offsets(b_s[a], a_s[a], grid, anchor_masks[ai] if anchor_masks is not None else None)
+            if pts is None:
+                continue
             # phase correlation returns the shift d that maps aux onto beauty: aux point = p - d
             for p, dd in zip(pts, d):
                 q_b.append([a, p[0], p[1]])
@@ -962,7 +1041,14 @@ class LocalTemporalAligner:
             arr = np.array(list(acc.values()), np.float64)
             pts = arr[:, 1:3] / arr[:, :1]
             disp = arr[:, 3:5] / arr[:, :1]
-            out.append(((pts / s).astype(np.float32), np.clip(disp / s, -8.0, 8.0).astype(np.float32)))
+            pts_p = (pts / s).astype(np.float32)
+            disp_p = np.clip(disp / s, -8.0, 8.0).astype(np.float32)
+            ex = frame_exclude(t) if frame_exclude is not None else None
+            if ex is not None and len(pts_p):
+                ii = np.clip(np.round(pts_p).astype(int), 0, [self.plate_w - 1, self.plate_h - 1])
+                keep = ~np.asarray(ex, bool)[ii[:, 1], ii[:, 0]]
+                pts_p, disp_p = pts_p[keep], disp_p[keep]
+            out.append((pts_p, disp_p))
         return out
 
 
@@ -996,6 +1082,97 @@ def warp_global(img: np.ndarray, m: np.ndarray, interpolation: int = cv2.INTER_C
                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     return cv2.warpPerspective(img, m.astype(np.float32), (w, h), flags=interpolation,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+LOCK_SHAKE_PX = 0.5     # camera lock (auto): p95 of the frames' non-translational corner deviation from the median model under this
+LOCK_JITTER_PX = 2.0    # ... and p95 of the per-frame translation jitter under this (above = a move, not jitter)
+LOCK_GRID_FILE = "grid_lock.exr"   # the one local field of a locked camera (every frame's grid_rel_path)
+
+
+def _plate_corners(w: int, h: int) -> np.ndarray:
+    return np.array([[0, 0, 1], [w, 0, 1], [0, h, 1], [w, h, 1]], np.float64).T
+
+
+def _model_from_corners(src: np.ndarray, dst: np.ndarray, kind: str) -> np.ndarray:
+    """3x3 forward model of `kind` mapping the 4 plate corners src (2, 4) onto dst (2, 4)."""
+    s, d = np.ascontiguousarray(src.T, np.float32), np.ascontiguousarray(dst.T, np.float32)
+    m = np.eye(3)
+    if kind == "translation":
+        m[:2, 2] = np.median(dst - src, axis=1)
+    elif kind == "similarity":
+        M, _ = cv2.estimateAffinePartial2D(s, d, method=cv2.LMEDS)
+        m[:2] = M if M is not None else np.eye(2, 3)
+    elif kind == "affine":
+        M, _ = cv2.estimateAffine2D(s, d, method=cv2.LMEDS)
+        m[:2] = M if M is not None else np.eye(2, 3)
+    else:
+        m = np.asarray(cv2.getPerspectiveTransform(s, d), np.float64)
+    return m
+
+
+def detect_camera_lock(frames: List[AlignmentFrameResult], plate_w: int, plate_h: int, mode: str = "auto",
+                       shake_px: float = LOCK_SHAKE_PX, jitter_px: float = LOCK_JITTER_PX) -> Dict[str, Any]:
+    """„Kamera zablokowana” (align_v2 step 2): decide from the per-frame GLOBAL models whether the beauty / aux pair
+    was shot with one locked camera. The 4 plate corners through every frame's model; their median over the frames
+    is the locked model (`_model_from_corners`, of the most general kind the frames used); per frame the deviation
+    from it splits into a translation (`jitter`, kept per frame) and the rest (`shake`: rotation / scale /
+    perspective differences = measurement noise when the camera was locked). mode: auto (locked when p95 shake <
+    `shake_px` and p95 |jitter| < `jitter_px`), on (forced), off. Returns the decision with the numbers and reason."""
+    mode = (mode or "auto").lower()
+    if mode not in ("auto", "on", "off"):
+        raise ValueError("camera_lock: auto | on | off")
+    order = ["identity", "translation", "similarity", "affine", "homography"]
+    C = _plate_corners(plate_w, plate_h)
+    P = []
+    for f in frames:
+        q = _frame_matrix_cv(f) @ C
+        P.append(q[:2] / q[2])
+    P = np.array(P)                                   # (T, 2, 4)
+    med = np.median(P, axis=0)                         # (2, 4)
+    dev = P - med[None]
+    jit = dev.mean(axis=2)                             # (T, 2) translation part
+    shake = np.abs(dev - jit[:, :, None]).max(axis=(1, 2))
+    jl = np.hypot(jit[:, 0], jit[:, 1])
+    shake_p95 = float(np.percentile(shake, 95)) if len(shake) else 0.0
+    jitter_p95 = float(np.percentile(jl, 95)) if len(jl) else 0.0
+    kinds = [(f.global_method if f.method == "local_stmap" else f.method) for f in frames]
+    kinds = [k for k in kinds if k in order]
+    kind = max(kinds, key=order.index) if kinds else "translation"
+    if kind == "identity":
+        kind = "translation"
+    m_lock = _model_from_corners(C[:2], med, kind)
+    if mode == "off":
+        locked, reason = False, "wyłączone"
+    elif mode == "on":
+        locked, reason = True, "wymuszone"
+    else:
+        locked = shake_p95 < shake_px and jitter_p95 < jitter_px
+        reason = (f"drganie modeli globalnych p95 {shake_p95:.2f} px < {shake_px} px" if locked else
+                  (f"drganie modeli globalnych p95 {shake_p95:.2f} px ≥ {shake_px} px" if shake_p95 >= shake_px else
+                   f"przesunięcia per klatka p95 {jitter_p95:.2f} px ≥ {jitter_px} px (ruch, nie drganie)"))
+    return {"mode": mode, "locked": bool(locked), "reason": reason, "shake_p95_px": round(shake_p95, 4),
+            "jitter_p95_px": round(jitter_p95, 4), "global_method": kind, "matrix": m_lock.tolist(),
+            "jitter": {int(f.frame): [float(jit[i, 0]), float(jit[i, 1])] for i, f in enumerate(frames)}}
+
+
+def apply_camera_lock(frames: List[AlignmentFrameResult], lock: Dict[str, Any]) -> None:
+    """Every frame's global model := T(its jitter) x the locked model (in place; method / matrix / dx, dy)."""
+    m_lock = np.asarray(lock["matrix"], np.float64)
+    kind = lock["global_method"]
+    for f in frames:
+        jx, jy = lock["jitter"].get(int(f.frame), lock["jitter"].get(str(int(f.frame)), [0.0, 0.0]))
+        t = np.eye(3)
+        t[0, 2], t[1, 2] = jx, jy
+        m = t @ m_lock
+        f.method = kind
+        f.dx, f.dy = float(m[0, 2]), float(m[1, 2])
+        if kind == "translation":
+            f.transform_matrix = None
+            f.rotation_deg, f.scale = 0.0, 1.0
+        else:
+            f.transform_matrix = (m[:2] if kind in ("similarity", "affine") else m).tolist()
+            f.scale = float(math.hypot(m[0, 0], m[0, 1]))
+            f.rotation_deg = float(math.degrees(math.atan2(m[1, 0], m[0, 0])))
 
 
 def compose_remap(frame: AlignmentFrameResult, grid: Optional[align_grid.AlignGrid], out_w: int, out_h: int,
@@ -1052,7 +1229,7 @@ class NukeAlignGroupGenerator:
         output_json_path: Path
     ) -> str:
         """Generates Nuke script text with single Group node adhering to Nuke conventions.
-        
+
         Outside: 1 input (Input1), 1 output (Output1).
         Inside: Dot1 -> Switch1 (inputs: unaligned input 0, aligned input 1), toggled by parent.use_aligned.
         """
@@ -1082,7 +1259,9 @@ class NukeAlignGroupGenerator:
         if node_method == "local_stmap":
             # global model (Transform / CornerPin2D, M) FIRST, then the alignment grid (engine.align_grid) read at its
             # own size, scaled to the plate in Nuke and turned into an STMap: the same order as compose_remap
-            grid_pat = str(output_nk_path.parent / f"grid_{plate_name}" / "grid_%04d.exr").replace("\\", "/")
+            shared = {f.grid_rel_path for f in frames if f.grid_rel_path}
+            one = next(iter(shared)) if len(shared) == 1 and not next(iter(shared)).startswith("grid_0") else None
+            grid_pat = str(output_nk_path.parent / f"grid_{plate_name}" / (one or "grid_%04d.exr")).replace("\\", "/")
             gw, gh = align_grid.grid_shape(plate_w, plate_h)
             if global_node:
                 inner_node = (global_node + "\nset N_global [stack 0]\n"
@@ -1341,19 +1520,53 @@ def _frame_path(pattern: str, f: int) -> str:
     return pattern.replace("####", f"{f:04d}").replace("%04d", f"{f:04d}")
 
 
-def _global_frame_job(job: Tuple[int, str, str, str, float, Any]) -> Optional[AlignmentFrameResult]:
-    """One frame of the global model (runs in a pool process). None when a file is missing."""
-    f_num, b_path, a_path, mode, scale, exclude_box = job
+def frame_exclusion_of(job_excl: Any, f_num: int, w: int, h: int) -> Optional[np.ndarray]:
+    """The (h, w) bool exclusion of a frame from the small per-job spec (engine.align_exclude.exclusion_spec with
+    only this frame's paths), None when nothing is excluded."""
+    if not job_excl:
+        return None
+    from engine.align_exclude import frame_exclusion
+    return frame_exclusion(job_excl, f_num, w, h)
+
+
+def _job_exclusion(exclusion: Optional[Dict[str, Any]], f: int) -> Optional[Dict[str, Any]]:
+    """The exclusion spec cut down to one frame (paths of that frame only) - small enough for every pool job."""
+    if not exclusion:
+        return None
+    paths = exclusion.get("paths") or {}
+    ps = paths.get(int(f)) or paths.get(str(int(f)))
+    if not ps and not exclusion.get("user_mask"):
+        return None
+    return {"paths": {int(f): list(ps or [])}, "dilate_px": exclusion.get("dilate_px", 0),
+            "user_mask": exclusion.get("user_mask")}
+
+
+def _global_frame_job(job: Tuple[Any, ...]) -> Optional[AlignmentFrameResult]:
+    """One frame of the global model (runs in a pool process). None when a file is missing.
+    job = (frame, beauty path, aux path, mode, scale, exclude_box[, exclusion of the frame (_job_exclusion)])."""
+    f_num, b_path, a_path, mode, scale, exclude_box = job[:6]
+    excl = job[6] if len(job) > 6 else None
     if not os.path.exists(b_path) or not os.path.exists(a_path):
         return None
     img_b = imread_unchanged(b_path)
     img_a = imread_unchanged(a_path)
     feat_b = AlignmentFeatureExtractor.extract(img_b, mode=mode, scale=scale)
     feat_a = AlignmentFeatureExtractor.extract(img_a, mode=mode, scale=scale)
-    static_mask = compute_static_mask(img_b, img_a, mode=mode, scale=scale, exclude_box=exclude_box)
+    ex = frame_exclusion_of(excl, f_num, img_b.shape[1], img_b.shape[0])
+    static_mask = compute_static_mask(img_b, img_a, mode=mode, scale=scale, exclude_box=exclude_box, exclude_mask=ex)
     method, params, med_err, max_err = GlobalAligner(scale=scale).select_best_model(feat_a, feat_b, static_mask)
+    return global_frame_result(f_num, method, params, med_err, max_err)
+
+
+def global_frame_result(f_num: int, method: str, params: Dict[str, Any], med_err: float, max_err: float
+                        ) -> AlignmentFrameResult:
+    """AlignmentFrameResult of a global model (CPU job and the GPU twin): a residual that could not be measured
+    (NaN: fewer than MIN_EVAL_POINTS textured control points in the static area, e.g. everything excluded) = status
+    NO_TEXTURE, identity model, residual -1 (JSON has no NaN) - nothing is applied to such a frame."""
+    if med_err is None or max_err is None or not (math.isfinite(float(med_err)) and math.isfinite(float(max_err))):
+        return AlignmentFrameResult(frame=f_num, method="identity", residual_px=-1.0, residual_max_px=-1.0, status=NO_TEXTURE)
     return AlignmentFrameResult(
-        frame=f_num, method=method, residual_px=med_err, residual_max_px=max_err,
+        frame=f_num, method=method, residual_px=float(med_err), residual_max_px=float(max_err),
         dx=params.get("dx", 0.0), dy=params.get("dy", 0.0), rotation_deg=params.get("rotation_deg", 0.0),
         scale=params.get("scale", 1.0), transform_matrix=params.get("matrix"))
 
@@ -1388,8 +1601,117 @@ def _local_frame_job(job: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
     grid, ho_med, ho_max = patch.fit_rbf_grid(pts, disp, resp=resp)
     align_grid.write_grid(Path(grid_path), grid)
     return {"ho_med": ho_med, "ho_max": ho_max, "ho_frac_ok": getattr(patch, "last_holdout_frac_ok", 0.0),
+            "fitted": bool(getattr(patch, "last_fit_ok", True)),
             "refined_frac": float(refined.mean()) if len(refined) else 0.0, "grid": grid_path,
             "n_points": int(len(pts)), "n_rejected": int(patch.last_n_rejected), "reject": patch.last_reject}
+
+
+def _anchor_refine_job(job: Tuple[Any, ...]) -> Tuple[np.ndarray, np.ndarray]:
+    """One anchor of the locked-camera path: full-res refinement of its offsets (refine_local_offsets on the aux
+    pre-warped by the global model) -> (disp refined (N, 2), response (N,)); nothing to refine -> as given."""
+    b_path, a_path, mode, pts, disp, m = job
+    if len(pts) == 0:
+        return np.asarray(disp, np.float32).reshape(-1, 2), np.zeros(0, np.float64)
+    feat_b = AlignmentFeatureExtractor.extract(imread_unchanged(b_path), mode=mode, scale=1.0)
+    feat_a = AlignmentFeatureExtractor.extract(aux_luma_global(a_path, m), mode=mode, scale=1.0)
+    d, _refined, resp = refine_local_offsets(feat_b, feat_a, pts, disp)
+    return d, resp
+
+
+def median_stack(stack: np.ndarray) -> np.ndarray:
+    """Per point the median over the anchors of (dx, dy, response), NaN = not measured there: (A, N, 3) -> (N, 3).
+    The GPU worker's `median_disp` op is its twin (engine.align_gpu.make_median)."""
+    with np.errstate(all="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            return np.nanmedian(np.asarray(stack, np.float64), axis=0)
+
+
+def median_anchor_field(per_anchor: List[Tuple[np.ndarray, np.ndarray]], refined: List[Tuple[np.ndarray, np.ndarray]],
+                        plate_w: int, plate_h: int,
+                        median_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Per grid point the median of the anchors' refined offsets (align_v2 step 2; a point measured on one anchor
+    only keeps that value) -> (pts (M, 2), disp (M, 2), resp (M,) median response, before, after):
+    before = an anchor's own thin-plate field (= one measurement, what the per-frame path has) judged by another
+    anchor's refined offsets; after = the median field of the other anchors (leave-one-out) judged by the same offsets;
+    both the median over anchors (<= 3 partner anchors each). The GPU worker carries `median_disp` as a twin."""
+    key = {}
+    vals: Dict[Tuple[int, int], List[Tuple[int, float, float, float]]] = {}
+    for ai, ((pts, _d0), (d, resp)) in enumerate(zip(per_anchor, refined)):
+        for k in range(len(pts)):
+            kk = (int(round(float(pts[k, 0]))), int(round(float(pts[k, 1]))))
+            key.setdefault(kk, len(key))
+            rv = float(resp[k]) if len(resp) > k else float("nan")
+            vals.setdefault(kk, []).append((ai, float(d[k, 0]), float(d[k, 1]), rv))
+    if not key:
+        z = np.zeros((0, 2), np.float32)
+        return z, z.copy(), np.zeros(0, np.float64), 0.0, 0.0
+    pts_m = np.array(list(key), np.float32)
+    n_anch = len(per_anchor)
+    # (anchors, points, 3) with NaN where an anchor did not measure the point -> the median (CPU numpy / GPU twin)
+    stack = np.full((n_anch, len(key), 3), np.nan, np.float64)
+    for kk, i in key.items():
+        for a_, x, y, r in vals[kk]:
+            stack[a_, i] = (x, y, r)
+    med = (median_fn or median_stack)(stack)
+    disp_m = med[:, :2].astype(np.float32)
+    resp_m = med[:, 2].astype(np.float64)
+    al = LocalPatchAligner(plate_w, plate_h)
+    usable = [ai for ai, ((pts, _d0), _r) in enumerate(zip(per_anchor, refined)) if len(pts) >= MIN_FIT_POINTS]
+
+    def field_of(ai: int):
+        pts, _d0 = per_anchor[ai]
+        d, resp = refined[ai]
+        g, _m, _x = al.fit_rbf_grid(pts, d, resp=resp)
+        return align_grid.upsample(g)
+
+    def err_at(dxdy, ai: int) -> Optional[float]:
+        """Median error of a dense field against anchor ai's refined offsets (points with a usable response)."""
+        pts, _d0 = per_anchor[ai]
+        d, resp = refined[ai]
+        dx, dy = dxdy
+        ii = np.clip(np.round(np.asarray(pts, np.float64)).astype(int), 0, [plate_w - 1, plate_h - 1])
+        err = np.hypot(dx[ii[:, 1], ii[:, 0]] - d[:, 0], dy[ii[:, 1], ii[:, 0]] - d[:, 1])
+        keep = np.isfinite(resp) & (resp > OUTLIER_RESP_MIN) if len(resp) == len(err) else np.ones(len(err), bool)
+        return float(np.median(err[keep])) if keep.any() else None
+
+    # before = one anchor's own field judged by ANOTHER anchor's measurements (what a per-frame field is: one
+    # measurement; its own hold-out is optimistic - neighbouring 128 px patches overlap, their noise correlates);
+    # after = the median field of the OTHER anchors judged by the same measurements (leave-one-out) - the same yardstick
+    fields = {ai: field_of(ai) for ai in usable} if len(usable) <= 12 else {}
+    befores, afters = [], []
+    for k in usable:
+        others = [j for j in usable if j != k]
+        if not others:
+            continue
+        js = others if len(others) <= 3 else sorted(others, key=lambda j: abs(j - k))[:3]
+        for j in js:
+            e = err_at(fields[j] if j in fields else field_of(j), k)
+            if e is not None:
+                befores.append(e)
+        o_pts, o_disp, o_resp = [], [], []
+        for kk, _i in key.items():
+            v = np.array([(x, y, r) for a_, x, y, r in vals[kk] if a_ != k], np.float64)
+            if not len(v):
+                continue
+            o_pts.append(kk)
+            o_disp.append(np.median(v[:, :2], axis=0))
+            rr = v[:, 2][np.isfinite(v[:, 2])]
+            o_resp.append(float(np.median(rr)) if len(rr) else np.nan)
+        if len(o_pts) < MIN_FIT_POINTS:
+            continue
+        g_o, _m, _x = al.fit_rbf_grid(np.array(o_pts, np.float32), np.array(o_disp, np.float32), resp=np.array(o_resp))
+        e = err_at(align_grid.upsample(g_o), k)
+        if e is not None:
+            afters.append(e)
+    if len(usable) == 1:   # nothing to compare with: the anchor's own hold-out, for both
+        _g, ho_med, _x = al.fit_rbf_grid(per_anchor[usable[0]][0], refined[usable[0]][0], resp=refined[usable[0]][1])
+        befores, afters = [ho_med], [ho_med]
+    before = float(np.median(befores)) if befores else 0.0
+    after = float(np.median(afters)) if afters else 0.0
+    return pts_m, disp_m, resp_m, before, after
 
 
 def _warped_coverage(mats: List[np.ndarray], plate_w: int, plate_h: int, margin: int) -> np.ndarray:
@@ -1435,8 +1757,28 @@ class AlignmentPipeline:
         device: Optional[str] = None,
         gpu_python: Optional[str] = None,
         gpu_env: Optional[Dict[str, str]] = None,
+        exclusion: Optional[Dict[str, Any]] = None,
+        camera_lock: str = "auto",
+        anchor_every: int = 24,
+        fullres_check: bool = False,
+        global_only: bool = False,
     ) -> AlignmentReport:
         """Measures full sequence alignment between beauty and auxiliary plate.
+
+        `fullres_check` (step 6a, option): the residual on full-res control points at the anchor frames after the
+        global model (report `checks["global"]`) - and it decides, next to the 21 px evaluator, whether the local
+        model runs (median >= 0.5 px or p95 > 0.5 px) - and after the local model (`checks["local"]`).
+        `camera_lock` auto | on | off (align_v2 step 2, `detect_camera_lock`): a locked camera gets ONE global model
+        (median of the frames' models, per frame only its translation jitter) and ONE local field = the median of the
+        anchor frames' measurements (no tracking; `_run_local_model_locked`), written as LOCK_GRID_FILE. `anchor_every`:
+        anchor spacing of the local model (frames; tests).
+        `global_only` (user 2026-11-10, "tylko transform"): never run the local model - the plate only gets the global
+        Transform / CornerPin (no warp); the residual the local model would have fixed stays and the report says so.
+
+        `exclusion` (engine.align_exclude.exclusion_spec, 2026-11-03): the objects' masks (dilated), a user mask -
+        excluded from the static area of every frame's global model and of the local model, whose static mask is
+        built from ALL anchor frames (not the first one) and minus everything the objects ever covered; the report
+        keeps what was excluded (`exclusions`). `exclude_box` stays as the box of the spec.
 
         When the best global model leaves a residual >= 0.5 px (or max > 0.5 px) and `grid_dir` is given, the local
         model (SPEC 1b, `LocalTemporalAligner`) runs and per-frame alignment grids (engine.align_grid) are written
@@ -1451,7 +1793,10 @@ class AlignmentPipeline:
         from engine import align_gpu
         scale = 0.5
         total_frames = last_frame - first_frame + 1
-        jobs = [(f, _frame_path(beauty_pattern, f), _frame_path(aux_pattern, f), aux_plate_type, scale, exclude_box)
+        if exclusion and exclusion.get("box") and exclude_box is None:
+            exclude_box = tuple(int(v) for v in exclusion["box"])
+        jobs = [(f, _frame_path(beauty_pattern, f), _frame_path(aux_pattern, f), aux_plate_type, scale, exclude_box,
+                 _job_exclusion(exclusion, f))
                 for f in range(first_frame, last_frame + 1)]
 
         def on_done(n: int, i: int) -> None:
@@ -1492,19 +1837,43 @@ class AlignmentPipeline:
             if not frame_results:
                 raise ValueError(f"No frames could be read for alignment from {aux_pattern}")
 
+            measured = [f for f in frame_results if f.status != NO_TEXTURE]
+            n_no_tex = len(frame_results) - len(measured)
+            if not measured:
+                raise ValueError("Brak tekstury w obszarze statycznym na każdej klatce (wykluczenia / prostokąt zakrywają "
+                                 "wszystko?) – nic nie zmierzono")
             # Temporal trajectory smoothing (median filter radius 2 on shifts)
-            cls._smooth_trajectory(frame_results)
+            cls._smooth_trajectory(measured)
+            lock = detect_camera_lock(measured, plate_w, plate_h, camera_lock)
+            if lock["locked"]:
+                apply_camera_lock(measured, lock)
 
             local_engine = ""
+            local_info: Dict[str, Any] = {}
+            checks: Dict[str, Any] = {}
+            need_local = (float(np.median([f.residual_px for f in measured])) >= 0.5
+                          or float(np.median([f.residual_max_px for f in measured])) > 0.5)
+            if fullres_check:
+                if step_cb:
+                    step_cb("Wyrównanie: reszta modelu globalnego w pełnej rozdzielczości (klatki kotwiczne)")
+                checks["global"] = cls.fullres_residual_check(beauty_pattern, aux_pattern, measured, aux_plate_type,
+                                                             plate_w, plate_h, None, exclusion, anchor_every, cancel_check)
+                g = checks["global"]
+                if g.get("median") is not None and (g["median"] >= 0.5 or g["p95"] > 0.5):
+                    need_local = True
             # global model insufficient (SPEC 4a pkt 1): residual > 0.5 px or uneven residual map (max > 0.5 px)
-            if grid_dir is not None and (float(np.median([f.residual_px for f in frame_results])) >= 0.5
-                                          or float(np.median([f.residual_max_px for f in frame_results])) > 0.5):
+            if grid_dir is not None and need_local and not global_only:
                 run_local = lambda g: cls._run_local_model(  # noqa: E731
-                    beauty_pattern, aux_pattern, frame_results, aux_plate_type, plate_w, plate_h,
+                    beauty_pattern, aux_pattern, measured, aux_plate_type, plate_w, plate_h,
                     exclude_box, Path(grid_dir), tracker, workers=workers, progress_cb=progress_cb, step_cb=step_cb,
-                    cancel_check=cancel_check, gpu=g, decode_workers=n_dec)
+                    cancel_check=cancel_check, gpu=g, decode_workers=n_dec, exclusion=exclusion, info=local_info,
+                    lock=lock, anchor_every=anchor_every)
                 local_engine = ""
-                check_local_model_ram(len(frame_results), plate_w, plate_h)
+                # a locked camera keeps only the anchor frames at work size (no tracking): check for those
+                n_keep = len(LocalTemporalAligner.anchors_of(len(frame_results), anchor_every)) if lock["locked"] else len(frame_results)
+                check_local_model_ram(n_keep, plate_w, plate_h)
+                if n_no_tex:
+                    logger.warning("alignment: %d frames without texture in the static area - local model skips them", n_no_tex)
                 if gpu is not None:
                     try:
                         local_engine = run_local(gpu)
@@ -1519,24 +1888,40 @@ class AlignmentPipeline:
                 if not local_engine:
                     local_engine = run_local(None)
                     used.append("cpu")
+                if fullres_check:
+                    if step_cb:
+                        step_cb("Wyrównanie: reszta modelu lokalnego w pełnej rozdzielczości (klatki kotwiczne)")
+                    checks["local"] = cls.fullres_residual_check(beauty_pattern, aux_pattern, measured, aux_plate_type,
+                                                                plate_w, plate_h, Path(grid_dir), exclusion, anchor_every,
+                                                                cancel_check)
         finally:
             align_gpu.close_aligner(gpu)
         used_dev = "+".join(dict.fromkeys(used))
 
         # Sequence-level statistics
-        all_meds = [f.residual_px for f in frame_results]
-        all_maxs = [f.residual_max_px for f in frame_results]
+        measured = [f for f in frame_results if f.status != NO_TEXTURE]
+        all_meds = [f.residual_px for f in measured]
+        all_maxs = [f.residual_max_px for f in measured]
         seq_med = float(np.median(all_meds))
         seq_max = float(np.max(all_maxs))
 
         # Determine dominant method
-        methods = [f.method for f in frame_results]
+        methods = [f.method for f in measured]
         dominant_method = max(set(methods), key=methods.count)
 
         # Thresholds per SPEC 4a: median > 0.3 px or max > 0.75 px
         needs_correction = (seq_med > 0.3) or (seq_max > 0.75)
 
-        if not needs_correction:
+        # frames where the local model was needed but no field could be fitted (they stay on the global model, whose
+        # residual estimate is low – NEXT_STEPS align v2 step 6): never „zgodny” then (SH010 clear plate 2026-11-07)
+        n_fail = sum(1 for f in measured if local_engine and f.method != "local_stmap" and f.status == "uncertain")
+        if n_fail:
+            recommendation = (
+                f"⚠ {aux_plate_type.capitalize()}: dopasowanie lokalne nie wyszło w {n_fail}/{len(measured)} kl. "
+                "(za mało zgodnych punktów – paralaksa, inna treść albo obiekt w kadrze; wyklucz obiekty) – te klatki "
+                f"mają tylko model globalny (reszta wg oceny globalnej {seq_max:.2f} px, zaniżona) – sprawdź „Mapą reszty”")
+            needs_correction = True
+        elif not needs_correction:
             recommendation = f"{aux_plate_type.capitalize()} zgodny (max {seq_max:.2f} px) – nic nie rób"
         else:
             recommendation = (
@@ -1558,10 +1943,74 @@ class AlignmentPipeline:
             local_tracker_engine=local_engine,
             device=used_dev,
             device_note=note if "cpu" in used or dev == "cpu" else "",
+            exclusions={**report_fields(exclusion), **local_info},
+            camera_lock={k: v for k, v in lock.items() if k != "jitter"},
+            checks=checks,
+            global_only=bool(global_only),
         )
-        if local_engine:
+        if global_only and need_local:
+            report.recommendation += (f" · tylko transform (bez warpa): model lokalny pominięty, reszta {seq_med:.2f} px "
+                                      f"(max {seq_max:.2f} px) zostaje")
+        if checks.get("local") or checks.get("global"):
+            c = checks.get("local") or checks["global"]
+            if c.get("median") is not None:
+                report.recommendation += (f" · reszta na punktach kontrolnych (pełna rozdz., kotwice): mediana {c['median']:.2f} px, "
+                                          f"p95 {c['p95']:.2f} px, {round(100 * c['frac_ok'])} % < 0,3 px")
+        if n_no_tex:
+            report.recommendation += (f" · UWAGA: {n_no_tex} kl. bez tekstury w obszarze statycznym (nic nie zmierzono – "
+                                      "za szerokie wykluczenia / prostokąt?)")
+        if local_engine == "median" and lock.get("local_failed"):
+            report.recommendation += (f" · kamera zablokowana: pola z mediany {lock.get('anchors', 0)} klatek kotwicznych "
+                                      "nie dało się dopasować (model globalny)")
+        elif local_engine == "median":
+            report.recommendation += (f" · kamera zablokowana: jedno pole z mediany {lock.get('anchors', 0)} klatek "
+                                      f"kotwicznych (reszta kotwic {lock.get('local_before_px', 0):.2f} → "
+                                      f"{lock.get('local_after_px', 0):.2f} px)")
+        elif local_engine:
             report.recommendation += f" · dopasowanie lokalne (śledzenie: {local_engine})"
+        elif lock["locked"]:
+            report.recommendation += " · kamera zablokowana (jeden model globalny)"
         return report
+
+    @staticmethod
+    def fullres_residual_check(beauty_pattern: str, aux_pattern: str, frame_results: List[AlignmentFrameResult],
+                               mode: str, plate_w: int, plate_h: int, grid_dir: Optional[Path],
+                               exclusion: Optional[Dict[str, Any]], anchor_every: int = 24,
+                               cancel_check: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+        """Step 6a: engine.align_residual.frame_residual at the anchor frames of `frame_results` (their composed
+        alignment: the global model, + the grid in `grid_dir` when the frame has one) on the static area minus the
+        exclusion -> {"frames": {frame: stats}, "median", "p95", "max", "frac_ok"} (medians over the anchors of the
+        per-frame median / p95, the max of the maxima, the mean share < 0.3 px). CPU; the same code on both devices."""
+        from engine.align_exclude import frame_exclusion
+        from engine.align_residual import frame_residual
+        anchors = LocalTemporalAligner.anchors_of(len(frame_results), anchor_every)
+        per: Dict[int, Dict[str, Any]] = {}
+        for a in anchors:
+            if cancel_check:
+                cancel_check()
+            fr = frame_results[a]
+            f = fr.frame
+            b = imread_unchanged(_frame_path(beauty_pattern, f))
+            x = imread_unchanged(_frame_path(aux_pattern, f))
+            if b is None or x is None:
+                continue
+            grid = None
+            if grid_dir is not None and fr.method == "local_stmap" and fr.grid_rel_path and (grid_dir / fr.grid_rel_path).exists():
+                grid = align_grid.read_grid(grid_dir / fr.grid_rel_path)
+            ex = frame_exclusion(exclusion, f, plate_w, plate_h) if exclusion else None
+            if exclusion and exclusion.get("box"):
+                x0, y0, x1, y1 = exclusion["box"]
+                e2 = np.zeros((plate_h, plate_w), bool) if ex is None else ex.copy()
+                e2[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
+                ex = e2
+            per[int(f)] = frame_residual(b, x, fr, grid, mode=mode, exclude=ex)["stats"]
+        vals = [s for s in per.values() if s.get("median") is not None]
+        if not vals:
+            return {"frames": per, "median": None, "p95": None, "max": None, "frac_ok": None}
+        return {"frames": per, "median": round(float(np.median([s["median"] for s in vals])), 4),
+                "p95": round(float(np.median([s["p95"] for s in vals])), 4),
+                "max": round(float(max(s["max"] for s in vals)), 4),
+                "frac_ok": round(float(np.mean([s["frac_ok"] for s in vals])), 4)}
 
     @staticmethod
     def _run_local_model(beauty_pattern: str, aux_pattern: str, frame_results: List[AlignmentFrameResult],
@@ -1570,12 +2019,21 @@ class AlignmentPipeline:
                          workers: Optional[int] = None, progress_cb: Optional[Any] = None,
                          step_cb: Optional[Callable[[str], None]] = None,
                          cancel_check: Optional[Callable[[], None]] = None, gpu: Any = None,
-                         decode_workers: Optional[int] = None) -> str:
+                         decode_workers: Optional[int] = None, exclusion: Optional[Dict[str, Any]] = None,
+                         info: Optional[Dict[str, Any]] = None, lock: Optional[Dict[str, Any]] = None,
+                         anchor_every: int = 24) -> str:
         """Local model; gpu (engine.align_gpu.GpuAligner) computes the anchor offsets and per-frame fields there,
-        with `decode_workers` processes for decoding instead of `workers`."""
+        with `decode_workers` processes for decoding instead of `workers`. `info` (dict) receives how the static
+        mask was built (`static_mask`, `static_frac`). A locked camera (`lock["locked"]`) takes the median path
+        (`_run_local_model_locked`, returns "median" as the engine)."""
         from engine import align_gpu
         frames = [r.frame for r in frame_results]
         paths = [(_frame_path(beauty_pattern, f), _frame_path(aux_pattern, f)) for f in frames]
+        if lock and lock.get("locked"):
+            return AlignmentPipeline._run_local_model_locked(
+                paths, frame_results, aux_plate_type, plate_w, plate_h, exclude_box, grid_dir, workers=workers,
+                progress_cb=progress_cb, step_cb=step_cb, cancel_check=cancel_check, gpu=gpu,
+                decode_workers=decode_workers, exclusion=exclusion, info=info, lock=lock, anchor_every=anchor_every)
 
         def on_done(n: int, i: int) -> None:
             if progress_cb:
@@ -1589,13 +2047,19 @@ class AlignmentPipeline:
 
         # the local model is measured on the aux pre-aligned by each frame's GLOBAL model (the grid = the residual)
         mats = [_frame_matrix_cv(r) for r in frame_results]
-        local = LocalTemporalAligner(plate_w, plate_h, tracker=tracker, mode=aux_plate_type)
-        aux0 = warp_global(imread_unchanged(paths[0][1]), mats[0])
-        mask_s = compute_static_mask(imread_unchanged(paths[0][0]), aux0, mode=aux_plate_type,
-                                     scale=0.5, exclude_box=exclude_box)
-        mask = cv2.resize(mask_s.astype(np.float32), (plate_w, plate_h), interpolation=cv2.INTER_NEAREST)
+        local = LocalTemporalAligner(plate_w, plate_h, tracker=tracker, mode=aux_plate_type, anchor_every=anchor_every)
+        step("Dopasowanie lokalne: obszar statyczny z klatek kotwicznych")
+        mask, anchor_masks = AlignmentPipeline.local_static_mask(
+            paths, mats, local.anchors(len(frames)), frames, aux_plate_type, plate_w, plate_h, exclude_box, exclusion,
+            cancel_check)
         mask *= _warped_coverage(mats, plate_w, plate_h, margin=LOCAL_PATCH_PX // 2 + 8)
-        del aux0
+        if info is not None:
+            info["static_mask"] = "per_anchor"
+            info["static_frac"] = round(float((mask > 0.5).mean()), 4)
+        frame_exclude = None
+        if exclusion and exclusion.get("paths"):
+            from engine.align_exclude import frame_exclusion
+            frame_exclude = lambda i: frame_exclusion(exclusion, frames[i], plate_w, plate_h)  # noqa: E731
 
         load_workers = workers
         if gpu is not None:
@@ -1605,7 +2069,8 @@ class AlignmentPipeline:
         small = run_frames(_load_pair_job, [(b, a, local.work_size(), m) for (b, a), m in zip(paths, mats)],
                            load_workers, on_done, job_ram_bytes(plate_w, plate_h))
         step(f"Dopasowanie lokalne: śledzenie punktów ({local.engine})")
-        fields = local.measure([b for b, _ in small], [a for _, a in small], mask, cancel_check=cancel_check)
+        fields = local.measure([b for b, _ in small], [a for _, a in small], mask, cancel_check=cancel_check,
+                               anchor_masks=anchor_masks, frame_exclude=frame_exclude)
         del small
 
         step("Dopasowanie lokalne: doprecyzowanie w pełnej rozdzielczości + siatka" + (" (GPU)" if gpu else ""))
@@ -1623,6 +2088,13 @@ class AlignmentPipeline:
             if res is None:
                 r.status = "uncertain"
                 continue
+            if not res.get("fitted", True):
+                # no local field (too few points survived the rejection, SH010 clear plate 2026-11-07): the frame stays
+                # on its global model with ITS residual - the zero grid's 0.0 hold-out used to be reported as a
+                # perfect match ("zgodny – nic nie rób") while the plate was 6 px off
+                r.n_points, r.n_rejected = int(res.get("n_points", 0)), int(res.get("n_rejected", 0))
+                r.status = "uncertain"
+                continue
             r.global_method = r.method          # the model the grid is the residual over (matrix / dx, dy stay)
             r.method = "local_stmap"
             r.residual_px, r.residual_max_px = res["ho_med"], res["ho_max"]
@@ -1631,6 +2103,137 @@ class AlignmentPipeline:
             r.grid_rel_path = Path(res["grid"]).name
             r.status = "ok" if res["ho_frac_ok"] >= 0.9 else "uncertain"
         return local.engine
+
+    @staticmethod
+    def _run_local_model_locked(paths: List[Tuple[str, str]], frame_results: List[AlignmentFrameResult], mode: str,
+                                plate_w: int, plate_h: int, exclude_box: Optional[Tuple[int, int, int, int]],
+                                grid_dir: Path, workers: Optional[int] = None, progress_cb: Optional[Any] = None,
+                                step_cb: Optional[Callable[[str], None]] = None,
+                                cancel_check: Optional[Callable[[], None]] = None, gpu: Any = None,
+                                decode_workers: Optional[int] = None, exclusion: Optional[Dict[str, Any]] = None,
+                                info: Optional[Dict[str, Any]] = None, lock: Optional[Dict[str, Any]] = None,
+                                anchor_every: int = 24) -> str:
+        """Local model of a locked camera (align_v2 step 2): the anchor frames' offsets (patch correlation on the grid,
+        per-anchor static mask) refined at full resolution, then per grid point the MEDIAN over the anchors (noise
+        / sqrt(N)) -> one thin-plate field (LOCK_GRID_FILE) for every frame; no tracking. `lock` receives anchors,
+        local_before_px (median hold-out of the anchors' own per-anchor fields = what the per-frame path leaves) and
+        local_after_px (leave-one-out: the median field of the OTHER anchors against this anchor's measurements)."""
+        from engine import align_gpu
+        frames = [r.frame for r in frame_results]
+        T = len(frames)
+
+        def step(text: str) -> None:
+            if step_cb:
+                step_cb(text)
+            if cancel_check:
+                cancel_check()
+
+        mats = [_frame_matrix_cv(r) for r in frame_results]
+        local = LocalTemporalAligner(plate_w, plate_h, tracker=object(), mode=mode, anchor_every=anchor_every)
+        anchors = local.anchors(T)
+        step("Dopasowanie lokalne (kamera zablokowana): obszar statyczny z klatek kotwicznych")
+        mask, anchor_masks = AlignmentPipeline.local_static_mask(paths, mats, anchors, frames, mode, plate_w, plate_h,
+                                                                 exclude_box, exclusion, cancel_check)
+        mask *= _warped_coverage(mats, plate_w, plate_h, margin=LOCAL_PATCH_PX // 2 + 8)
+        if info is not None:
+            info["static_mask"] = "per_anchor"
+            info["static_frac"] = round(float((mask > 0.5).mean()), 4)
+        load_workers = decode_workers if gpu is not None else workers
+        if gpu is not None:
+            local.measure_patches = align_gpu.make_patch_measure(gpu, cancel_check)
+        step("Dopasowanie lokalne (kamera zablokowana): wczytywanie klatek kotwicznych")
+        small = run_frames(_load_pair_job, [(paths[a][0], paths[a][1], local.work_size(), mats[a]) for a in anchors],
+                           load_workers, None, job_ram_bytes(plate_w, plate_h))
+        step("Dopasowanie lokalne (kamera zablokowana): pomiar kotwic")
+        grid = local.grid_points(mask)
+        s = local.s
+        per_anchor: List[Tuple[np.ndarray, np.ndarray]] = []   # (pts plate px, disp plate px) per anchor, grid order
+        for (b, a), am in zip(small, anchor_masks):
+            if cancel_check:
+                cancel_check()
+            pts, d = local.anchor_offsets(b, a, grid, am)
+            if pts is None:
+                per_anchor.append((np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)))
+                continue
+            per_anchor.append(((np.asarray(pts, np.float64) / s).astype(np.float32),
+                               np.clip(np.asarray(d, np.float64) / s, -8.0, 8.0).astype(np.float32)))
+        del small
+        step("Dopasowanie lokalne (kamera zablokowana): doprecyzowanie kotwic w pełnej rozdzielczości"
+             + (" (GPU)" if gpu else ""))
+        a_paths = [paths[a] for a in anchors]
+        a_mats = [mats[a] for a in anchors]
+        if gpu is not None:
+            refined = align_gpu.anchor_refine(gpu, a_paths, per_anchor, mode, a_mats, decode_workers or 1, cancel_check,
+                                              patch=LOCAL_PATCH_PX)
+        else:
+            jobs = [(b, a, mode, pts, disp, m) for (b, a), (pts, disp), m in zip(a_paths, per_anchor, a_mats)]
+            refined = run_frames(_anchor_refine_job, jobs, workers, None, job_ram_bytes(plate_w, plate_h))
+        step("Dopasowanie lokalne (kamera zablokowana): mediana kotwic + siatka")
+        pts_m, disp_m, resp_m, before, after = median_anchor_field(
+            per_anchor, refined, plate_w, plate_h, median_fn=align_gpu.make_median(gpu, cancel_check) if gpu else None)
+        patch = LocalPatchAligner(plate_w, plate_h, grid_spacing=local.grid_spacing)
+        g, ho_med, ho_max = patch.fit_rbf_grid(pts_m, disp_m, resp=resp_m)
+        grid_dir.mkdir(parents=True, exist_ok=True)
+        align_grid.write_grid(grid_dir / LOCK_GRID_FILE, g)
+        frac = float(getattr(patch, "last_holdout_frac_ok", 0.0))
+        if not getattr(patch, "last_fit_ok", True):     # no field: every frame stays on the global model (see above)
+            for i, r in enumerate(frame_results):
+                r.n_points, r.n_rejected = int(len(pts_m)), int(patch.last_n_rejected)
+                r.status = "uncertain"
+                if progress_cb:
+                    progress_cb(i + 1, T, r.frame)
+            if lock is not None:
+                lock.update(anchors=len(anchors), local_before_px=round(before, 4), local_after_px=None,
+                            n_points=int(len(pts_m)), local_failed=True)
+            return "median"
+        for i, r in enumerate(frame_results):
+            r.global_method = r.method
+            r.method = "local_stmap"
+            r.residual_px, r.residual_max_px = ho_med, ho_max
+            r.holdout_frac_ok = frac
+            r.n_points, r.n_rejected = int(len(pts_m)), int(patch.last_n_rejected)
+            r.grid_rel_path = LOCK_GRID_FILE
+            r.status = "ok" if frac >= 0.9 else "uncertain"
+            if progress_cb:
+                progress_cb(i + 1, T, r.frame)
+        if lock is not None:
+            lock.update(anchors=len(anchors), local_before_px=round(before, 4), local_after_px=round(after, 4),
+                        n_points=int(len(pts_m)))
+        return "median"
+
+    @staticmethod
+    def local_static_mask(paths: List[Tuple[str, str]], mats: List[np.ndarray], anchors: List[int], frames: List[int],
+                          mode: str, plate_w: int, plate_h: int, exclude_box: Optional[Tuple[int, int, int, int]],
+                          exclusion: Optional[Dict[str, Any]], cancel_check: Optional[Callable[[], None]] = None,
+                          static_fn: Optional[Callable[..., np.ndarray]] = None
+                          ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Static area of the local model (align_v2 step 1, 2026-11-03) -> (grid mask (plate_h, plate_w) float32,
+        per-anchor masks at scale 0.5, bool). Per anchor: `compute_static_mask` of that frame (beauty vs the aux
+        pre-warped by its global model: margins, clear-plate difference) minus the known objects' masks 1+2 on that
+        frame, dilated (engine.align_exclude.frame_exclusion). The grid mask is their OR: a point is measured at the
+        anchors where it is static and carried by the tracker elsewhere; a frame's points under the object are dropped
+        (`LocalTemporalAligner.measure(frame_exclude=)`). Before 2026-11-03: the first frame's mask alone for every
+        anchor - an object walking across the frame dragged grid points with it.
+        `static_fn(img_b, aux_warped, mode, scale, exclude_box, exclude_mask) -> mask at scale 0.5` replaces the
+        per-anchor difference mask (the GPU worker's twin, engine.align_gpu.static_mask_fn)."""
+        from engine.align_exclude import frame_exclusion
+        per: List[np.ndarray] = []
+        acc = None
+        for a in anchors:
+            if cancel_check:
+                cancel_check()
+            img_b = imread_unchanged(paths[a][0])
+            aux_w = warp_global(imread_unchanged(paths[a][1]), mats[a])
+            ex = frame_exclusion(exclusion, frames[a], plate_w, plate_h) if exclusion else None
+            if static_fn is not None:
+                m = static_fn(img_b, aux_w, mode, 0.5, exclude_box, ex)
+            else:
+                m = compute_static_mask(img_b, aux_w, mode=mode, scale=0.5, exclude_box=exclude_box, exclude_mask=ex)
+            per.append(np.asarray(m) > 0.5)
+            acc = (m > 0.5) if acc is None else (acc | (m > 0.5))
+            del img_b, aux_w
+        mask = cv2.resize(acc.astype(np.float32), (plate_w, plate_h), interpolation=cv2.INTER_NEAREST)
+        return mask, per
 
     @staticmethod
     def _smooth_trajectory(frames: List[AlignmentFrameResult]) -> None:

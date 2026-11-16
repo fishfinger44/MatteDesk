@@ -1,7 +1,7 @@
 // MatteDesk – Copyright (C) 2026 Lech Gruszewski
 // SPDX-License-Identifier: GPL-3.0-or-later
 // static/tips.js - tooltips of the stage panels (Z24): what an option does + when to use it, in one place.
-// Texts proposed in PLAN_OPUS_5_5.md (Z24) – the user corrects them here. Applied as native `title` to elements by id
+// Texts proposed in docs/archive/PLAN_OPUS_5_5.md (Z24) – the user corrects them here. Applied as native `title` to elements by id
 // (and to <option>s by select id + value) whenever the panels change (MutationObserver), never overwriting a title
 // that the code sets dynamically for a state (e.g. "Trwa: …" while a job runs).
 (function () {

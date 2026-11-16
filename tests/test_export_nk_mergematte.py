@@ -97,9 +97,11 @@ def test_backdrop_wiring_and_knobs(tmp_path):
     assert ins["Stamp_copy_hair"] == ["Anchor_hair"] and ins["Anchor_hair"] == ["MATTE_hair"]
     g = txt[txt.index("name MergeMatte_hair"):]
     for k, v in mmnk.PRESET_SH010.items():
-        if k in ("log", "bypass"):
+        if k in ("log_curve", "bypass"):
             continue
         assert re.search(rf"^ {k} {v:.6g}$", g, re.M), k
+    assert re.search(r"^ log_curve ACEScct$", g, re.M)      # the preset's `project` resolved (no profile known here → ACEScct)
+    assert "OCIOColorSpace" not in txt
 
 
 def test_unknown_colorspace_is_left_to_the_user(tmp_path):

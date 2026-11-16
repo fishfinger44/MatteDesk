@@ -18,6 +18,7 @@ import json
 import zlib
 import re
 import threading
+import uuid
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -27,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")   # must precede the first `import cv2` (EXR alpha / plates)
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,14 +38,14 @@ from comfy_client import ComfyClient
 import engine.config as engine_config
 from engine.config import load_config
 from engine.jobs import CURRENT_JOB, JOBS, JobBusy, JobCancelled
+from engine.lru import LockedLRU
+from engine.objects import ObjectNotFound
 from doctor import EnvironmentDoctor
 from engine.coords import CoordTransformer, FrameMapper
-from engine.clean import (CleanReport, DeflickerMetrics, NukeDeflickerGroupGenerator, PinnedFrameCache, PlateCleaner,
-                          clean_cache_budget)
-from engine.camera import Camera2DData, Camera2DTracker, NukeCamera2DGroupGenerator
 from engine.ingest import (VIDEO_EXT, MediaInspector, ProjectCreator, ProxyGenerator, is_video_file, renumber_sequence,
                            video_to_sequence)
-from engine.project import ShotProject
+from engine.export import EXPORT_FALLBACK, EXPORT_SOURCE_LABEL, EXPORT_SOURCES
+from engine.project import ShotProject, StateFileError, load_defaults
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("matte_desk.app")
@@ -74,6 +75,10 @@ logging.getLogger("uvicorn.access").addFilter(_QuietPolling())
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    try:   # weights outside ComfyUI's folders (HF cache): set before any worker / ComfyUI autostart inherits the env
+        engine_config.apply_weights_dir(load_config())
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("matte_desk").warning("weights dir: %s", e)
     _reopen_last_project()
     try:   # ComfyUI chosen in the Doctor, started in the background when it is not running (comfy_autostart)
         from engine import comfy_launch
@@ -111,7 +116,10 @@ _STARTED_AT = __import__("time").time()
 def _code_changed_since_start() -> bool:
     """True when the Python code on disk is newer than this server process (git pull / edits without a restart)."""
     root = Path(__file__).resolve().parent
-    files = [root / "app.py", root / "doctor.py", root / "comfy_client.py", root / "VERSION", *(root / "engine").glob("*.py")]
+    # the routers in api/ and the engine's subpackages too (2026-11-11: a new route in api/cleanup.py was not seen –
+    # the button of the new static JS hit the old server and got „Brak kotwicy”)
+    files = [root / "app.py", root / "doctor.py", root / "comfy_client.py", root / "VERSION",
+             *(root / "engine").rglob("*.py"), *(root / "api").glob("*.py")]
     try:
         return max(f.stat().st_mtime for f in files if f.exists()) > _STARTED_AT + 1
     except ValueError:
@@ -121,11 +129,28 @@ def _code_changed_since_start() -> bool:
 @app.get("/api/version")
 def get_version():
     """Running version + whether the server runs older code than on disk (the UI then asks for a restart)."""
-    return {"version": APP_VERSION, "on_disk": _read_version(), "stale": _code_changed_since_start()}
+    root = Path(__file__).resolve().parent
+    # checkout = a git copy started by start_v<version>.bat (the installer's copy has its own python\ and no .git):
+    # the UI then names the .bat, not the Start-menu shortcut (that one runs the installed copy)
+    from engine.features import all_features
+    return {"version": APP_VERSION, "on_disk": _read_version(), "stale": _code_changed_since_start(),
+            "checkout": (root / ".git").exists() and not (root / "python").is_dir(), "features": all_features()}
+
+
+@app.middleware("http")
+async def _feature_gate(request: Request, call_next):
+    """Parts switched off in this release (engine/features.py): Cleanup 3D routes `/api/cleanup3d/...` answer 404 with
+    the reason; `GET /api/cleanup3d` stays (the stage bar reads the C1 state from it)."""
+    if request.url.path.startswith("/api/cleanup3d/"):
+        from engine.features import OFF_WHY, enabled
+        if not enabled("cleanup3d"):
+            return JSONResponse(status_code=404, content={"detail": OFF_WHY["cleanup3d"]})
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # only the tool's own origins: with "*" any page open in the browser could call the API (audit 2026-11-02 #7)
+    allow_origins=["http://127.0.0.1:8765", "http://localhost:8765"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -171,10 +196,15 @@ async def _api_no_heuristic_cache(request, call_next):
 async def _unhandled_error_as_json(request, exc):
     """An unhandled exception in an /api/* handler used to give a plain-text "Internal Server Error", which the UI
     failed to parse. Same shape as HTTPException ({"detail": ...}) so the UI can show the real reason."""
+    if isinstance(exc, StateFileError):   # corrupt project.json / outputs.json: the file is kept, the user repairs it (audit 2026-11-02 #3)
+        logging.getLogger(__name__).error("%s %s: %s", request.method, request.url.path, exc)
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
     missing = _work_dir_missing() if isinstance(exc, OSError) else None
     if missing:   # the project folder vanished (deleted / moved / drive unplugged): one clear line, not a traceback per request
         logging.getLogger(__name__).warning("%s %s: %s", request.method, request.url.path, missing["detail"])
         return JSONResponse(status_code=409, content={"detail": missing})
+    if isinstance(exc, ObjectNotFound):   # e.g. a request of the previous project that arrives after a project switch
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
     logging.getLogger(__name__).error("Unhandled error in %s %s", request.method, request.url.path, exc_info=exc)
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
@@ -457,7 +487,8 @@ def _activate_project(data: Dict[str, Any]) -> Dict[str, Any]:
     STATE["frame_mapper"] = FrameMapper(project["first_frame"], project["last_frame"])
     STATE["coord_transformer"] = CoordTransformer(project["plate_w"], project["plate_h"])
     STATE["comfy_client"] = ComfyClient.from_config()
-    STATE["display_cache"] = {}   # Z8 tiles: full-frame display images of the previous project are stale
+    STATE.pop("display_cache", None)   # Z8 tiles: full-frame display images of the previous project are stale
+    STATE["open_id"] = uuid.uuid4().hex   # one open = one id: the page applies its response + WS event once (audit #15)
     try:   # legacy parts (part_of) -> group entities, once, on open (PLAN_GROUP_COMPOSE step 6); never fails the open
         from engine.groups import migrate_part_of
         for d in migrate_part_of(_objects()):
@@ -611,6 +642,70 @@ def set_comfy_config(req: ComfyFlavorRequest):
     if req.autostart is not None:
         engine_config.write_local({"comfy_autostart": bool(req.autostart)})
     return get_comfy_config()
+
+
+class WeightsDirRequest(BaseModel):
+    path: str = ""          # "" = back to the default (HF_HOME variable / <models_dir>/huggingface)
+    move: bool = True       # move the weights already downloaded (hub/) from the old folder
+
+
+def _dir_gb(p: Path) -> float:
+    try:
+        return round(sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1e9, 2)
+    except OSError:
+        return 0.0
+
+
+@app.get("/api/config/weights")
+def get_weights_dir():
+    """Doctor: where MatteDesk keeps the weights it downloads outside ComfyUI (Hugging Face cache) – the folder, why
+    it is that one, its size and the free space of its drive (user decision 2026-11-10)."""
+    import shutil as _sh
+    cfg = load_config()
+    d, src = engine_config.weights_dir(cfg)
+    p = Path(d)
+    probe = next((q for q in [p, *p.parents] if q.exists()), None)
+    free = round(_sh.disk_usage(probe).free / 1e9, 1) if probe else None
+    default = engine_config.weights_dir({**cfg, "hf_home": ""})
+    return {"path": d, "source": src, "default": default[0], "default_source": default[1],
+            "used_gb": _dir_gb(p / "hub") if (p / "hub").is_dir() else 0.0, "free_gb": free,
+            "active": os.environ.get("HF_HOME", "").replace("\\", "/") == d}
+
+
+@app.post("/api/config/weights")
+@when_idle("Zmiana folderu wag")
+def set_weights_dir(req: WeightsDirRequest):
+    """Set the folder (config.local `hf_home`), move what is already downloaded (hub/, xet/) when asked – a move,
+    nothing deleted; items that already exist in the new folder stay in the old one – and use it from now on
+    (HF_HOME of this process and its workers; a ComfyUI started outside MatteDesk keeps its own variable)."""
+    import shutil as _sh
+    cfg = load_config()
+    old = Path(engine_config.weights_dir(cfg)[0])
+    new_raw = (req.path or "").strip()
+    if new_raw and not (os.path.isabs(new_raw) or (len(new_raw) > 1 and new_raw[1] == ":")):
+        raise HTTPException(status_code=400, detail="Podaj pełną ścieżkę folderu (np. F:/hf_cache)")
+    new = Path(engine_config.resolve_path(new_raw)) if new_raw else Path(engine_config.weights_dir({**cfg, "hf_home": ""})[0])
+    try:
+        new.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Nie można utworzyć folderu {new}: {e}")
+    moved, kept = [], []
+    if req.move and old.resolve() != new.resolve() and old.is_dir():
+        for sub in ("hub", "xet"):
+            src = old / sub
+            if not src.is_dir():
+                continue
+            (new / sub).mkdir(parents=True, exist_ok=True)
+            for item in src.iterdir():
+                dst = new / sub / item.name
+                if dst.exists():
+                    kept.append(str(item).replace("\\", "/"))
+                    continue
+                _sh.move(str(item), str(dst))
+                moved.append(item.name)
+    engine_config.write_local({"hf_home": new_raw})
+    engine_config.apply_weights_dir(load_config())
+    return {**get_weights_dir(), "moved": moved, "kept_in_old": kept, "old": str(old).replace("\\", "/")}
 
 
 @app.get("/api/models/removable")
@@ -776,11 +871,13 @@ def install_component(what: str):
             res = installer.install_videomama(cfg)
         elif what in ("sam3", "matanyone2_weights", "lama") or what in installer.HF_FOLDERS:
             res = installer.install_model(cfg, what)
+        elif what in installer.INSTALL_ACTIONS:      # Cleanup 3D: flux3_klein | klein_restore_lora | qwen21 | colmap
+            res = installer.INSTALL_ACTIONS[what](cfg)
         elif what in installer.GIT_NODE_PACKS:
             res = installer.install_git_node(cfg, what)
         else:
             installer.progress_end(False, "unknown")
-            raise HTTPException(status_code=404, detail="ffmpeg | git | nodes | cotracker | vitmatte | birefnet | sapiens2 | ltx | videomama | sam3 | matanyone2_weights | lama | matanyone2_node | inpaint_nodes | vhs_nodes | restart_comfy")
+            raise HTTPException(status_code=404, detail="ffmpeg | git | nodes | cotracker | vitmatte | birefnet | sapiens2 | ltx | videomama | sam3 | matanyone2_weights | lama | flux3_klein | klein_restore_lora | qwen21 | colmap | matanyone2_node | inpaint_nodes | vhs_nodes | restart_comfy")
     except HTTPException:
         raise
     except Exception as e:  # report, the doctor re-checks afterwards
@@ -809,6 +906,7 @@ async def open_project(req: OpenProjectRequest):
 
     await ws_manager.broadcast({
         "type": "project_opened",
+        "open_id": STATE["open_id"],
         "shot": manifest.get("shot"),
         "first_frame": first_f,
         "last_frame": last_f
@@ -818,7 +916,8 @@ async def open_project(req: OpenProjectRequest):
         "success": True,
         "project": data["project"],
         "manifest": manifest,
-        "work_dir": data["work_dir"]
+        "work_dir": data["work_dir"],
+        "open_id": STATE["open_id"]
     }
 
 
@@ -1079,6 +1178,7 @@ async def open_or_create_project(req: OpenOrCreateProjectRequest):
 
     await ws_manager.broadcast({
         "type": "project_opened",
+        "open_id": STATE["open_id"],
         "shot": manifest.get("shot"),
         "first_frame": first_f,
         "last_frame": last_f
@@ -1088,7 +1188,8 @@ async def open_or_create_project(req: OpenOrCreateProjectRequest):
         "success": True,
         "project": project,
         "manifest": manifest,
-        "work_dir": data["work_dir"]
+        "work_dir": data["work_dir"],
+        "open_id": STATE["open_id"]
     }
 
 
@@ -1109,7 +1210,8 @@ def get_current_project():
         "loaded": True,
         "project": STATE["project"],
         "manifest": STATE["manifest"],
-        "work_dir": STATE["work_dir"]
+        "work_dir": STATE["work_dir"],
+        "open_id": STATE.get("open_id")
     }
 
 
@@ -1187,6 +1289,20 @@ def _reject_aux_mismatch(name: str, pattern: str, manifest: Dict[str, Any]) -> N
             "(backlit / clear plate muszą być z tej samej kamery i rozdzielczości)"))
 
 
+def _plate_content(name: str, pattern: str, beauty: str, work_dir: Optional[str]) -> Dict[str, Any]:
+    """Stage 0: the content check of a backlit / clear plate (engine/plate_match.py) – {content, content_note}."""
+    from engine import plate_match as pm
+    if not pm.is_checked(name) or not beauty or not work_dir or _aux_mismatch(name, pattern, STATE.get("manifest") or {}):
+        return {}
+    try:
+        r = pm.ensure(Path(work_dir), beauty, pattern)
+    except Exception as e:   # never breaks the plates list
+        return {"content": {"state": "unknown", "why": str(e)}, "content_note": None}
+    if r is None:
+        return {"content": {"state": "pending"}, "content_note": "… sprawdzam zgodność z beauty"}
+    return {"content": r, "content_note": pm.describe(r)}
+
+
 @app.get("/api/project/plates")
 def get_project_plates():
     if not STATE.get("manifest"):
@@ -1229,9 +1345,39 @@ def get_project_plates():
             "is_primary": (name == "beauty"),
             # backlit / clear plate of another resolution = a wrong plate, not used by any stage (engine/pipeline.py)
             "mismatch": _aux_mismatch(name, pattern_str, manifest) if exists else None,
+            # ... and its CONTENT against the beauty (engine/plate_match.py, 2026-11-06): ok / shifted / other shot,
+            # computed once in the background (None = being checked); BG / depth are other images by design
+            **(_plate_content(name, pattern_str, plates.get("beauty") or "", work_dir) if exists else {}),
         })
 
     return {"success": True, "shot": shot, "plates": results}
+
+
+class PlateContentRequest(BaseModel):
+    action: str                          # remeasure | override | clear_override
+
+
+@app.post("/api/project/plate/{name}/content")
+def plate_content_action(name: str, req: PlateContentRequest):
+    """Stage 0, the content check of a backlit / clear plate (NEXT_STEPS 5): „↻ zmierz ponownie” drops the stored result
+    (measured again in the background), „użyj mimo to” makes a plate flagged „inne ujęcie” usable by the stages again
+    (and back). Written to <work>/matte_desk/plate_match.json – never the shot manifest."""
+    from engine import plate_match as pm
+    m = STATE.get("manifest")
+    if not m or not STATE.get("work_dir"):
+        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
+    plates = m.get("plates", {})
+    pattern = plates.get(name) or ""
+    if not pattern or not pm.is_checked(name):
+        raise HTTPException(status_code=404, detail=f"{name}: brak backlitu / clear plate'u o tej nazwie")
+    work = Path(STATE["work_dir"])
+    if req.action == "remeasure":
+        pm.forget(work, pattern)
+    elif req.action in ("override", "clear_override"):
+        pm.set_override(work, pattern, req.action == "override")
+    else:
+        raise HTTPException(status_code=400, detail="action: remeasure | override | clear_override")
+    return {"success": True, **_plate_content(name, pattern, plates.get("beauty") or "", str(work))}
 
 
 @app.post("/api/project/plate/inspect")
@@ -1364,24 +1510,56 @@ def _bg_proxy_path(frame_num: int) -> Path:
         raise HTTPException(status_code=404, detail=str(e))
 
 
+def _plate_name_or_400(plate: str) -> str:
+    """A plate role from a query / path parameter builds file paths (`proxy/<plate>/`): letters, digits, `_`, `-` only
+    (audit 2026-11-02 #8)."""
+    from engine.objects import _NAME
+    if not _NAME.match(plate or ""):
+        raise HTTPException(status_code=400, detail=f"Nieprawidłowa nazwa plate'u: {plate!r}")
+    return plate
+
+
 def _proxy_path(plate: str, frame_num: int) -> Path:
     """Proxy JPEG of a plate frame, rendered on demand (like the old /api/frame)."""
     if plate == "bg":
         return _bg_proxy_path(frame_num)
-    proxy_dir = Path(STATE["work_dir"]) / "proxy" / plate
-    proxy_file = proxy_dir / f"p_{frame_num:04d}.jpg"
-    if proxy_file.exists():
-        return proxy_file
+    _plate_name_or_400(plate)
+    proxy_file = _fresh_proxy(plate, frame_num)
+    if proxy_file is None:
+        raise HTTPException(status_code=404, detail=f"Proxy frame {frame_num} not found for plate '{plate}'")
+    return proxy_file
+
+
+def _fresh_proxy(plate: str, frame_num: int) -> Optional[Path]:
+    """The cached proxy JPEG of a plate frame, rendered again when its source frame is newer (2026-11-10: a new Cleanup
+    run points the plate „cleaned” at another version / rewrites it, and the view kept showing the first run's proxies).
+    A proxy whose source is gone is kept. None = no proxy and no source."""
+    proxy_file = Path(STATE["work_dir"]) / "proxy" / plate / f"p_{frame_num:04d}.jpg"
     manifest = STATE.get("manifest") or {}
     pattern = manifest.get("plates", {}).get(plate, "")
-    if pattern:
-        src_file = ProxyGenerator.resolve_frame_path(pattern, frame_num)
-        if src_file.exists():
-            ProxyGenerator.render_proxy_file(source_frame_path=src_file, dest_proxy_path=proxy_file,
-                                             colorspace=manifest.get("colorspace", "ACES2065-1"))
-            if proxy_file.exists():
-                return proxy_file
-    raise HTTPException(status_code=404, detail=f"Proxy frame {frame_num} not found for plate '{plate}'")
+    src = ProxyGenerator.resolve_frame_path(pattern, frame_num) if pattern else None
+    src_ok = bool(src) and src.exists()
+    # 2026-11-11: "newer than the source" was not enough – switching back to an OLDER version (v002 after v004) kept
+    # the newer version's proxies. A sidecar names the source file (path + mtime) the proxy was made from.
+    side = proxy_file.with_suffix(".src")
+    ident = f"{Path(src).resolve()}|{src.stat().st_mtime_ns}" if src_ok else ""
+    if proxy_file.exists():
+        if not src_ok:
+            return proxy_file
+        try:
+            made = side.read_text(encoding="utf-8")
+        except OSError:
+            made = None
+        if made == ident or (made is None and proxy_file.stat().st_mtime >= src.stat().st_mtime):
+            return proxy_file
+    if src_ok:
+        ProxyGenerator.render_proxy_file(source_frame_path=src, dest_proxy_path=proxy_file,
+                                         colorspace=manifest.get("colorspace", "ACES2065-1"))
+        try:
+            side.write_text(ident, encoding="utf-8")
+        except OSError:
+            pass
+    return proxy_file if proxy_file.exists() else None
 
 
 def _aligned_proxy_path(plate: str, frame_num: int) -> Path:
@@ -1434,9 +1612,11 @@ def get_proxy_frame(frame_num: int, plate: str = "beauty", aligned: int = 0):
     result of 'Skoryguj plate' without writing anything to the plate folders."""
     if not STATE["work_dir"]:
         raise HTTPException(status_code=400, detail="No project loaded")
+    # no-cache = the browser asks again (cheap 304 by ETag) instead of reusing a proxy a new Cleanup run has replaced
+    nc = {"Cache-Control": "no-cache"}
     if aligned:
-        return FileResponse(_aligned_proxy_path(plate, frame_num), media_type="image/jpeg")
-    return FileResponse(_proxy_path(plate, frame_num), media_type="image/jpeg")
+        return FileResponse(_aligned_proxy_path(plate, frame_num), media_type="image/jpeg", headers=nc)
+    return FileResponse(_proxy_path(plate, frame_num), media_type="image/jpeg", headers=nc)
 
 
 TILE_MAX = 2048          # Z8: max side of a tile (plate px)
@@ -1446,20 +1626,18 @@ DISPLAY_CACHE_FRAMES = 3  # full-frame display images kept in memory (4096x2731x
 def _full_display_u8(plate: str, frame_num: int) -> np.ndarray:
     """Full-resolution display image (BGR uint8) of a plate frame – the SAME conversion as the proxy
     (`ProxyGenerator.load_frame_rgb`), so the tile has the proxy's colours. LRU of DISPLAY_CACHE_FRAMES in STATE."""
-    cache = STATE.setdefault("display_cache", {})
-    key = (plate, int(frame_num))
+    cache = STATE.setdefault("display_cache", LockedLRU(DISPLAY_CACHE_FRAMES))
+    manifest = STATE.get("manifest") or {}
+    pattern = manifest.get("plates", {}).get(plate, "")
+    src = ProxyGenerator.resolve_frame_path(pattern, frame_num) if pattern else None
+    if not src or not src.exists():
+        raise HTTPException(status_code=404, detail=f"Brak klatki {frame_num} plate'u '{plate}'")
+    key = (plate, int(frame_num), str(src), src.stat().st_mtime_ns)   # a new / rewritten source = a new entry
     img = cache.get(key)
     if img is None:
-        manifest = STATE.get("manifest") or {}
-        pattern = manifest.get("plates", {}).get(plate, "")
-        src = ProxyGenerator.resolve_frame_path(pattern, frame_num) if pattern else None
-        if not src or not src.exists():
-            raise HTTPException(status_code=404, detail=f"Brak klatki {frame_num} plate'u '{plate}'")
         rgb = ProxyGenerator.load_frame_rgb(src, colorspace=manifest.get("colorspace", "ACES2065-1"))
         img = np.ascontiguousarray(rgb[..., ::-1])
-        while len(cache) >= DISPLAY_CACHE_FRAMES:
-            cache.pop(next(iter(cache)))
-        cache[key] = img
+        cache.put(key, img)
     return img
 
 
@@ -1518,7 +1696,12 @@ def project_stages():
                            "frame_count": int(info.get("frame_count") or 0),
                            "proxy_count": len(list(pdir.glob("p_*.jpg"))) if pdir.is_dir() else 0,
                            "aux": name in ("backlit", "cleanplate", "clean_plate", "cleanplate_auto") or name.endswith("_align"),
-                           "aligned_of": name[:-6] if name.endswith("_align") else None})
+                           "aligned_of": name[:-6] if name.endswith("_align") else None,
+                           # stage 0 pills (static/stage0.js): wrong resolution (2026-10-17 – the pill never got it from
+                           # here) and the content check (2026-11-06)
+                           "mismatch": _aux_mismatch(name, pattern, manifest) if info.get("exists") else None,
+                           **(_plate_content(name, pattern, plates.get("beauty") or "", str(work_dir))
+                              if info.get("exists") else {})})
     align = {}
     for name in ("backlit", "cleanplate"):
         if name not in plates:
@@ -1533,12 +1716,18 @@ def project_stages():
                               "frame_range": d.get("frame_range"), "recommendation": d.get("recommendation"),
                               "nk": (work_dir / "align" / f"Align_{name}.nk").exists(),
                               "frames_over": [f["frame"] for f in d.get("frames", []) if (f.get("residual_px") or 0) > 0.3],
+                              "frames_no_texture": [f["frame"] for f in d.get("frames", []) if f.get("status") == "no_texture"],
                               "created_at": d.get("created_at"),
                               "device": d.get("device") or "", "device_note": d.get("device_note") or "",
-                              "stale": stale_report_reason(d)})
+                              "exclusions": d.get("exclusions") or {}, "camera_lock": d.get("camera_lock") or {},
+                              "checks": d.get("checks") or {}, "global_only": bool(d.get("global_only")),
+                              "stale": stale_report_reason(d, work_dir)})
             except (OSError, ValueError):
                 entry["measured"] = False
         align[name] = entry
+    # align_v2 step 1: the objects whose masks 1+2 the measurement can exclude (checkbox „wyklucz obiekty” in stage 0)
+    from engine.align_exclude import objects_with_cores
+    align_objects = [{"name": n} for n in objects_with_cores(work_dir)]
     clean = {}
     for name in plates:
         rp = work_dir / "deflicker" / f"Deflicker_{name}.json"
@@ -1568,7 +1757,7 @@ def project_stages():
     except Exception:
         n_frames = 0
     gate = _plate_gate()     # Z26: plate QA per plate + the stage-1 gate
-    return {"plates": out_plates, "bg": bg, "align": align, "clean": clean, "camera": camera, "depth": depth,
+    return {"plates": out_plates, "bg": bg, "align": align, "align_objects": align_objects, "clean": clean, "camera": camera, "depth": depth,
             "objects": nobj, "n_frames": n_frames, "mask_plate_denoise": _mask_plate_denoise_info(),
             "beauty_proxy_ok": any(p["name"] == "beauty" and p["proxy_count"] > 0 for p in out_plates),
             "plate_qa": gate["plates"], "plate_qa_block": gate["block"]}
@@ -1584,831 +1773,32 @@ async def websocket_events(websocket: WebSocket):
         ws_manager.disconnect(websocket)
 
 
-# -----------------------------------------------------------------------------
-# Plate Alignment Endpoints (Stage E1b, SPEC Section 4a, 10, 12)
-# -----------------------------------------------------------------------------
-
-class AlignMeasureRequest(BaseModel):
-    plate: str
-    aux_plate_type: str = "backlit"
-    first_frame: Optional[int] = None
-    last_frame: Optional[int] = None
-    device: Optional[str] = None   # auto | gpu | cpu; None = config `align_device` (UI: Auto / GPU / CPU)
-
-
-class AlignExportNkRequest(BaseModel):
-    plate: str
-
-
-class AlignApplyRequest(BaseModel):
-    plate: str
-    confirmed: bool = False
-
-
-def _align_oom_message(e: BaseException, w: int, h: int, n: int) -> str:
-    """HTTP 507 text of the alignment endpoints: our own readable RamLimitError, else a generic hint."""
-    from engine.procpool import RamLimitError
-    if isinstance(e, RamLimitError):
-        return str(e)
-    return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Skróć zakres klatek albo ustaw mniejszą liczbę procesów (align_workers)."
-
-
-@app.post("/api/plate/align/measure")
-@long_job("Pomiar wyrównania")
-async def measure_plate_alignment(req: AlignMeasureRequest):
-    if not STATE.get("manifest") or not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    device = (req.device or "").strip().lower() or None
-    if device not in (None, "auto", "gpu", "cpu"):
-        raise HTTPException(status_code=400, detail="device: auto | gpu | cpu")
-
-    manifest = STATE["manifest"]
-    plates = manifest.get("plates", {})
-    beauty_pat = plates.get("beauty")
-    if not beauty_pat:
-        raise HTTPException(status_code=400, detail="Brak zdefiniowanego plate'u beauty w manifeście")
-
-    aux_pat = plates.get(req.plate)
-    if not aux_pat:
-        # Check if plate key matches a plate path directly
-        aux_pat = plates.get("backlit" if req.aux_plate_type == "backlit" else "cleanplate")
-        if not aux_pat:
-            raise HTTPException(status_code=400, detail=f"Nie znaleziono ścieżki dla plate'u '{req.plate}' w manifeście")
-
-    first_f = req.first_frame or manifest.get("first", 1)
-    last_f = req.last_frame or manifest.get("last", 100)
-    w, h = _plate_size()
-
-    work_dir = Path(STATE["work_dir"])
-    align_dir = work_dir / "align"
-    align_dir.mkdir(parents=True, exist_ok=True)
-
-    loop = asyncio.get_running_loop()
-
-    def on_progress(done: int, total: int, f_num: int):
-        JOBS.progress(done, total, f_num)
-        asyncio.run_coroutine_threadsafe(
-            ws_manager.broadcast({
-                "type": "align_progress",
-                "plate": req.plate,
-                "done": done,
-                "total": total,
-                "frame": f_num
-            }),
-            loop
-        )
-
-    from engine.align import AlignmentPipeline, NukeAlignGroupGenerator
-
-    try:
-        report = await loop.run_in_executor(
-            None,
-            lambda: AlignmentPipeline.measure_sequence(
-                beauty_pattern=beauty_pat,
-                aux_pattern=aux_pat,
-                first_frame=first_f,
-                last_frame=last_f,
-                plate_name=req.plate,
-                aux_plate_type=req.aux_plate_type,
-                plate_w=w,
-                plate_h=h,
-                progress_cb=on_progress,
-                grid_dir=align_dir / f"grid_{req.plate}",
-                step_cb=JOBS.progress,
-                cancel_check=JOBS.check,
-                device=device,
-            )
-        )
-    except MemoryError as e:
-        raise HTTPException(status_code=507, detail=_align_oom_message(e, w, h, last_f - first_f + 1))
-
-    # Save report JSON
-    json_path = align_dir / f"Align_{req.plate}.json"
-    nk_path = align_dir / f"Align_{req.plate}.nk"
-    NukeAlignGroupGenerator.generate_script(
-        plate_name=req.plate,
-        report=report,
-        plate_w=w,
-        plate_h=h,
-        output_nk_path=nk_path,
-        output_json_path=json_path
-    )
-
-    report.nk_script_path = str(nk_path)
-    report.json_path = str(json_path)
-
-    await ws_manager.broadcast({
-        "type": "align_complete",
-        "plate": req.plate,
-        "recommendation": report.recommendation,
-        "residual_median": report.residual_median,
-        "residual_max": report.residual_max,
-        "method": report.method,
-        "needs_correction": report.needs_correction
-    })
-
-    return report.to_dict()
-
-
-@app.post("/api/plate/align/export_nk")
-def export_align_nk(req: AlignExportNkRequest):
-    if not STATE.get("work_dir") or not STATE.get("manifest"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    work_dir = Path(STATE["work_dir"])
-    json_path = work_dir / "align" / f"Align_{req.plate}.json"
-    nk_path = work_dir / "align" / f"Align_{req.plate}.nk"
-
-    if not json_path.exists():
-        raise HTTPException(status_code=404, detail=f"Brak zapisanego pomiaru wyrównania dla '{req.plate}'. Najpierw uruchom pomiar.")
-
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    from engine.align import AlignmentReport, NukeAlignGroupGenerator
-    report = AlignmentReport.from_dict(data)
-
-    manifest = STATE["manifest"]
-    w, h = _plate_size()
-
-    script = NukeAlignGroupGenerator.generate_script(
-        plate_name=req.plate,
-        report=report,
-        plate_w=w,
-        plate_h=h,
-        output_nk_path=nk_path,
-        output_json_path=json_path
-    )
-
-    valid, msg = NukeAlignGroupGenerator.validate_nuke_syntax(script)
-    if not valid:
-        raise HTTPException(status_code=500, detail=f"Błąd składni skryptu Nuke: {msg}")
-
-    return {
-        "success": True,
-        "nk_path": str(nk_path),
-        "json_path": str(json_path),
-        "script": script
-    }
-
-
-@app.post("/api/plate/align/apply")
-@long_job("Zapis wyrównania")
-async def apply_plate_alignment(req: AlignApplyRequest):
-    if not req.confirmed:
-        raise HTTPException(status_code=400, detail="Operacja wymaga potwierdzenia użytkownika ('confirmed': true)")
-
-    if not STATE.get("work_dir") or not STATE.get("manifest"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    work_dir = Path(STATE["work_dir"])
-    json_path = work_dir / "align" / f"Align_{req.plate}.json"
-    if not json_path.exists():
-        raise HTTPException(status_code=404, detail=f"Brak pomiaru wyrównania dla '{req.plate}'")
-
-    with open(json_path, "r", encoding="utf-8") as f:
-        report_data = json.load(f)
-
-    from engine.align import AlignmentReport, PlateWarper
-    report = AlignmentReport.from_dict(report_data)
-
-    manifest = STATE["manifest"]
-    plates = manifest.get("plates", {})
-    aux_pat = plates.get(req.plate)
-    if not aux_pat:
-        aux_pat = plates.get("backlit" if report.aux_plate_type == "backlit" else "cleanplate")
-        if not aux_pat:
-            raise HTTPException(status_code=400, detail=f"Brak ścieżki plate'u '{req.plate}'")
-
-    # Output directory alongside the original plate folder: <plate folder>_align (SPEC 4a pkt 3)
-    sample_path = Path(aux_pat.replace("####", "0001").replace("%04d", "0001"))
-    src_parent = sample_path.parent
-    align_dest_dir = src_parent.parent / f"{src_parent.name}_align"
-
-    grid_dir = work_dir / "align" / f"grid_{req.plate}"
-
-    loop = asyncio.get_running_loop()
-
-    def on_progress(done: int, total: int, f_num: int):
-        JOBS.progress(done, total, f_num)
-        asyncio.run_coroutine_threadsafe(
-            ws_manager.broadcast({
-                "type": "align_apply_progress",
-                "plate": req.plate,
-                "done": done,
-                "total": total,
-                "frame": f_num
-            }),
-            loop
-        )
-
-    try:
-        written = await loop.run_in_executor(
-            None,
-            lambda: PlateWarper.warp_sequence(
-                aux_pattern=aux_pat,
-                report=report,
-                dest_dir=align_dest_dir,
-                grid_dir=grid_dir if grid_dir.exists() else None,
-                progress_cb=on_progress
-            )
-        )
-    except MemoryError as e:
-        raise HTTPException(status_code=507, detail=_align_oom_message(e, *_plate_size(), len(report.frames)))
-
-    # Register the aligned plate in project.json (manifest is read-only)
-    align_pat = str(align_dest_dir / sample_path.name.replace("0001", "####"))
-    STATE["shot_project"].set_plate(f"{req.plate}_align", align_pat)
-    _refresh_manifest_view()
-
-    return {
-        "success": True,
-        "aligned_count": len(written),
-        "aligned_dir": str(align_dest_dir),
-        "pattern": align_pat
-    }
-
-
-@app.get("/api/plate/align/report")
-def get_align_report(plate: str):
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    work_dir = Path(STATE["work_dir"])
-    json_path = work_dir / "align" / f"Align_{plate}.json"
-    if not json_path.exists():
-        return {"exists": False}
-
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    from engine.align import stale_report_reason
-    return {"exists": True, "report": data, "stale": stale_report_reason(data)}
-
-
-# -----------------------------------------------------------------------------
-# Plate Cleaning Endpoints: Deflicker & Denoise (Stage E1c, SPEC Section 4c)
-# -----------------------------------------------------------------------------
-
-class CleanMeasureRequest(BaseModel):
-    plate: str = "beauty"
-    max_frames: int = 16
-
-
-class CleanRunRequest(BaseModel):
-    plate: str = "beauty"
-    target_reduction: float = 0.70
-    enable_stage1: bool = True
-    enable_stage2: bool = True
-    enable_stage3: bool = False
-    enable_stage4: bool = True
-    enable_denoise: bool = False
-    export_mode: str = "nuke_group"  # "nuke_group" | "exr_deflicker" | "exr_deflicker_dn"
-    confirmed: bool = False
-    # palette knobs (docs/PLAN_DEFLICKER_AUTO.md § 4); None = engine defaults
-    stage1_window: Optional[int] = None
-    stage1_iterations: Optional[int] = None
-    stage3_radius: Optional[int] = None
-    stage1_sigma: Optional[float] = None
-    stage4_luma: Optional[bool] = None
-    exr_dir: Optional[str] = None   # EXR export folder; None / "" = default <plate folder>_deflicker[_dn] next to the plate
-
-
-class CleanExportNkRequest(BaseModel):
-    plate: str = "beauty"
-
-
-def _clean_default_exr_dir(pat: str, denoise: bool) -> Path:
-    """<plate folder>_deflicker / _deflicker_dn next to the original (SPEC 4c.3)."""
-    source_p = Path(pat)
-    return source_p.parent.parent / f"{source_p.parent.name}_{'deflicker_dn' if denoise else 'deflicker'}"
-
-
-def _clean_exr_dir(pat: str, denoise: bool, chosen: Optional[str]) -> Path:
-    """Folder for the deflickered EXRs: the user's choice or the default; never the plate's own folder (same file names ->
-    the original frames would be overwritten)."""
-    dest = Path(chosen).expanduser() if chosen and chosen.strip() else _clean_default_exr_dir(pat, denoise)
-    if not dest.is_absolute():
-        raise HTTPException(status_code=400, detail=f"Katalog EXR musi być pełną ścieżką: {chosen}")
-    try:
-        same = dest.resolve() == Path(pat).parent.resolve()
-    except OSError:
-        same = False
-    if same:
-        raise HTTPException(status_code=400, detail="Katalog EXR = katalog oryginalnego plate'u – zapis nadpisałby oryginalne klatki. Wybierz inny katalog.")
-    return dest
-
-
-@app.get("/api/plate/clean/exr_dir")
-def get_clean_exr_dir(plate: str = "beauty", denoise: bool = False):
-    """Default EXR export folder of a plate (the palette shows it before the run)."""
-    if not STATE.get("manifest"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    pat = STATE["manifest"].get("plates", {}).get(plate)
-    if not pat:
-        raise HTTPException(status_code=400, detail=f"Brak zdefiniowanego plate'u '{plate}' w manifeście")
-    return {"path": str(_clean_default_exr_dir(pat, denoise)).replace("\\", "/")}
-
-
-def _clean_oom_message(w: int, h: int, n: int) -> str:
-    return f"Brak pamięci RAM przy {w}x{h}, {n} klatek. Skróć zakres klatek."
-
-
-@app.post("/api/plate/clean/measure")
-@long_job("Pomiar migotania")
-async def measure_plate_clean(req: CleanMeasureRequest):
-    if not STATE.get("manifest") or not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    manifest = STATE["manifest"]
-    plates = manifest.get("plates", {})
-    pat = plates.get(req.plate)
-    if not pat:
-        raise HTTPException(status_code=400, detail=f"Brak zdefiniowanego plate'u '{req.plate}' w manifeście")
-
-    first_f = manifest.get("first", 1)
-    last_f = manifest.get("last", 100)
-    total_frames = last_f - first_f + 1
-    sample_count = min(req.max_frames, total_frames) if total_frames > 24 else total_frames
-
-    frames = []
-    for f_idx in range(sample_count):
-        fn = first_f + f_idx
-        f_path = Path(pat.replace("####", f"{fn:04d}"))
-        if not f_path.exists():
-            break
-        img = cv2.imread(str(f_path), cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            frames.append(img)
-
-    if len(frames) < 2:
-        raise HTTPException(status_code=400, detail=f"Nie udało się wczytać klatek z {pat}")
-
-    loop = asyncio.get_running_loop()
-    try:
-        flicker = await loop.run_in_executor(None, lambda: DeflickerMetrics.measure_flow_aligned(frames))
-        variance = await loop.run_in_executor(None, lambda: DeflickerMetrics.measure_temporal_variance(frames))
-    except MemoryError:
-        h0, w0 = frames[0].shape[:2]
-        raise HTTPException(status_code=507, detail=f"Brak pamięci RAM przy {w0}x{h0}, {len(frames)} klatek. Zmniejsz liczbę próbkowanych klatek.")
-
-    return {
-        "success": True,
-        "flicker": flicker.to_dict(),
-        "temporal_variance": round(variance, 4),
-        "needs_deflicker": flicker.mean > 4.0 or flicker.p95 > 6.0
-    }
-
-
-@app.post("/api/plate/clean/run")
-@long_job("Deflicker")
-async def run_plate_clean(req: CleanRunRequest):
-    if not STATE.get("manifest") or not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    manifest = STATE["manifest"]
-    plates = manifest.get("plates", {})
-    pat = plates.get(req.plate)
-    if not pat:
-        raise HTTPException(status_code=400, detail=f"Brak zdefiniowanego plate'u '{req.plate}' w manifeście")
-
-    if req.export_mode in ("exr_deflicker", "exr_deflicker_dn") and not req.confirmed:
-        raise HTTPException(
-            status_code=400,
-            detail="Wymagane jest potwierdzenie zapisu pełnych klatek EXR na dysku (zasada IZOLACJI)."
-        )
-
-    first_f = manifest.get("first", 1)
-    last_f = manifest.get("last", 100)
-    work_dir = Path(STATE["work_dir"])
-    plate_w, plate_h = _plate_size()
-
-    # Frames are read from disk on demand (RGB only, BGR order; alpha / other layers are copied untouched on export):
-    # a 4K float32 frame is ~134 MB, so the whole sequence is never held in RAM (the cleaner passes over it a few times)
-    from engine.exr_io import read_rgb
-    file_paths = []
-    for fn in range(first_f, last_f + 1):
-        f_path = ProxyGenerator.resolve_frame_path(pat, fn)
-        if not f_path.exists():
-            break
-        file_paths.append(f_path)
-
-    if len(file_paths) < 2:
-        raise HTTPException(status_code=400, detail=f"Brak wystarczającej liczby klatek ({len(file_paths)}) dla plate'u {req.plate}")
-
-    def load_frame(i: int) -> np.ndarray:
-        f_path = file_paths[i]
-        img = read_rgb(f_path) if f_path.suffix.lower() == ".exr" else cv2.imread(str(f_path), cv2.IMREAD_COLOR)
-        if img is None:
-            raise HTTPException(status_code=400, detail=f"Nie udało się wczytać klatki {f_path}")
-        return img.astype(np.float32)
-
-    # frames read once are pinned in RAM up to a budget (the cleaner sweeps the sequence ~10x; the rest is re-read)
-    frames = PinnedFrameCache(len(file_paths), load_frame, clean_cache_budget())
-    frames[0]   # unreadable first frame -> clear error before the long run
-
-    # Stage 3 and denoise rebuild pixels: only an EXR export carries them (the Nuke Group applies gain maps only) –
-    # without one they are skipped, so the report measures what the result really contains
-    write_exr = req.export_mode in ("exr_deflicker", "exr_deflicker_dn")
-    notes: List[str] = []
-    enable_stage3, enable_denoise = req.enable_stage3, req.enable_denoise
-    if not write_exr and (enable_stage3 or enable_denoise):
-        enable_stage3 = enable_denoise = False
-        notes.append("Etap 3 / odszumianie pominięte – działają tylko przy zapisie EXR (Group w Nuke'u nakłada tylko mapy jasności).")
-
-    # EXR export: each cleaned frame is written as soon as it is ready (stage 3 / denoise never hold the sequence)
-    sink = None
-    dest_exr_dir = None
-    written = [0]
-    if write_exr:
-        from engine.exr_io import write_rgb_like
-        # chosen folder or <plate folder>_deflicker / _deflicker_dn next to the original (SPEC 4c.3)
-        source_p = Path(pat)
-        dest_exr_dir = _clean_exr_dir(pat, req.export_mode == "exr_deflicker_dn", req.exr_dir)
-        dest_exr_dir.mkdir(parents=True, exist_ok=True)
-        tag = "+".join(n for n, on in (("stage1", req.enable_stage1), ("stage2", req.enable_stage2),
-                                       ("stage4", req.enable_stage4), ("stage3", enable_stage3),
-                                       ("denoise", enable_denoise)) if on)
-
-        def sink(idx: int, cl_frame: np.ndarray) -> None:
-            # Same encoding as the source (channels, half/float, compression, metadata) – SPEC 4c.3
-            src_file = file_paths[idx]
-            dest_file = dest_exr_dir / src_file.name
-            if src_file.suffix.lower() == ".exr":
-                write_rgb_like(dest_file, cl_frame, src_file, extra_attrs={"matteDesk": f"deflicker {tag}".encode()})
-            else:
-                cv2.imwrite(str(dest_file), cl_frame)
-            written[0] += 1
-
-    loop = asyncio.get_running_loop()
-    JOBS.update(unit="pct")   # the cleaner reports stage milestones in % (0 / 10 / 40 / ... / 100), not frames
-    knobs = {k: getattr(req, k) for k in ("stage1_window", "stage1_iterations", "stage3_radius", "stage1_sigma", "stage4_luma")
-             if getattr(req, k) is not None}
-
-    def on_progress(step_name: str, done: int, total: int):
-        JOBS.progress(step_name, done, total)
-        asyncio.run_coroutine_threadsafe(
-            ws_manager.broadcast({
-                "type": "clean_progress",
-                "step": step_name,
-                "done": done,
-                "total": total,
-                "plate": req.plate
-            }),
-            loop
-        )
-
-    try:
-        cleaned, gains, report, residuals = await loop.run_in_executor(
-            None,
-            lambda: PlateCleaner.process_sequence(
-                frames=frames,
-                plate_name=req.plate,
-                target_reduction=req.target_reduction,
-                enable_stage1=req.enable_stage1,
-                enable_stage2=req.enable_stage2,
-                enable_stage3=enable_stage3,
-                enable_stage4=req.enable_stage4,
-                enable_denoise=enable_denoise,
-                progress_cb=on_progress,
-                frame_sink=sink,
-                **knobs
-            )
-        )
-    except MemoryError:
-        raise HTTPException(status_code=507, detail=_clean_oom_message(plate_w, plate_h, len(file_paths)))
-
-    logger.info(f"Deflicker {req.plate}: frame cache {frames.stats()}")
-    clean_dir = work_dir / "deflicker"
-    clean_dir.mkdir(parents=True, exist_ok=True)
-    gain_dir = clean_dir / f"gain_{req.plate}"
-    gain_pattern = PlateCleaner.export_gain_maps(gains, first_frame=first_f, output_dir=gain_dir)
-    report.gain_map_pattern = gain_pattern
-
-    # Generate Nuke Group script
-    nk_file = clean_dir / f"Deflicker_{req.plate}.nk"
-    NukeDeflickerGroupGenerator.generate_script(
-        plate_name=req.plate,
-        gain_pattern=gain_pattern,
-        plate_w=plate_w,
-        plate_h=plate_h,
-        first_frame=first_f,
-        last_frame=last_f,
-        report=report,
-        output_nk_path=nk_file
-    )
-    report.nk_group_path = str(nk_file).replace("\\", "/")
-
-    # EXRs were written by the sink while cleaning
-    export_dir_str = ""
-    if write_exr:
-        export_dir_str = str(dest_exr_dir).replace("\\", "/")
-        report.export_dir = export_dir_str
-
-        # Update manifest to point beauty or plate to cleaned version if beauty
-        new_pat = str(dest_exr_dir / source_p.name).replace("\\", "/")
-        STATE["shot_project"].set_plate(f"{req.plate}_clean", new_pat)
-        _refresh_manifest_view()
-
-    # Save JSON report
-    json_path = clean_dir / f"Deflicker_{req.plate}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
-
-    return {
-        "success": True,
-        "report": report.to_dict(),
-        "nk_script_path": report.nk_group_path,
-        "export_dir": export_dir_str,
-        "exr_written": written[0],
-        "notes": notes
-    }
-
-
-@app.get("/api/plate/clean/report")
-def get_clean_report(plate: str):
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    work_dir = Path(STATE["work_dir"])
-    json_path = work_dir / "deflicker" / f"Deflicker_{plate}.json"
-    if not json_path.exists():
-        return {"exists": False}
-
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {"exists": True, "report": data}
-
-
-# -----------------------------------------------------------------------------
-# 2D Camera Motion Endpoints (Stage E1d, SPEC Section 4d, 12, 16)
-# -----------------------------------------------------------------------------
-
-class CameraTrackRequest(BaseModel):
-    ref_frame: Optional[int] = None
-    eval_w: int = 1024
-    anchor_interval: int = 24
-    export_nk: bool = True
-
-
-@app.post("/api/camera/track")
-@long_job("Kamera 2D")
-async def track_camera_motion(req: CameraTrackRequest):
-    if not STATE.get("manifest") or not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    manifest = STATE["manifest"]
-    shot_name = manifest.get("shot", "shot")
-    fps = float(manifest.get("fps", 24.0))
-    first_f = int(manifest.get("first", 1))
-    last_f = int(manifest.get("last", 1))
-    ref_frame = req.ref_frame if req.ref_frame is not None else first_f
-
-    work_dir = Path(STATE["work_dir"])
-    cam_dir = work_dir / "camera"
-    cam_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Gather frames: check proxy frames first for lightning fast processing, fallback to source
-    proxy_dir = work_dir / "proxy" / "beauty"
-    frames: List[np.ndarray] = []
-    frame_nums: List[int] = []
-
-    if proxy_dir.exists() and len(list(proxy_dir.glob("p_*.jpg"))) >= (last_f - first_f + 1):
-        for fn in range(first_f, last_f + 1):
-            pf = proxy_dir / f"p_{fn:04d}.jpg"
-            if pf.exists():
-                img = cv2.imread(str(pf))
-                if img is not None:
-                    frames.append(img)
-                    frame_nums.append(fn)
-    else:
-        # Load from plate pattern
-        plates = manifest.get("plates", {})
-        pat = plates.get("beauty")
-        if not pat:
-            raise HTTPException(status_code=400, detail="Brak plate'u beauty w manifeście")
-        for fn in range(first_f, last_f + 1):
-            src_file = ProxyGenerator.resolve_frame_path(pat, fn)
-            if src_file.exists():
-                img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
-                if img is not None:
-                    frames.append(img)
-                    frame_nums.append(fn)
-
-    if not frames:
-        raise HTTPException(status_code=404, detail="Nie znaleziono klatek do analizy ruchu kamery")
-
-    loop = asyncio.get_running_loop()
-
-    def on_progress(step_name: str, done: int, total: int):
-        JOBS.progress(step_name, done, total)
-        asyncio.run_coroutine_threadsafe(
-            ws_manager.broadcast({
-                "type": "camera_progress",
-                "step": step_name,
-                "done": done,
-                "total": total
-            }),
-            loop
-        )
-
-    cam_data: Camera2DData = await loop.run_in_executor(
-        None,
-        lambda: Camera2DTracker.track_sequence(
-            frames=frames,
-            frame_numbers=frame_nums,
-            ref_frame=ref_frame,
-            eval_w=req.eval_w,
-            anchor_interval=req.anchor_interval,
-            shot_name=shot_name,
-            fps=fps,
-            progress_cb=on_progress,
-            plate_w=_plate_size()[0],
-            plate_h=_plate_size()[1],
-        )
-    )
-
-    json_path = cam_dir / "camera2d.json"
-    cam_data.save(json_path)
-
-    nk_path_str = ""
-    if req.export_nk:
-        nk_file = cam_dir / f"Camera2D_{shot_name}.nk"
-        NukeCamera2DGroupGenerator.generate_script(
-            shot_name=shot_name,
-            camera_data=cam_data,
-            output_nk_path=nk_file,
-            output_json_path=json_path
-        )
-        nk_path_str = str(nk_file).replace("\\", "/")
-
-    from engine.outputs import update_outputs
-    update_outputs(work_dir, "camera2d", {
-        "json_path": str(json_path).replace("\\", "/"),
-        "nk_path": nk_path_str,
-        "motion_type": cam_data.motion_type,
-        "residual_median_px": cam_data.residual_median_px,
-        "anchor_drift_px": cam_data.anchor_drift_px
-    })
-
-    return {
-        "success": True,
-        "camera2d": cam_data.to_dict(),
-        "nk_script_path": nk_path_str,
-        "json_path": str(json_path).replace("\\", "/")
-    }
-
-
-@app.get("/api/camera/report")
-def get_camera_report():
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    work_dir = Path(STATE["work_dir"])
-    json_path = work_dir / "camera" / "camera2d.json"
-    if not json_path.exists():
-        return {"exists": False}
-
-    try:
-        cam_data = Camera2DData.load(json_path)
-        nk_file = work_dir / "camera" / f"Camera2D_{cam_data.shot_name}.nk"
-        return {
-            "exists": True,
-            "camera2d": cam_data.to_dict(),
-            "nk_exists": nk_file.exists(),
-            "nk_path": str(nk_file).replace("\\", "/") if nk_file.exists() else ""
-        }
-    except Exception as e:
-        logger.error(f"Error loading camera2d.json: {e}")
-        return {"exists": False, "error": str(e)}
-
-
-@app.post("/api/camera/export_nk")
-def export_camera_nuke_group():
-    if not STATE.get("work_dir") or not STATE.get("manifest"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-
-    work_dir = Path(STATE["work_dir"])
-    json_path = work_dir / "camera" / "camera2d.json"
-    if not json_path.exists():
-        raise HTTPException(status_code=404, detail="Brak pliku camera2d.json. Najpierw przeprowadź analizę ruchu.")
-
-    cam_data = Camera2DData.load(json_path)
-    shot_name = cam_data.shot_name
-    nk_file = work_dir / "camera" / f"Camera2D_{shot_name}.nk"
-
-    nk_content = NukeCamera2DGroupGenerator.generate_script(
-        shot_name=shot_name,
-        camera_data=cam_data,
-        output_nk_path=nk_file,
-        output_json_path=json_path
-    )
-
-    return {
-        "success": True,
-        "nk_path": str(nk_file).replace("\\", "/"),
-        "script": nk_content
-    }
-
-
-
-# -----------------------------------------------------------------------------
-# Depth map Endpoints (Stage E1e, SPEC Section 4e, 10)
-# -----------------------------------------------------------------------------
-
-class DepthComputeRequest(BaseModel):
-    plate: str = "beauty"
-    first_frame: Optional[int] = None
-    last_frame: Optional[int] = None
-    workflow_path: Optional[str] = None
-
-
-def _depth_workflow_path(explicit: Optional[str]) -> Path:
-    """The user's DepthCrafter workflow (Comfy UI JSON). Config `depth_workflow`, else Comfy's workflows dir."""
-    if explicit:
-        return Path(explicit)
-    cfg = load_config()
-    if cfg.get("depth_workflow"):
-        return Path(cfg["depth_workflow"])
-    return Path(cfg.get("comfy_dir", "")) / "user" / "default" / "workflows" / "workflow_comfyui_depthcrafter.json"
-
-
-@app.post("/api/depth/compute")
-@long_job("Głębia (DepthCrafter)")
-async def compute_depth(req: DepthComputeRequest):
-    if not STATE.get("shot_project"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    from engine.depth import run_depth
-
-    proj: ShotProject = STATE["shot_project"]
-    manifest = STATE["manifest"]
-    plates = manifest.get("plates", {})
-    work_dir = Path(STATE["work_dir"])
-    wf = _depth_workflow_path(req.workflow_path)
-    if not wf.exists():
-        raise HTTPException(status_code=400, detail=f"Nie znaleziono workflowu DepthCrafter: {wf}")
-
-    # Input after deflicker (4e.1 pkt 1): the `_deflicker` EXR if exported, otherwise plate x gain maps
-    plate_pat = plates.get(f"{req.plate}_clean") or plates.get(req.plate)
-    if not plate_pat:
-        raise HTTPException(status_code=400, detail=f"Brak plate'u '{req.plate}'")
-    gain_dir = work_dir / "deflicker" / f"gain_{req.plate}"
-    gain_pat = str(gain_dir / "gain_%04d.exr") if not plates.get(f"{req.plate}_clean") and gain_dir.exists() else None
-
-    first_f = req.first_frame or int(manifest.get("first", 1))
-    last_f = req.last_frame or int(manifest.get("last", 1))
-    frames = list(range(first_f, last_f + 1))
-    w, h = proj.plate_size
-
-    homs = None
-    cam_json = work_dir / "camera" / "camera2d.json"
-    if cam_json.exists():
-        cam = Camera2DData.load(cam_json)
-        by_f = {fr.frame: np.array(fr.homography, dtype=np.float64) for fr in cam.frames}
-        if all(f in by_f for f in frames):
-            sx, sy = w / float(cam.plate_w), h / float(cam.plate_h)
-            S = np.diag([sx, sy, 1.0])
-            homs = [S @ by_f[f] @ np.linalg.inv(S) for f in frames]
-
-    client = STATE.get("comfy_client") or ComfyClient.from_config()
-    loop = asyncio.get_running_loop()
-
-    def on_progress(step: str, done: int, total: int):
-        JOBS.progress(step, done, total)
-        asyncio.run_coroutine_threadsafe(
-            ws_manager.broadcast({"type": "depth_progress", "step": step, "done": done, "total": total}), loop)
-
-    try:
-        rep = await loop.run_in_executor(None, lambda: run_depth(
-            client, wf, manifest.get("shot", "shot"), plate_pat, frames, w, h, work_dir, work_dir / "export",
-            gain_pattern=gain_pat, homographies=homs, progress_cb=on_progress))
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    return {"success": True, "report": rep.to_dict()}
-
-
-@app.get("/api/depth/report")
-def get_depth_report():
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    p = Path(STATE["work_dir"]) / "depth" / "depth_report.json"
-    if not p.exists():
-        return {"exists": False}
-    return {"exists": True, "report": json.loads(p.read_text(encoding="utf-8"))}
-
-
-@app.post("/api/depth/export_nk")
-def export_depth_nk():
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    from engine.depth import DepthReport, NukeDepthGroupGenerator
-
-    p = Path(STATE["work_dir"]) / "depth" / "depth_report.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Najpierw policz głębię")
-    rep = DepthReport(**json.loads(p.read_text(encoding="utf-8")))
-    nk = Path(STATE["work_dir"]) / "depth" / f"Depth_{rep.shot}.nk"
-    text = NukeDepthGroupGenerator.generate_script(rep.shot, rep, nk)
-    return {"success": True, "nk_path": str(nk).replace("\\", "/"), "script": text}
+# ---- Plate alignment endpoints (stage E1b, SPEC 4a) -> api/plate_align.py (audit 2026-11-02 step 8); included here so the route order is unchanged
+from api.plate_align import make as _make_plate_align
+_r, _x = _make_plate_align(STATE=STATE, _plate_size=lambda *a, **k: _plate_size(*a, **k), _refresh_manifest_view=lambda *a, **k: _refresh_manifest_view(*a, **k), long_job=lambda *a, **k: long_job(*a, **k), ws_manager=ws_manager)
+app.include_router(_r)
+del _r, _x
+
+
+# ---- Plate cleaning endpoints: deflicker and denoise (stage E1c, SPEC 4c) -> api/plate_clean.py (audit 2026-11-02 step 8); included here so the route order is unchanged
+from api.plate_clean import make as _make_plate_clean
+_r, _x = _make_plate_clean(STATE=STATE, _plate_size=lambda *a, **k: _plate_size(*a, **k), _refresh_manifest_view=lambda *a, **k: _refresh_manifest_view(*a, **k), long_job=lambda *a, **k: long_job(*a, **k), ws_manager=ws_manager)
+app.include_router(_r)
+del _r, _x
+
+
+# ---- 2D camera motion endpoints (stage E1d, SPEC 4d) -> api/camera.py (audit 2026-11-02 step 8); included here so the route order is unchanged
+from api.camera import make as _make_camera
+_r, _x = _make_camera(STATE=STATE, _plate_size=lambda *a, **k: _plate_size(*a, **k), long_job=lambda *a, **k: long_job(*a, **k), ws_manager=ws_manager)
+app.include_router(_r)
+del _r, _x
+
+
+# ---- Depth map endpoints (stage E1e, SPEC 4e) -> api/depth.py (audit 2026-11-02 step 8); included here so the route order is unchanged
+from api.depth import make as _make_depth
+_r, _x = _make_depth(STATE=STATE, long_job=lambda *a, **k: long_job(*a, **k), ws_manager=ws_manager)
+app.include_router(_r)
+del _r, _x
 
 
 # -----------------------------------------------------------------------------
@@ -2455,15 +1845,10 @@ def _proxy_scale() -> float:
 
 def _load_proxy_display(frame: int, plate: str = "beauty") -> np.ndarray:
     """Display proxy (BGR float 0..1) – rendered on demand like /api/frame."""
-    proxy_dir = Path(STATE["work_dir"]) / "proxy" / plate
-    pf = proxy_dir / f"p_{frame:04d}.jpg"
-    if not pf.exists():
-        pattern = STATE["manifest"].get("plates", {}).get(plate, "")
-        src = ProxyGenerator.resolve_frame_path(pattern, frame) if pattern else None
-        if not src or not src.exists():
-            raise HTTPException(status_code=404, detail=f"Brak klatki {frame} plate'u {plate}")
-        ProxyGenerator.render_proxy_file(source_frame_path=src, dest_proxy_path=pf,
-                                         colorspace=STATE["manifest"].get("colorspace", "ACES2065-1"))
+    _plate_name_or_400(plate)
+    pf = _fresh_proxy(plate, frame)
+    if pf is None:
+        raise HTTPException(status_code=404, detail=f"Brak klatki {frame} plate'u {plate}")
     img = cv2.imread(str(pf), cv2.IMREAD_COLOR)
     w, h = _plate_size()
     s = _proxy_scale()
@@ -2676,12 +2061,10 @@ def _backlit_pattern() -> Optional[str]:
 
 
 def _mplate_global_enabled() -> bool:
-    """defaults.json mplate.enabled: global kill-switch of the plate-to-mask denoise (false = off everywhere)."""
-    try:
-        d = json.loads((REPO_DIR / "defaults.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        d = {}
-    return bool(d.get("mplate", {}).get("enabled", True))
+    """defaults.json mplate.enabled: global kill-switch of the plate-to-mask denoise (false = off everywhere).
+    The same defaults the pipeline is built from (`load_defaults`), so the API and the runs never disagree."""
+    from engine.mplate import global_enabled
+    return global_enabled(load_defaults())
 
 
 def _mask_plate_denoise_info(proj: Any = None, manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2698,23 +2081,20 @@ def _mask_plate_denoise() -> bool:
     return _mask_plate_denoise_info()["effective"]
 
 
-def _pipeline():
+def _pipeline_for(proj: ShotProject, work_frames: Optional[List[int]]):
+    """The pipeline of `proj` – ONE build for the UI and the night queue (audit 2026-11-02 #1, engine
+    ObjectPipeline.from_project); only the Comfy client, the display transform and the LTX-2.5 workflow come from here."""
     from engine.pipeline import ObjectPipeline
-    w, h = _plate_size()
-    defaults = json.loads((REPO_DIR / "defaults.json").read_text(encoding="utf-8"))
-    m = STATE["manifest"]
-    gain_dir = Path(STATE["work_dir"]) / "deflicker" / "gain_beauty"
-    plate = m["plates"].get("beauty_clean") or m["plates"]["beauty"]   # exported _deflicker EXR, if chosen (4b pkt 1)
-    gain = str(gain_dir / "gain_%04d.exr") if (not m["plates"].get("beauty_clean") and gain_dir.exists()) else None
-    pipe = ObjectPipeline(Path(STATE["work_dir"]), plate, w, h,
-                          STATE.get("comfy_client") or ComfyClient.from_config(), display=_plate_display,
-                          backlit_pattern=_backlit_pattern(), backlit_params=defaults.get("backlit", {}),
-                          ltx_workflow=_ltx_workflow(), use_mplate=_mask_plate_denoise(),
-                          gain_pattern=gain, frames=_shot_frames(), shutter_deg=float(m.get("shutter_deg", 180)),
-                          cleanplate_pattern=m["plates"].get("cleanplate_align") or m["plates"].get("cleanplate") or None,
-                          io_mode=_comfy_io_mode())
-    pipe.work_frames = _work_frames()   # the mask 1+2 of the band previews = the work-area batch (2026-10-24)
-    return pipe
+    return ObjectPipeline.from_project(proj, STATE.get("comfy_client") or ComfyClient.from_config(),
+                                       defaults=load_defaults(), display=_plate_display, ltx_workflow=_ltx_workflow(),
+                                       work_frames=work_frames)
+
+
+def _pipeline():
+    proj: Optional[ShotProject] = STATE.get("shot_project")
+    if proj is None:
+        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
+    return _pipeline_for(proj, _work_frames())   # the mask 1+2 of the band previews = the work-area batch (2026-10-24)
 
 
 EDGE_MODES = ("auto", "backlit", "matanyone", "core", "ltx")
@@ -2876,17 +2256,18 @@ def set_object_life(name: str, req: LifeRequest):
     from engine.workarea import normalize_life
     o = _objects()
     try:
-        obj = o.get(name)
         life = normalize_life(req.life, _shot_range())
+        with o.lock(name):
+            obj = o.get(name)
+            if life:
+                obj["life"] = life
+            else:
+                obj.pop("life", None)
+            o._write(o.dir(name) / "object.json", obj)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if life:
-        obj["life"] = life
-    else:
-        obj.pop("life", None)
-    o._write(o.dir(name) / "object.json", obj)
     return get_object_life(name)
 
 
@@ -3143,16 +2524,21 @@ class LtxSettingsRequest(BaseModel):
 
 def _ltx_status() -> Dict[str, Any]:
     """Models of stage LTX-2.5 (present / missing with size and repo) + the Comfy nodes it needs."""
-    from engine.ltx_alpha import missing_nodes, models_status
+    from engine.ltx_alpha import COND_NODES, cond_file, missing_nodes, models_status
     cfg = load_config()
     models = models_status(cfg.get("models_dir"))
     try:
-        nodes = missing_nodes((STATE.get("comfy_client") or ComfyClient.from_config()).get_object_info())
+        info = (STATE.get("comfy_client") or ComfyClient.from_config()).get_object_info()
+        nodes = missing_nodes(info)
+        cond_nodes = bool(info) and all(n in info for n in COND_NODES)
     except Exception:
-        nodes = None    # Comfy not running: unknown
-    miss = [m for m in models if not m["present"]]
+        nodes, cond_nodes = None, False    # Comfy not running: unknown
+    miss = [m for m in models if m["needed"] and not m["present"]]
+    cf = cond_file(cfg.get("models_dir"))
     return {"models": models, "missing_models": [m["file"] for m in miss],
             "missing_gb": round(sum(m["gb"] for m in miss), 1), "missing_nodes": nodes,
+            # the empty prompt encoded once (2026-11-06): used when Comfy has our PlateMatte nodes for it
+            "cond_path": str(cf) if cf and cond_nodes else None, "cond_saved": bool(cf and cf.exists()),
             "ready": not miss and nodes == []}
 
 
@@ -3254,7 +2640,8 @@ async def ltx_compute(name: str):
     pipe = _pipeline()
     cb = _ws_progress("object_progress", name)
     try:
-        run = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.ltx_run(name, frames, progress_cb=cb))
+        run = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: pipe.ltx_run(name, frames, progress_cb=cb, cond_path=st.get("cond_path")))
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
     rj = json.loads((_objects().dir(name) / "runs" / run / "run.json").read_text(encoding="utf-8"))
@@ -4595,6 +3982,9 @@ def get_zone_region(name: str, zone_id: str, frame: int):
     """The propagated region of the zone in `frame` (contours in plate px, bbox) – the starting point of a correction.
     The propagation transforms are cached (zones_cache/<zone>/transforms_*.npz); the first call tracks (CoTracker3)."""
     _load_zone_or_404(name, zone_id)
+    outside = _band_outside(name, frame)
+    if outside:   # not an error (user report 2026-11-06: an error window + 20 retries at F140 of a F1–60 core)
+        return {"frame": frame, "contours": [], "outside": outside}
     try:
         # only frames with a core on disk (the work range): an object without an active version gave the whole shot and
         # the tracking stopped at the first frame past the range („brak rdzenia klatki 51”, user report 2026-10-30)
@@ -4608,6 +3998,16 @@ def _band_frames(name: str, frame: int) -> List[int]:
     """Frames the points are tracked over – the same span as the zone preview (active version, cores on disk)."""
     d = _objects().dir(name)
     return [x for x in _active_run_frames(name) if (d / "core" / f"c_{x:04d}.png").exists()] or [frame]
+
+
+def _band_outside(name: str, frame: int) -> Optional[str]:
+    """Why the band / zone area cannot be shown in `frame`: the frame is past the computed SAM 3.1 core (e.g. core F1–60,
+    frame 140) – nothing to track or snap the points to there. None = inside."""
+    frames = _band_frames(name, frame)
+    if frame in frames:
+        return None
+    return (f"F{frame} poza policzonym rdzeniem SAM 3.1 (F{frames[0]}–{frames[-1]}) – pas i jego punkty tylko w tym "
+            f"zakresie; dalsze klatki = policz etap 1 dla nich (obszar roboczy)")
 
 
 class _BandOwner:
@@ -4744,7 +4144,7 @@ def _band_state(name: str, z, frame: int) -> Dict[str, Any]:
 
 
 def _band_state_o(name: str, ow: "_BandOwner", frame: int) -> Dict[str, Any]:
-    from engine.bandmap import angle_at, band_points, snap_frame, widths_at
+    from engine.bandmap import band_points
     from engine.bandtrack import track_positions
     from engine.zonecache import ZoneCache
     name = ow.name
@@ -4770,19 +4170,8 @@ def _band_state_o(name: str, ow: "_BandOwner", frame: int) -> Dict[str, Any]:
     except FileNotFoundError:
         core = None
     so, si = ow.scales()        # the sliders size the band, the points shape it (2026-10-21)
-    from engine.bandmap import _contours
-    cs = _contours(core) if core is not None else None     # one outline trace for all the points of the frame
-    out = []
-    for q in pts:
-        x, y, vis = pos.get(q["id"], (None, None, False))
-        o, i = widths_at(q, frame)
-        o, i = o * so, i * si
-        sn = snap_frame(core, x, y, cs) if core is not None and x is not None else None
-        out.append({"id": q["id"], "x": x, "y": y, "visible": vis, "out": round(o, 2), "in": round(i, 2),
-                    "ang": round(angle_at(q, frame), 2),
-                    "key": str(frame) in q["keys"], "keys": sorted(int(k) for k in q["keys"]),
-                    **({"sx": round(sn[0], 2), "sy": round(sn[1], 2), "nx": round(sn[2], 4), "ny": round(sn[3], 4),
-                                                                      "tx": round(sn[4], 4), "ty": round(sn[5], 4)} if sn else {})})
+    from engine.bandedit import state_points
+    out = state_points(pts, frame, pos, core, so, si)
     return {"frame": frame, "points": out, "defaults": defaults, "tracking": bool(tinfo.get("pending")),
             "scale": {"out": round(so, 4), "in": round(si, 4)}}
 
@@ -4821,49 +4210,23 @@ def put_zone_band(name: str, zone_id: str, frame: int, req: BandPointRequest):
     return _band_put(_zone_owner(name, z), frame, req)
 
 
-def _ang_field(new: Optional[float], cur: Any) -> Dict[str, float]:
-    """The key's tilt: the request's, else the one shown now; 0 is not stored (keys of old projects stay as they are)."""
-    from engine.bandmap import MAX_ANGLE_DEG
-    a = float(max(-MAX_ANGLE_DEG, min(MAX_ANGLE_DEG, float(new if new is not None else (cur or 0.0)))))
-    return {"ang": round(a, 2)} if a else {}
-
-
 def _band_put(ow: "_BandOwner", frame: int, req: "BandPointRequest") -> Dict[str, Any]:
-    from engine.bandmap import MAX_WIDTH_PX, band_points
+    from engine.bandmap import band_points
     name = ow.name
+    outside = _band_outside(name, frame)
+    if outside:   # a key there is never tracked nor snapped (user report 2026-11-06)
+        raise HTTPException(status_code=409, detail=outside)
     pts = [dict(p) for p in band_points(ow.params)]
     if not ow.params.get("band_ref_out"):   # the sliders as they are now = scale 1 for these points
         ow.params = {**ow.params, **ow.refs()}
     state = _band_state_o(name, ow, frame)
-    cur = {q["id"]: q for q in state["points"]}
+    from engine.bandedit import BandEditError, put_point
     so, si = ow.scales()
-    clamp = lambda v: float(min(MAX_WIDTH_PX, max(0.0, v)))
-    raw_o = lambda v: clamp(v) / so if so > 1e-6 else clamp(v)     # shown (scaled) px -> stored px
-    raw_i = lambda v: clamp(v) / si if si > 1e-6 else clamp(v)
-    if req.id is None:
-        if req.x is None or req.y is None:
-            raise HTTPException(status_code=400, detail="Nowy punkt pasa: podaj x i y")
-        d0 = state["defaults"]
-        n = 1 + max([int(p["id"][1:]) for p in pts if str(p["id"]).startswith("p") and str(p["id"])[1:].isdigit()] or [0])
-        pts.append({"id": f"p{n}", "keys": {str(frame): {"x": float(req.x), "y": float(req.y),
-                                                         "out": raw_o(req.out if req.out is not None else d0["out"]),
-                                                         "in": raw_i(req.in_ if req.in_ is not None else d0["in"]),
-                                                         **_ang_field(req.ang, 0.0)}}})
-        pid = f"p{n}"
-    else:
-        p = next((q for q in pts if q["id"] == req.id), None)
-        if p is None:
-            raise HTTPException(status_code=404, detail=f"Brak punktu pasa {req.id}")
-        c = cur.get(req.id, {})
-        x = req.x if req.x is not None else c.get("sx", c.get("x"))     # snapped to the outline (station 2026-10-21:
-        y = req.y if req.y is not None else c.get("sy", c.get("y"))     # a raw track had drifted 500 px into the sky)
-        if x is None or y is None:
-            raise HTTPException(status_code=409, detail="Punkt jest w tej klatce niewidoczny – podaj jego położenie (x, y)")
-        p["keys"] = {**p["keys"], str(frame): {"x": float(x), "y": float(y),
-                                               "out": raw_o(req.out if req.out is not None else c.get("out", 0)),
-                                               "in": raw_i(req.in_ if req.in_ is not None else c.get("in", 0)),
-                                               **_ang_field(req.ang, c.get("ang", 0.0))}}
-        pid = req.id
+    try:
+        pts, pid = put_point(pts, frame, {q["id"]: q for q in state["points"]}, state["defaults"], so, si,
+                             id=req.id, x=req.x, y=req.y, out=req.out, in_=req.in_, ang=req.ang)
+    except BandEditError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
     ow.store(pts)
     return {"success": True, "point": pid, "band": _band_state_o(name, ow, frame)}
 
@@ -4876,17 +4239,12 @@ def delete_zone_band(name: str, zone_id: str, point_id: str, frame: Optional[int
 
 
 def _band_delete_point(ow: "_BandOwner", point_id: str, frame: Optional[int]) -> Dict[str, Any]:
+    from engine.bandedit import BandEditError, delete_point
     from engine.bandmap import band_points
-    pts = [dict(p) for p in band_points(ow.params)]
-    p = next((q for q in pts if q["id"] == point_id), None)
-    if p is None:
-        raise HTTPException(status_code=404, detail=f"Brak punktu pasa {point_id}")
-    if frame is not None:
-        if str(frame) not in p["keys"]:
-            raise HTTPException(status_code=404, detail=f"Punkt {point_id} nie ma klucza w klatce {frame}")
-        p["keys"] = {k: v for k, v in p["keys"].items() if k != str(frame)}
-    if frame is None or not p["keys"]:
-        pts = [q for q in pts if q["id"] != point_id]
+    try:
+        pts = delete_point(band_points(ow.params), point_id, frame)
+    except BandEditError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
     ow.store(pts)
     return {"success": True}
 
@@ -4900,18 +4258,12 @@ def delete_zone_band_keys(name: str, zone_id: str, frame: Optional[int] = None):
 
 
 def _band_delete_keys(ow: "_BandOwner", frame: Optional[int]) -> Dict[str, Any]:
+    from engine.bandedit import BandEditError, delete_keys
     from engine.bandmap import band_points
-    pts = [dict(p) for p in band_points(ow.params)]
-    if frame is None:
-        removed = [p["id"] for p in pts]
-        pts = []
-    else:
-        removed = [p["id"] for p in pts if str(frame) in p["keys"]]
-        if not removed:
-            raise HTTPException(status_code=404, detail=f"Brak kluczy pasa w klatce {frame}")
-        for p in pts:
-            p["keys"] = {k: v for k, v in p["keys"].items() if k != str(frame)}
-        pts = [p for p in pts if p["keys"]]
+    try:
+        pts, removed = delete_keys(band_points(ow.params), frame)
+    except BandEditError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
     ow.store(pts)
     return {"success": True, "removed": removed, "points": [p["id"] for p in pts]}
 
@@ -5262,8 +4614,7 @@ def propose_band(name: str, req: BandProposeRequest):
             "model": sapiens2.LABEL}
 
 
-from collections import OrderedDict
-_LINES_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()   # band lines by CONTENT (stage_band_lines)
+_LINES_CACHE = LockedLRU(160)   # band lines by CONTENT (stage_band_lines)
 
 
 def _band_lines_cached(name: str, frame: int, mask: np.ndarray, out: float, inn: float, fi: float, fo: float, pts,
@@ -5280,7 +4631,6 @@ def _band_lines_cached(name: str, frame: int, mask: np.ndarray, out: float, inn:
                       float(fi), float(fo), [[round(float(v), 2) for v in p] for p in pts], float(unit)])
     hit = _LINES_CACHE.get(key) if cacheable else None
     if hit is not None:
-        _LINES_CACHE.move_to_end(key)
         return dict(hit)
     o, i = band_widths(m, out, inn, pts or None)
     if np.isinf(i).all() and unit:   # „cały rdzeń”: the points' inner whiskers shape the feather
@@ -5288,9 +4638,7 @@ def _band_lines_cached(name: str, frame: int, mask: np.ndarray, out: float, inn:
         fi = whole_feather(m, fi, pts or None, unit)
     res = preview_lines(*feather_lines(sdf_px(m.astype(np.float32)), o, i, fi, fo))
     if cacheable:
-        _LINES_CACHE[key] = res
-        while len(_LINES_CACHE) > 160:
-            _LINES_CACHE.popitem(last=False)
+        _LINES_CACHE.put(key, res)
     return dict(res)
 
 
@@ -5392,7 +4740,11 @@ def zone_color_pick(name: str, frame: int, x: float, y: float):
 @app.delete("/api/object/{name}/zones/{zone_id}")
 @object_edit
 def delete_zone(name: str, zone_id: str):
-    p = _objects().dir(name) / "zones" / f"{zone_id}.json"
+    from engine.zones import zone_file
+    try:
+        p = zone_file(_objects().dir(name), zone_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not p.exists():
         raise HTTPException(status_code=404, detail="Brak strefy")
     p.unlink()
@@ -5452,9 +4804,10 @@ def object_runs(name: str):
 @object_edit
 def delete_run(name: str, run: str, dry: bool = False):
     """Delete a version (user request 2026-10-25, stage 5 "Version comparison"): `dry=1` = what would go (size) and
-    what still uses it; otherwise the folder moves to <work>/trash/runs/ (engine/run_trash.py). A version still named
-    by the object (active, a stage's current result, the base of another version …) is refused with 409 + where."""
-    from engine.run_trash import RUN_RE, run_refs, run_size, trash_run
+    what still uses it; otherwise the folder is deleted from disk for good (engine/run_delete.py, user decision
+    2026-11-13). A version still named by the object (active, a stage's current result, the base of another version …)
+    is refused with 409 + where."""
+    from engine.run_delete import RUN_RE, delete_run as _delete_run, run_refs, run_size
     store = _objects()
     od = store.dir(name)
     if not RUN_RE.fullmatch(run) or not (od / "runs" / run).is_dir():
@@ -5465,8 +4818,8 @@ def delete_run(name: str, run: str, dry: bool = False):
         return {"run": run, **size, "refs": refs}
     if refs:
         raise HTTPException(status_code=409, detail=f"Wersja {run} jest w użyciu – nie usuwam: {'; '.join(refs[:5])}")
-    dest = trash_run(od, store.root.parent, name, run)
-    return {"success": True, "run": run, **size, "trash": str(dest)}
+    freed = _delete_run(od, run)
+    return {"success": True, "run": run, **size, "freed_bytes": freed}
 
 
 def _run_cov(obj_dir: Path, run: str):
@@ -5786,10 +5139,19 @@ def set_mask_plate_denoise(req: MaskPlateDenoiseRequest):
     return info
 
 
-def _merge_plate() -> Tuple[str, str]:
-    """(beauty pattern, colorspace) of the manifest – the plate Read of the .nk backdrop MERGEMATTE (RGB from the plate)."""
+def _merge_plate() -> Tuple[str, str, Optional[str]]:
+    """(beauty pattern, colorspace, log curve of the plate colour profile) of the manifest / project – the plate Read of
+    the .nk backdrop MERGEMATTE (RGB from the plate) and the curve an object's `log_curve` = `project` resolves to."""
     m = STATE.get("manifest") or {}
-    return str((m.get("plates") or {}).get("beauty") or "").replace("\\", "/"), str(m.get("colorspace") or "")
+    pc = _project_curve()
+    return (str((m.get("plates") or {}).get("beauty") or "").replace("\\", "/"), str(m.get("colorspace") or ""),
+            pc.get("id") if pc else None)
+
+
+def _project_curve() -> Optional[Dict[str, Any]]:
+    """The project's plate colour profile as a MergeMatte log curve {"id", "label", "reason"} (api/color_profile.py,
+    included below the MergeMatte router); None without a project."""
+    return _color_profile_curve()
 
 
 @app.post("/api/export/nk")
@@ -5808,11 +5170,21 @@ def export_nk_only():
     shot = data.get("shot") or m.get("shot", "shot")
     root = Path(data.get("export_dir") or _export_dir())
     from engine.final_touch import merge_matte_export
+    from engine.ft_nuke import specs as ft_specs
     merge = merge_matte_export(STATE["work_dir"], [e["name"] for e in data.get("objects", [])], *_merge_plate())
     nk = write_mattes_nk(root / f"{shot}_mattes.nk", data, shot, int(fr[0]), int(fr[1]), w, h,
-                         channels=data.get("mattes_all_channels") if data.get("mattes_all") else None, merge=merge)
+                         channels=data.get("mattes_all_channels") if data.get("mattes_all") else None, merge=merge,
+                         ft=ft_specs(STATE["work_dir"], data))
     update_outputs(STATE["work_dir"], "mattes_nk", str(nk).replace("\\", "/"))
     return {"success": True, "nk": str(nk).replace("\\", "/")}
+
+
+@app.get("/api/export/nk_text")
+def export_nk_text():
+    """The export's Nuke script as text (2026-11-16, „⧉ Kopiuj do schowka”): regenerated like „tylko .nk” (current
+    Final Touch nodes, MergeMatte knobs), so Ctrl+V in Nuke's node graph pastes what the file holds."""
+    r = export_nk_only()
+    return {"success": True, "nk": r["nk"], "text": Path(r["nk"]).read_text(encoding="utf-8")}
 
 
 def _active_run_frames(name: str) -> List[int]:
@@ -5856,19 +5228,6 @@ from engine.final_touch import FT_PREFIX, base_run as ft_base_run, set_context_p
 
 _ft_set_ctx(lambda: _ft_context())   # the Final Touch motion blur reads the open shot's plate through the app
 
-EXPORT_SOURCES = ("active", "core", "matanyone", "videomama", "vitmatte", "ltx", "version", "final_touch")
-EXPORT_SOURCE_LABEL = {"active": "aktywna wersja", "core": "rdzeń (1+2)", "matanyone": "MatAnyone2 (etap 3)",
-                       "videomama": "VideoMaMa (etap 4)", "vitmatte": "ViTMatte (etap 5)", "ltx": "LTX-2.5 Alpha-Gen (etap 7)",
-                       "version": "wybrana wersja", "final_touch": "Final Touch (baza + korekty)"}
-# when an object of a full export / of the context has no result of the chosen source (e.g. a hand without ViTMatte
-# zones): the next source down, reported in the warning – a written object chosen by name never falls back
-EXPORT_FALLBACK = {"vitmatte": ["vitmatte", "videomama", "matanyone", "active", "core"],
-                   "matanyone": ["matanyone", "active", "core"],
-                   "videomama": ["videomama", "matanyone", "active", "core"],
-                   "ltx": ["ltx", "vitmatte", "videomama", "matanyone", "active", "core"],
-                   "core": ["core"], "version": ["version", "active"], "active": ["active"],
-                   # an object without its own corrections: base = the result of the last computed stage
-                   "final_touch": ["final_touch"]}
 
 
 def _group_coverage(group: str, frames: List[int]) -> List[List[int]]:
@@ -5940,17 +5299,21 @@ def _export_source_run(name: str, source: str, run: Optional[str] = None, build_
 
 async def _export_by_source(req: "ExportRequest"):
     """Export with a chosen source (2026-10-15): every written object / group strictly from `req.source` (409 with the
-    reasons), the context objects (front subtraction) from the same source with EXPORT_FALLBACK."""
-    from engine.export import export_objects
+    reasons), the context objects (front subtraction) from the same source with EXPORT_FALLBACK.
+    The plain export (source "active", no version, no group named): objects only, any object without a current final
+    result among those it writes = 409 „Przelicz finalnie”, a full export too."""
+    from engine.export import core_fix_warning, export_objects
     from engine.workarea import missing_detail, need_missing, object_life, run_coverage
     if req.source not in EXPORT_SOURCES:
         raise HTTPException(status_code=400, detail=f"source: {' | '.join(EXPORT_SOURCES)}")
     if req.scope not in ("all", "work_area"):
         raise HTTPException(status_code=400, detail="scope = all | work_area")
     store = _objects()
-    from engine.groups import group_depth, list_groups, whole_results
+    from engine.groups import group_depth, is_group, list_groups, whole_results
+    plain = req.source == "active" and not req.run and not any(
+        (store.dir(n) / "object.json").exists() and is_group(store.get(n)) for n in req.objects)
     # group entities (PLAN_GROUP_COMPOSE): one layer each, at their front-most member; an empty group is no layer
-    ents = [{**g, "depth_order": group_depth(store, g["name"])} for g in list_groups(store) if g.get("members")]
+    ents = [] if plain else [{**g, "depth_order": group_depth(store, g["name"])} for g in list_groups(store) if g.get("members")]
     every = store.list() + ents
     gnames = {g["name"] for g in ents}
     names = {o["name"] for o in every}
@@ -5962,6 +5325,12 @@ async def _export_by_source(req: "ExportRequest"):
                 raise HTTPException(status_code=404, detail=f"nieznany obiekt / grupa: {n}")
             needed.add(n)
             want.append(n)
+    if plain:
+        from engine.stages import blocked_for_export
+        stale = blocked_for_export(store, sorted(needed) if want is not None else [o["name"] for o in every],
+                                   Path(STATE["work_dir"]), _mask_plate_denoise())
+        if stale:
+            raise HTTPException(status_code=409, detail=f"Najpierw „Przelicz finalnie” (eksport nie bierze rdzenia ani nieaktualnego wyniku): {', '.join(stale)}")
     one = req.objects[0] if (req.run and len(req.objects) == 1 and req.objects[0] in names) else None
     runs, bad, fell = {}, {}, {}
     for o in every:
@@ -6021,7 +5390,7 @@ async def _export_by_source(req: "ExportRequest"):
             holes[n] = miss
     if holes:
         lbl = "całym ujęciu" if req.scope == "all" else f"zakresie pracy F{frames[0]}–{frames[-1]}"
-        raise HTTPException(status_code=409, detail=missing_detail(EXPORT_SOURCE_LABEL[req.source], lbl, holes))
+        raise HTTPException(status_code=409, detail=missing_detail("Wynik finalny" if plain else EXPORT_SOURCE_LABEL[req.source], lbl, holes))
     missing_front = []
     if want is not None:
         first = min((o.get("depth_order", 0) for o in every if o["name"] in needed), default=0)
@@ -6045,12 +5414,17 @@ async def _export_by_source(req: "ExportRequest"):
     from engine.contract import validate
     warn = []
     if missing_front:
-        warn.append(f"Obiekty z przodu bez wyniku nie zostały odjęte: {', '.join(missing_front)}")
+        warn.append(f"Obiekty z przodu bez aktualnego wyniku nie zostały odjęte: {', '.join(missing_front)}")
     if fell:
         warn.append("Inne źródło (brak wyniku „" + EXPORT_SOURCE_LABEL[req.source] + "”): " +
                     ", ".join(f"{n} → {s}" for n, s in sorted(fell.items())))
+    warn.append(core_fix_warning(out))
+    fb = [f"{e['name']}: {e['final_touch']['nuke']['why']}" for e in out.get("objects", [])
+          if e["name"] in needed and ((e.get("final_touch") or {}).get("nuke") or {}).get("requested")]
+    if fb:
+        warn.append("Final Touch wpalony zamiast węzłów Nuke'a – " + "; ".join(fb))
     return {"success": True, "outputs": out, "contract_errors": validate(out), "written": want or "all",
-            "warning": " · ".join(warn), "format": out.get("export_format"), "scope": req.scope,
+            "warning": " · ".join(x for x in warn if x), "format": out.get("export_format"), "scope": req.scope,
             "frames": [frames[0], frames[-1]], "source": req.source, "runs": {n: runs[n] for n in sorted(needed)}}
 
 
@@ -6062,82 +5436,9 @@ async def export_mattes(req: ExportRequest = ExportRequest()):
     whole result / Final Touch / composition, PLAN_GROUP_COMPOSE; `selection` = the selected object / group (+ members), with the
     multi-EXR). Mattes are always computed in the context of all objects with a result, so a single export equals that
     object in a full export.
-    `source` / `run` (2026-10-15): mattes from the mask 1+2, the stage-3 / stage-4 result or a chosen version
-    (_export_by_source); the default "active" is the export as before."""
-    if req.source != "active" or req.run:
-        return await _export_by_source(req)
-    from engine.groups import is_group
-    if any((_objects().dir(n) / "object.json").exists() and is_group(_objects().get(n)) for n in req.objects):
-        return await _export_by_source(req)   # a group entity: its whole result or its composition
-    from engine.export import export_objects
-    from engine.stages import blocked_for_export
-    store = _objects()
-    work = Path(STATE["work_dir"])
-    dn = _mask_plate_denoise()
-    every = store.list()
-    want = None
-    if req.objects:
-        want, needed = [], set()
-        names = {o["name"] for o in every}
-        for n in req.objects:
-            if n not in names:
-                raise HTTPException(status_code=404, detail=f"nieznany obiekt / grupa: {n}")
-            needed.add(n)
-            want.append(n)
-        stale = blocked_for_export(store, sorted(needed), work, dn)
-    else:
-        stale = blocked_for_export(store, [o["name"] for o in every], work, dn)
-    if stale:
-        raise HTTPException(status_code=409, detail=f"Najpierw „Przelicz finalnie” (eksport nie bierze rdzenia ani nieaktualnego wyniku): {', '.join(stale)}")
-    if req.scope not in ("all", "work_area"):
-        raise HTTPException(status_code=400, detail="scope = all | work_area")
-    frames = _work_frames() if req.scope == "work_area" else _shot_frames()
-    # context: every object with a valid final result (front objects are subtracted, parts split the whole)
-    ok = set(o["name"] for o in every) - set(blocked_for_export(store, [o["name"] for o in every], work, dn))
-    objs = [o for o in every if o["name"] in ok]
-    # every written matte and every object it depends on (front objects, parts of the same whole) must have a final
-    # result on all exported frames – never an export with silent holes (409 + the missing intervals)
-    from engine.workarea import missing_detail, need_missing, object_life, run_coverage
-    if want is None:
-        relevant = set(ok)
-    else:
-        relevant = set(needed)
-        back = max((o.get("depth_order", 0) for o in every if o["name"] in needed), default=0)
-        relevant |= {o["name"] for o in objs if o.get("depth_order", 0) < back}
-    holes = {}
-    for n in sorted(relevant & ok):
-        miss = need_missing((frames[0], frames[-1]), run_coverage(store.dir(n), store.get(n)["tool"].get("active_run")) or [],
-                            object_life(store.get(n)))     # frames outside the object's life = black, counted
-        if miss:
-            holes[n] = miss
-    if holes:
-        lbl = "całym ujęciu" if req.scope == "all" else f"zakresie pracy F{frames[0]}–{frames[-1]}"
-        raise HTTPException(status_code=409, detail=missing_detail("Wynik finalny", lbl, holes))
-    missing_front = []
-    if want is not None:
-        first = min((o.get("depth_order", 0) for o in every if o["name"] in set(want)), default=0)
-        missing_front = [o["name"] for o in every if o["name"] not in ok and o.get("depth_order", 0) < first]
-    m = STATE["manifest"]
-    w, h = _plate_size()
-    depth = None
-    if req.with_depth:
-        from engine.outputs import load_outputs
-        depth = load_outputs(STATE["work_dir"]).get("depth", {}).get("path")
-    bit = int(m.get("bit_depth", 16))
-    from engine.export import EXPORT_FORMATS
-    fmt = (req.format or _export_format_setting()).lower()
-    if fmt not in EXPORT_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Format musi być jednym z: {', '.join(EXPORT_FORMATS)}")
-    cb = _ws_progress("export_progress", "*")
-    out = await asyncio.get_running_loop().run_in_executor(None, lambda: export_objects(
-        Path(STATE["work_dir"]), m.get("shot", "shot"), objs, frames, w, h, bit, req.multichannel, depth,
-        req.with_core, cb, want, export_dir=_export_dir(), export_format=fmt, selection=req.selection,
-        merge_plate=_merge_plate()))
-    from engine.contract import validate
-    warn = (f"Obiekty z przodu bez aktualnego wyniku nie zostały odjęte: {', '.join(missing_front)}"
-            if missing_front else "")
-    return {"success": True, "outputs": out, "contract_errors": validate(out), "written": want or "all", "warning": warn,
-            "format": out.get("export_format"), "scope": req.scope, "frames": [frames[0], frames[-1]]}
+    `source` / `run` (2026-10-15): mattes from the mask 1+2, the stage-3 / stage-4 result or a chosen version;
+    the default "active" is the export of the final results of objects (_export_by_source)."""
+    return await _export_by_source(req)
 
 
 class ObjectExportRequest(BaseModel):
@@ -6192,8 +5493,12 @@ def _ft_info(name: str) -> Dict[str, Any]:
     from engine.final_touch import corrections_sig, frames_of, load as ft_load
     d = ft_load(_objects().dir(name))
     fin = d.get("finish") or {}
+    from engine.ft_nuke import available as nuke_available
+    nk_ok, nk_why = nuke_available(fin)
     return {"base": _ft_base(name), "base_choice": d.get("base"), "frames": {str(f): d["frames"][str(f)] for f in frames_of(d)},
-            "finish": fin, "shutter_manifest": _pipeline()._mb_shutter(None), "sig": corrections_sig(d)}
+            "finish": fin, "shutter_manifest": _pipeline()._mb_shutter(None),
+            "shutter_source": getattr(_pipeline(), "shutter_source", "manifest"), "sig": corrections_sig(d),
+            "nuke": {"mode": d["nuke_mode"], "available": nk_ok, "why": nk_why}}
 
 
 @app.get("/api/object/{name}/final_touch")
@@ -6210,6 +5515,7 @@ class FinalTouchBaseRequest(BaseModel):
 
 
 @app.put("/api/object/{name}/final_touch")
+@object_edit
 def put_final_touch_base(name: str, req: FinalTouchBaseRequest):
     """Choose the base (DECYZJA: any computed version, changeable at any time – the corrections stay, on the new base)."""
     from engine.final_touch import set_base
@@ -6238,24 +5544,40 @@ class FinalTouchFinishRequest(BaseModel):
 def _ft_gpu():
     """GPU worker for the Final Touch motion blur (user request 2026-10-22): `mb_device` auto | gpu | cpu as the
     „Motion blur alfy” palette; one worker kept open for the session (a preview per frame cannot pay a process start
-    every time), the device decision cached for 30 s (it asks ComfyUI's queue). None = the CPU."""
+    every time), the device decision cached for 30 s (it asks ComfyUI's queue). None = the CPU.
+    Only the first decision is made in the request; a stale one is refreshed in the background while the request uses
+    the previous one (measured 2026-11-06: ComfyUI's /queue took 1.3–2.5 s while it computed, paid by the first frame
+    after every 30 s pause)."""
     import time as _t
     from engine import align_gpu
-    from engine.motionblur import mb_device
-    now = _t.time()
     dec = STATE.get("ft_mb_device")
-    if not dec or now - dec[1] > 30.0:
-        try:
-            dec = (mb_device()[0], now)
-        except align_gpu.GpuWorkerError:
-            dec = ("cpu", now)
-        STATE["ft_mb_device"] = dec
+    if not dec:
+        dec = _ft_mb_decide()
+    elif _t.time() - dec[1] > 30.0 and not STATE.get("ft_mb_refreshing"):
+        STATE["ft_mb_refreshing"] = True
+        threading.Thread(target=_ft_mb_decide, daemon=True, name="ft-mb-device").start()
     if dec[0] != "gpu":
         return None
     g = STATE.get("ft_gpu")
     if g is None:
         g = STATE["ft_gpu"] = align_gpu.open_aligner()
     return g
+
+
+def _ft_mb_decide():
+    """('gpu' | 'cpu', time) of the Final Touch motion blur (`mb_device`), stored in STATE."""
+    import time as _t
+    from engine import align_gpu
+    from engine.motionblur import mb_device
+    try:
+        try:
+            dec = (mb_device()[0], _t.time())
+        except align_gpu.GpuWorkerError:
+            dec = ("cpu", _t.time())
+        STATE["ft_mb_device"] = dec
+        return dec
+    finally:
+        STATE["ft_mb_refreshing"] = False
 
 
 def _ft_gpu_error(e: Exception) -> None:
@@ -6279,12 +5601,13 @@ def _ft_context() -> Optional[Dict[str, Any]]:
 
 
 @app.put("/api/object/{name}/final_touch/finish")
+@object_edit
 def put_final_touch_finish(name: str, req: FinalTouchFinishRequest):
     """Global finishing of the Final Touch (levels / gamma / erode / blur, user decision 2026-10-22: moved here from the
     ViTMatte zone sliders): applied on the base before the strokes, live in the preview and in the export."""
     from engine.final_touch import set_finish
     _require_stage(name, "final_touch")
-    body = {k: v for k, v in req.dict().items() if v is not None and k != "mb_shutter_manifest"}
+    body = {k: v for k, v in req.model_dump().items() if v is not None and k != "mb_shutter_manifest"}
     if req.mb_shutter_manifest:
         body["mb_shutter_deg"] = None
     try:
@@ -6294,11 +5617,50 @@ def put_final_touch_finish(name: str, req: FinalTouchFinishRequest):
     return _ft_info(name)
 
 
+class FinalTouchNukeRequest(BaseModel):
+    mode: str                        # engine/final_touch.NUKE_MODES: bake | grade | paint
+
+
+@app.put("/api/object/{name}/final_touch/nuke")
+@object_edit
+def put_final_touch_nuke(name: str, req: FinalTouchNukeRequest):
+    """How the object's Final Touch goes to Nuke in the export's .nk (engine/ft_nuke, 2026-11-16): baked into the
+    alpha, the finish as nodes, or the strokes as a RotoPaint + the finish as nodes. The app's alpha never changes."""
+    from engine.final_touch import set_nuke_mode
+    try:
+        set_nuke_mode(_objects().dir(name), req.mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _ft_info(name)
+
+
+@app.get("/api/object/{name}/final_touch/nk")
+def get_final_touch_nk(name: str, part: str):
+    """One section of the Final Touch palette as Nuke nodes (its „⇪ Export” button, 2026-11-16): part = grade (Grade →
+    Dilate → Blur with the current values) | paint (the strokes as a RotoPaint). Clipboard text (Ctrl+V in the node
+    graph connects to the selected node), also written to objects/<o>/final_touch/FT_<part>_<o>.nk."""
+    from engine.final_touch import load as ft_load
+    from engine.ft_nuke import paste_text
+    if not STATE.get("work_dir"):
+        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
+    od = _objects().dir(name)
+    w, h = _plate_size()
+    try:
+        text, nodes = paste_text(part, ft_load(od), w, h, name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    path = od / "final_touch" / f"{nodes[0]}.nk"          # FT_grade_<o>.nk / FT_paint_<o>.nk
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, "utf-8", newline="\n")
+    return {"text": text, "path": str(path).replace("\\", "/"), "nodes": nodes}
+
+
 class FinalTouchFrameRequest(BaseModel):
     strokes: List[Dict[str, Any]] = []   # [{mode add|remove|erase, radius_px, hardness, p: [[x, y(, r)], ...]}] plate px
 
 
 @app.put("/api/object/{name}/final_touch/frames/{frame}")
+@object_edit
 def put_final_touch_frame(name: str, frame: int, req: FinalTouchFrameRequest):
     """Replace the strokes of one frame (the UI appends a stroke, Ctrl+Z puts the previous list back); [] = none."""
     from engine.final_touch import set_frame
@@ -6313,6 +5675,7 @@ def put_final_touch_frame(name: str, frame: int, req: FinalTouchFrameRequest):
 
 
 @app.delete("/api/object/{name}/final_touch/frames/{frame}")
+@object_edit
 def delete_final_touch_frame(name: str, frame: int):
     """Remove the corrections of one frame (🔑✕ / Delete in the stage)."""
     from engine.final_touch import set_frame
@@ -6343,8 +5706,7 @@ def final_touch_layer(name: str, frame: int, c: Optional[str] = None):
     return _png_response(bgra)
 
 
-_FT_BASE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()   # the base of a Final Touch frame (+ its quantized copies) – strokes do not change it
-_FT_BASE_CACHE_MAX = 2
+_FT_BASE_CACHE = LockedLRU(2)   # the base of a Final Touch frame (+ its quantized copies) – strokes do not change it
 
 
 def _ft_base_sig(od: Path, b: str, frame: int) -> tuple:
@@ -6377,11 +5739,7 @@ def _ft_base_entry(od: Path, b: str, frame: int, w: int, h: int) -> dict:
     ent = _FT_BASE_CACHE.get(key)
     if ent is None:
         ent = {"base": run_alpha_loader(od, b, w, h)(frame)}
-        _FT_BASE_CACHE[key] = ent
-        while len(_FT_BASE_CACHE) > _FT_BASE_CACHE_MAX:
-            _FT_BASE_CACHE.popitem(last=False)
-    else:
-        _FT_BASE_CACHE.move_to_end(key)
+        _FT_BASE_CACHE.put(key, ent)
     return ent
 
 
@@ -6474,7 +5832,6 @@ def final_touch_frame(name: str, frame: int, b: Optional[str] = None, c: Optiona
     """Proxy PNG of base + corrections in `frame` – the alpha the export writes for source „Final Touch” (same loader,
     8-bit rounding like view=alpha). `b` = the resolved base version from GET final_touch (saves resolving it per frame);
     `c` = the corrections hash (cache buster only); base=1 = the base alone (no strokes, no finish) for the GPU preview."""
-    from engine.export import run_alpha_loader
     from engine.workarea import fmt_intervals, run_coverage, run_frames
     store = _objects()
     od = store.dir(name)
@@ -6512,7 +5869,6 @@ class LibrarySaveRequest(BaseModel):
 
 @app.post("/api/library")
 def library_save(req: LibrarySaveRequest):
-    from engine.crop import frame_segments, load_crops
     from engine.library import save_to_library
     store = _objects()
     obj = store.get(req.object)
@@ -6678,18 +6034,19 @@ def queue_report():
 
 
 def _queue_worker(job: Dict[str, Any]) -> Dict[str, Any]:
-    """One queued object: open its shot (read-only manifest), core + 'Przelicz finalnie' + QA. Keys untouched."""
+    """One queued object: open its shot (read-only manifest), core + 'Przelicz finalnie' + QA. Keys untouched.
+    The pipeline is the UI's (`_pipeline_for`: backlit, gain maps, clean plate, shutter – audit 2026-11-02 #1) and the
+    model gate of the UI holds here too (user rule 2026-10-16: a stage without its model is unavailable)."""
     from engine.ingest import ProjectCreator
-    from engine.comfy_io import io_mode_for
-    from engine.pipeline import ObjectPipeline
+    from engine.stage_models import model_gate
+    g = model_gate(load_config()).get("core")
+    if g:
+        raise RuntimeError(g["why"])
     data = ProjectCreator().init_project_from_manifest(job["manifest_path"])
     proj = data["shot_project"]
     m = proj.effective_manifest()
-    w, h = proj.plate_size
     frames = list(range(int(m["first"]), int(m["last"]) + 1))
-    pipe = ObjectPipeline(proj.work_dir, m["plates"]["beauty"], w, h, STATE.get("comfy_client") or ComfyClient.from_config(),
-                          display=_plate_display, frames=frames, io_mode=io_mode_for(m),
-                          use_mplate=_mask_plate_denoise_info(proj, m)["effective"])
+    pipe = _pipeline_for(proj, None)
     pipe.run_core(job["object"], frames)
     _, rep, run_dir = pipe.finalize(job["object"], frames)
     qa = json.loads((run_dir / "qa.json").read_text(encoding="utf-8"))
@@ -6749,209 +6106,13 @@ def set_interval_engine(name: str, req: IntervalEngineRequest):
     return {"success": True, "interval": iname, "engines": eng}
 
 
-# ----------------------------------------------------------------------------- groups (PLAN_GROUP_COMPOSE, 2026-10-29)
-def _group_or_404(group: str) -> Dict[str, Any]:
-    from engine.groups import get_group
-    try:
-        return get_group(_objects(), group)
-    except (FileNotFoundError, ValueError) as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
-def _group_payload(group: str) -> Dict[str, Any]:
-    """The group as the palette shows it: members (depth order) with what each brings, the sources it can pick
-    („Do grupy z:” – only computed ones, ↻ when stale) and whether it is switched on, seam, depth place, whole results."""
-    from engine import groups
-    from engine.stages import _run_json, stage_run
-    store = _objects()
-    g = groups.get_group(store, group)
-    ms = []
-    for m in groups.members(store, group):
-        o = store.get(m)
-        avail = [{"source": "core", "run": "core", "valid": True}]
-        for src in ("matanyone", "videomama", "vitmatte", "ltx"):
-            r, ok, _ = stage_run(store, m, src)
-            if r:
-                e = {"source": src, "run": r, "valid": ok}
-                if src == "vitmatte":   # stage 5 = ViTMatte or BiRefNet: the engine of THIS result names it in the picker
-                    e["engine"] = _run_edge_engine(_run_json(store.dir(m), r)) or "vitmatte"
-                avail.append(e)
-        r, ok, _ = groups.ft_run(store, m)   # Final Touch: its base is chosen on stage 8 (user decision 2026-10-29)
-        if r:
-            avail.append({"source": "final_touch", "run": r, "valid": ok})
-        ms.append({**groups.member_run(store, m), "depth_order": o.get("depth_order", 0), "available": avail,
-                   "on": groups.is_on(o), "seam_px": groups.member_seam(store, group, m),
-                   "seam_own": o.get("group_seam_px") is not None})
-    return {"name": group, "kind": "group", "members": ms, "seam_px": groups.seam(store, group),
-            "depth_order": groups.group_depth(store, group), "whole_results": groups.whole_results(store, group),
-            "stage_runs": (g.get("tool") or {}).get("stage_runs") or {}}
-
-
-class GroupCreateRequest(BaseModel):
-    name: str
-    members: List[str] = []
-    seam_px: Optional[int] = None
-
-
-@app.post("/api/groups")
-@when_idle("Nowa grupa")
-def create_group_ep(req: GroupCreateRequest):
-    """New group entity (palette Obiekty): optionally with its first members (each joins with „Do grupy z:” = Core)."""
-    from engine.export import SEAM_PX_DEFAULT
-    from engine.groups import create_group
-    try:
-        create_group(_objects(), req.name, req.members, seam_px=SEAM_PX_DEFAULT if req.seam_px is None else req.seam_px)
-    except FileExistsError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except (FileNotFoundError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"success": True, "group": _group_payload(req.name)}
-
-
-class GroupMemberRequest(BaseModel):
-    name: str
-
-
-@app.post("/api/group/{group}/members")
-@when_idle("Obiekt do grupy")
-def add_group_member(group: str, req: GroupMemberRequest):
-    """Drop an object into the group (palette): it joins with Core; the whole recompute becomes stale (↻)."""
-    from engine.groups import add_member
-    _group_or_404(group)
-    try:
-        add_member(_objects(), group, req.name)
-    except (FileNotFoundError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"success": True, "group": _group_payload(group)}
-
-
-@app.delete("/api/group/{group}/members/{member}")
-@when_idle("Obiekt z grupy")
-def remove_group_member(group: str, member: str, confirm: bool = False):
-    """Detach a member. With a whole result (stages on the whole / Final Touch) and without ?confirm=1: 409 with the
-    warning (needs_confirm, whole_stages) – nothing changed; with it the whole results go to the project trash."""
-    from engine.groups import remove_member
-    _group_or_404(group)
-    try:
-        r = remove_member(_objects(), group, member, confirm=confirm)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if r.get("needs_confirm"):
-        raise HTTPException(status_code=409, detail=r)
-    return {**r, "group": _group_payload(group)}
-
-
-class GroupSourceRequest(BaseModel):
-    source: str
-    run: Optional[str] = None
-
-
-@app.put("/api/group/{group}/members/{member}/source")
-@when_idle("Źródło członka grupy")
-def set_group_member_source(group: str, member: str, req: GroupSourceRequest):
-    """„Do grupy z:” of a member (core | matanyone | videomama | vitmatte | ltx | version | final_touch)."""
-    from engine.groups import set_member_source
-    _group_or_404(group)
-    try:
-        set_member_source(_objects(), group, member, {"source": req.source, "run": req.run})
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"success": True, "group": _group_payload(group)}
-
-
-class GroupSettingsRequest(BaseModel):
-    seam_px: Optional[int] = None
-
-
-@app.put("/api/group/{group}")
-@when_idle("Ustawienia grupy")
-def put_group(group: str, req: GroupSettingsRequest):
-    """Seam of the group (↻ on the whole recompute)."""
-    from engine.groups import set_seam
-    _group_or_404(group)
-    if req.seam_px is not None:
-        set_seam(_objects(), group, req.seam_px)
-    return {"success": True, "group": _group_payload(group)}
-
-
-class GroupMemberOnRequest(BaseModel):
-    on: bool
-
-
-class GroupMemberSeamRequest(BaseModel):
-    seam_px: Optional[int] = None    # None = the group's seam
-
-
-@app.put("/api/group/{group}/members/{member}/seam")
-@when_idle("Szew członka grupy")
-def set_group_member_seam(group: str, member: str, req: GroupMemberSeamRequest):
-    """A member's own seam reach (user decision 2026-10-29: hair small, a dress large); null = the group's seam.
-    Part of the group signature – ↻ on the whole recompute."""
-    from engine.groups import set_member_seam
-    _group_or_404(group)
-    try:
-        set_member_seam(_objects(), group, member, req.seam_px)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"success": True, "group": _group_payload(group)}
-
-
-@app.put("/api/group/{group}/members/{member}/on")
-@when_idle("Członek grupy wł. / wył.")
-def set_group_member_on(group: str, member: str, req: GroupMemberOnRequest):
-    """Palette checkbox of a member (user decision 2026-10-29): switched off = out of the group's composition (alpha,
-    preview, whole recompute input – ↻), still a member."""
-    from engine.groups import set_member_on
-    _group_or_404(group)
-    try:
-        set_member_on(_objects(), group, member, req.on)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"success": True, "group": _group_payload(group)}
-
-
-@app.delete("/api/group/{group}")
-@when_idle("Rozgrupowanie")
-def delete_group(group: str, confirm: bool = False):
-    """Ungroup: members become standalone (results untouched), the group's folder -> project trash; with whole results
-    and without ?confirm=1 -> 409 with the warning."""
-    from engine.groups import ungroup
-    _group_or_404(group)
-    r = ungroup(_objects(), group, confirm=confirm)
-    if r.get("needs_confirm"):
-        raise HTTPException(status_code=409, detail=r)
-    return r
-
-
-@app.get("/api/group/{group}")
-def group_info(group: str):
-    """The group entity: members in depth order with what each brings („Do grupy z:” – source, version, current or ↻,
-    the reason when there is nothing), the seam and the group's place in the depth order (its front-most member)."""
-    from engine import groups
-    g = _group_or_404(group)
-    store = _objects()
-    ms = [{**groups.member_run(store, m), "depth_order": store.get(m).get("depth_order", 0)}
-          for m in groups.members(store, group)]
-    return {"name": group, "members": ms, "seam_px": groups.seam(store, group),
-            "depth_order": groups.group_depth(store, group), "stage_runs": (g.get("tool") or {}).get("stage_runs") or {}}
-
-
-@app.get("/api/group/{group}/frame/{frame}")
-def group_frame(group: str, frame: int):
-    """Proxy PNG of the basic group matte (the composition of the members' chosen alphas with the seams, nothing
-    computed; objects in front not subtracted). 409 + `missing` when a member has nothing to bring."""
-    from engine.groups import GroupSourceMissing, group_alpha_loader
-    _group_or_404(group)
-    w, h = _plate_size()
-    sc = _proxy_scale()
-    pw, ph = max(1, round(w * sc)), max(1, round(h * sc))
-    try:
-        a = group_alpha_loader(_objects(), group, w, h)(int(frame))
-    except GroupSourceMissing as e:
-        raise HTTPException(status_code=409, detail={"message": str(e), "missing": e.missing})
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return _png_response(_alpha_u8(cv2.resize(a, (pw, ph), interpolation=cv2.INTER_AREA)))
+# ---- Groups (PLAN_GROUP_COMPOSE, 2026-10-29) -> api/groups.py (audit 2026-11-02 step 8); included here so the route order is unchanged
+from api.groups import make as _make_groups
+_r, _x = _make_groups(_alpha_u8=lambda *a, **k: _alpha_u8(*a, **k), _objects=lambda *a, **k: _objects(*a, **k), _plate_size=lambda *a, **k: _plate_size(*a, **k), _png_response=lambda *a, **k: _png_response(*a, **k), _proxy_scale=lambda *a, **k: _proxy_scale(*a, **k), _run_edge_engine=lambda *a, **k: _run_edge_engine(*a, **k), when_idle=lambda *a, **k: when_idle(*a, **k))
+app.include_router(_r)
+_group_payload = _x["_group_payload"]
+_mask_info = _x["_mask_info"]
+del _r, _x
 
 
 @app.get("/api/objects")
@@ -6966,6 +6127,11 @@ def list_objects():
         o = dict(o)
         o["has"] = {"core": (od / "core" / "core.json").exists(),
                     "final": bool(run) and (od / "runs" / run / "run.json").exists()}
+        if not o.get("group") and o.get("kind") != "group":   # an object outside a group: its own mask (2026-11-15)
+            try:
+                o["mask_info"] = _mask_info(store, o["name"])
+            except Exception:  # noqa: BLE001 – a broken object must not hide the list
+                o["mask_info"] = None
         out.append(o)
     # group entities (PLAN_GROUP_COMPOSE): listed too – selecting one opens its stages (3 / 4 / 5 / 7, band, Final
     # Touch) like an object; `group` = the palette payload (members, „Do grupy z:”, seam, whole results)
@@ -7056,8 +6222,8 @@ def _size_info(files: List[Path]) -> Dict[str, Any]:
 
 @app.get("/api/object/{name}/delete_info")
 def object_delete_info(name: str):
-    """What deleting the object removes (for the confirmation dialog): its folder (-> project trash) and, optionally,
-    its exported masks (outputs.json)."""
+    """What deleting the object removes for good (for the confirmation dialog): its folder and, optionally, its
+    exported masks (outputs.json)."""
     store = _objects()
     try:
         store.get(name)
@@ -7098,11 +6264,10 @@ def rename_object(name: str, req: RenameObjectRequest):
 @app.delete("/api/object/{name}")
 @object_edit
 def delete_object(name: str, exports: int = 0):
-    """Delete an object: folder -> <work>/trash/objects/ (recoverable), entry removed from outputs.json, objects behind
-    it that used it as a front object get 'do przeliczenia'. exports=1: its exported masks (outputs.json) are moved too,
-    to <work>/trash/exports/<name>_<time>/ (also recoverable); without it the exported files on disk stay."""
-    import shutil
-    import time as _time
+    """Delete an object: its folder is deleted from disk for good (user decision 2026-11-13: no project trash), entry
+    removed from outputs.json, objects behind it that used it as a front object get 'do przeliczenia'. exports=1: its
+    exported masks (outputs.json) are deleted for good too; without it the exported files on disk stay."""
+    from engine import deletion as DEL
     from engine.export import mark_dependents
     from engine.outputs import load_outputs, update_outputs
     store = _objects()
@@ -7113,14 +6278,10 @@ def delete_object(name: str, exports: int = 0):
     work = Path(STATE["work_dir"])
     exp_files = _export_files(work, name) if exports else []
     marked = mark_dependents(store, name)
-    trash = store.remove(name)
-    exp_trash = None
+    freed = store.remove(name)
+    exp_freed = 0
     if exp_files:
-        exp_trash = work / "trash" / "exports" / f"{name}_{_time.strftime('%Y%m%d_%H%M%S')}"
-        for f in exp_files:
-            dest = exp_trash / f.parent.name / f.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(dest))
+        exp_freed = DEL.remove(*exp_files)
         for d in {f.parent for f in exp_files}:
             try:
                 d.rmdir()          # only when empty
@@ -7130,8 +6291,8 @@ def delete_object(name: str, exports: int = 0):
     drop = {name, f"{name}_full"} if exports else {name}
     if any(e.get("name") in drop for e in outs.get("objects", [])):
         update_outputs(work, "objects", [e for e in outs["objects"] if e.get("name") not in drop])
-    return {"success": True, "trash": str(trash), "marked_for_recompute": marked,
-            "exports_trash": str(exp_trash) if exp_trash else None, "exports_moved": len(exp_files)}
+    return {"success": True, "freed_bytes": freed + exp_freed, "marked_for_recompute": marked,
+            "exports_deleted": len(exp_files), "exports_freed_bytes": exp_freed}
 
 
 @app.post("/api/object/{name}/detect")
@@ -7232,7 +6393,7 @@ def _compute_crops(name: str) -> Dict[str, Any]:
     to_proxy = lambda m: cv2.resize(m.astype(np.float32), (max(1, round(w * s)), max(1, round(h * s))),
                                     interpolation=cv2.INTER_AREA)
     key_masks = {f: to_proxy(store.key_mask(name, f)) > 0.5 for f, k in keys.items() if k.get("author") == "user"}
-    defaults = json.loads((REPO_DIR / "defaults.json").read_text(encoding="utf-8"))
+    defaults = load_defaults()
     try:
         res = run_crop_engine(
             _sam3_runner(), _load_proxy_display, frames, start, to_proxy(store.key_mask(name, start)), s, w, h,
@@ -7290,7 +6451,55 @@ from engine.merge_matte_api import make_router as _make_mm_router   # noqa: E402
 app.include_router(_make_mm_router(objects=lambda: _objects(), require_stage=lambda n, s: _require_stage(n, s),
                                    ft_base=lambda n: _ft_base(n), ft_alpha=lambda *a: _ft_frame_quantized(*a),
                                    plate_size=lambda: _plate_size(), display_u8=lambda p, f: _full_display_u8(p, f),
-                                   has_project=lambda: bool(STATE.get("work_dir"))))
+                                   has_project=lambda: bool(STATE.get("work_dir")), project_curve=lambda: _project_curve()))
+
+# Plate colour profile (stage 0, 2026-11-03): project.json color_profile -> the log curve MergeMatte / the .nk export default to
+from api.color_profile import make as _make_color_profile   # noqa: E402
+_r, _x = _make_color_profile(STATE=STATE)
+app.include_router(_r)
+_color_profile_curve = _x["_project_curve"]
+del _r, _x
+
+# GPU memory forecast before a stage (2026-11-06, engine/vram_forecast.py): VideoMaMa run / frame preview vs the card
+from api.vram import make as _make_vram   # noqa: E402
+_r, _x = _make_vram(objects=lambda: _objects(), pipeline=lambda: _pipeline(), work_frames=lambda: _work_frames(),
+                    shot_frames=lambda: _shot_frames(),
+                    comfy_client=lambda: STATE.get("comfy_client") or ComfyClient.from_config())
+app.include_router(_r)
+del _r, _x
+
+# Plate cleaning – the „Czyszczenie” mode (MVP 2026-11-06, engine/cleanup.py): remove objects, fill from the clear plate / LaMa
+from api.cleanup import make as _make_cleanup   # noqa: E402
+_r, _x = _make_cleanup(STATE=STATE, objects=lambda: _objects(), plate_size=lambda: _plate_size(),
+                       work_frames=lambda: _work_frames(), proxy_scale=lambda: _proxy_scale(),
+                       comfy_client=lambda: STATE.get("comfy_client") or ComfyClient.from_config(),
+                       long_job=lambda *a, **k: long_job(*a, **k), refresh_manifest=lambda: _refresh_manifest_view())
+app.include_router(_r)
+_cleanup_exports = _x   # the MVP's plate / alpha / fill-source helpers, shared with Cleanup 3D below
+del _r, _x
+
+# The band of Cleanup step C1 „Inpaint” (2026-11-11, engine/inpaint_band.py): the editor's points, preview lines
+from api.inpaint_band import make as _make_inpaint_band   # noqa: E402
+_r, _x = _make_inpaint_band(STATE=STATE, plate_size=lambda: _plate_size(), cleanup=_cleanup_exports)
+app.include_router(_r)
+del _r, _x
+
+# Cleanup 3D (docs/PLAN_CLEANUP_3D.md, 2026-11-09): camera solve, cards, keys per card, key regeneration, projection
+from api.cleanup3d import make as _make_cleanup3d   # noqa: E402
+_r, _x = _make_cleanup3d(STATE=STATE, objects=lambda: _objects(), plate_size=lambda: _plate_size(),
+                         work_frames=lambda: _work_frames(), proxy_scale=lambda: _proxy_scale(),
+                         comfy_client=lambda: STATE.get("comfy_client") or ComfyClient.from_config(),
+                         long_job=lambda *a, **k: long_job(*a, **k), refresh_manifest=lambda: _refresh_manifest_view(),
+                         cleanup=_cleanup_exports)
+app.include_router(_r)
+del _r, _x
+
+# Shutter angle measured on the plate (2026-11-08, engine/shutter.py): project.json `shutter` > manifest > 180
+from api.shutter import make as _make_shutter   # noqa: E402
+_r, _x = _make_shutter(STATE=STATE, pipeline=lambda: _pipeline(), shot_frames=lambda: _shot_frames(),
+                       long_job=lambda *a, **k: long_job(*a, **k))
+app.include_router(_r)
+del _r, _x
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -7308,224 +6517,17 @@ def serve_index():
     return HTMLResponse("<h1>MatteDesk</h1><p>Frontend static files loading...</p>")
 
 
+# ---- Plate QA + fix (stage 0, Z26) -> api/plate_qa.py (audit 2026-11-02 step 8); included here so the route order is unchanged
+from api.plate_qa import make as _make_plate_qa
+_r, _x = _make_plate_qa(STATE=STATE, _objects=lambda *a, **k: _objects(*a, **k), _shot_frames=lambda *a, **k: _shot_frames(*a, **k), long_job=lambda *a, **k: long_job(*a, **k))
+app.include_router(_r)
+_plate_gate = _x["_plate_gate"]
+_require_plates_ok = _x["_require_plates_ok"]
+del _r, _x
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8765)
 
 
-# ----------------------------------------------------------------------------- Z26: plate QA + fix (stage 0)
-class PlateQARequest(BaseModel):
-    plate: str = "beauty"
-    frames: Optional[List[int]] = None     # [first, last]
-    source: bool = False                   # plate switched to a MatteDesk `_fix`: check its source again (change the repair)
-
-
-class PlateDecisionsRequest(BaseModel):
-    decisions: Dict[str, str] = {}         # frame -> mean | flow | gain | keep ("" removes the decision)
-
-
-def _plate_fix_rec(plate: str) -> Optional[Dict[str, Any]]:
-    proj = STATE.get("shot_project")
-    return ((proj.data.get("plate_fix") or {}).get(plate)) if proj else None
-
-
-def _plate_source(plate: str) -> Optional[str]:
-    """Pattern a repair / a re-check of `plate` starts from: the source of the MatteDesk `_fix` in use, else the plate."""
-    from engine.plate_qa import _norm
-    cur = ((STATE.get("manifest") or {}).get("plates") or {}).get(plate)
-    rec = _plate_fix_rec(plate)
-    if rec and cur and _norm(rec.get("pattern")) == _norm(cur):
-        return rec.get("source")
-    return cur
-
-
-def _plate_gate() -> Dict[str, Any]:
-    """Z26 gate of stage 1 (like Z18): per plate of the project the QA state; `block` = reason while some flagged
-    frame has no decision or decided repairs are not written yet (None = stage 1 open)."""
-    from engine.plate_qa import gate_state, load_report
-    plates = {k: v for k, v in ((STATE.get("manifest") or {}).get("plates") or {}).items() if v and k != "bg"}
-    work = Path(STATE["work_dir"]) if STATE.get("work_dir") else None
-    out: Dict[str, Any] = {}
-    for name, pattern in plates.items():
-        out[name] = gate_state(load_report(work, name) if work else None, pattern, _plate_fix_rec(name))
-    bad = [(n, g) for n, g in out.items() if g["blocking"]]
-    block = None
-    if bad:
-        block = "najpierw etap 0 – kontrola klatek: " + "; ".join(
-            (f"„{n}”: {len(g['undecided'])} kl. bez decyzji" if g["state"] == "undecided" else f"„{n}”: zapisz naprawę (_fix)")
-            for n, g in bad)
-    return {"plates": out, "block": block}
-
-
-def _require_plates_ok() -> None:
-    if not STATE.get("work_dir"):
-        return
-    block = _plate_gate()["block"]
-    if block:
-        raise HTTPException(status_code=409, detail=block)
-
-
-class PlateFixRequest(BaseModel):
-    plate: str = "beauty"
-    decisions: Dict[str, str] = {}         # frame -> mean | flow | gain | keep
-    confirmed: bool = False                # EXR / GBs are written only after the user confirmed (plan with sizes first)
-
-
-@app.post("/api/plate/qa")
-@long_job("Kontrola klatek: {plate}", quiet=True)
-async def plate_qa_run(req: PlateQARequest):
-    """Z26: control of damaged frames of a plate (missing / unreadable / NaN / size / exposure jump / image jump /
-    duplicate) -> matte_desk/plate_qa/<plate>.json with per-frame measures, flagged frames and a suggested repair."""
-    from engine.comfy_io import job_progress
-    from engine.plate_qa import analyze_plate, save_report, suggest_method
-    m = STATE.get("manifest") or {}
-    pattern = (m.get("plates") or {}).get(req.plate)
-    if not pattern:
-        raise HTTPException(status_code=400, detail=f"Brak plate'u {req.plate} w projekcie")
-    if req.source:
-        pattern = _plate_source(req.plate) or pattern
-    frames = _shot_frames()
-    if req.frames and len(req.frames) == 2:
-        frames = [f for f in frames if req.frames[0] <= f <= req.frames[1]]
-    thr = json.loads((REPO_DIR / "defaults.json").read_text(encoding="utf-8")).get("plate_qa") or {}
-    cb = lambda d, t: job_progress(f"Kontrola klatek: {req.plate}", d, t)
-    rep = await asyncio.get_running_loop().run_in_executor(None, lambda: analyze_plate(pattern, frames, thr, cb))
-    rep["suggested"] = {str(f): suggest_method(rep["frames"][f]) for f in rep["flagged"]}
-    # re-check of the source of the `_fix` in use: the written decisions are the starting point (unchanged -> "fixed")
-    rec = _plate_fix_rec(req.plate)
-    if req.source and rec and rec.get("source") == pattern:
-        rep["decisions"] = {str(k): v for k, v in (rec.get("decisions") or {}).items() if int(k) in rep["flagged"]}
-    save_report(Path(STATE["work_dir"]), req.plate, rep)
-    return {"success": True, "plate": req.plate, "flagged": rep["flagged"], "suggested": rep["suggested"],
-            "seconds": rep["seconds"], "n": rep.get("n")}
-
-
-@app.get("/api/plate/qa/{plate}")
-def plate_qa_report(plate: str):
-    from engine.plate_qa import load_report
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    rep = load_report(Path(STATE["work_dir"]), plate)
-    if rep is None:
-        return {"exists": False, "plate": plate}
-    rep["frames"] = {str(k): v for k, v in rep["frames"].items()}
-    return {"exists": True, **rep, "gate": _plate_gate()["plates"].get(plate), "fix": _plate_fix_rec(plate)}
-
-
-@app.put("/api/plate/qa/{plate}/decisions")
-def plate_qa_decisions(plate: str, req: PlateDecisionsRequest):
-    """Z26: the user's decision per flagged frame (mean / flow / gain / keep) – stored in the report; the gate of
-    stage 1 opens once every flag has one and the repairs are written."""
-    from engine.plate_qa import save_decisions
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    try:
-        rp = save_decisions(Path(STATE["work_dir"]), plate, req.decisions)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    gate = _plate_gate()
-    return {"decisions": rp.get("decisions") or {}, "gate": gate["plates"].get(plate), "block": gate["block"]}
-
-
-@app.get("/api/plate/qa/{plate}/preview/{frame}")
-def plate_qa_preview(plate: str, frame: int, method: str = "orig", side: int = 960):
-    """Z26: before / after of a repair (JPEG, display conversion like the proxy, longest side <= `side`): method
-    orig = the source frame (404 when missing), mean / flow / gain = the repair computed on downscaled neighbours."""
-    from fastapi.responses import Response
-    from engine.ingest import tonemap_plate_to_display
-    from engine.plate_fix import preview_repair
-    from engine.plate_qa import load_report
-    if not STATE.get("work_dir"):
-        raise HTTPException(status_code=400, detail="Brak otwartego projektu")
-    if method not in ("orig", "mean", "flow", "gain", "keep"):
-        raise HTTPException(status_code=400, detail="method: orig | mean | flow | gain | keep")
-    rp = load_report(Path(STATE["work_dir"]), plate)
-    pattern = (rp or {}).get("pattern") or _plate_source(plate)
-    if not pattern:
-        raise HTTPException(status_code=404, detail=f"Brak plate'u {plate}")
-    dec = {int(k): v for k, v in ((rp or {}).get("decisions") or {}).items()}
-    bad = [f for f in ((rp or {}).get("flagged") or []) if dec.get(int(f)) != "keep"]
-    try:
-        img = preview_repair(pattern, _shot_frames(), frame, method, side=max(64, min(int(side), 2048)), flagged=bad)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    if img is None:
-        raise HTTPException(status_code=404, detail=f"klatka {frame}: brak pliku")
-    cs = str((STATE.get("manifest") or {}).get("colorspace", "ACES2065-1")).upper()
-    linear = pattern.lower().endswith(".exr") and any(t in cs for t in ("ACES", "LINEAR", "RAW"))
-    u8 = tonemap_plate_to_display(img) if linear else np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    ok, buf = cv2.imencode(".jpg", np.ascontiguousarray(u8), [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    return Response(content=buf.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-
-@app.post("/api/plate/fix")
-@long_job("Naprawa plate'u: {plate}")
-async def plate_fix_run(req: PlateFixRequest):
-    """Z26: write `<plate dir>_fix/` (repaired frames in the source encoding, the rest hard links, README) and switch
-    the plate in project.json to it (manifest untouched). Without `confirmed` only the plan (sizes) is returned."""
-    from engine.comfy_io import job_progress
-    from engine.plate_fix import write_fixed_plate
-    import time as _time
-    from engine.plate_qa import _norm, load_report, save_decisions
-    m = STATE.get("manifest") or {}
-    current = (m.get("plates") or {}).get(req.plate)
-    if not current:
-        raise HTTPException(status_code=400, detail=f"Brak plate'u {req.plate} w projekcie")
-    pattern = _plate_source(req.plate) or current      # a change of the repair starts from the source, never `_fix_fix`
-    frames = _shot_frames()
-    decisions = {int(k): v for k, v in req.decisions.items()}
-    bad = [v for v in decisions.values() if v not in ("mean", "flow", "gain", "keep")]
-    if bad:
-        raise HTTPException(status_code=400, detail="metoda naprawy: mean | flow | gain | keep")
-    repairs = {f: v for f, v in decisions.items() if v != "keep"}
-    if not repairs and _norm(pattern) == _norm(current):
-        raise HTTPException(status_code=400, detail="brak klatek do naprawy (same „zostaw”) – nic do zapisu")
-    if not repairs:
-        # every flag kept now: back to the source plate (nothing written; the `_fix` folder stays on disk)
-        if not req.confirmed:
-            return {"success": False, "detail": "powrót do oryginalnego plate'u wymaga potwierdzenia",
-                    "plan": {"restore": pattern, "repair": {}, "hardlinks": 0, "bytes_written_estimate": 0, "eta_s": 0,
-                             "dir": str(Path(pattern).parent), "exists": True, "ours": True}}
-        res: Dict[str, Any] = {"success": True, "pattern": pattern, "dir": str(Path(pattern).parent), "repaired": {},
-                               "hardlinks": 0, "copies": 0, "seconds": 0.0, "restored": True}
-    else:
-        cb = lambda label, d, t: job_progress(label, d, t)
-        try:
-            res = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: write_fixed_plate(pattern, frames, decisions, req.confirmed, cb))
-        except (ValueError, FileNotFoundError, FileExistsError, OSError) as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        if not res.get("success"):
-            return {"success": False, "plan": res["plan"], "detail": res["detail"]}
-    stale: List[str] = []
-    proj = STATE.get("shot_project")
-    if proj is not None:
-        proj.set_plate(req.plate, res["pattern"])
-        fx = proj.data.setdefault("plate_fix", {})
-        if res.get("restored"):
-            fx.pop(req.plate, None)
-        else:
-            fx[req.plate] = {"source": pattern, "pattern": res["pattern"], "at": _time.time(),
-                             "decisions": {str(k): v for k, v in decisions.items()}}
-        # objects computed from this plate before the change are "do przeliczenia" (engine/stages.py, plate_changed)
-        proj.data.setdefault("plate_changed", {})[req.plate] = {"at": _time.time(),
-                                                               "frames": sorted(int(f) for f in (repairs or decisions))}
-        proj.save()
-        STATE["manifest"] = proj.effective_manifest()
-        STATE["project"] = proj.to_dict()
-        # proxies / tiles of the changed frames were rendered from the old frame -> rendered again on demand
-        for f in proj.data["plate_changed"][req.plate]["frames"]:
-            for d in (req.plate, f"{req.plate}_aligned_preview"):
-                (Path(STATE["work_dir"]) / "proxy" / d / f"p_{int(f):04d}.jpg").unlink(missing_ok=True)
-        STATE["display_cache"] = {}
-        from engine.stages import plate_stale_objects
-        stale = plate_stale_objects(_objects(), Path(STATE["work_dir"]), req.plate)
-    # the decisions sent (CLI / UI) become the report's decisions of that source
-    rp = load_report(Path(STATE["work_dir"]), req.plate)
-    if rp is not None and _norm(rp.get("pattern")) == _norm(pattern):
-        flagged = {int(f) for f in rp.get("flagged") or []}
-        save_decisions(Path(STATE["work_dir"]), req.plate, {str(f): v for f, v in decisions.items() if f in flagged})
-    return {"success": True, "plate": req.plate, **{k: v for k, v in res.items() if k != "repaired"},
-            "repaired": {str(k): v for k, v in res["repaired"].items()}, "stale_objects": stale}

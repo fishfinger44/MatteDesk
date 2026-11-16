@@ -81,7 +81,8 @@ def test_measure_sequence_cancel_in_local_stage(tmp_path):
         AlignmentPipeline.measure_sequence(
             beauty_pattern=str(tmp_path / "b_####.exr"), aux_pattern=str(tmp_path / "a_####.exr"),
             first_frame=1, last_frame=T, plate_name="aux", aux_plate_type="cleanplate", plate_w=w, plate_h=h,
-            grid_dir=tmp_path / "grid", tracker=LKTracker(), workers=1, step_cb=step_cb)
+            grid_dir=tmp_path / "grid", tracker=LKTracker(), workers=1, step_cb=step_cb,
+            camera_lock="off")      # the tracked path (a locked camera has no tracking step, tests/test_align_lock.py)
     assert not (tmp_path / "grid" / "grid_0001.exr").exists()
 
 

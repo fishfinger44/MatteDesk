@@ -18,11 +18,6 @@ from __future__ import annotations
 import atexit
 import json
 import os
-import queue
-import subprocess
-import tempfile
-import threading
-import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -32,9 +27,10 @@ import cv2
 import numpy as np
 
 from engine.exr_io import imread_unchanged
+from engine.worker_proto import CHECK_CACHE, WorkerDied, WorkerProcess, WorkerTimeout, check_worker as wp_check
 
 WORKER = Path(__file__).resolve().parent / "align_gpu_worker.py"   # run with -I (engine/queue.py shadows stdlib)
-_CHECK_CACHE: Dict[str, Tuple[bool, str]] = {}
+_CHECK_CACHE = CHECK_CACHE
 
 
 class GpuWorkerError(RuntimeError):
@@ -49,22 +45,8 @@ def worker_python() -> Optional[Path]:
 
 def check_worker(python: Optional[Union[str, Path]] = None, env: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
     """(ok, "cuda <gpu name>" / "cpu" / the reason): can ComfyUI's Python run the alignment worker? Cached."""
-    python = python if python is not None else worker_python()
-    if not python or not Path(python).exists():
-        return False, "nie znaleziono Pythona ComfyUI (ustaw comfy_dir / comfy_python)"
-    key = str(python) + ("|fake" if env and env.get("MD_ALIGN_GPU_FAKE") == "1" else "")
-    if key not in _CHECK_CACHE:
-        try:
-            r = subprocess.run([str(python), "-I", str(WORKER), "--check"], capture_output=True, text=True,
-                               timeout=180, env=env)
-            out = (r.stdout or r.stderr or "").strip()
-            if r.returncode == 0 and out.startswith("ok"):
-                _CHECK_CACHE[key] = (True, out[3:].strip())
-            else:
-                _CHECK_CACHE[key] = (False, out[-300:] or f"kod {r.returncode}")
-        except Exception as e:
-            _CHECK_CACHE[key] = (False, str(e))
-    return _CHECK_CACHE[key]
+    ok, out = wp_check(python if python is not None else worker_python(), WORKER, env=env)
+    return ok, out[3:].strip() if ok else out
 
 
 def comfy_busy(cfg: Optional[Dict[str, Any]] = None, timeout: float = 2.0) -> bool:
@@ -90,130 +72,46 @@ def decode_workers() -> int:
     return n if n > 0 else 4
 
 
-class GpuAligner:
+class GpuAligner(WorkerProcess):
     """One worker process in ComfyUI's Python; `call(req)` -> response dict. Restarted once if it dies."""
+
+    worker = WORKER
+    label = "worker GPU"
+    doctor_item = "Wyrównanie na GPU"
+    tmp_prefix = "md_align_gpu_"
+    error_cls = GpuWorkerError
 
     def __init__(self, python: Optional[Union[str, Path]] = None, env: Optional[Dict[str, str]] = None,
                  timeout_s: float = 600.0):
-        py = python if python is not None else worker_python()
-        self.python = str(py) if py else ""
-        self.env = env
-        self.timeout_s = timeout_s
+        super().__init__(python if python is not None else worker_python(), env, timeout_s)
         self.device = "?"
         self.gpu_seconds = 0.0
-        self.restarts = 0
-        self._proc: Optional[subprocess.Popen] = None
-        self._lines: "queue.Queue[Optional[str]]" = queue.Queue()
-        self._log = None
-        self._dir = tempfile.TemporaryDirectory(prefix="md_align_gpu_")
-        self.tmp = Path(self._dir.name)
-
-    def _start(self) -> None:
-        if not self.python or not Path(self.python).exists():
-            raise GpuWorkerError("nie znaleziono Pythona ComfyUI (Doktor → „Wyrównanie na GPU”)")
-        if self._log is None:
-            self._log = open(self.tmp / "worker.log", "a+", encoding="utf-8", errors="replace")
-        self._proc = subprocess.Popen([self.python, "-I", str(WORKER), "--serve"], stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=self._log, text=True, bufsize=1, env=self.env)
-        lines: "queue.Queue[Optional[str]]" = queue.Queue()
-        self._lines = lines
-        proc = self._proc
-
-        def reader():
-            for line in proc.stdout:
-                lines.put(line)
-            lines.put(None)
-
-        threading.Thread(target=reader, daemon=True).start()
-
-    def _log_tail(self) -> str:
-        try:
-            self._log.flush()
-            self._log.seek(0)
-            return self._log.read()[-600:].strip()
-        except Exception:
-            return ""
-
-    def _kill(self) -> None:
-        p, self._proc = self._proc, None
-        if p is not None and p.poll() is None:
-            p.kill()
-            try:
-                p.wait(timeout=10)
-            except Exception:
-                pass
-
-    def _send(self, obj: Dict[str, Any]) -> None:
-        self._proc.stdin.write(json.dumps(obj) + "\n")
-        self._proc.stdin.flush()
-
-    def _read(self, cancel_check: Optional[Callable[[], None]]) -> Dict[str, Any]:
-        t0 = time.time()
-        while True:
-            try:
-                line = self._lines.get(timeout=0.25)
-            except queue.Empty:
-                if cancel_check:
-                    cancel_check()
-                if time.time() - t0 > self.timeout_s:
-                    raise GpuWorkerError(f"worker GPU nie odpowiedział w {self.timeout_s:.0f} s")
-                continue
-            if line is None:
-                raise _WorkerDied(self._log_tail())
-            return json.loads(line)
+        self.tmp = self.tmp_dir()
 
     def call(self, req: Dict[str, Any], cancel_check: Optional[Callable[[], None]] = None,
              on_sift: Optional[Callable[[Dict[str, str]], Dict[str, Any]]] = None) -> Dict[str, Any]:
         """One request; on_sift(dump paths) -> SIFT models when the worker asks for them. A dead worker is restarted
         and the request repeated once; "Przerwij" (cancel_check raising) kills the worker."""
         from engine.gpu_manager import GPU
-        with GPU.use(self, "wyrównanie GPU", self._kill, cancel_check):
-            for attempt in (0, 1):
-                try:
-                    if self._proc is None or self._proc.poll() is not None:
-                        self._start()
-                    self._send(req)
-                    resp = self._read(cancel_check)
-                    while resp.get("need_sift"):
-                        models = on_sift(resp["dump"]) if on_sift else {}
-                        self._send({"op": "sift_models", "models": {k: np.asarray(v).tolist() for k, v in models.items()}})
-                        resp = self._read(cancel_check)
-                except (_WorkerDied, BrokenPipeError, OSError) as e:
-                    self._kill()
-                    if attempt == 0:
-                        self.restarts += 1
-                        continue
-                    raise GpuWorkerError(f"worker GPU zakończył się dwa razy: {e}") from None
-                except BaseException:
-                    self._kill()                    # cancelled / timed out: never leave a busy worker behind
-                    raise
-                if not resp.get("ok"):
-                    raise GpuWorkerError(f"worker GPU: {resp.get('error')}")
-                self.device = resp.get("device") or self.device
-                self.gpu_seconds += float(resp.get("seconds") or 0.0)
-                return resp
-            raise GpuWorkerError("worker GPU: brak odpowiedzi")
 
-    def close(self) -> None:
-        p = self._proc
-        if p is not None and p.poll() is None:
+        def on_reply(resp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not resp.get("need_sift"):
+                return None
+            models = on_sift(resp["dump"]) if on_sift else {}
+            return {"op": "sift_models", "models": {k: np.asarray(v).tolist() for k, v in models.items()}}
+
+        with GPU.use(self, "wyrównanie GPU", self.kill, cancel_check):
             try:
-                self._send({"op": "quit"})
-                p.wait(timeout=10)
-            except Exception:
-                pass
-        self._kill()
-        if self._log is not None:
-            self._log.close()
-            self._log = None
-        try:
-            self._dir.cleanup()
-        except Exception:
-            pass
-
-
-class _WorkerDied(RuntimeError):
-    pass
+                resp = self.request(req, cancel_check, restarts=1, on_reply=on_reply)
+            except WorkerDied as e:
+                raise GpuWorkerError(f"worker GPU zakończył się dwa razy: {e}") from None
+            except WorkerTimeout as e:
+                raise GpuWorkerError(str(e)) from None
+            if not resp.get("ok"):
+                raise GpuWorkerError(f"worker GPU: {resp.get('error')}")
+            self.device = resp.get("device") or self.device
+            self.gpu_seconds += float(resp.get("seconds") or 0.0)
+            return resp
 
 
 _OPEN: List[GpuAligner] = []
@@ -330,19 +228,23 @@ def _rm(*paths: Optional[str]) -> None:
 
 # ------------------------------------------------------------------------------------------- stage drivers
 
-def global_frames(g: GpuAligner, jobs: List[Tuple[int, str, str, str, float, Any]], workers: int,
+def global_frames(g: GpuAligner, jobs: List[Tuple[Any, ...]], workers: int,
                   on_done: Optional[Callable[[int, int], None]] = None,
                   cancel_check: Optional[Callable[[], None]] = None) -> List[Any]:
-    """GPU twin of run_frames(_global_frame_job, jobs): same AlignmentFrameResult per frame (None = missing file)."""
-    from engine.align import AlignmentFrameResult, GlobalAligner
+    """GPU twin of run_frames(_global_frame_job, jobs): same AlignmentFrameResult per frame (None = missing file).
+    A job's 7th element (the frame's exclusion spec, engine.align._job_exclusion) becomes the worker's `exclude`
+    mask (uint8 at the work scale, nearest like compute_static_mask)."""
+    from engine.align import GlobalAligner, frame_exclusion_of, global_frame_result
     from engine.procpool import imap_frames
     tmp = str(g.tmp)
-    dec_jobs = [(f, b, a, scale, tmp) for f, b, a, _mode, scale, _box in jobs]
+    dec_jobs = [(j[0], j[1], j[2], j[4], tmp) for j in jobs]
     out: List[Any] = [None] * len(jobs)
     n = 0
     for i, d in imap_frames(decode_global_job, dec_jobs, workers):
-        f, _b, _a, mode, scale, box = jobs[i]
+        f, _b, _a, mode, scale, box = jobs[i][:6]
+        excl = jobs[i][6] if len(jobs[i]) > 6 else None
         if d is not None:
+            ex_path = None
             try:
                 h0, w0 = d["size"]
                 h, w = int(round(h0 * scale)), int(round(w0 * scale))
@@ -350,6 +252,11 @@ def global_frames(g: GpuAligner, jobs: List[Tuple[int, str, str, str, float, Any
                     "op": "global", "mode": mode, "scale": scale, "dump_dir": tmp,
                     "lf_b": d["lf_b"], "lf_a": d["lf_a"], "lm_b": d["lm_b"], "lm_a": d["lm_a"],
                     "border": [max(4, int(round(w * 0.02))), max(4, int(round(h * 0.02)))]}
+                ex = frame_exclusion_of(excl, f, w0, h0)
+                if ex is not None:
+                    ex_path = os.path.join(tmp, f"g{f}_ex.npy")
+                    np.save(ex_path, cv2.resize(ex.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST))
+                    req["exclude"] = ex_path
                 if box is not None:
                     bx0, by0, bx1, by1 = box
                     req["box"] = [max(0, int(round(bx0 * scale))), max(0, int(round(by0 * scale))),
@@ -365,12 +272,8 @@ def global_frames(g: GpuAligner, jobs: List[Tuple[int, str, str, str, float, Any
 
                 r = g.call(req, cancel_check, on_sift)
             finally:
-                _rm(d.get("lf_b"), d.get("lf_a"), d.get("lm_b"), d.get("lm_a"))
-            p = r["params"]
-            out[i] = AlignmentFrameResult(
-                frame=f, method=r["method"], residual_px=r["med"], residual_max_px=r["max"],
-                dx=p.get("dx", 0.0), dy=p.get("dy", 0.0), rotation_deg=p.get("rotation_deg", 0.0),
-                scale=p.get("scale", 1.0), transform_matrix=p.get("matrix"))
+                _rm(d.get("lf_b"), d.get("lf_a"), d.get("lm_b"), d.get("lm_a"), ex_path)
+            out[i] = global_frame_result(f, r["method"], r["params"], r.get("med"), r.get("max"))
         n += 1
         if on_done:
             on_done(n, i)
@@ -412,6 +315,70 @@ def make_patch_measure(g: GpuAligner, cancel_check: Optional[Callable[[], None]]
     return measure
 
 
+def make_median(g: GpuAligner, cancel_check: Optional[Callable[[], None]] = None) -> Callable[[np.ndarray], np.ndarray]:
+    """GPU twin of the per-point median over the anchors (engine.align.median_anchor_field `median_fn`): (A, N, 3)
+    with NaN for an anchor that did not measure the point -> (N, 3) = np.nanmedian(axis=0)."""
+
+    def median(stack: np.ndarray) -> np.ndarray:
+        paths = {k: str(g.tmp / f"median_{k}.npy") for k in ("vals", "out")}
+        np.save(paths["vals"], np.asarray(stack, np.float64))
+        try:
+            g.call({"op": "median_disp", **paths}, cancel_check)
+            return np.load(paths["out"])
+        finally:
+            _rm(*paths.values())
+
+    return median
+
+
+def anchor_refine(g: GpuAligner, paths: List[Tuple[str, str]], fields: List[Tuple[np.ndarray, np.ndarray]], mode: str,
+                  mats: List[np.ndarray], workers: int, cancel_check: Optional[Callable[[], None]] = None,
+                  patch: int = 128, max_change_px: float = 4.0) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """GPU twin of engine.align._anchor_refine_job for the locked-camera path (align_v2 step 2): per anchor the
+    full-res lumas (aux pre-warped by its global model, the decode pool) and the worker's `patches` op started from
+    the anchor's offsets (= refine_local_offsets: phase correlation + Gauss-Newton; kept where the response is weak or
+    the change exceeds max_change_px). Returns per anchor (disp refined (N, 2) float32, response (N,) float64)."""
+    from engine.procpool import imap_frames, open_pool
+    tmp = str(g.tmp)
+    out: List[Tuple[np.ndarray, np.ndarray]] = [(np.asarray(d, np.float32).reshape(-1, 2), np.full(len(p), np.nan))
+                                                for p, d in fields]
+    todo = [i for i, (p, _d) in enumerate(fields) if len(p)]
+    with open_pool(workers) as pool:
+        for k, d in imap_frames(decode_local_job, [(i, *paths[i], tmp, np.asarray(mats[i], np.float64).tolist())
+                                                   for i in todo], workers, pool=pool):
+            i = todo[k]
+            pts, disp = fields[i]
+            disp = np.asarray(disp, np.float32).reshape(-1, 2).copy()
+            lb = np.load(d["luma_b"], mmap_mode="r")
+            h, w = lb.shape
+            del lb
+            half = patch // 2
+            xy = np.array([[int(round(float(p[0]))), int(round(float(p[1])))] for p in pts], np.int64).reshape(-1, 2)
+            inside = (xy[:, 0] >= half) & (xy[:, 0] < w - half) & (xy[:, 1] >= half) & (xy[:, 1] < h - half)
+            ii = np.nonzero(inside)[0]
+            response = np.full(len(disp), np.nan, np.float64)
+            fp = {k2: os.path.join(tmp, f"a{i}_{k2}.npy") for k2 in ("xy", "d0", "out")}
+            try:
+                if len(ii):
+                    np.save(fp["xy"], xy[ii])
+                    np.save(fp["d0"], disp[ii].astype(np.float64))
+                    g.call({"op": "patches", "mode": mode, "patch": int(patch), "luma_b": d["luma_b"],
+                            "luma_a": d["luma_a"], "xy": fp["xy"], "d0": fp["d0"], "out": fp["out"]}, cancel_check)
+                    res = np.load(fp["out"])
+                    for k3, (rx, ry, resp, gx, gy) in zip(ii, res):
+                        response[k3] = resp
+                        if not (resp > 0.1) or not (np.isfinite(rx) and np.isfinite(ry)):
+                            continue
+                        d0 = disp[k3]
+                        if not (np.isfinite(gx) and np.isfinite(gy)) or float(np.hypot(gx - d0[0], gy - d0[1])) > max_change_px:
+                            continue
+                        disp[k3] = (np.clip(gx, -8.0, 8.0), np.clip(gy, -8.0, 8.0))
+            finally:
+                _rm(d["luma_b"], d["luma_a"], *fp.values())
+            out[i] = (disp, response)
+    return out
+
+
 def local_frames(g: GpuAligner, paths: List[Tuple[str, str]], fields: List[Tuple[np.ndarray, np.ndarray]],
                  mode: str, plate_w: int, plate_h: int, grid_paths: List[str], workers: int,
                  on_done: Optional[Callable[[int, int], None]] = None,
@@ -447,6 +414,7 @@ def local_frames(g: GpuAligner, paths: List[Tuple[str, str]], fields: List[Tuple
             finally:
                 _rm(d["luma_b"], d["luma_a"], fp["pts"], fp["disp"])
             out[i] = {"ho_med": r["ho_med"], "ho_max": r["ho_max"], "ho_frac_ok": r["ho_frac_ok"],
+                      "fitted": bool(r.get("fitted", True)),
                       "refined_frac": r["refined_frac"], "grid": grid_paths[i],
                       "n_points": int(r.get("n_points", len(pts))), "n_rejected": int(r.get("n_rejected", 0)),
                       "reject": r.get("reject") or {}}

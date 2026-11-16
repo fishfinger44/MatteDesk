@@ -1,7 +1,7 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Delete a version (user request 2026-10-25, stage 5 "Version comparison"): to the project trash, never one in use,
-numbers never reused."""
+"""Delete a version (user request 2026-10-25, stage 5 "Version comparison"): from disk for good (user decision
+2026-11-13), never one in use, numbers never reused."""
 
 import json
 import sys
@@ -18,7 +18,7 @@ def _run(od: Path, run: str, **extra) -> None:
     (d / "a_0001.png").write_bytes(b"x" * 1000)
 
 
-def test_delete_run_to_trash_refs_and_numbering(tmp_path, monkeypatch):
+def test_delete_run_permanent_refs_and_numbering(tmp_path, monkeypatch):
     from test_zone_matte import _api_project
     from engine.refine import next_run_dir
     app_module, api, shot, pipe, frames, start = _api_project(tmp_path, monkeypatch, n=3)
@@ -38,11 +38,10 @@ def test_delete_run_to_trash_refs_and_numbering(tmp_path, monkeypatch):
         assert (od / "runs" / r).is_dir()
     assert api.delete("/api/object/obj/runs/v009").status_code == 404
     assert api.delete("/api/object/obj/runs/..%2Fobject.json").status_code == 404
-    # free: moved to <work>/trash/runs, gone from the list
+    # free: deleted for good, gone from the list, nothing in a trash folder
     ok = api.delete("/api/object/obj/runs/v001").json()
     assert ok["success"] and not (od / "runs" / "v001").exists()
-    trash = Path(ok["trash"])
-    assert trash.parent == store.root.parent / "trash" / "runs" and (trash / "run.json").exists()
+    assert ok["freed_bytes"] == d["bytes"] and "trash" not in ok and not (store.root.parent / "trash").exists()
     assert "v001" not in [r["run"] for r in api.get("/api/object/obj/runs").json()["runs"]]
     # the highest number is never given again, even after deleting it
     store.update("obj", tool={"active_run": "v002", "stage_runs": {}})

@@ -152,6 +152,56 @@ def test_busy_rules_while_a_job_runs(monkeypatch):
     assert api.post("/api/object/tree/run").status_code == 200       # free again
 
 
+@pytest.mark.parametrize("job_obj", ["figure", "*"])
+def test_final_touch_edits_refused_while_the_object_is_computed(monkeypatch, tmp_path, job_obj):
+    """Audit 2026-11-02 #10: Final Touch edits follow `object_edit` – a stroke saved during an export from the source
+    `final_touch` would mix frames. The file stays untouched, another object is free (job on one object only)."""
+    class Store:
+        def dir(self, n):
+            return tmp_path / n
+
+    monkeypatch.setattr(app_module, "_require_stage", lambda name, stage: None)
+    monkeypatch.setattr(app_module, "_objects", lambda: Store())
+    monkeypatch.setattr(app_module, "_shot_frames", lambda: [1, 2, 3])
+    monkeypatch.setattr(app_module, "_ft_info", lambda name: {"ok": True})
+    api = TestClient(app_module.app)
+    stroke = {"strokes": [{"mode": "add", "radius_px": 5, "p": [[1, 2]]}]}
+    edits = [("put", "final_touch", {"source": None}), ("put", "final_touch/finish", {"gamma": 1.2}),
+             ("put", "final_touch/frames/2", stroke), ("delete", "final_touch/frames/2", None)]
+
+    def call(obj, method, path, body):
+        return getattr(api, method)(f"/api/object/{obj}/{path}", **({} if body is None else {"json": body}))
+
+    jid = JOBS.try_start("export_mattes", "Eksport", job_obj)
+    try:
+        for method, path, body in edits:
+            r = call("figure", method, path, body)
+            assert r.status_code == 409 and "jest teraz liczony" in r.json()["detail"], (method, path, r.text)
+        assert not (tmp_path / "figure").exists()
+        if job_obj != "*":
+            assert call("tree", "put", "final_touch/frames/2", stroke).status_code == 200
+    finally:
+        JOBS.finish(jid, "done")
+    for method, path, body in edits:                                  # free again
+        assert call("figure", method, path, body).status_code == 200, (method, path)
+
+
+def test_final_touch_finish_no_pydantic_v1_call(monkeypatch, tmp_path):
+    """`req.dict()` is the deprecated Pydantic v1 name; the finish endpoint uses `model_dump()`."""
+    import warnings
+
+    class Store:
+        def dir(self, n):
+            return tmp_path / n
+
+    monkeypatch.setattr(app_module, "_require_stage", lambda name, stage: None)
+    monkeypatch.setattr(app_module, "_objects", lambda: Store())
+    monkeypatch.setattr(app_module, "_ft_info", lambda name: {"ok": True})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        assert app_module.put_final_touch_finish(name="figure", req=app_module.FinalTouchFinishRequest(gamma=1.2)) == {"ok": True}
+
+
 # ----------------------------------------------------------------------------- Z19: failure detection + details
 from mock_comfy import FakeComfyServer  # noqa: E402
 

@@ -27,7 +27,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np

@@ -40,6 +40,7 @@ import numpy as np
 from engine.comfy_io import job_progress
 from engine.crop import CropSegment, extract_crop, paste_crop
 from engine.depth import frame_path
+from engine.jsonio import write_json
 from engine.segment import sdf
 
 SMOOTHING = {"weak": (1, 0.5), "normal": (2, 0.35), "strong": (4, 0.25)}   # (radius, motion_limit) – SPEC 1.2
@@ -751,8 +752,8 @@ def pick_keyframes(keys: Sequence[int], start: int, max_keys: Optional[int] = No
 def next_run_dir(obj_dir: Path) -> Path:
     runs = obj_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    from engine.run_trash import last_run_number
-    n = last_run_number(runs) + 1      # deleted versions keep their numbers (engine/run_trash.py)
+    from engine.run_delete import last_run_number
+    n = last_run_number(runs) + 1      # deleted versions keep their numbers (engine/run_delete.py)
     d = runs / f"v{n:03d}"
     d.mkdir()
     return d
@@ -807,6 +808,30 @@ def _vram_used_gb(client: Any) -> Optional[float]:
     return None
 
 
+def _vram_device_gb(client: Any) -> Optional[float]:
+    """GPU memory in use on the whole device (vram_total - vram_free of /system_stats): what a 12 GB card has to fit."""
+    try:
+        dev = ((client.get_system_stats() or {}).get("devices") or [{}])[0]
+        if "vram_total" in dev and "vram_free" in dev:
+            return (dev["vram_total"] - dev["vram_free"]) / 2 ** 30
+        if "torch_vram_total" in dev and "torch_vram_free" in dev:   # older Comfy / test stand-ins: Comfy's own share
+            return (dev["torch_vram_total"] - dev["torch_vram_free"]) / 2 ** 30
+    except Exception:
+        pass
+    return None
+
+
+PEAK_SAMPLE_S = 0.5   # how often the device memory is read during a MatAnyone2 prompt
+
+
+def vram_peak_sampler(client: Any):
+    """Peak device VRAM (GB) while the `with` block runs (`.peak`). The scale probe used to read VRAM AFTER the trial,
+    once `_release_comfy_cache` had emptied Comfy – it always saw ~0 GB (sh060 2026-11-07: „VRAM 0.01 GB” while the
+    card held 7.4 GB during the pass), so the 11 GB limit never applied."""
+    from engine.sysinfo import SpillSampler
+    return SpillSampler(lambda: _vram_device_gb(client), interval_s=PEAK_SAMPLE_S, base=0.0)
+
+
 def _comfy_shared_reader(client: Any) -> Optional[Callable[[], Optional[float]]]:
     """Reader of the Comfy process' shared (spilled) GPU memory – engine.sysinfo.comfy_shared_reader (one reader for the
     MatAnyone2 scale probe and the spill warning of every Comfy prompt, 2026-10-26)."""
@@ -821,7 +846,7 @@ def write_run_json(run_dir: Path, rj: Dict[str, Any]) -> None:
     from engine.jobs import JOBS
     sp = JOBS.spill_gb()
     out = {**rj, **({"gpu_spill_gb": round(sp, 1)} if sp is not None and sp >= SPILL_WARN_GB else {})}
-    (Path(run_dir) / "run.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_json(Path(run_dir) / "run.json", out, indent=2, ensure_ascii=False)
 
 
 def contiguous_chunks(frames: Sequence[int]) -> List[List[int]]:
@@ -888,7 +913,8 @@ class Finalizer:
         self._run_graph(backlit_graph(str(job / "b_####.exr").replace("\\", "/"), len(frames),
                                       str(job / "c_####.png").replace("\\", "/"), out, self.backlit_params,
                                       grow_px=int(round(grow_px)),
-                                      wall_pattern=str(job / "w_####.exr").replace("\\", "/") if use_wall else None))
+                                      wall_pattern=str(job / "w_####.exr").replace("\\", "/") if use_wall else None),
+                        "Backlit w ComfyUI…")
         return {f: read_alpha(frame_path(out, i)) for i, f in enumerate(frames)}
 
     def _ltx_segment(self, seg: CropSegment, frames: List[int], core: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
@@ -913,7 +939,7 @@ class Finalizer:
             ld["inputs"].update({"path_pattern": str(job / "f_####.exr").replace("\\", "/"), "first_frame": 0,
                                  "last_frame": b - a, "crop_x": 0, "crop_y": 0, "crop_w": 0, "crop_h": 0})
             sv["inputs"]["out_pattern"] = str(job / "a_####.exr").replace("\\", "/")
-            self._run_graph(g)
+            self._run_graph(g, "LTX-2.5 w ComfyUI…")
             n_b = b - a + 1
             for i, f in enumerate(frames[a:b + 1]):
                 al = cv2.resize(read_alpha(frame_path(sv["inputs"]["out_pattern"], i)), (side, side),
@@ -937,11 +963,14 @@ class Finalizer:
             self._soft_ok = core_soft_supported(self.client)
         return self._soft_ok
 
-    def _run_graph(self, g: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_graph(self, g: Dict[str, Any], label: str = "MatAnyone2 w ComfyUI…") -> Dict[str, Any]:
         busy = self.client.busy_error()
         if busy:
             raise RuntimeError(busy)
         from engine.gpu_manager import comfy_lease
+        # the job's step while Comfy computes: the previous phase's label ("zapis klatek do Comfy 9/9", earlier
+        # "Stabilizacja rdzenia 5/5") stayed on the bar for the whole model run (NEXT_STEPS 2026-10-17 pt 5)
+        job_progress(label, 0, 0)
         t = time.perf_counter()
         with comfy_lease(self.client, "MatAnyone2"):
             sub = self.client.queue_prompt(g)
@@ -1117,15 +1146,18 @@ class Finalizer:
             sampler = SpillSampler(self.shared_gb, base=idle) if self.shared_gb is not None else None
             if sampler is not None:
                 sampler.__enter__()
+            peak = vram_peak_sampler(self.client)
+            peak.__enter__()
             try:
                 self._matanyone_segment(seg, test, core, {**keys, test[0]: keys.get(test[0], core[test[0]])},
                                         test[0], scale, f"probe{int(scale * 100)}")
             finally:
+                peak.__exit__(None, None, None)
                 if sampler is not None:
                     sampler.__exit__(None, None, None)
-            used = _vram_used_gb(self.client)
+            used = peak.peak   # the peak DURING the trial (after it Comfy's cache is already released)
             spill = sampler.spill_gb if sampler is not None else None
-            rep.vram_log.append(f"ma_scale {scale}: VRAM {used if used is None else round(used, 2)} GB"
+            rep.vram_log.append(f"ma_scale {scale}: VRAM (szczyt karty) {used if used is None else round(used, 2)} GB"
                                 f"{'' if spill is None else f', przelane do RAM {spill:.2f} GB'}, "
                                 f"{time.time() - t0:.1f} s / {len(test)} kl.")
             if (used is None or used <= VRAM_LIMIT_GB) and (spill is None or spill <= SPILL_LIMIT_GB):
@@ -1200,14 +1232,20 @@ class Finalizer:
             if edge_mode == "matanyone":
                 t_seg = time.time()
                 soft = {}
-                for ch in chunks:
-                    soft.update(self._matanyone_segment(seg, ch, core, keys, start, scale, "final", soft=soft_in))
-                    if soft_in is not None:
-                        rep.soft_start["frames"] += int(getattr(self, "_last_soft", 0))
-                    rep.keys_used = sorted(set(rep.keys_used) | set(self._last_keys))
-                if smode != "auto":   # fixed scale: no probe, VRAM still logged (after each segment)
-                    used = _vram_used_gb(self.client)
-                    rep.vram_log.append(f"ma_scale {scale} (wybrana, bez próby) {seg.seg_id}: VRAM "
+                peak = vram_peak_sampler(self.client)
+                with peak:
+                    for ch in chunks:
+                        soft.update(self._matanyone_segment(seg, ch, core, keys, start, scale, "final", soft=soft_in))
+                        if soft_in is not None:
+                            rep.soft_start["frames"] += int(getattr(self, "_last_soft", 0))
+                        rep.keys_used = sorted(set(rep.keys_used) | set(self._last_keys))
+                used = peak.peak
+                if smode == "auto" and used is not None:   # the full pass's peak next to the trial's (NEXT_STEPS pt 2)
+                    rep.vram_log.append(f"ma_scale {scale} {seg.seg_id}: przebieg – VRAM (szczyt karty) {round(used, 2)} GB, "
+                                        f"{time.time() - t_seg:.1f} s / {len(sf)} kl.")
+                    rep.vram_gb = max(rep.vram_gb or 0.0, used)
+                if smode != "auto":   # fixed scale: no probe, VRAM still logged (peak of the segment)
+                    rep.vram_log.append(f"ma_scale {scale} (wybrana, bez próby) {seg.seg_id}: VRAM (szczyt karty) "
                                         f"{used if used is None else round(used, 2)} GB, {time.time() - t_seg:.1f} s / "
                                         f"{len(sf)} kl.")
                     if used is not None:
@@ -1428,7 +1466,9 @@ def apply_soft_override(base: np.ndarray, sa: np.ndarray, area: np.ndarray, feat
 
 def assemble_full(per_seg: Dict[str, Dict[int, np.ndarray]], segs: Sequence[CropSegment], frames: Sequence[int],
                   w: int, h: int) -> Dict[int, np.ndarray]:
-    """Full-frame alpha from crop-segment results; overlaps crossfaded linearly over the shared frames."""
+    """Full-frame alpha from crop-segment results; overlaps crossfaded linearly over the shared frames. Three or more
+    segments on a frame (a `manual` one): folded in order of `first` – each next one crossfades with the mix so far, over
+    the frames until the mix ends, so every segment is in the result and leaves it without a jump."""
     full = {}
     for f in frames:
         cover = [s for s in segs if s.first <= f <= s.last and f in per_seg.get(s.seg_id, {})]
@@ -1438,8 +1478,12 @@ def assemble_full(per_seg: Dict[str, Dict[int, np.ndarray]], segs: Sequence[Crop
         if len(cover) == 1:
             full[f] = paste_crop(per_seg[cover[0].seg_id][f], cover[0], w, h)
             continue
-        a, b = sorted(cover, key=lambda s: s.first)[:2]
-        lo, hi = b.first, a.last
-        wb = (f - lo + 1) / float(hi - lo + 2)
-        full[f] = (1 - wb) * paste_crop(per_seg[a.seg_id][f], a, w, h) + wb * paste_crop(per_seg[b.seg_id][f], b, w, h)
+        ordered = sorted(cover, key=lambda s: s.first)
+        mix, hi = paste_crop(per_seg[ordered[0].seg_id][f], ordered[0], w, h), ordered[0].last
+        for b in ordered[1:]:
+            lo = b.first
+            wb = (f - lo + 1) / float(hi - lo + 2)
+            mix = (1 - wb) * mix + wb * paste_crop(per_seg[b.seg_id][f], b, w, h)
+            hi = max(hi, b.last)
+        full[f] = mix
     return full

@@ -7,6 +7,10 @@
 // rail (objects.js S.tool band_add / band_remove), keys = triangles on the timeline, 🔑✕ / Delete / Ctrl+Z work on
 // them, preview = dashed band edges + thin dashes where the feathers end (GET …/stage_band/{stage}/{f}/lines).
 // API: GET / PUT / DELETE /api/object/{o}/stage_band/{stage}/…, POST …/copy (from a zone or another stage).
+// Owner „c3d” (P14, 2026-11-10): the band of the Cleanup 3D key patch (static/cleanup3d.js, C5 „Wtopienie łaty”) – the same
+// editor on /api/cleanup3d/band/…; outer side only (no blue whisker), tools on the C5 palette (MD_CLEANUP3D.bandTool).
+// Owner „c1” (2026-11-11): the band of Cleanup step C1 „Inpaint” (static/cleanup.js, „Pas na zewnątrz” = grow_px) – the
+// cleaned thing's own band on /api/cleanup/band/…; outer side only, tools on the Inpaint palette (MD_CLEANUP.bandTool).
 // The points are the shared object band by default (2026-10-22, engine/objband.py): the same endpoints edit it; a
 // detached stage („odłącz”) keeps its own copy, PUT …/mode, POST /api/object/{o}/band/from („ustaw jako wspólny”).
 (function () {
@@ -19,17 +23,24 @@
               keyset: null, keyBusy: null };
   // the band being edited: a stage (3 MatAnyone2 / 4 VideoMaMa / 7 LTX-2.5) or, in stage 5, the active whole-outline zone
   // („zone:<id>” – one editor for every band, user decision 2026-10-24; the server's stage_band endpoints take both)
-  const STAGE_OF = () => (!H ? null : S().stage === H.ST.VIDEOMAMA ? 'videomama' : S().stage === H.ST.MATANYONE ? 'matanyone'
+  const c3dOn = () => !!(window.MD_CLEANUP3D && window.MD_CLEANUP3D.bandOwner && window.MD_CLEANUP3D.bandOwner());
+  const c1On = () => !!(window.MD_CLEANUP && window.MD_CLEANUP.bandOwner && window.MD_CLEANUP.bandOwner());
+  const STAGE_OF = () => (!H ? null : c1On() ? 'c1' : c3dOn() ? 'c3d' : S().stage === H.ST.VIDEOMAMA ? 'videomama' : S().stage === H.ST.MATANYONE ? 'matanyone'
     : S().stage === H.ST.LTX ? 'ltx' : S().stage === H.ST.VITMATTE && H.zoneBand ? H.zoneBand() : null);
   const isZone = () => (STAGE_OF() || '').startsWith('zone:');
-  const PFX = () => (isZone() ? 'z4' : ({ matanyone: 'ep', videomama: 'vm', ltx: 'lx' }[STAGE_OF()] || 'vm'));   // palette ids: epBandInfo …
-  const on = () => !!(H && obj() && !S().auxMode && STAGE_OF());
-  const base = () => `/api/object/${obj()}/stage_band/${STAGE_OF()}`;
-  const key = (f) => `${obj()}|${STAGE_OF()}|${f}`;
+  const isC1 = () => STAGE_OF() === 'c1';     // the Cleanup C1 band: outer side only, the cleaned thing's own
+  const isC3d = () => STAGE_OF() === 'c3d' || isC1();   // a Cleanup patch band: outer side only, not an object band
+  const PFX = () => (isZone() ? 'z4' : isC1() ? 'cu' : isC3d() ? 'c3' : ({ matanyone: 'ep', videomama: 'vm', ltx: 'lx' }[STAGE_OF()] || 'vm'));   // palette ids: epBandInfo …
+  const on = () => !!(H && STAGE_OF() && (isC3d() || (obj() && !S().auxMode)));
+  const base = () => (isC1() ? '/api/cleanup/band' : isC3d() ? '/api/cleanup3d/band' : `/api/object/${obj()}/stage_band/${STAGE_OF()}`);
+  const who = () => (isC1() ? `cu:${window.MD_CLEANUP.target}` : obj());   // C1: the cleaned thing, not the cut-out selection
+  const key = (f) => `${who()}|${STAGE_OF()}|${f}`;
   // the band preview checkbox of the stage hides the band points with it (user report 2026-10-24); same sources as the palettes
   const ls = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : v === '1'; } catch (e) { return d; } };
   const pvShown = () => {
     const s = STAGE_OF();
+    if (s === 'c3d') return true;   // the owner is active only while the C5 live blend preview is shown
+    if (s === 'c1') return window.MD_CLEANUP.bandPv();
     if (s === 'matanyone') return S().edgePv == null ? true : !!S().edgePv;
     if (s === 'videomama') return ls('md_vmm_band', true);
     if (s === 'ltx') return ls('md_ltx_band', true);
@@ -44,7 +55,7 @@
   // the band keys = a property of the band, not of the frame (user report 2026-10-26: the triangles hid while scrubbing –
   // they came from the current frame, empty until it loaded and without the points occluded there): read from the
   // stored band points (GET …/params), the current frame's points only until that answer arrives
-  const owner = () => `${obj()}|${STAGE_OF()}`;
+  const owner = () => `${who()}|${STAGE_OF()}`;
   async function loadKeyset() {
     const k = owner();
     if (B.keyBusy === k || !on()) return;
@@ -58,11 +69,38 @@
     } catch (e) { /* no band (yet): the frame's points stand in */ }
     finally { if (B.keyBusy === k) B.keyBusy = null; }
   }
-  const allKeys = () => {
+  const pointKeys = () => {
     if (B.keyset && B.keyset.k === owner()) return B.keyset.keys;
     loadKeyset();
     const s = st(V().currentFrame); return s ? [...new Set(s.points.flatMap((p) => p.keys || []))].sort((a, b) => a - b) : [];
   };
+  // ---- slider keys (user decision 2026-11-15): the band's sliders keyed per frame, owned by the band's palette
+  // (`setSliderKeys(stage, {keys, set, del, restore, label})` – today the C1 band); ONE lane, ONE 🔑✕ / PPM / Ctrl+Z with the
+  // point keys. keyedAt = the arithmetic of engine/bandsys.keyed_at (linear between keys, held outside them).
+  const SK = {};
+  const sk = () => (on() ? SK[STAGE_OF()] || null : null);
+  const sliderKeys = () => { const o = sk(); return o ? o.keys() || {} : {}; };
+  function keyedAt(keys, f, base) {
+    const fs = Object.keys(keys || {}).map(Number).sort((a, b) => a - b);
+    const val = (x, n) => (keys[String(x)][n] != null ? +keys[String(x)][n] : +base[n]);
+    const out = {};
+    for (const n of Object.keys(base)) {
+      if (!fs.length) out[n] = +base[n];
+      else if (f <= fs[0]) out[n] = val(fs[0], n);
+      else if (f >= fs[fs.length - 1]) out[n] = val(fs[fs.length - 1], n);
+      else { const i = fs.findIndex((x) => x >= f); const a = fs[i - 1], b = fs[i]; out[n] = val(a, n) + (f - a) / (b - a) * (val(b, n) - val(a, n)); }
+    }
+    return out;
+  }
+  async function setSliderKey(f, field, value) {   // a slider change of the owner = a key of frame f (undo: the whole key set)
+    const o = sk(); if (!o) return null;
+    const prev = JSON.parse(JSON.stringify(sliderKeys()));
+    B.undo.push({ f, what: `klucz pasa F${f}`, restore: () => o.restore(prev) }); if (B.undo.length > 50) B.undo.shift();
+    const r = await o.set(f, field, value);
+    renderLane(); info();
+    return r;
+  }
+  const allKeys = () => [...new Set([...pointKeys(), ...Object.keys(sliderKeys()).map(Number)])].sort((a, b) => a - b);
 
   async function load(f) {
     const k = key(f);
@@ -81,8 +119,10 @@
     }
     finally { delete B.busy[k]; }
   }
+  // the last lines drawn per frame stay (lastLines): they are shown dimmed until the new ones arrive, so a slider
+  // release / point edit never blanks the band (user report 2026-11-11, C1: the band vanished after a slider change)
   function dirty() { B.data = B.keep ? { [B.keep.k]: B.keep.d } : {}; B.keyset = null; dirtyLines(); B.live = null; }
-  function dirtyLines() { B.lines = {}; B.lastLines = {}; }
+  function dirtyLines() { B.lines = {}; }
   // preview lines of the band: the palette's slider values (live while dragging = the whiskers scale, lines after release)
   async function loadLines(f, params, prefetch) {
     const q = Object.entries(params || {}).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
@@ -103,7 +143,7 @@
     finally { delete B.busy[k]; }
     // the neighbours in the background (user report 2026-10-22: the band showed late after a frame step): the next
     // step finds its lines here / in the server cache – one at a time, only while the frame stays put and not playing
-    if (!prefetch) {
+    if (!prefetch && !isC3d()) {
       for (const g of [f + 1, f - 1]) {
         const v = V();
         if (!v || v.currentFrame !== f || v.isPlaying || g < v.firstFrame || g > v.lastFrame || !on()) break;
@@ -139,6 +179,8 @@
     renderLane(); V().render();
   }
   async function reloadStage() {   // the stage palette reads its settings again (objects.js loadVmm via the reload hook)
+    if (isC1()) { if (window.MD_CLEANUP.reloadBand) await window.MD_CLEANUP.reloadBand(); return; }
+    if (isC3d()) { if (window.MD_CLEANUP3D.reloadBand) await window.MD_CLEANUP3D.reloadBand(); return; }
     if (isZone()) {   // stage 5: the zone list again, AND the palettes of stages 3 / 4 / 7 – „odłącz” / „ustaw jako wspólny” / a
       // band edit of a zone changes the band they show (user report 2026-10-24: stage 3 kept the old sliders)
       if (window.MD_ZONES && window.MD_ZONES.reloadBand) await window.MD_ZONES.reloadBand();
@@ -152,20 +194,31 @@
     if (!u) { H.status('Nic do cofnięcia w tym etapie', 'warn'); return true; }
     B.undo.pop();
     try {
+      if (u.restore) { await u.restore(); renderLane(); info(); V().render(); H.status(`Cofnięto: ${u.what}`, 'ok'); return true; }
       await H.api('PUT', `${u.url}/params`, u.prev);
       dirty(); await reloadStage(); renderLane(); V().render();
       H.status(`Cofnięto: ${u.what} (F${u.f})`, 'ok');
     } catch (e) { H.status(`Cofanie pasa: ${e.message}`, 'err'); }
     return true;
   }
-  const hasKeyAt = (f) => pts(f).some((p) => (p.keys || []).includes(f));
-  async function deleteKeyAt(f) {
+  const hasSliderKey = (f) => !!sliderKeys()[String(f)];
+  const hasKeyAt = (f) => hasSliderKey(f) || pts(f).some((p) => (p.keys || []).includes(f));
+  async function deleteKeyAt(f, opts) {   // the band keys of frame f: the points' keys AND the slider key (one band, one delete)
     const ids = pts(f).filter((p) => (p.keys || []).includes(f)).map((p) => p.id);
-    if (!ids.length) { H.toast(`F${f}: brak kluczy pasa`); return false; }
+    const slider = hasSliderKey(f);
+    if (!ids.length && !slider) { H.toast(`F${f}: brak kluczy pasa`); return false; }
     const gone = pts(f).filter((p) => (p.keys || []).length === 1 && p.keys[0] === f).map((p) => p.id);
-    const msg = `Usunąć klucze pasa w klatce ${f} (${ids.join(', ')})?` + (gone.length ? `\nPunkty bez innych kluczy znikną: ${gone.join(', ')}` : '');
-    if (!(await V().uiConfirm(msg, { ok: 'Usuń', tone: 'error' }))) return false;
-    await save(f, null, `klucze pasa usunięte (${ids.join(', ')})`, `?frame=${f}`);
+    const what = [slider ? `suwaki (${sk().label || 'pas'})` : '', ids.length ? `punkty ${ids.join(', ')}` : ''].filter(Boolean).join(' + ');
+    const msg = `Usunąć klucz pasa w klatce ${f} (${what})?` + (gone.length ? `\nPunkty bez innych kluczy znikną: ${gone.join(', ')}` : '');
+    // opts.confirm false: the caller already asked (Cleanup's „co usunąć?” window – no second question)
+    if (!(opts && opts.confirm === false) && !(await V().uiConfirm(msg, { ok: 'Usuń', tone: 'error' }))) return false;
+    if (slider) {
+      const o = sk(); const prev = JSON.parse(JSON.stringify(sliderKeys()));
+      B.undo.push({ f, what: `klucz suwaków pasa F${f}`, restore: () => o.restore(prev) });
+      await o.del(f);
+    }
+    if (ids.length) await save(f, null, `klucze pasa usunięte (${ids.join(', ')})`, `?frame=${f}`);
+    renderLane(); info();
     return true;
   }
   async function copyFrom(source, label) {
@@ -285,7 +338,7 @@
     if (after) after(); else renderMode();
   }
   function renderMode() {
-    if (!on()) return;
+    if (!on() || isC3d()) return;   // the Cleanup patch band has no shared / own mode
     const p = PFX(); const src = $(`${p}BandSrc`);
     renderModeInto($(`${p}BandMode`), STAGE_OF(), [src && src.closest('label'), $(`${p}BandCopy`)]);
   }
@@ -320,14 +373,14 @@
       const g = geom(pt); if (!g) continue;
       const e = ends(g);
       if (near(e.o)) return { kind: 'out', p: pt };
-      if (near(e.i)) return { kind: 'in', p: pt };
+      if (near(e.i) && !isC3d()) return { kind: 'in', p: pt };
       if (near([g.sx, g.sy])) return { kind: 'move', p: pt };
     }
     // the whisker line itself (2026-10-26): grabbing anywhere along it moves the point, like grabbing the point
     for (const pt of s.points) {
       const g = geom(pt); if (!g) continue;
       const e = ends(g);
-      const ax = e.i[0], ay = e.i[1], bx = e.o[0], by = e.o[1];
+      const ax = isC3d() ? g.sx : e.i[0], ay = isC3d() ? g.sy : e.i[1], bx = e.o[0], by = e.o[1];
       const l2 = (bx - ax) ** 2 + (by - ay) ** 2; if (l2 <= 0) continue;
       const t = Math.max(0, Math.min(1, ((p[0] - ax) * (bx - ax) + (p[1] - ay) * (by - ay)) / l2));
       if (Math.hypot(p[0] - (ax + t * (bx - ax)), p[1] - (ay + t * (by - ay))) <= tol) return { kind: 'move', p: pt };
@@ -343,30 +396,31 @@
     const k = img.width / ((H.plateSize && H.plateSize()[0]) || img.width);
     const q = Object.entries(params || {}).map(([kk, v]) => `${kk}=${encodeURIComponent(v)}`).join('&');
     let L = B.lines[`${key(f)}|${q}`];
-    let dim = false;
     if (L && L.error) return false;   // the server refused: nothing to draw, lineNote(f, params) says why
     if (!L) {
       const pre = `${key(f)}|`;
       if (!(opts.live && Object.keys(B.busy).some((b) => b.startsWith(pre)))) loadLines(f, params);
-      L = opts.live && pts(f).length ? B.lastLines[key(f)] : null;
-      if (!L) return false;
-      dim = true;
+      L = B.lastLines[key(f)];   // the previous lines of this frame, dimmed, until the asked ones arrive
+      if (!L || L.error) return false;
+      strokeLines(ctx, k, L, { alpha: 0.5 });
+      return true;
     }
     B.lastLines[key(f)] = L;
-    strokeLines(ctx, k, L, { alpha: dim ? 0.5 : null });
+    strokeLines(ctx, k, L, {});
     return true;
   }
   // ONE drawing of a band preview (stages 3 / 4 / 5 / 7, 2026-10-24): `L` = a lines dict of the server (band_contours /
   // inset_feather_contours / feather_contours in plate px, engine/bandsys.preview_lines), `k` = plate -> image scale:
-  // dashed band edges + thin dashes where the feathers end, no fill (user decision 2026-10-21)
+  // dashed band edges + thin dashes where the feathers end, no fill (user decision 2026-10-21); also any other canvas
+  // (Cleanup's frame mask preview, 2026-11-11): `opts.px` = one screen px in that canvas' units (default 1 / viewer zoom)
   function strokeLines(ctx, k, L, opts = {}) {
-    const v = V();
+    const u = opts.px != null ? +opts.px : 1 / V().zoom;
     ctx.save();
     if (opts.alpha != null) ctx.globalAlpha = opts.alpha;
     try {
-      ctx.strokeStyle = 'rgba(255,212,0,0.95)'; ctx.lineWidth = 1.6 / v.zoom; ctx.setLineDash([6 / v.zoom, 4 / v.zoom]);
+      ctx.strokeStyle = 'rgba(255,212,0,0.95)'; ctx.lineWidth = 1.6 * u; ctx.setLineDash([6 * u, 4 * u]);
       for (const c of L.band_contours || []) { poly(ctx, k, c); ctx.stroke(); }
-      ctx.strokeStyle = 'rgba(255,212,0,0.8)'; ctx.lineWidth = 0.8 / v.zoom; ctx.setLineDash([3 / v.zoom, 3 / v.zoom]);
+      ctx.strokeStyle = 'rgba(255,212,0,0.8)'; ctx.lineWidth = 0.8 * u; ctx.setLineDash([3 * u, 3 * u]);
       for (const c of [...(L.inset_feather_contours || []), ...(L.feather_contours || [])]) { poly(ctx, k, c); ctx.stroke(); }
     } finally { ctx.restore(); }
   }
@@ -410,7 +464,7 @@
           continue;
         }
         const e = ends(g);
-        for (const [end, col] of [[e.o, '#ffd400'], [e.i, '#4da3ff']]) {
+        for (const [end, col] of isC3d() ? [[e.o, '#ffd400']] : [[e.o, '#ffd400'], [e.i, '#4da3ff']]) {
           ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = lw;
           ctx.beginPath(); ctx.moveTo(g.sx * k, g.sy * k); ctx.lineTo(end[0] * k, end[1] * k); ctx.stroke();
           ctx.fillRect(end[0] * k - h, end[1] * k - h, 2 * h, 2 * h);
@@ -428,11 +482,15 @@
   }
 
   // ---- tools (left rail) and pointer
-  const tool = () => (on() && ['band_add', 'band_remove'].includes(S().tool) ? S().tool : null);
+  const tool = () => {
+    if (!on()) return null;
+    const t = isC1() ? window.MD_CLEANUP.bandTool() : isC3d() ? (window.MD_CLEANUP3D.bandTool ? window.MD_CLEANUP3D.bandTool() : null) : S().tool;
+    return ['band_add', 'band_remove'].includes(t) ? t : null;
+  };
   // a band-point tool picked while the stage's band preview is off switches the preview on (user request 2026-10-24)
   function onTool() {
     if (tool() && !pvShown()) {
-      const cb = $(isZone() ? 'zpBandPv' : { matanyone: 'ePv', videomama: 'vmPvBand', ltx: 'lxPvBand' }[STAGE_OF()]);
+      const cb = $(isZone() ? 'zpBandPv' : { matanyone: 'ePv', videomama: 'vmPvBand', ltx: 'lxPvBand', c1: 'cuBandPv' }[STAGE_OF()]);
       if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
     }
     V().canvas.style.cursor = tool() ? 'crosshair' : ''; info(); V().render(); }
@@ -463,7 +521,9 @@
         const vx = sg * (p[0] - d.p.sx), vy = sg * (p[1] - d.p.sy);
         const tx = d.p.tx == null ? -d.p.ny : d.p.tx, ty = d.p.ty == null ? d.p.nx : d.p.ty;
         let a = Math.atan2(vx * tx + vy * ty, vx * d.p.nx + vy * d.p.ny) * 180 / Math.PI;
-        a = Math.max(-80, Math.min(80, a)); if (Math.abs(a) < 4) a = 0;
+        // C1: the whisker turns all round – pointed into the object it cuts the patch there (2026-11-15); stages ±80°
+        const lim = isC1() ? 180 : 80;
+        a = Math.max(-lim, Math.min(lim, a)); if (Math.abs(a) < 4) a = 0;
         d.ang = Math.round(a * 10) / 10;
         d.val = Math.max(0, Math.round(Math.hypot(vx, vy)));
       }
@@ -496,7 +556,7 @@
   function laneEl() {
     let lane = $('timelineStageBand'); if (lane) return lane;
     const keys = $('timelineKeys'); if (!keys) return null;
-    lane = H.el('<div class="timeline-zones" id="timelineStageBand" title="Klucze punktów pasa etapu (trójkąty): klik = skok, PPM = usuń klucze pasa tej klatki"></div>');
+    lane = H.el('<div class="timeline-zones" id="timelineStageBand" title="Klucze pasa etapu (trójkąty): punkty pasa i – w C1 – suwaki pasa; klik = skok, PPM = usuń klucze pasa tej klatki"></div>');
     keys.parentNode.insertBefore(lane, keys);
     return lane;
   }
@@ -510,7 +570,9 @@
       const m = document.createElement('div');
       m.className = `band-key ${f === v.currentFrame ? 'cur' : ''}`;
       m.style.left = `${100 * (f - v.firstFrame) / range}%`;
-      m.title = `Klucz punktów pasa F${f} · klik = skok · PPM = usuń klucze pasa`;
+      const sv = sliderKeys()[String(f)]; const hp = pointKeys().includes(f);
+      if (sv && !hp) m.classList.add('slider');
+      m.title = `Klucz pasa F${f}${sv ? ` · suwaki: ${Object.entries(sv).map(([n, x]) => `${(sk().names || {})[n] || n} ${x}`).join(', ')}` : ''}${hp ? ' · punkty pasa' : ''} · klik = skok · PPM = usuń klucz pasa`;
       m.addEventListener('click', (e) => { e.stopPropagation(); v.goToFrame(f); });
       m.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); v.goToFrame(f); deleteKeyAt(f); });
       lane.appendChild(m);
@@ -523,6 +585,14 @@
     const el = $(`${PFX()}BandInfo`); if (!el || !on()) return;
     const f = V().currentFrame; const n = pts(f).length;
     if (B.tracking) { el.textContent = '⏳ śledzę punkty (CoTracker3) – na razie położenie z najbliższego klucza'; return; }
+    if (isC3d()) {
+      el.textContent = tool() === 'band_add' ? (isC1() ? 'klik przy obrysie obiektu = nowy punkt; żółty wąs = jak daleko łata sięga (Esc = koniec)' : 'klik przy krawędzi łaty = nowy punkt; żółty wąs = jak daleko łata sięga (Esc = koniec)')
+        : tool() === 'band_remove' ? 'klik na punkt = usuń punkt (Esc = koniec)'
+          : (n ? `${n} ${tr(n === 1 ? 'punkt' : 'pkt')} · klucze: ${allKeys().map((k) => 'F' + k).join(' ')} · PPM na punkcie = usuń`
+            : isC1() ? 'brak punktów – pas o stałej szerokości z suwaka „Pas na zewnątrz”' : 'brak punktów – łata sięga na zewnątrz o „Wtopienie” wszędzie');
+      const c = $(`${PFX()}BandClear`); if (c) { c.style.display = n ? '' : 'none'; c.disabled = !hasKeyAt(f); }
+      return;
+    }
     el.textContent = tool() === 'band_add' ? 'klik przy krawędzi bazy = nowy punkt (Esc = koniec)'
       : tool() === 'band_remove' ? 'klik na punkt = usuń punkt (Esc = koniec)'
         : (n ? `${n} ${tr(n === 1 ? 'punkt' : 'pkt')} · klucze: ${allKeys().map((k) => 'F' + k).join(' ')} · PPM na punkcie = usuń`
@@ -558,6 +628,8 @@
              range: `type="range" min="0" max="${smax}" step="1" title="${rt}"`,
              num: `type="number" min="0" max="${nmax}" step="1" class="form-input edge-num" title="${nt}"` };
   }
+  const setSliderKeys = (stage, o) => { SK[stage] = o; };
   window.MD_BANDPTS = { init, draw, drawLines, strokeLines, lineNote, onTool, slider, SLIDER_ORDER, pointsAt: (f) => pts(f), watchMask12, onFrame, reset, dirty, undo, hasKeyAt, deleteKeyAt, copyFrom, setLive,
+                        keyedAt, setSliderKeys, setSliderKey, hasSliderKey,
                         renderLane, info, stage: STAGE_OF, renderMode, renderModeInto, ready: false };
 })();

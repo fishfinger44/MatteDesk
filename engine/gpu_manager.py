@@ -43,6 +43,12 @@ STAGE_CALLS = (
     ("engine/pipeline.py", "ltx_run", "comfy"),             # 7 LTX-2.5
     ("engine/depth.py", "run_depth", "comfy"),              # depth (DepthCrafter)
     ("engine/pipeline.py", "release_comfy_gpu", "local"),   # 2 CoTracker3, 5 ViTMatte / BiRefNet, Sapiens2
+    ("engine/cleanup3d/void_engine.py", "void_fill", "comfy"),      # VOID over the shot (whole card)
+    ("engine/cleanup3d/void_engine.py", "seedvr2_keys", "comfy"),   # SeedVR2 on the keys of a card
+    ("engine/h3_fill.py", "run", "comfy"),                  # Inpaint MiniMax-H3 (2026-11-11: Comfy's cache out first)
+    ("engine/vace_fill.py", "run", "comfy"),                # Inpaint Wan 2.2 Fun VACE
+    ("engine/ltx_fill.py", "run", "comfy"),                 # Inpaint LTX-2.5 (IC-LoRA in-/outpainting)
+    ("engine/inpaint_upscale.py", "upscale", "comfy"),      # Inpaint „⤴ Upscale” (SeedVR2)
 )
 
 # the model calls that must run under a lease (module, class, method) – checked by the test (AST)
@@ -52,6 +58,12 @@ LEASED_CALLS = (
     ("engine/tracking.py", "_CoTrackerWorker", "request"),          # CoTracker3 (served)
     ("engine/tracking.py", "CoTracker3Tracker", "_one_shot"),       # CoTracker3 (process per call)
     ("engine/align_gpu.py", "GpuAligner", "call"),                  # alignment / motion blur worker
+    ("engine/cleanup3d/geom.py", "GeomGpuWorker", "call"),          # Cleanup 3D geometry worker
+    ("engine/lama_full.py", "LamaWorker", "call"),                  # LaMa at full resolution
+    ("engine/prompt_assist.py", "PromptWorker", "call"),            # Qwen3-VL-4B prompt assistant (C1 „✨ Popraw opis”)
+    ("engine/cleanup3d/solve_colmap.py", "ColmapRunner", "run"),    # COLMAP (process per command)
+    ("engine/cleanup3d/void_engine.py", "VoidRunner", "run"),       # VOID (Cleanup 3D P12, own venv)
+    ("engine/cleanup3d/void_engine.py", "SeedVR2Runner", "run"),    # SeedVR2 (Cleanup 3D P12, own venv)
 )
 
 COMFY = "comfy"               # the lease key of ComfyUI
@@ -255,7 +267,7 @@ class GpuManager:
                 time.sleep(5.0)
                 try:
                     self.reap_idle()
-                except Exception as e:     # noqa: BLE001 – the reaper must never die
+                except Exception as e:     # the reaper must never die
                     log.debug("GPU reaper: %s", e)
         self._reaper = threading.Thread(target=loop, name="gpu-reaper", daemon=True)
         self._reaper.start()
@@ -309,14 +321,18 @@ def _vram_free(client: Any) -> Optional[int]:
         return None
 
 
-def wait_comfy_freed(client: Any, before: Optional[int], clock=None, sleep=None) -> Optional[float]:
-    """Wait (max FREE_WAIT_S) until Comfy has applied /free: GB freed, None when its stats are unavailable."""
+def wait_comfy_freed(client: Any, before: Optional[int], clock=None, sleep=None, wait_s: Optional[float] = None,
+                     cancel_check: Optional[Callable[[], None]] = None) -> Optional[float]:
+    """Wait (max `wait_s`, default FREE_WAIT_S) until Comfy has applied /free: GB freed, None when its stats are
+    unavailable. `cancel_check` is called at every poll (it raises to end the wait)."""
     clock, sleep = clock or time.monotonic, sleep or time.sleep
     if before is None or not hasattr(client, "get_system_stats"):
         return None
     t0 = clock()
     last, last_change, rose = before, t0, False
-    while clock() - t0 < FREE_WAIT_S:
+    while clock() - t0 < (FREE_WAIT_S if wait_s is None else wait_s):
+        if cancel_check:
+            cancel_check()
         sleep(FREE_POLL_S)
         cur = _vram_free(client)
         if cur is None:
@@ -355,3 +371,61 @@ def before_stage(kind: str, client: Any, reason: str = "") -> dict:
     log.info("GPU zwolnione przed: %s (Comfy: %s, zwolniono %s GB, workery: %s)", reason or kind, comfy,
              freed if freed is not None else "?", ", ".join(workers) or "-")
     return {"comfy": comfy, "workers": workers, "freed_gb": freed}
+
+
+# ------------------------------------------------------------------------- one retry after GPU out-of-memory
+# A Comfy prompt that ran out of GPU memory often fits on a second try: Comfy frees between prompts, so after /free
+# has really been applied the same graph starts on an empty card (idea: AInVFX "Paint a plate", Apache-2.0 - the idea
+# only). Used by comfy_client.ComfyClient.wait_for_prompt = the one path every graph goes through.
+OOM_KIND = "oom_gpu"          # comfy_client.describe_error: "outofmemory" / "out of memory" / "allocation on device"
+OOM_FREE_WAIT_S = 30.0        # max wait for an idle queue, and then for the memory to come back
+OOM_RETRY_TEXT = "Brak pamięci GPU – zwalniam i ponawiam (1/1)"
+OOM_TWICE_TEXT = "Brak pamięci GPU dwa razy z rzędu (także po zwolnieniu pamięci ComfyUI i ponowieniu)"
+
+
+def retry_after_oom(client: Any, res: Dict[str, Any], requeue: Callable[[], Dict[str, Any]],
+                    wait: Callable[[str], Dict[str, Any]], cancel_check: Optional[Callable[[], None]] = None,
+                    clock=None, sleep=None) -> Dict[str, Any]:
+    """`res` = the result of a finished Comfy prompt. Not a GPU out-of-memory failure -> returned as is (never
+    retried). Otherwise: /free (idle queue only), wait until the memory is released, `requeue()` the same graph ONCE
+    and `wait(prompt_id)`; a second out-of-memory returns that failure with OOM_TWICE_TEXT in front (the caller raises
+    its usual error). "Przerwij" / `cancel_check` end the waiting. Comfy that cannot be freed = no retry."""
+    if not isinstance(res, dict) or res.get("success") or res.get("kind") != OOM_KIND:
+        return res
+    if client is None or not hasattr(client, "free_vram"):
+        return res
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+    from engine.jobs import JOBS
+
+    def check() -> None:
+        JOBS.check()
+        if cancel_check:
+            cancel_check()
+
+    log.warning("GPU: %s (%s)", OOM_RETRY_TEXT, res.get("error"))
+    # no "error" key in comfy_info: the UI shows that one as a failure
+    JOBS.update(comfy=OOM_RETRY_TEXT, comfy_info={"state": "oom_retry", "first_error": res.get("error")})
+    before = _vram_free(client) if hasattr(client, "get_system_stats") else None
+    t0 = clock()
+    while True:
+        check()
+        if release_comfy(client, "po braku pamięci GPU"):
+            break
+        if clock() - t0 >= OOM_FREE_WAIT_S:
+            log.warning("GPU: ComfyUI nie przyjął zwolnienia pamięci (zajęta kolejka?) – bez ponowienia")
+            return res
+        sleep(FREE_POLL_S)
+    freed = wait_comfy_freed(client, before, clock, sleep, wait_s=OOM_FREE_WAIT_S, cancel_check=check)
+    check()
+    log.info("GPU: po braku pamięci zwolniono %s GB – ponawiam ten sam graf", freed if freed is not None else "?")
+    sub = requeue()
+    if not sub.get("success"):
+        return {**res, "error": f"{res.get('error')} (ponowienie po zwolnieniu pamięci odrzucone: {sub.get('error')})"}
+    res2 = wait(sub["prompt_id"])
+    if isinstance(res2, dict):
+        res2["oom_retried"] = True
+        if not res2.get("success") and res2.get("kind") == OOM_KIND:
+            res2["error"] = f"{OOM_TWICE_TEXT}: {res2.get('error')}"
+            JOBS.update(comfy=res2["error"], comfy_info={"state": "error", "error": res2["error"],
+                                                         "raw_error": res2.get("raw_error")})
+    return res2

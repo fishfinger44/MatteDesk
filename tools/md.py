@@ -22,6 +22,14 @@
     python tools/md.py zone-apply osoba z_01 --wait   # "Zastosuj": only the zones recomputed (cache) -> new version
                                                   # [--stage vitmatte] = stage 4: on the stage-3 MatAnyone version
     python tools/md.py cleanplate-auto [--wait] [--frames 1-120]   # auto clean plate from the shot (after the cores; LaMa / OpenCV for holes)
+    python tools/md.py c3d status                 # Cleanup 3D: steps done / stale, camera report, cards with keys, engines
+    python tools/md.py c3d solve [--moving a,b] [--no-horizon] [--free-lens] --wait   # 3D camera (COLMAP + CoTracker3)
+    python tools/md.py c3d propose | c3d keys sand [--frames 1,20 | --every 8]        # cards from the solve | keys of a card
+    python tools/md.py c3d key-export sand 20 [--format png16] | c3d key-import sand 20 D:/paint/sand_k0020.png
+    python tools/md.py c3d key-undo sand 20 | c3d key-delete sand 20 --yes            # delete = for good (no trash)
+    python tools/md.py c3d regen sand 20 [--engine lama|qwen21_edit|klein_restore] [--soften] [--prompt "…"] --wait
+    python tools/md.py c3d render [--frames 20-22] [--blur auto|off] [--feather 40] --wait   # -> inpaint/v###, plate „cleaned”
+    python tools/md.py c3d nuke                   # C6: Nuke script (.nk + .chan + STMaps) -> inpaint/nuke/c3d_<v### or date>.nk
     python tools/md.py api-doc > docs/AGENT_API_routes.md
 
 Only `urllib` (no new dependencies). Server = config.json / config.local.json -> backend_host / backend_port
@@ -44,6 +52,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAVY = {"run", "rerun", "finalize", "edge-fix", "export", "core-fix"}
+C3D_VERBS = ("status", "solve", "propose", "keys", "key-export", "key-import", "key-undo", "key-delete", "regen", "render", "nuke")
 ROUTES_BEGIN, ROUTES_END = "<!-- routes:begin (python tools/md.py api-doc --write) -->", "<!-- routes:end -->"
 
 
@@ -582,6 +591,132 @@ class CLI:
             self.out(json.dumps(d, ensure_ascii=False, indent=1))
         return 0
 
+    # ------------------------------------------------------------------ Cleanup 3D (api/cleanup3d.py)
+    def c3d(self, a) -> int:
+        """`c3d <verb> [card] [frame] [path]` – the Cleanup 3D routes (docs/PLAN_CLEANUP_3D.md)."""
+        verb, base = a.verb, "/api/cleanup3d"
+
+        def need(n: int, what: str) -> Optional[int]:
+            if len(a.args) < n:
+                self.out(f"c3d {verb}: podaj {what}")
+                return 1
+            return None
+
+        def done(d: Any, line: str) -> int:
+            self.out(line)
+            if a.json:
+                self.out(json.dumps(d, ensure_ascii=False, indent=1))
+            return 0
+
+        if verb == "status":
+            st, d = self.call("GET", base)
+            if st != 200:
+                return self.fail(st, d)
+            mark = lambda k: "↻" if (d.get("stale") or {}).get(k) else ("✔" if (d.get("done") or {}).get(k) else "○")   # noqa: E731
+            self.out("Czyszczenie 3D: " + " · ".join(f"{mark(k)} {k}" for k in ("camera", "cards", "keys", "project")))
+            cam = d.get("camera")
+            if cam:
+                r = cam.get("report") or {}
+                self.out(f"  kamera: {cam.get('n_frames')} kl. · {cam.get('source')} · reprojekcja {r.get('reproj_px')} px · "
+                         f"horyzont {r.get('horizon_px')} px")
+            for c in d.get("cards") or []:
+                ext = f"zasięg {len(c.get('extent') or [])} warstw (F{c.get('extent_frame')})" if c.get("extent") else "cała karta"
+                self.out(f"  karta {c['id']} ({c.get('kind')}, {ext}): klucze "
+                         + (", ".join(f"F{k['frame']}:{k['active']}" for k in c.get("keys") or []) or "brak"))
+            for e in d.get("engines") or []:
+                self.out(f"  silnik {e['label']}: {'dostępny' if e.get('available') else 'NIEDOSTĘPNY – ' + str(e.get('reason'))}")
+            sv = d.get("solve") or {}
+            self.out(f"  solve kamery: {'dostępny' if sv.get('available') else 'NIEDOSTĘPNY – ' + str(sv.get('reason'))}")
+            if d.get("render"):
+                self.out(f"  projekcja: {d['render']['version']} ({d['render'].get('date')})"
+                         + (" – do przeliczenia" if d["render"].get("stale") else ""))
+            return done(d, "") if a.json else 0
+        if verb in ("solve", "regen", "render"):
+            g = self.busy_guard()
+            if g:
+                return g
+            t0 = time.time()
+            if verb == "solve":
+                body: Dict[str, Any] = {"moving": None if a.moving is None else [n for n in a.moving.split(",") if n],
+                                        "single_focal": not a.free_lens, "horizon": not a.no_horizon}
+                st, d = self.heavy("POST", f"{base}/camera/solve", body, a.wait)
+            elif verb == "regen":
+                if need(2, "kartę i klatkę klucza"):
+                    return 1
+                body = {"engine": a.engine, "soften_seams": bool(a.soften), "prompt": a.prompt}
+                st, d = self.heavy("POST", f"{base}/keys/{a.args[0]}/{int(a.args[1])}/regen", body, a.wait)
+            else:
+                body = {"frames": None, "motion_blur": a.blur, "feather_px": a.feather}
+                if a.frames:
+                    lo, hi = a.frames.split("-")
+                    body["frames"] = list(range(int(lo), int(hi) + 1))
+                st, d = self.heavy("POST", f"{base}/render", body, a.wait)
+            if st == 202:
+                self.out(f"c3d {verb}: {d['detail']}")
+                return 0
+            if st != 200:
+                return self.fail(st, d)
+            dt = time.time() - t0
+            if verb == "solve":
+                r = d.get("report") or {}
+                return done(d, f"Kamera 3D: {d.get('n_frames')} kl. w {dt:.0f} s · reprojekcja {r.get('reproj_px')} px · "
+                               f"horyzont {r.get('horizon_px')} px · najgorsze klatki "
+                               + ", ".join(f"F{w['frame']} ({w['err_px']} px)" for w in r.get("worst_frames") or []))
+            if verb == "regen":
+                return done(d, f"Klucz {a.args[0]} F{a.args[1]}: nowa wersja {d.get('version')} ({d.get('engine')}, "
+                               f"{d.get('tiles')} kafli, {d.get('area_px')} px) w {dt:.1f} s")
+            return done(d, f"Projekcja: {d.get('version')} · {d.get('n_frames')} kl. w {dt:.0f} s · źródła {d.get('counts')} · "
+                           f"plate „{d.get('plate')}” · {d.get('dir')}")
+        if verb == "propose":
+            st, d = self.call("POST", f"{base}/cards/propose")
+            if st != 200:
+                return self.fail(st, d)
+            return done(d, "Karty: " + ", ".join(c["id"] for c in d.get("cards") or [])
+                        + f" · dodane: {', '.join(d.get('added') or []) or 'nic (już są)'}")
+        if verb == "nuke":
+            st, d = self.call("POST", f"{base}/export_nuke", {})
+            if st != 200:
+                return self.fail(st, d)
+            for n in d.get("notes") or []:
+                self.out(f"  uwaga: {n}")
+            return done(d, f"Skrypt Nuke'a: {d['nk']} · {d['chan']} · karty {d['counts']['cards']}, klucze {d['counts']['keys']}")
+        if need(1, "kartę"):
+            return 1
+        card = a.args[0]
+        if verb == "keys":
+            if a.frames or a.every:
+                body = {"frames": [int(v) for v in a.frames.split(",")]} if a.frames else {"every": int(a.every)}
+                st, d = self.call("POST", f"{base}/keys/{card}", body)
+                if st != 200:
+                    return self.fail(st, d)
+                return done(d, f"Klucze karty {card}: " + ", ".join(f"F{k['frame']}" for k in d["keys"])
+                            + f" · nowe: {', '.join(f'F{f}' for f in d.get('added') or []) or 'brak'}")
+            st, d = self.call("GET", f"{base}/keys?card={card}")
+            if st != 200:
+                return self.fail(st, d)
+            for k in d["keys"]:
+                self.out(f"  F{k['frame']}: aktywna {k['active']} · " + ", ".join(f"{v['v']} ({v.get('source')})" for v in k["versions"]))
+            return done(d, f"Klucze karty {card}: {len(d['keys'])}")
+        if need(2, "kartę i klatkę klucza"):
+            return 1
+        url = f"{base}/keys/{card}/{int(a.args[1])}"
+        if verb == "key-export":
+            st, d = self.call("POST", f"{url}/export", {"format": a.format, "dir": a.dir})
+            return self.fail(st, d) if st != 200 else done(d, f"Klucz zapisany: {d['path']}")
+        if verb == "key-import":
+            if need(3, "kartę, klatkę i ścieżkę pliku"):
+                return 1
+            st, d = self.call("POST", f"{url}/import", {"path": a.args[2]})
+            return self.fail(st, d) if st != 200 else done(d, f"Klucz wczytany jako wersja {d['version']}")
+        if verb == "key-undo":
+            st, d = self.call("POST", f"{url}/undo")
+            return self.fail(st, d) if st != 200 else done(d, f"Aktywna wersja klucza: {d['version']}")
+        if not a.yes:                                        # key-delete
+            self.out("usunięcie klucza kasuje z dysku na stałe wszystkie jego wersje (nie da się cofnąć) – dodaj --yes")
+            return 1
+        st, d = self.call("DELETE", url)
+        return self.fail(st, d) if st != 200 else done(d, f"Klucz usunięty z dysku ({(d.get('freed_bytes') or 0) / 2**20:.1f} MB)".replace('.', ','))
+
     def api_doc(self, a) -> int:
         table = api_routes_markdown()
         if not a.write:
@@ -601,7 +736,17 @@ def api_routes_markdown() -> str:
     import app as app_module
     from fastapi.routing import APIRoute
     rows = ["| Metoda | Ścieżka | Rodzaj | Opis |", "|---|---|---|---|"]
-    for r in app_module.app.routes:
+
+    def flat(routes):
+        """Routes in matching order; an included router (FastAPI 0.141 `_IncludedRouter`, the api/ modules) is flattened in
+        place – like tests/test_app_routers.py, else the table loses every api/ route (seen 2026-11-03)."""
+        for r in routes:
+            if getattr(r, "original_router", None) is not None:
+                yield from flat(r.original_router.routes)
+            else:
+                yield r
+
+    for r in flat(app_module.app.routes):
         if not isinstance(r, APIRoute) or not r.include_in_schema:
             continue
         e = r.endpoint
@@ -688,6 +833,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cleanplate-auto"); p.add_argument("--wait", action="store_true"); p.add_argument("--frames", default=None, help="a-b")
     p = sub.add_parser("denoise"); p.add_argument("value", nargs="?", choices=("auto", "on", "off"), default=None,
                                                   help="auto = wł. dla EXR / > 8 bit, wył. dla 8-bit; bez wartości = pokaż")
+    p = sub.add_parser("c3d", help="Czyszczenie 3D: " + " | ".join(C3D_VERBS)); p.add_argument("verb", choices=C3D_VERBS)
+    p.add_argument("args", nargs="*", help="[karta] [klatka klucza] [ścieżka pliku]"); p.add_argument("--wait", action="store_true")
+    p.add_argument("--moving", default=None, help="solve: obiekty ruchome a,b ('' = nic; brak = obiekty usuwane w Czyszczeniu)")
+    p.add_argument("--no-horizon", action="store_true"); p.add_argument("--free-lens", action="store_true", help="solve: obiektyw jak z COLMAP")
+    p.add_argument("--frames", default=None, help="keys: 1,8,20 · render: a-b"); p.add_argument("--every", type=int, default=None)
+    p.add_argument("--format", default="png", choices=("png", "png16", "exr")); p.add_argument("--dir", default=None)
+    p.add_argument("--engine", default="lama", choices=("lama", "qwen21_edit", "klein_restore")); p.add_argument("--soften", action="store_true")
+    p.add_argument("--prompt", default=None); p.add_argument("--blur", default="auto", choices=("auto", "off"))
+    p.add_argument("--feather", type=float, default=None); p.add_argument("--yes", action="store_true")
     p = sub.add_parser("api-doc"); p.add_argument("--write", action="store_true", help="podmień tabelę w docs/AGENT_API.md")
     return ap
 

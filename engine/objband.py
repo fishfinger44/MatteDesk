@@ -420,6 +420,44 @@ def zone_params(zone: Dict[str, Any], obj: Optional[Dict[str, Any]], root: Optio
     return p
 
 
+# ----------------------------------------------------------------------------- the Cleanup 3D patch band (P14)
+CLEANUP_KEY = "c3d"   # owner key / tracking owner of the Cleanup 3D key patch band (static/bandpoints.js STAGE_OF)
+
+
+def cleanup_band(render_settings: Optional[Dict[str, Any]], params: Optional[Dict[str, Any]] = None) -> BandSettings:
+    """The band of the Cleanup 3D key patch (P14 „Pas Czyszczenia”, docs/PLAN_CLEANUP_3D.md): an instance of the one
+    model, OUTER SIDE ONLY. Its base mask is the patch hole (the removal mask + the object's traces); out = the C5
+    slider „Wtopienie łaty” (`key_soft_px`), the outer feather = the same value (the ramp spans the whole band, so without
+    points the patch is what it was before P14), no inset (in_px 0, inset feather 0). `params` = the project's band points
+    (engine/cleanup3d/band.py, {band_points, band_ref_out, band_ref_in}); the slider scales their widths (`scales`).
+    Not an object band: never shared, no detach."""
+    from engine.bandmap import band_points
+    soft = float((render_settings or {}).get("key_soft_px", 32.0) or 0.0)
+    p = params or {}
+    pts = band_points({"band_points": p.get("band_points")}) if p.get("band_points") else []
+    return BandSettings(soft, 0.0, 0.0, soft, pts, p.get("band_ref_out"), p.get("band_ref_in"), CLEANUP_KEY, False,
+                        CLEANUP_KEY)
+
+
+# ----------------------------------------------------------------------------- the Cleanup C1 „Inpaint” patch band
+INPAINT_KEY = "c1"   # owner key / tracking owner of the C1 band (static/bandpoints.js STAGE_OF)
+
+
+def inpaint_band(s: Optional[Dict[str, Any]]) -> BandSettings:
+    """The band of Cleanup step C1 „Inpaint” (user decision 2026-11-11): an instance of the one model, OUTER SIDE ONLY,
+    owned by the cleaned thing (its own values in the cleanup settings, engine/cleanup.PER_TARGET – never the object band,
+    no shared / detach, no copy). Base mask = the removed objects (alpha > 0.02); out = „Pas na zewnątrz” (`grow_px`:
+    the patch is solid that far out), outer feather = „Wtopienie zewnętrzne” (`soft_px`: the soft edge OUTSIDE the band –
+    the patch has to cover the object fully, so the ramp never eats into the band; engine/cleanup.removal_mask), no inset
+    (in_px 0). The points (`band_points`, set against `band_ref_out`) widen / narrow the band locally; the slider scales
+    their widths (`scales`)."""
+    from engine.bandmap import band_points
+    s = s or {}
+    pts = band_points({"band_points": s.get("band_points")}) if s.get("band_points") else []
+    return BandSettings(float(s.get("grow_px") or 0.0), 0.0, 0.0, float(s.get("soft_px") or 0.0), pts,
+                        s.get("band_ref_out"), s.get("band_ref_in"), INPAINT_KEY, False, INPAINT_KEY)
+
+
 # ----------------------------------------------------------------------------- migration
 def _read(p: Path) -> Optional[Dict[str, Any]]:
     from engine.objects import ObjectStore

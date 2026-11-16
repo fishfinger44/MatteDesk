@@ -18,7 +18,6 @@ from __future__ import annotations
 import atexit
 import json
 import logging
-import os
 import subprocess
 import tempfile
 import threading
@@ -29,6 +28,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+
+from engine.worker_proto import CHECK_CACHE, WorkerProcess, check_worker
 
 logger = logging.getLogger("matte_desk.tracking")
 
@@ -76,85 +77,37 @@ def default_cotracker_checkpoint() -> Optional[Path]:
 
 # run with -I: the worker sits in engine/, where engine/queue.py would shadow the stdlib `queue`
 WORKER = Path(__file__).resolve().parent / "cotracker_worker.py"
-_CHECK_CACHE: dict = {}
+_CHECK_CACHE = CHECK_CACHE
 
 
-class _CoTrackerWorker:
+class _CoTrackerWorker(WorkerProcess):
     """One long-lived `cotracker_worker.py --serve` process per (python, checkpoint): the model is loaded once, every
     `request` is one in.npz -> out.npz round trip over stdin / stdout (2026-10-25; before, every tracking started a
     new process: torch + CUDA + weights, ~10-20 s, for a single band-point edit). Restarted when it died; a cancel
     kills it (the next request starts a fresh one). The maths in the worker is the one-shot code: same tracks."""
 
+    worker = WORKER
+    label = "CoTracker3"
+    doctor_item = "Model: CoTracker3"
+    tmp_prefix = "md_cotracker_srv_"
+
     def __init__(self, python: str, env: Optional[Dict[str, str]] = None):
-        self.python = python
-        self.env = env
+        super().__init__(python, env, timeout_s=3600.0)
         self.device: Optional[str] = None
         self.load_seconds = 0.0
-        self._proc: Optional[subprocess.Popen] = None
-        self._log = None
-        self._dir: Optional[tempfile.TemporaryDirectory] = None
         self.lock = threading.Lock()         # one request at a time (the GPU is one; callers queue here)
         self.busy = False
 
-    def _start(self) -> None:
-        if self._dir is None:
-            # ignore_cleanup_errors: on Windows a worker killed a moment ago can still hold worker.log (its stderr)
-            # when the directory goes – that must not raise at interpreter exit (testmon run 2026-10-25)
-            self._dir = tempfile.TemporaryDirectory(prefix="md_cotracker_srv_", ignore_cleanup_errors=True)
-        if self._log is None:
-            self._log = open(Path(self._dir.name) / "worker.log", "a+", encoding="utf-8", errors="replace")
-        self._proc = subprocess.Popen([self.python, "-I", str(WORKER), "--serve"], stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=self._log, text=True, bufsize=1, env=self.env)
-
-    def _log_tail(self) -> str:
-        try:
-            self._log.flush()
-            self._log.seek(0)
-            return self._log.read()[-600:].strip()
-        except Exception:
-            return ""
-
     def request(self, src: Path, dst: Path, cancel_check: Optional[Callable[[], None]] = None,
                 timeout_s: float = 3600.0) -> Dict[str, Any]:
-        """Run one in.npz -> out.npz tracking; `cancel_check()` is polled every second and, if it raises, the worker
+        """Run one in.npz -> out.npz tracking; `cancel_check()` is polled and, if it raises, the worker
         is killed (a running CoTracker3 forward cannot be interrupted any other way) and the exception propagates.
         Runs under the GPU lease (engine/gpu_manager): another work on the card first, and a cancel while waiting."""
         from engine.gpu_manager import GPU
         with GPU.use(self, "CoTracker3", self.close, cancel_check), self.lock:
             self.busy = True
             try:
-                if self._proc is None or self._proc.poll() is not None:
-                    self._start()
-                result: Dict[str, Any] = {}
-                done = threading.Event()
-
-                def read():
-                    try:
-                        result["line"] = self._proc.stdout.readline()
-                    finally:
-                        done.set()
-                self._proc.stdin.write(json.dumps({"in": str(src), "out": str(dst)}) + "\n")
-                self._proc.stdin.flush()
-                th = threading.Thread(target=read, daemon=True)
-                th.start()
-                t0 = time.time()
-                while not done.wait(1.0):
-                    try:
-                        if cancel_check:
-                            cancel_check()
-                        if time.time() - t0 > timeout_s:
-                            raise RuntimeError(f"CoTracker3 (Python ComfyUI): przekroczony czas {timeout_s:.0f} s")
-                    except BaseException:
-                        self.close()
-                        raise
-                line = result.get("line")
-                if not line:
-                    alive = self._proc.poll() is None
-                    tail = self._log_tail()
-                    self.close()
-                    raise RuntimeError("CoTracker3 (Python ComfyUI) " + ("nie odpowiedział" if alive else "zakończył się")
-                                       + f": {tail}")
-                resp = json.loads(line)
+                resp = super().request({"in": str(src), "out": str(dst)}, cancel_check, timeout_s)
                 if not resp.get("ok"):
                     raise RuntimeError(f"CoTracker3 (Python ComfyUI) nie policzył: {resp.get('error')}")
                 self.device = resp.get("device") or self.device
@@ -163,25 +116,6 @@ class _CoTrackerWorker:
             finally:
                 self.busy = False
 
-    def close(self) -> None:
-        p, self._proc = self._proc, None
-        if p is not None and p.poll() is None:
-            try:
-                p.stdin.write(json.dumps({"op": "quit"}) + "\n")
-                p.stdin.flush()
-                p.wait(timeout=5)
-            except Exception:
-                p.kill()
-                p.wait()
-        log, self._log = self._log, None
-        if log is not None:
-            log.close()
-        d, self._dir = self._dir, None
-        if d is not None:
-            try:
-                d.cleanup()
-            except OSError:
-                pass
 
 
 _WORKERS: Dict[str, _CoTrackerWorker] = {}
@@ -221,18 +155,8 @@ def tracker_python() -> Optional[Path]:
 
 def check_tracker_python(python: Optional[Union[str, Path]], env: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
     """(ok, "cuda"/"cpu" or the reason): can ComfyUI's Python import torch + cotracker? Cached per interpreter."""
-    if not python or not Path(python).exists():
-        return False, "nie znaleziono Pythona ComfyUI (ustaw comfy_dir / comfy_python)"
-    key = str(python) + ("|fake" if (env or os.environ).get("MD_COTRACKER_FAKE") == "1" else "")
-    if key not in _CHECK_CACHE:
-        try:
-            r = subprocess.run([str(python), "-I", str(WORKER), "--check"], capture_output=True, text=True, timeout=120,
-                               env=env)
-            out = (r.stdout or r.stderr or "").strip()
-            _CHECK_CACHE[key] = (r.returncode == 0, out.split()[-1] if r.returncode == 0 and out else out[-300:])
-        except Exception as e:
-            _CHECK_CACHE[key] = (False, str(e))
-    return _CHECK_CACHE[key]
+    ok, out = check_worker(python, WORKER, env=env)
+    return ok, out.split()[-1] if ok else out
 
 
 class CoTracker3Tracker:

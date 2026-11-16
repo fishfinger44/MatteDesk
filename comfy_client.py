@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 SPILL_WARN_GB = 1.0     # GPU memory of Comfy in shared RAM from which the job warns (idle Comfy: ~0.3 GB)
 SPILL_SAMPLE_S = 5.0    # how often it is read (Get-Counter ~1-2 s, background thread)
@@ -64,6 +64,7 @@ class ComfyClient:
         # watched during every prompt (user request 2026-10-26); None = default sampler, a callable = tests
         self.spill_watch_factory: Optional[Any] = None
         self._spill_reader: Optional[Any] = None
+        self._sent: Dict[str, Any] = {}    # the last queued graph {prompt_id: (graph, extra_data)}
 
     @staticmethod
     def is_timeout(err: Any) -> bool:
@@ -180,6 +181,7 @@ class ComfyClient:
             prompt_id = resp.get("prompt_id")
             if prompt_id:
                 self.our_prompts.add(prompt_id)
+                self._sent = {prompt_id: (workflow_api, extra_data)}   # for the one retry after GPU out-of-memory
             return {"success": True, "prompt_id": prompt_id, "data": resp}
         return {"success": False, "error": resp}
 
@@ -202,7 +204,24 @@ class ComfyClient:
         `lost_after_s` (Comfy restarted) -> kind "lost"; execution_error -> readable message (GPU / RAM out of memory)
         with the raw text in `raw_error`. A request that TIMES OUT (the connection is accepted, no answer) means
         Comfy is busy, not down: waited for up to `busy_after_s`, then kind "comfy_hung". While our prompt runs, GPU
-        memory spilled to RAM >= SPILL_WARN_GB is reported in the job (comfy text + comfy_info.spill_gb + gpu_spill_gb)."""
+        memory spilled to RAM >= SPILL_WARN_GB is reported in the job (comfy text + comfy_info.spill_gb + gpu_spill_gb).
+        A prompt queued by this client that fails with GPU out-of-memory (kind "oom_gpu") is retried ONCE with the same
+        graph after Comfy has freed its memory (engine.gpu_manager.retry_after_oom); the result then has `oom_retried`."""
+        res = self._wait_once(prompt_id, timeout_sec, poll_interval, progress_callback)
+        sent = self._sent.pop(prompt_id, None)
+        if sent is None or res.get("kind") != "oom_gpu":
+            return res
+        from engine.gpu_manager import retry_after_oom
+        try:
+            return retry_after_oom(
+                self, res, requeue=lambda: self.queue_prompt(*sent),
+                wait=lambda pid: self._wait_once(pid, timeout_sec, poll_interval, progress_callback),
+                clock=self._clock, sleep=self._sleep)
+        finally:
+            self._sent.clear()
+
+    def _wait_once(self, prompt_id: str, timeout_sec: float, poll_interval: float,
+                   progress_callback: Optional[Any]) -> Dict[str, Any]:
         spill = self._spill_watch()
         if spill is None:
             return self._wait_loop(prompt_id, timeout_sec, poll_interval, progress_callback, None)

@@ -90,7 +90,8 @@ def test_measure_sequence_runs_local_model_and_records_engine(tmp_path):
     rep = AlignmentPipeline.measure_sequence(
         beauty_pattern=str(tmp_path / "b_####.exr"), aux_pattern=str(tmp_path / "a_####.exr"),
         first_frame=1, last_frame=T, plate_name="aux", aux_plate_type="cleanplate",
-        plate_w=w, plate_h=h, grid_dir=tmp_path / "grid", tracker=NamedLK())
+        plate_w=w, plate_h=h, grid_dir=tmp_path / "grid", tracker=NamedLK(),
+        camera_lock="off")   # a 2 px pan reads as a locked camera in auto (2026-11-03); this test is about the tracker
     assert rep.local_tracker_engine == "mock_tracker"
     assert [f.method for f in rep.frames] == ["local_stmap"] * T, [(f.method, f.status) for f in rep.frames]
     assert (tmp_path / "grid" / "grid_0003.exr").exists()
@@ -121,3 +122,24 @@ def test_anchor_segments_match_full_tracking_lk():
     for t in range(T):
         assert len(fs[t][0]) == len(ff[t][0]) > 0
         assert np.array_equal(fs[t][0], ff[t][0]) and np.array_equal(fs[t][1], ff[t][1]), t
+
+
+def test_failed_local_fit_keeps_the_global_residual_2026_11_07(tmp_path, monkeypatch):
+    """SH010 clear plate (A/B 2026-11-07): 93 % of the local points were rejected, the zero-grid fallback reported a
+    hold-out of 0.0 px and the report said „Cleanplate zgodny (max 0.00 px) – nic nie rób” for a plate 6 px off.
+    A frame without a fitted field stays on its global model with the global residual, marked uncertain."""
+    import engine.align as A
+    T, h, w = 5, 256, 384
+    beauty, aux, _, _ = _sequence(T, h, w, pan=0.5)
+    for i in range(T):
+        cv2.imwrite(str(tmp_path / f"b_{i + 1:04d}.exr"), beauty[i].astype(np.float32))
+        cv2.imwrite(str(tmp_path / f"a_{i + 1:04d}.exr"), aux[i].astype(np.float32))
+    monkeypatch.setattr(A, "reject_outliers", lambda p, d, r=None, **k: (np.zeros(len(np.asarray(p).reshape(-1, 2)), bool),
+                                                                         {"n": len(p), "resp": 0, "clip": len(p), "nbr": 0}))
+    rep = AlignmentPipeline.measure_sequence(
+        beauty_pattern=str(tmp_path / "b_####.exr"), aux_pattern=str(tmp_path / "a_####.exr"),
+        first_frame=1, last_frame=T, plate_name="aux", aux_plate_type="cleanplate",
+        plate_w=w, plate_h=h, grid_dir=tmp_path / "grid", tracker=LKTracker(), camera_lock="off", device="cpu", workers=1)
+    assert all(f.method != "local_stmap" and f.status == "uncertain" and f.grid_rel_path in (None, "") for f in rep.frames)
+    assert all(f.residual_px > 0 for f in rep.frames) and rep.residual_median > 0
+    assert "nic nie rób" not in rep.recommendation and "nie wyszło w 5/5" in rep.recommendation and rep.needs_correction

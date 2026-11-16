@@ -6,7 +6,7 @@
     since step 6 (parts migrated to groups) checked against the frozen formula `_core_composition`;
 (b) a member with source X brings exactly the alpha of X into the composition, outside the seam;
 (c) a change of a member's source / the seam / the members = the whole recompute is stale;
-(d) detaching a member while the group has a whole result -> a warning first, the result goes to the project trash.
+(d) detaching a member while the group has a whole result -> a warning first, the result is deleted for good (2026-11-13).
 
 (b)–(d) describe the new behaviour and are xfail(strict) until their step lands. Every call of the not-yet-built group
 API goes through `G` below – step 1 (data model) adjusts only that adapter, never the assertions."""
@@ -221,24 +221,25 @@ def test_c_group_change_makes_whole_recompute_stale(tmp_path, change):
         _object(store, "arm", (abs(xx - 140) <= 8) & (yy >= 40) & (yy < 70), 3)
         G.add(work, "body", "arm")
     else:
-        G.detach(work, "body", "legs", confirm=True)      # the whole result goes to the trash (d)
+        G.detach(work, "body", "legs", confirm=True)      # the whole result is deleted (d)
     assert not G.whole_valid(work, "body", "matanyone")
 
 
 # ---------------------------------------------------------------- (d)
-def test_d_detach_with_whole_result_warns_then_trashes(tmp_path):
+def test_d_detach_with_whole_result_warns_then_deletes(tmp_path):
     work, store, ms = _three(tmp_path)
     G.fake_whole_run(work, "body", "matanyone")
     before = {n: sorted(p.relative_to(store.dir(n)).as_posix() for p in store.dir(n).rglob("*"))
               for n in ("head", "torso", "legs")}
     r = G.detach(work, "body", "legs", confirm=False)
     assert r["needs_confirm"] and "matanyone" in r["whole_stages"] and r["warning"]   # nothing done yet
+    assert "na stałe" in r["warning"] and "kosza" not in r["warning"] and r["bytes"] > 0
     assert G.whole_valid(work, "body", "matanyone")
     assert not (work / "trash").exists()
     r = G.detach(work, "body", "legs", confirm=True)
-    assert r["success"] and r["trash"]
-    trash = work / "trash"
-    assert trash.exists() and any(p.name == "run.json" for p in trash.rglob("run.json"))   # the whole result is recoverable
+    assert r["success"] and r["whole_deleted"] and r["freed_bytes"] > 0
+    assert not (work / "trash").exists() and not (store.dir("body") / "runs" / "v001").exists()   # gone for good
+    assert (store.dir("body") / "runs" / ".last_run").read_text(encoding="utf-8") == "1"      # v001 never reused
     assert not G.whole_valid(work, "body", "matanyone")
     for n, files in before.items():                                    # members keep their own results untouched
         assert sorted(p.relative_to(store.dir(n)).as_posix() for p in store.dir(n).rglob("*")) == files

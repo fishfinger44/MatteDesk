@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -34,16 +35,56 @@ from engine.exr_io import write_gray_exr
 from engine.outputs import load_outputs, remove_outputs, update_outputs
 from engine.refine import assemble_full, read_alpha
 
+logger = logging.getLogger(__name__)
 
 CORE_RUN = "core"     # export source "rdzeń (1+2)" (2026-10-15): the mask 1+2 of core_fix/ instead of a run version
 
+EXPORT_SOURCES = ("active", "core", "matanyone", "videomama", "vitmatte", "ltx", "version", "final_touch")
+EXPORT_SOURCE_LABEL = {"active": "aktywna wersja", "core": "rdzeń (1+2)", "matanyone": "MatAnyone2 (etap 3)",
+                       "videomama": "VideoMaMa (etap 4)", "vitmatte": "ViTMatte (etap 5)", "ltx": "LTX-2.5 Alpha-Gen (etap 7)",
+                       "version": "wybrana wersja", "final_touch": "Final Touch (baza + korekty)"}
+# when an object of a full export / of the context has no result of the chosen source (e.g. a hand without ViTMatte
+# zones): the next source down, reported in the warning – a written object chosen by name never falls back
+EXPORT_FALLBACK = {"vitmatte": ["vitmatte", "videomama", "matanyone", "active", "core"],
+                   "matanyone": ["matanyone", "active", "core"],
+                   "videomama": ["videomama", "matanyone", "active", "core"],
+                   "ltx": ["ltx", "vitmatte", "videomama", "matanyone", "active", "core"],
+                   "core": ["core"], "version": ["version", "active"], "active": ["active"],
+                   # an object without its own corrections: base = the result of the last computed stage
+                   "final_touch": ["final_touch"]}
+
+
+def core_fix_holes(obj_dir: Path, frames: Sequence[int]) -> List[int]:
+    """Frames of `frames` without the mask 1+2 in a core_fix/ that has other frames: they fall back on the SAM 3.1 core,
+    without the corrections. No core_fix/ at all = no corrections to lose = no holes (audit 2026-11-02 #6)."""
+    d = Path(obj_dir) / "core_fix"
+    if not d.is_dir() or next(d.glob("c_*.png"), None) is None:
+        return []
+    return [int(f) for f in frames if not (d / f"c_{int(f):04d}.png").exists()]
+
+
+def core_fix_warning(outputs: Dict[str, Any]) -> str:
+    """The export's warning about mixed frames (`core_fix_fallback` of export_objects), "" when none."""
+    holes = outputs.get("core_fix_fallback") or {}
+    if not holes:
+        return ""
+    return "Klatki bez maski 1+2 (rdzeń SAM 3.1 bez poprawek – „Zastosuj poprawki” na całym zakresie): " + "; ".join(
+        f"{n}: " + ", ".join(f"F{a}–{b}" for a, b in iv) for n, iv in sorted(holes.items()))
+
 
 def core_fix_loader(obj_dir: Path, w: int, h: int) -> Callable[[int], np.ndarray]:
-    """Full-frame 0 / 1 alpha of the mask 1+2 (core_fix/c_####.png, stage 2); a frame without it -> the SAM 3.1 core."""
+    """Full-frame 0 / 1 alpha of the mask 1+2 (core_fix/c_####.png, stage 2); a frame without it -> the SAM 3.1 core:
+    logged once per loader here, reported by the export (core_fix_holes)."""
+    warned = [False]
+
     def load(f: int) -> np.ndarray:
         for sub in ("core_fix", "core"):
-            m = cv2.imread(str(Path(obj_dir) / sub / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
+            p = Path(obj_dir) / sub / f"c_{f:04d}.png"
+            m = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None   # no OpenCV warning per frame in the log
             if m is not None:
+                if sub == "core" and not warned[0] and core_fix_holes(obj_dir, [f]):
+                    warned[0] = True
+                    logger.warning("%s: F%d bez maski 1+2 – rdzeń SAM 3.1 bez poprawek", Path(obj_dir).name, f)
                 if m.shape != (h, w):
                     m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
                 return (m > 127).astype(np.float32)
@@ -145,10 +186,14 @@ def seamless_union(alphas: Sequence[np.ndarray], cores: Sequence[Optional[np.nda
 
 
 def subtract_front(alpha: np.ndarray, fronts: Sequence[np.ndarray]) -> np.ndarray:
-    out = alpha.astype(np.float32)
-    for fr in fronts:
-        out = np.clip(out - fr, 0.0, 1.0)
-    return out
+    """Visible part of a layer behind `fronts`: clamp(alpha − max(fronts)) – as MatteSubtractFront (spec 5.2). Not the
+    running difference: the export context holds a group AND its members, so a soft edge was subtracted twice
+    (audit 2026-11-02 #2)."""
+    out = alpha.astype(np.float32, copy=True)
+    if not fronts:
+        return out
+    top = np.maximum.reduce([np.asarray(fr, np.float32) for fr in fronts])
+    return np.clip(out - top, 0.0, 1.0)
 
 
 def params_hash(obj: Dict[str, Any], run_json: Dict[str, Any]) -> str:
@@ -178,6 +223,7 @@ class FrameAlphas:
         from engine.workarea import object_life
         self.life = {o["name"]: object_life(o) for o in self.objs}
         self.w, self.h = w, h
+        self.fronts: Dict[str, Optional[np.ndarray]] = {}   # of the last frame(): max of the raw layers each one is cut by
 
     def _group_layer(self, o: Dict[str, Any]) -> Dict[str, Any]:
         """A group entity (engine/groups.py) in the context: its depth = its front-most member (copy of the dict)."""
@@ -198,6 +244,36 @@ class FrameAlphas:
         from engine.workarea import is_visible
         return is_visible(f, self.life.get(name))
 
+    def core_fix_holes(self, frames: Sequence[int]) -> Dict[str, List[List[int]]]:
+        """{object: intervals} of `frames` where a layer of the context reads the SAM 3.1 core in a place of a missing mask
+        1+2 (a group: through its members with the source „core”); frames outside the object's life do not count."""
+        from engine.final_touch import base_run
+        from engine.workarea import intervals_from_frames, is_visible, object_life
+        store = None
+        out: Dict[str, List[List[int]]] = {}
+        for o in self.objs:
+            if base_run(o["tool"]["active_run"]) != CORE_RUN:
+                continue
+            if o.get("kind") == "group":
+                from engine.groups import active_members, member_run
+                from engine.objects import ObjectStore
+                store = store or ObjectStore(self.work_dir)
+                ms = [(m, object_life(store.get(m))) for m in active_members(store, o["name"])
+                      if base_run(member_run(store, m)["run"] or "") == CORE_RUN]
+            else:
+                ms = [(o["name"], self.life.get(o["name"]))]
+            for m, life in ms:
+                miss = core_fix_holes(self.work_dir / "objects" / m, [f for f in frames if is_visible(f, life)])
+                if miss:
+                    out[m] = intervals_from_frames(miss)
+        return out
+
+    def has_front(self, name: str) -> bool:
+        """Whether any layer of the context is in front of `name` and cuts it (export.subtract_front)."""
+        o = next(x for x in self.objs if x["name"] == name)
+        skip = self._excluded(o)
+        return any(x["name"] not in skip for x in self.objs[:self.objs.index(o)])
+
     def run_of(self, name: str) -> str:
         return next(x for x in self.objs if x["name"] == name)["tool"]["active_run"]
 
@@ -208,7 +284,9 @@ class FrameAlphas:
         for o in self.objs:
             raw = self.loaders[o["name"]](f) if self.visible(o["name"], f) else np.zeros((self.h, self.w), np.float32)
             skip = self._excluded(o)
-            alphas[o["name"]] = subtract_front(raw, [a_ for n_, a_ in front_layers if n_ not in skip])
+            fr = [a_ for n_, a_ in front_layers if n_ not in skip]
+            alphas[o["name"]] = subtract_front(raw, fr)
+            self.fronts[o["name"]] = np.maximum.reduce([np.asarray(a_, np.float32) for a_ in fr]) if fr else None
             front_layers.append((o["name"], raw))
         return alphas
 
@@ -254,9 +332,37 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
                            extra_attrs={"matteDesk/object": name.encode(), "matteDesk/run": run.encode()})
         return str(d / (f"{name}_####." + ("png" if png else "exr"))).replace("\\", "/")
 
+    # Final Touch as Nuke nodes (engine/ft_nuke, user decision 2026-11-16): the objects written from Final Touch whose
+    # nuke_mode is grade / paint get their base sequence (raw, not cut) + the max of their front layers; their matte
+    # stays the baked one (the multi-EXR / union unchanged), the .nk rebuilds it from the base with live nodes
+    from engine import final_touch as _ft
+    from engine.ft_nuke import available as ft_available
+    ftn: Dict[str, Dict[str, Any]] = {}
+    for o in objs:
+        run = o["tool"]["active_run"]
+        if (want is not None and o["name"] not in want) or not _ft.is_ft(run):
+            continue
+        od = work_dir / "objects" / o["name"]
+        d = _ft.load(od)
+        if d["nuke_mode"] == "bake":
+            continue
+        ok, why = ft_available(d.get("finish") or {})
+        if not ok:
+            ftn[o["name"]] = {"mode": "bake", "requested": d["nuke_mode"], "why": why}
+            continue
+        ftn[o["name"]] = {"mode": d["nuke_mode"], "front": fa.has_front(o["name"]),
+                          "load": _ft.partial_loader(od, run_alpha_loader(od, _ft.base_run(run), w, h), d["nuke_mode"] == "grade")}
     multi_channels: List[str] = []
     for i, f in enumerate(frames):
         alphas = fa.frame(f)
+        for n_, sp in ftn.items():
+            if sp["mode"] == "bake":
+                continue
+            raw = sp["load"](f) if fa.visible(n_, f) else np.zeros((h, w), np.float32)
+            sp["base_matte"] = write_matte(f"{n_}_ftbase", raw, f, "ft-base")
+            if sp["front"]:
+                fr = fa.fronts.get(n_)
+                sp["front_matte"] = write_matte(f"{n_}_front", fr if fr is not None else np.zeros((h, w), np.float32), f, "front")
         for o in objs:
             if want is not None and o["name"] not in want:
                 continue
@@ -298,6 +404,7 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
         if progress_cb:
             progress_cb("Eksport", i + 1, len(frames))
     # outputs.json (data contract)
+    holes = fa.core_fix_holes(frames)
     entries = []
     for o in objs:
         if o["name"] not in written:
@@ -320,7 +427,10 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
                         **({"members": list(o.get("members") or [])} if o.get("kind") == "group" else {}),
                         # Final Touch: which base and which corrections (hash) – the export is reproducible (plan §3)
                         **({"final_touch": {"base": base_run(ver), "corrections_sig":
-                                            corrections_sig(ft_load(work_dir / "objects" / o["name"]))}} if is_ft(ver) else {})})
+                                            corrections_sig(ft_load(work_dir / "objects" / o["name"])),
+                                            **({"nuke": {k: v for k, v in ftn[o["name"]].items() if k in
+                                                         ("mode", "requested", "why", "base_matte", "front_matte")}}
+                                               if o["name"] in ftn else {})}} if is_ft(ver) else {})})
     data = load_outputs(work_dir)
     keep = [e for e in data.get("objects", []) if e["name"] not in written]
     update_outputs(work_dir, "objects", keep + entries)
@@ -336,14 +446,19 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
     update_outputs(work_dir, "frame_range", [int(frames[0]), int(frames[-1])])
     update_outputs(work_dir, "plate_size", [int(w), int(h)])
     update_outputs(work_dir, "export_dir", str(export_dir).replace("\\", "/"))
+    if holes:
+        update_outputs(work_dir, "core_fix_fallback", holes)
+    else:
+        remove_outputs(work_dir, "core_fix_fallback")
     # Z29: Nuke script with the mattes (backdrop MASKI, Shuffle2 + anchor + copy stamp per channel)
     from engine.nuke_mattes import write_mattes_nk
     data = load_outputs(work_dir)
     from engine.final_touch import merge_matte_export
     merge = merge_matte_export(work_dir, [e["name"] for e in data.get("objects", [])], *merge_plate) if merge_plate else None
+    from engine.ft_nuke import specs as ft_specs
     nk = write_mattes_nk(export_dir / f"{shot}_mattes.nk", data, shot, int(frames[0]), int(frames[-1]), w, h,
                          channels=data.get("mattes_all_channels") if data.get("mattes_all") else None,
-                         merge=merge)
+                         merge=merge, ft=ft_specs(work_dir, data))
     update_outputs(work_dir, "mattes_nk", str(nk).replace("\\", "/"))
     return load_outputs(work_dir)
 

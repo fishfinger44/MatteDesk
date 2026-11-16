@@ -7,6 +7,7 @@
 // in the keys; an empty key ends a correction (the region fades towards it). Points never on parts of the object / on
 // objects in front (pipeline.zone_regions), local warp (params.track = local). „▶▶ Zastosuj poprawki” = POST core_fix
 // -> the mask 1+2 on the shot (view core_fix). Stage 3 (MatAnyone) and the export source "rdzeń (1+2)" use the same zones.
+// Stroke geometry (one stroke, a region = polygons + strokes − eraser) lives in static/brushcore.js – load it first.
 (function () {
   const $ = (id) => document.getElementById(id);
   const V = () => window.viewer;
@@ -102,7 +103,7 @@
   function renderList() {
     const box = $('b2List'); if (!box) return;
     const act = activeZone();
-    const pend = B.pendingNew ? `<div class="zone-card active" style="--zc:${MODES[B.pendingNew].css}" title="Nowa warstwa powstanie z następnej kreski ${MODES[B.pendingNew].label}"><span class="zone-ic">${B.pendingNew === 'add' ? '🖌+' : '🖌−'}</span><span class="zone-name"><b>nowa warstwa ${MODES[B.pendingNew].label}</b><br><span class="muted">następna kreska ją tworzy</span></span></div>` : '';
+    const pend = B.pendingNew ? `<div class="zone-card active" style="--zc:${MODES[B.pendingNew].css}" title="Nowa warstwa powstanie z następnej kreski ${esc(MODES[B.pendingNew].label)}"><span class="zone-ic">${B.pendingNew === 'add' ? '🖌+' : '🖌−'}</span><span class="zone-name"><b>nowa warstwa ${esc(MODES[B.pendingNew].label)}</b><br><span class="muted">następna kreska ją tworzy</span></span></div>` : '';
     box.innerHTML = B.list.length || pend ? B.list.map((z) => {
       const m = MODES[z.mode] || MODES.add; const ks = keyFrames(z);
       return `<div class="zone-card ${z.enabled ? '' : 'off'} ${z === act && !B.pendingNew ? 'active' : ''}" data-z="${esc(z.zone_id)}" style="--zc:${m.css}" title="Warstwa ${layerName(z)}: klucze ${ks.map((f) => 'F' + f).join(', ')} – klik = aktywna (kreski idą do niej), dwuklik = skok do najbliższego klucza">
@@ -340,16 +341,8 @@
   // frame: region = polygon + strokes − erase strokes (rasterised by the canvas, on the GPU); Add = core ∪ the region's
   // components touching the core (connected_to; its 200 px reach is not applied here), Remove = core − region. Frames
   // without a key or a pending stroke keep the server's mask (propagated fixes need CoTracker3).
-  function regionCanvas(W, H, kp, polys, strokes) {   // region of one zone in proxy px (white), erase strokes cut out
-    const c = document.createElement('canvas'); c.width = W; c.height = H;
-    const g = c.getContext('2d');
-    g.fillStyle = g.strokeStyle = '#fff';
-    for (const poly of polys) if (poly && poly.length >= 3) { g.beginPath(); poly.forEach((q, i) => (i ? g.lineTo(q[0] * kp, q[1] * kp) : g.moveTo(q[0] * kp, q[1] * kp))); g.closePath(); g.fill(); }
-    for (const st of strokes.filter((x) => !x.erase)) strokePath(g, st, kp);
-    g.globalCompositeOperation = 'destination-out';
-    for (const st of strokes.filter((x) => x.erase)) strokePath(g, st, kp);
-    return c;
-  }
+  // region of one zone in proxy px (white), erase strokes cut out – the shared brush core (static/brushcore.js)
+  const regionCanvas = (W, Hh, kp, polys, strokes) => window.MD_BRUSHCORE.regionCanvas(W, Hh, kp, polys, strokes, H_drawVar());
   function liveMatte(f) {
     if (!inStage() || !obj()) return null;
     const pend = S().strokes[f] || [];
@@ -424,13 +417,8 @@
   }
 
   // ------------------------------------------------------------------------------------------------ overlays (inside pan / zoom)
-  function strokePath(ctx, st, k) {
-    if (st.p.some((q) => q.length >= 3) && H.drawVarStroke) { H.drawVarStroke(ctx, st.p, k, st.radius_px); return; }
-    ctx.lineWidth = 2 * (st.radius_px || 8) * k; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    ctx.beginPath(); st.p.forEach((q, i) => (i ? ctx.lineTo(q[0] * k, q[1] * k) : ctx.moveTo(q[0] * k, q[1] * k)));
-    if (st.p.length === 1) ctx.lineTo(st.p[0][0] * k + 0.01, st.p[0][1] * k);
-    ctx.stroke();
-  }
+  // stroke geometry = static/brushcore.js (shared with the Cleanup 3D area editor); pen strokes through objects.js
+  const H_drawVar = () => (H && H.drawVarStroke) || null;
   function draw(ctx, img, k, f) {
     if (!inStage() || !B.show) return;
     const v = V();
@@ -443,11 +431,7 @@
         if (key) {   // the key's area as ONE flat layer (polygon + strokes − eraser): one opacity, no darker overlaps
           const paint = (c) => {
             c.fillStyle = c.strokeStyle = `rgb(${r},${g},${b})`;
-            if ((key.polygon || []).length >= 3) { c.beginPath(); key.polygon.forEach((q, i) => (i ? c.lineTo(q[0] * k, q[1] * k) : c.moveTo(q[0] * k, q[1] * k))); c.closePath(); c.fill(); }
-            for (const st of (key.strokes || []).filter((x) => !x.erase)) strokePath(c, st, k);
-            c.globalCompositeOperation = 'destination-out';
-            for (const st of (key.strokes || []).filter((x) => x.erase)) strokePath(c, st, k);
-            c.globalCompositeOperation = 'source-over';
+            window.MD_BRUSHCORE.paintRegion(c, k, [key.polygon || []], key.strokes || [], H_drawVar());
           };
           if (H.flatDraw) H.flatDraw(ctx, B.op / 100, paint);
         } else {

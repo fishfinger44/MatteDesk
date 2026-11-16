@@ -20,12 +20,11 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("matte_desk.installer")
 
@@ -140,9 +139,9 @@ def comfy_python(cfg: Dict[str, Any]) -> Optional[Path]:
     if cfg.get("comfy_python"):
         p = Path(cfg["comfy_python"])
         return p if p.exists() else None
-    d = Path(cfg.get("comfy_dir") or "")
-    if not str(d):
+    if not cfg.get("comfy_dir"):     # (Path("") is "." – it used to find MatteDesk's own .venv in the working folder)
         return None
+    d = Path(cfg["comfy_dir"])
     for c in (d / ".venv" / "Scripts" / "python.exe", d / ".venv" / "bin" / "python",
               d.parent / "python_embeded" / "python.exe"):
         if c.exists():
@@ -164,9 +163,11 @@ def node_status(comfy_dir: str) -> Dict[str, str]:
     return out
 
 
-def _pip_requirements(cfg: Dict[str, Any], name: str, pkg_dir: Path, run: Callable[..., Any], log: List[str]) -> bool:
+def _pip_requirements(cfg: Dict[str, Any], name: str, pkg_dir: Path, run: Callable[..., Any], log: List[str],
+                      constraints: Optional[Path] = None) -> bool:
     """pip install -r <pkg>/requirements.txt into ComfyUI's Python (always, also for an up-to-date package: a node pack
-    copied earlier may still miss its dependencies -> "IMPORT FAILED" in Comfy). False = pip failed."""
+    copied earlier may still miss its dependencies -> "IMPORT FAILED" in Comfy). `constraints` = pip -c file (e.g.
+    torch_constraints: keep ComfyUI's PyTorch). False = pip failed."""
     req = pkg_dir / "requirements.txt"
     if not (req.exists() and req.read_text(encoding="utf-8", errors="ignore").strip()):
         return True
@@ -175,7 +176,8 @@ def _pip_requirements(cfg: Dict[str, Any], name: str, pkg_dir: Path, run: Callab
         log.append(f"{name}: nie znaleziono Pythona ComfyUI – doinstaluj ręcznie: pip install -r {req}")
         return False
     _step(f"pip install ({name})")
-    r = run([str(py), "-m", "pip", "install", "-r", str(req)], capture_output=True, text=True)
+    r = run([str(py), "-m", "pip", "install", "-r", str(req)] + (["-c", str(constraints)] if constraints else []),
+            capture_output=True, text=True)
     log.append(f"{name}: zależności (pip install -r requirements.txt) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
     if r.returncode:
         _log_failure(r, log)
@@ -241,22 +243,61 @@ GIT_NODE_PACKS = {
     "matanyone2_node": ("https://github.com/spiritform/comfy-matanyone2", "ComfyUI-MatAnyone2"),
     "inpaint_nodes": ("https://github.com/Acly/comfyui-inpaint-nodes", "comfyui-inpaint-nodes"),
     "depthcrafter_nodes": ("https://github.com/akatz-ai/ComfyUI-DepthCrafter-Nodes", "ComfyUI-DepthCrafter-Nodes"),
-    "minimax_nodes": ("https://github.com/1038lab/ComfyUI-MiniMax-Remover", "ComfyUI-MiniMax-Remover"),
     # Comfy I/O "png8" (8-bit sources): VHS_LoadImagesPath
     "vhs_nodes": ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite", "ComfyUI-VideoHelperSuite"),
     # stage VideoMaMa (2026-10-16): VideoMaMaPipelineLoader + VideoMaMaSampler (diffusers / transformers / accelerate)
     "videomama_node": ("https://github.com/okdalto/ComfyUI-VideoMaMa", "ComfyUI-VideoMaMa"),
+    # Cleanup 3D „SeedVR2: podbij klucze karty” (2026-11-10): MatteDesk runs its inference_cli.py with ComfyUI's Python
+    "seedvr2_node": ("https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler", "ComfyUI-SeedVR2_VideoUpscaler"),
+    # Inpaint C1 „Wan 2.2 Fun VACE” (2026-11-11): UnetLoaderGGUF for the Q4_K_S experts
+    "gguf_node": ("https://github.com/city96/ComfyUI-GGUF", "ComfyUI-GGUF"),
 }
 # Other folder names of the same pack (ComfyUI Manager clones under the registry id) – never clone a second copy
-GIT_NODE_ALIASES = {"vhs_nodes": ("comfyui-videohelpersuite",)}
+GIT_NODE_ALIASES = {"vhs_nodes": ("comfyui-videohelpersuite",), "gguf_node": ("comfyui-gguf",)}
 
 # Multi-file weights: key -> (Hugging Face repo, [files], folder in models_dir)
-HF_FOLDERS = {
-    "minimax_weights": ("zibojia/minimax-remover",
-                        ["scheduler/scheduler_config.json", "transformer/config.json",
-                         "transformer/diffusion_pytorch_model.safetensors", "vae/config.json",
-                         "vae/diffusion_pytorch_model.safetensors"], "MiniMax-Remover"),
-}
+HF_FOLDERS: Dict[str, Tuple[str, List[str], str]] = {}   # (MiniMax-Remover weights until 2026-11-09)
+
+
+# weights whose ComfyUI node reads ONLY folder_paths.models_dir/<folder> (not the extra model paths): ComfyUI Desktop keeps
+# the models in ComfyUI-Shared\models (--extra-model-paths-config) while models_dir is the install's empty models\ – the
+# MiniMax-Remover loader (dropped 2026-11-09) then downloaded its weights again. A directory junction install\models\<folder> ->
+# models_dir\<folder> lets it find them (nothing copied, custom_nodes untouched).
+COMFY_MODELS_DIR_LINKS: Tuple[str, ...] = ()
+
+
+def comfy_models_link(cfg: Dict[str, Any], folder: str) -> Tuple[Optional[Path], Optional[Path]]:
+    """(link in the Comfy install's models\, target in models_dir) when they differ; (None, None) when the same folder."""
+    comfy_dir, models_dir = cfg.get("comfy_dir") or "", cfg.get("models_dir") or ""
+    if not comfy_dir or not models_dir:
+        return None, None
+    link, target = Path(comfy_dir) / "models" / folder, Path(models_dir) / folder
+    try:
+        if link.resolve() == target.resolve():
+            return None, None
+    except OSError:
+        pass
+    return link, target
+
+
+def link_into_comfy_models(cfg: Dict[str, Any], folder: str) -> str:
+    """Create the junction (Windows) / symlink of COMFY_MODELS_DIR_LINKS; a log line."""
+    link, target = comfy_models_link(cfg, folder)
+    if link is None:
+        return f"{folder}: modele w folderze ComfyUI – połączenie niepotrzebne"
+    if link.exists():
+        return f"{folder}: ComfyUI widzi już {link}"
+    if not target.is_dir():
+        return f"{folder}: brak {target} – połączenie pominięte"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        if r.returncode != 0:
+            return f"{folder}: nie udało się połączyć {link} -> {target}: {(r.stderr or r.stdout).strip()[:200]}"
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    return f"{folder}: połączono {link} -> {target} (węzeł ComfyUI czyta tylko swój folder models)"
 
 
 def install_model(cfg: Dict[str, Any], key: str, download: Callable[[str, Path], None] = _download) -> Dict[str, Any]:
@@ -273,6 +314,8 @@ def install_model(cfg: Dict[str, Any], key: str, download: Callable[[str, Path],
                 continue
             download(f"https://huggingface.co/{repo}/resolve/main/{f}", dst)
             log.append(f"pobrane: {dst} ({dst.stat().st_size / 1048576:.0f} MB)")
+        if key in COMFY_MODELS_DIR_LINKS:
+            log.append(link_into_comfy_models(cfg, folder))
         return {"success": True, "log": log, "weights": str(Path(models_dir) / folder)}
     url, rel = model_download(key, cfg)
     dst = Path(models_dir) / rel
@@ -307,7 +350,7 @@ def install_ltx(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], No
                 keys: Optional[List[str]] = None) -> Dict[str, Any]:
     """Stage „LTX-2.5 Alpha-Gen”: the five LTX-2.5 files (~40 GB) into models_dir, from the gated Lightricks repos with the
     user's HF login. Present files are skipped; interrupted downloads resume."""
-    from engine.ltx_alpha import HF_PATH, LTX_MODELS
+    from engine.ltx_alpha import HF_PATH, LTX_MODELS, models_status
     models_dir = cfg.get("models_dir") or ""
     if not models_dir:
         raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
@@ -319,10 +362,14 @@ def install_ltx(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], No
                                "Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen.")
         download = lambda url, dst: _download_hf(url, dst, token)
     log: List[str] = []
+    needed = {m["key"]: m["needed"] for m in models_status(models_dir)}
     for key, (folder, fn, repo, gb) in LTX_MODELS.items():
         if keys and key not in keys:
             continue
         dst = Path(models_dir) / folder / fn
+        if not needed[key] and not dst.exists():
+            log.append(f"niepotrzebne: {fn} (pusty prompt już zakodowany – ltx_conditioning)")
+            continue
         if dst.exists() and dst.stat().st_size > 0.9 * gb * 1e9:
             log.append(f"już jest: {dst}")
             continue
@@ -363,7 +410,490 @@ def install_videomama(cfg: Dict[str, Any], download: Optional[Callable[[str, Pat
     return {"success": True, "log": log, "restart_comfy": not had_node}
 
 
-def install_git_node(cfg: Dict[str, Any], key: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+# --- Cleanup 3D (docs/PLAN_CLEANUP_3D.md, package P3) -------------------------------------------------------------
+def _klein_texts() -> Tuple[str, str]:
+    from engine.stage_models import KLEIN_PAGE
+    login = ("Brak logowania do Hugging Face: FLUX 3 Image Klein jest „gated”. Zaloguj się („hf auth login”, token Read z "
+             "https://huggingface.co/settings/tokens) i zaakceptuj dostęp (FLUX Kommunity License) na stronie modelu "
+             f"{KLEIN_PAGE}, potem kliknij „Zainstaluj” jeszcze raz.")
+    denied = ("Hugging Face odmówił dostępu do FLUX 3 Image Klein (401/403): zaakceptuj dostęp (FLUX Kommunity License) "
+              f"na stronie modelu {KLEIN_PAGE} tym samym kontem, którym zalogowano „hf auth login”, potem kliknij "
+              "„Zainstaluj” jeszcze raz – pobieranie wznowi się.")
+    return login, denied
+
+
+def _denied(e: BaseException) -> bool:
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (401, 403)
+    return "401/403" in str(e)
+
+
+def _install_hf_files(cfg: Dict[str, Any], files: List[Dict[str, Any]], what: str,
+                      download: Callable[[str, Path], None], denied_msg: Optional[str] = None) -> Dict[str, Any]:
+    """Download the missing files of `files` (stage_models.*_status rows) into models_dir; present files are skipped,
+    interrupted downloads resume (engine/download.py, SHA-256 from Hugging Face)."""
+    models_dir = Path(cfg["models_dir"])
+    log: List[str] = []
+    for m in files:
+        dst = models_dir / m["folder"] / m["file"]
+        if m["present"]:
+            log.append(f"już jest: {dst}")
+            continue
+        _step(f"{what}: {m['file']} ({m['gb']:.2f} GB)")
+        try:
+            download(m["url"], dst)
+        except (RuntimeError, urllib.error.HTTPError) as e:
+            if denied_msg and _denied(e):
+                raise RuntimeError(denied_msg) from None
+            raise
+        log.append(f"pobrane: {dst} ({dst.stat().st_size / 2 ** 30:.2f} GB)")
+    log.append("Odśwież listę modeli w ComfyUI (klawisz R) albo zrestartuj Comfy.")
+    return {"success": True, "log": log}
+
+
+def install_flux3_klein(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None) -> Dict[str, Any]:
+    """Cleanup 3D engine „FLUX 3 Image Klein + LoRA Restore”: the three FLUX 3 Image Klein files (~20.3 GB) from the gated
+    black-forest-labs repo with the user's HF login (as LTX-2.5)."""
+    from engine.stage_models import klein_status
+    if not cfg.get("models_dir"):
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    login, denied = _klein_texts()
+    if download is None:
+        token = hf_token()
+        if not token:
+            raise RuntimeError(login)
+        download = lambda url, dst: _download_hf(url, dst, token)
+    return _install_hf_files(cfg, klein_status(Path(cfg["models_dir"])), "FLUX 3 Image Klein", download, denied)
+
+
+def install_klein_restore_lora(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None
+                               ) -> Dict[str, Any]:
+    """LoRA Restore for FLUX 3 Image Klein (public repo, 161 MB) -> models/loras."""
+    from engine.stage_models import klein_lora_status
+    if not cfg.get("models_dir"):
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    return _install_hf_files(cfg, klein_lora_status(Path(cfg["models_dir"])), "LoRA Restore (FLUX 3 Image Klein)", download)
+
+
+def install_qwen21(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None) -> Dict[str, Any]:
+    """Cleanup 3D engine „Qwen-Image-2.1”: the three files (~17.3 GB) of Comfy-Org/Qwen-Image-2.1 (the HF login is used
+    when there is one; the repo is not gated as far as checked 2026-11-10)."""
+    from engine.stage_models import QWEN21_PAGE, qwen21_status
+    if not cfg.get("models_dir"):
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    denied = (f"Hugging Face odmówił dostępu do Qwen-Image-2.1 (401/403): otwórz stronę modelu {QWEN21_PAGE}, zaakceptuj "
+              "warunki, jeśli strona o to prosi, zaloguj się („hf auth login”) i kliknij „Zainstaluj” jeszcze raz.")
+    return _install_hf_files(cfg, qwen21_status(Path(cfg["models_dir"])), "Qwen-Image-2.1", download, denied)
+
+
+# COLMAP (CUDA) for the camera solve of Cleanup 3D (package P10): the official Windows build, BSD. Checked at the source
+# 2026-11-09 (GitHub releases API: size + `digest`). Unpacked next to the portable ffmpeg (engine/tools_install.py BIN_DIR).
+COLMAP_TAG = "4.2.1"
+COLMAP_ASSET = "colmap-x64-windows-cuda.zip"
+COLMAP_URL = f"https://github.com/colmap/colmap/releases/download/{COLMAP_TAG}/{COLMAP_ASSET}"
+COLMAP_SHA256 = "e9c5cbd84c2ea986d2e970a2473fc2d2e6b34a2cdcf5d3df2765c319a63af881"
+COLMAP_BYTES = 414666626
+COLMAP_DIR = REPO_DIR / "bin" / "colmap"
+
+
+def colmap_exe(cfg: Optional[Dict[str, Any]] = None, root: Optional[Path] = None) -> Optional[Path]:
+    """colmap.exe: config `colmap_path`, else <repo>/bin/colmap (bin/colmap.exe of the official package); None = missing."""
+    p = str((cfg or {}).get("colmap_path") or "")
+    if p and Path(p).is_file():
+        return Path(p)
+    root = Path(root or COLMAP_DIR)
+    for c in (root / "bin" / "colmap.exe", root / "colmap.exe"):
+        if c.is_file():
+            return c
+    return None
+
+
+def install_colmap(cfg: Dict[str, Any], download: Optional[Callable[[str, Path, str], None]] = None,
+                   root: Optional[Path] = None) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj COLMAP (CUDA)”: the release zip (resumable, SHA-256 checked) unpacked into <repo>/bin/colmap."""
+    import zipfile
+    root = Path(root or COLMAP_DIR)
+    found = colmap_exe(cfg, root)
+    if found:
+        return {"success": True, "log": [f"COLMAP już jest: {found}"], "path": str(found)}
+    if download is None:
+        from engine.download import download as _dl
+        download = lambda url, dst, sha: _dl(url, dst, sha256=sha, progress=_progress_cb(dst))
+    root.parent.mkdir(parents=True, exist_ok=True)
+    zpath = root.parent / COLMAP_ASSET
+    _step(f"COLMAP {COLMAP_TAG} (CUDA): {COLMAP_ASSET} ({COLMAP_BYTES / 2 ** 20:.0f} MB)")
+    download(COLMAP_URL, zpath, COLMAP_SHA256)
+    _step("rozpakowywanie COLMAP")
+    tmp = root.parent / "colmap_unpack"
+    shutil.rmtree(tmp, ignore_errors=True)
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(tmp)
+    exe = next(iter(sorted(tmp.rglob("colmap.exe"))), None)
+    if exe is None:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"W paczce {COLMAP_ASSET} nie ma colmap.exe – pobierz ręcznie z "
+                           "https://github.com/colmap/colmap/releases")
+    top = exe.parent.parent if exe.parent.name.lower() == "bin" else exe.parent
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.move(str(top), str(root))
+    shutil.rmtree(tmp, ignore_errors=True)
+    zpath.unlink(missing_ok=True)
+    found = colmap_exe(cfg, root)
+    if not found:
+        raise RuntimeError(f"COLMAP rozpakowany do {root}, ale nie znaleziono colmap.exe")
+    return {"success": True, "log": [f"COLMAP {COLMAP_TAG} (CUDA) rozpakowany do {root}"], "path": str(found)}
+
+
+# --- Cleanup 3D P12: SeedVR2 inside ComfyUI, VOID in a venv on ComfyUI's Python (user decision 2026-11-10) ---------
+TORCH_PKGS = ("torch", "torchvision", "torchaudio")
+
+
+def torch_constraints(py: Path, run: Callable[..., Any], dst: Path) -> Optional[Path]:
+    """A pip constraints file pinning the PyTorch packages `py` already has (exact version incl. +cuXXX) – pip then
+    never swaps ComfyUI's CUDA PyTorch for another build. None = no PyTorch there."""
+    code = ("import importlib.metadata as m\n"
+            f"for p in {TORCH_PKGS!r}:\n"
+            "    try: print(p + '==' + m.version(p))\n"
+            "    except m.PackageNotFoundError: pass\n")
+    r = run([str(py), "-c", code], capture_output=True, text=True)
+    pins = [ln.strip() for ln in (getattr(r, "stdout", "") or "").splitlines() if "==" in ln]
+    if getattr(r, "returncode", 1) != 0 or not any(p.startswith("torch==") for p in pins):
+        return None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("\n".join(pins) + "\n", encoding="utf-8")
+    return dst
+
+
+def _hf_files_to(repo: str, files: List[Tuple[str, float]], dst_dir: Path, what: str,
+                 download: Callable[[str, Path], None], log: List[str]) -> None:
+    """Download `files` [(path in repo, GB)] of the public HF `repo` into dst_dir; present files (>= 90 % of the size)
+    are skipped, interrupted ones resume."""
+    for rel, gb in files:
+        dst = dst_dir / rel
+        if dst.exists() and dst.stat().st_size >= 0.9 * gb * 1e9:
+            log.append(f"już jest: {dst}")
+            continue
+        _step(f"{what}: {rel}" + (f" ({gb:.1f} GB)" if gb >= 0.05 else ""))
+        download(f"https://huggingface.co/{repo}/resolve/main/{rel}", dst)
+        log.append(f"pobrane: {dst}" + (f" ({dst.stat().st_size / 2 ** 30:.2f} GB)" if gb >= 0.05 else ""))
+
+
+SEEDVR2_HF = "numz/SeedVR2_comfyUI"
+SEEDVR2_FILES = [("seedvr2_ema_7b_sharp_fp8_e4m3fn.safetensors", 7.67), ("ema_vae_fp16.safetensors", 0.47)]
+
+
+def seedvr2_files(card_gb: Optional[float] = None) -> List[Tuple[str, float]]:
+    """The DiT of the card's variant (void_engine.seedvr2_variant: 3B fp8 under 16 GB, else 7B sharp fp8) + the VAE."""
+    from engine.cleanup3d.void_engine import SEEDVR2_DITS, seedvr2_variant
+    return [SEEDVR2_DITS[seedvr2_variant(card_gb)], SEEDVR2_FILES[1]]
+
+
+def install_seedvr2(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,
+                    run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj SeedVR2”: the ComfyUI-SeedVR2_VideoUpscaler node into ComfyUI's custom_nodes, its
+    requirements into ComfyUI's Python with ComfyUI's PyTorch pinned, and the DiT of the card's variant (3B fp8 3.4 GB
+    under 16 GB VRAM, else 7B sharp fp8 8.2 GB) + the VAE into
+    <models_dir>/SEEDVR2. MatteDesk runs its inference_cli.py with ComfyUI's Python – no ComfyUI restart needed."""
+    from engine.cleanup3d.void_engine import tool_paths
+    py = comfy_python(cfg)
+    if py is None:
+        raise RuntimeError("Nie znaleziono Pythona ComfyUI – SeedVR2 instaluje się w ComfyUI. Ustaw ComfyUI w Doktorze.")
+    pins = torch_constraints(py, run, REPO_DIR / "bin" / "torch_pins_comfy.txt")   # bin/ is outside git
+    res = install_git_node(cfg, "seedvr2_node", run=run, constraints=pins)
+    log = [ln for ln in (res.get("log") or []) if not ln.startswith("Zrestartuj ComfyUI")]
+    log.append("PyTorch ComfyUI przypięty (pip -c): " + (pins.read_text(encoding="utf-8").replace("\n", " ").strip()
+                                                         if pins else "nie odczytano wersji – pip mógł go zmienić"))
+    if not res.get("success"):
+        return {"success": False, "log": log}
+    models = tool_paths(cfg, "seedvr2")["models"]
+    if models is None:
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    _hf_files_to(SEEDVR2_HF, seedvr2_files(), Path(models), "SeedVR2", download, log)
+    log.append("SeedVR2 gotowy – „Odśwież test”.")
+    return {"success": True, "log": log, "restart_comfy": False}
+
+
+VOID_GIT = "https://github.com/Netflix/void-model"
+VOID_HF = "netflix/void-model"
+VOID_BASE_HF = "alibaba-pai/CogVideoX-Fun-V1.5-5b-InP"
+# the repo's requirements.txt pins torch==2.7.1 (the PyPI build for Windows has no CUDA) and training tools (deepspeed,
+# tensorboard, datasets): MatteDesk installs only what inference (predict_v2v.py and the videox_fun modules it imports,
+# checked 2026-11-10) needs; the API-sensitive libraries at the repo's versions, the rest as ComfyUI has them.
+VOID_PIP = ["diffusers==0.33.1", "transformers==4.57.1", "accelerate==1.12.0", "peft==0.17.1", "safetensors>=0.6.2",
+            "absl-py", "ml_collections", "loguru", "mediapy", "einops", "imageio", "imageio-ffmpeg", "scikit-image",
+            "matplotlib", "scipy", "albumentations", "decord", "func-timeout", "sentencepiece", "opencv-python",
+            "Pillow", "omegaconf", "tqdm", "ftfy", "beautifulsoup4", "timm"]
+# predict_v2v.py loads the VAE without tiling: at 1344x768 it then fills a 24 GB card and stalls (experiment 2026-11-08,
+# experiments/removers/void/patches/void_windows.patch). Inserted after the VAE load, idempotent.
+VOID_VAE_ANCHOR = 'subfolder="vae"\n    ).to(weight_dtype)\n'
+VOID_VAE_PATCH = "    vae.enable_tiling(); vae.enable_slicing()  # MatteDesk: hi-res VAE without filling the card\n"
+VOID_BASE_SKIP = (".gitattributes", "README.md", "README_en.md", "LICENSE")
+
+
+def patch_void_vae(repo: Path) -> str:
+    """Add VAE tiling / slicing to the clone's predict_v2v.py (our clone in bin/void, not a ComfyUI node)."""
+    f = Path(repo) / "inference" / "cogvideox_fun" / "predict_v2v.py"
+    src = f.read_text(encoding="utf-8")
+    if VOID_VAE_PATCH in src:
+        return "predict_v2v.py: kafelkowanie VAE już jest"
+    if VOID_VAE_ANCHOR not in src:
+        return "predict_v2v.py: nie znaleziono miejsca łatki kafelkowania VAE – przy 1344×768 VOID może stanąć"
+    f.write_text(src.replace(VOID_VAE_ANCHOR, VOID_VAE_ANCHOR + VOID_VAE_PATCH, 1), encoding="utf-8")
+    return "predict_v2v.py: dodane kafelkowanie VAE (enable_tiling / enable_slicing)"
+
+
+def _hf_tree(repo: str, token: Optional[str]) -> List[Tuple[str, float]]:
+    """[(path, GB)] of every file in a Hugging Face model repo (the public tree API)."""
+    import json as _json
+    req = urllib.request.Request(f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true",
+                                 headers={"User-Agent": "MatteDesk", **({"Authorization": f"Bearer {token}"} if token else {})})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        rows = _json.loads(r.read().decode("utf-8"))
+    return [(x["path"], float(x.get("size") or 0) / 1e9) for x in rows if x.get("type") == "file"]
+
+
+def install_void_legacy(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,
+                 run: Callable[..., Any] = subprocess.run, tree: Optional[Callable[[str], List[Tuple[str, float]]]] = None,
+                 home: Optional[Path] = None) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj VOID”: git clone Netflix/void-model into bin/void, a venv made with ComfyUI's Python that
+    sees ComfyUI's packages through a .pth (its CUDA PyTorch is reused, not downloaded again; the venv's own packages –
+    diffusers / transformers at VOID's versions – come first, ComfyUI stays untouched), the VAE tiling patch, and the
+    weights: CogVideoX-Fun-V1.5-5b-InP (19.7 GB) + void_pass1.safetensors (10.4 GB) into <models_dir>/void."""
+    from engine.cleanup3d import void_engine as VE
+    py = comfy_python(cfg)
+    if py is None:
+        raise RuntimeError("Nie znaleziono Pythona ComfyUI – venv VOID powstaje na nim (jego PyTorch z CUDA). "
+                           "Ustaw ComfyUI w Doktorze.")
+    from engine.tools_install import find_tool
+    git = find_tool("git", cfg)
+    if not git:
+        raise RuntimeError("Brak Gita – kliknij „Zainstaluj” przy pozycji „Git” w Doktorze, potem spróbuj ponownie.")
+    home = Path(home or VE.VOID_HOME)
+    paths = VE.tool_paths(cfg, "void")
+    repo = Path(cfg.get("void_repo") or home / "void-model")
+    venv = home / "venv"
+    vpy = Path(cfg.get("void_python") or VE.venv_python(venv))
+    log: List[str] = []
+    fail = lambda r: (_log_failure(r, log), {"success": False, "log": log})[1]   # noqa: E731
+    home.mkdir(parents=True, exist_ok=True)
+    if not (repo / VE.VOID_SCRIPT).exists():
+        _step("git clone void-model")
+        r = run([git, "clone", "--depth", "1", VOID_GIT, str(repo)], capture_output=True, text=True)
+        log.append(f"git clone {VOID_GIT} -> kod {r.returncode}")
+        if r.returncode:
+            return fail(r)
+    else:
+        log.append(f"void-model: już jest ({repo})")
+    log.append(patch_void_vae(repo))
+    if not vpy.exists():
+        _step("venv VOID (Python ComfyUI)")
+        r = run([str(py), "-m", "venv", str(venv)], capture_output=True, text=True)
+        log.append(f"venv {venv} z {py} -> kod {r.returncode}")
+        if r.returncode:
+            return fail(r)
+    # ComfyUI's site-packages AFTER the venv's own (a .pth appends to sys.path): its PyTorch is reused
+    r = run([str(py), "-c", "import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))"],
+            capture_output=True, text=True)
+    comfy_site = (getattr(r, "stdout", "") or "").strip().splitlines()[-1:] if r.returncode == 0 else []
+    if not comfy_site:
+        log.append("Python ComfyUI nie ma PyTorcha – venv VOID nie ma czego współdzielić.")
+        return fail(r)
+    r = run([str(vpy), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"], capture_output=True, text=True)
+    if r.returncode:
+        return fail(r)
+    site = Path((r.stdout or "").strip().splitlines()[-1])
+    site.mkdir(parents=True, exist_ok=True)
+    (site / "_matte_desk_comfy.pth").write_text(comfy_site[0] + "\n", encoding="utf-8")
+    log.append(f"venv VOID widzi pakiety ComfyUI: {comfy_site[0]}")
+    pins = torch_constraints(py, run, home / "torch_pins.txt")
+    _step("pip install (VOID, tylko inferencja)")
+    r = run([str(vpy), "-m", "pip", "install", *VOID_PIP] + (["-c", str(pins)] if pins else []),
+            capture_output=True, text=True)
+    log.append(f"pip install (VOID) -> {'OK' if r.returncode == 0 else 'BŁĄD, kod ' + str(r.returncode)}")
+    if r.returncode:
+        return fail(r)
+    r = run([str(vpy), "-c", "import torch, diffusers, transformers; "
+                             "print(torch.__version__, torch.cuda.is_available(), diffusers.__version__, transformers.__version__)"],
+            capture_output=True, text=True)
+    log.append("venv VOID: torch / CUDA / diffusers / transformers = " + ((r.stdout or "").strip() or "?"))
+    if r.returncode:
+        return fail(r)
+    models = Path(paths["models"]) if cfg.get("void_models") or cfg.get("models_dir") else repo
+    token = hf_token()
+    if download is None:
+        download = lambda url, dst: _download_hf(url, dst, token)
+    tree = tree or (lambda rp: _hf_tree(rp, token))
+    base = [(p, gb) for p, gb in tree(VOID_BASE_HF) if Path(p).name not in VOID_BASE_SKIP]
+    _hf_files_to(VOID_BASE_HF, base, models / VE.VOID_BASE, "VOID: CogVideoX-Fun-V1.5-5b-InP", download, log)
+    _hf_files_to(VOID_HF, [(VE.VOID_TRANSFORMER, 10.38)], models, "VOID", download, log)
+    log.append("VOID gotowy – „Odśwież test”.")
+    return {"success": True, "log": log, "restart_comfy": False}
+
+
+def install_void(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,
+                 run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj VOID” (2026-11-11: natively in ComfyUI ≥ 0.45, no repo / venv): Comfy-Org/void-model
+    void_pass1 (11.1 GB, a whole transformer) + cogvideox_vae (0.4 GB) and – only when no t5xxl is there – t5xxl_fp16
+    (9.8 GB) into ComfyUI's models. The old repo + venv setup (install_void_legacy) stays usable when complete."""
+    from engine.cleanup3d import void_engine as VE
+    md = cfg.get("models_dir")
+    if not md:
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    have = VE.void_native_files(cfg)
+    log: List[str] = []
+    for rel, folder, name, gb in VE.VOID_NATIVE_FILES:
+        if folder == "text_encoders" and have["clip"]:
+            log.append(f"już jest: {have['clip']} (koder T5 wspólny z innymi modelami)")
+            continue
+        dst = Path(md) / folder / name
+        if dst.exists() and dst.stat().st_size >= 0.99 * gb * 1e9:
+            log.append(f"już jest: {dst}")
+            continue
+        _step(f"VOID: {name} ({gb:.1f} GB)")
+        download(f"https://huggingface.co/{VE.VOID_NATIVE_REPO}/resolve/main/{rel}", dst)
+        log.append(f"pobrane: {dst}")
+    log.append("VOID gotowy (natywnie w ComfyUI, wymaga ComfyUI ≥ 0.45) – „Odśwież test”.")
+    return {"success": True, "log": log, "restart_comfy": False}
+
+
+def install_vace(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,
+                 run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj Wan 2.2 Fun VACE” (Inpaint C1, 2026-11-11): the ComfyUI-GGUF node (UnetLoaderGGUF) into
+    ComfyUI's custom_nodes with ComfyUI's PyTorch pinned, the two Q4_K_S experts (2 x 10.6 GB, QuantStack, Apache-2.0)
+    into models/diffusion_models, the two Lightning LoRAs (2 x 1.23 GB – user 2026-11-13: installed WITH the model, so
+    „szybko – 4 kroki” never silently runs 20) and – only when missing – the umt5 text encoder (6.7 GB) and the Wan VAE
+    (0.25 GB). A ComfyUI restart is needed for the new node."""
+    from engine import vace_fill as VF
+    py = comfy_python(cfg)
+    if py is None:
+        raise RuntimeError("Nie znaleziono Pythona ComfyUI – Wan 2.2 Fun VACE działa w ComfyUI. Ustaw ComfyUI w Doktorze.")
+    md = cfg.get("models_dir")
+    if not md:
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    pins = torch_constraints(py, run, REPO_DIR / "bin" / "torch_pins_comfy.txt")
+    res = install_git_node(cfg, "gguf_node", run=run, constraints=pins)
+    log = list(res.get("log") or [])
+    if not res.get("success"):
+        return {"success": False, "log": log}
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    rows = [(VF.REPO, rel, folder, name, size) for rel, folder, name, size, _sha in VF.HF_FILES]
+    rows += [(VF.LIGHTNING_REPO, rel, folder, name, size) for rel, folder, name, size in VF.LIGHTNING_FILES]
+    have = VF.files(cfg)
+    rows += [(VF.WAN_REPO, rel, folder, name, size) for rel, folder, name, size in VF.SHARED_FILES
+             if not have["clip" if folder == "text_encoders" else "vae"]]
+    for repo, rel, folder, name, size in rows:
+        dst = Path(md) / folder / name
+        if dst.exists() and dst.stat().st_size >= 0.99 * size:
+            log.append(f"już jest: {dst}")
+            continue
+        _step(f"{VF.LABEL}: {name} ({size / 1e9:.1f} GB)")
+        download(f"https://huggingface.co/{repo}/resolve/main/{rel}", dst)
+        log.append(f"pobrane: {dst}")
+    log.append("Wan 2.2 Fun VACE gotowy – zrestartuj ComfyUI (nowy węzeł ComfyUI-GGUF), potem „Odśwież test”.")
+    return {"success": True, "log": log, "restart_comfy": True}
+
+
+def install_vace_lightning(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None,
+                           run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj LoRA Lightning (Wan 2.2 Fun VACE)” (2026-11-11): the two lightx2v 4-step LoRAs (T2V A14B,
+    2 x 1.23 GB, Comfy-Org/Wan_2.2_ComfyUI_Repackaged) into models/loras – Wan 2.2 Fun VACE in 4 steps at CFG 1."""
+    from engine import vace_fill as VF
+    md = cfg.get("models_dir")
+    if not md:
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    log: List[str] = []
+    for rel, folder, name, size in VF.LIGHTNING_FILES:
+        dst = Path(md) / folder / name
+        if dst.exists() and dst.stat().st_size >= 0.99 * size:
+            log.append(f"już jest: {dst}")
+            continue
+        _step(f"LoRA Lightning: {name} ({size / 1e9:.2f} GB)")
+        download(f"https://huggingface.co/{VF.LIGHTNING_REPO}/resolve/main/{rel}", dst)
+        log.append(f"pobrane: {dst}")
+    log.append("LoRA Lightning gotowe – Wan 2.2 Fun VACE liczy „szybko” w 4 krokach (restart ComfyUI niepotrzebny).")
+    return {"success": True, "log": log, "restart_comfy": False}
+
+
+def install_ltx_inpaint(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None) -> Dict[str, Any]:
+    """Doctor's „Zainstaluj LoRA inpaintu LTX-2.5” (Inpaint C1, 2026-11-13): the in-/outpainting IC-LoRA (1.31 GB,
+    Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting, gated – the user's HF login with the LTX-2.x licence accepted) into
+    models/loras. The base LTX-2.5 files are stage 7's install („ltx”)."""
+    from engine import ltx_fill as LF
+    md = cfg.get("models_dir")
+    if not md:
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    folder, name, repo, size = LF.LORA
+    if download is None:
+        token = hf_token()
+        if not token:
+            raise RuntimeError(f"Brak logowania do Hugging Face: {repo} jest „gated”. Zaloguj się („hf auth login”) i "
+                               f"zaakceptuj licencję LTX-2.x na stronie huggingface.co/{repo}.")
+        download = lambda url, dst: _download_hf(url, dst, token)
+    dst = Path(md) / folder / name
+    log: List[str] = []
+    if dst.exists() and dst.stat().st_size >= 0.99 * size:
+        log.append(f"już jest: {dst}")
+    else:
+        _step(f"LoRA inpaintu LTX-2.5: {name} ({size / 1e9:.2f} GB)")
+        download(f"https://huggingface.co/{repo}/resolve/main/{name}", dst)
+        log.append(f"pobrane: {dst}")
+    log.append("LoRA inpaintu gotowa – silnik „LTX-2.5” w Inpaint (C1); odśwież listę modeli w ComfyUI (R), restart niepotrzebny.")
+    return {"success": True, "log": log, "restart_comfy": False}
+
+
+def install_prompt_assist(cfg: Dict[str, Any], download: Optional[Callable[[str, Path], None]] = None) -> Dict[str, Any]:
+    """Inpaint (C1) „✨ Popraw opis”: the Qwen3-VL-4B-Instruct snapshot (~8.9 GB, Apache-2.0, not gated) into
+    models/LLM/Qwen3-VL-4B-Instruct; runs in ComfyUI's Python with its transformers (engine/prompt_worker.py)."""
+    from engine import prompt_assist as PA
+    if not cfg.get("models_dir"):
+        raise RuntimeError("Brak models_dir (ustaw comfy_dir/models_dir w config.local.json).")
+    if download is None:
+        token = hf_token()
+        download = lambda url, dst: _download_hf(url, dst, token)
+    r = _install_hf_files(cfg, PA.status(Path(cfg["models_dir"])), PA.LABEL, download)
+    r["log"] = [x for x in r["log"] if "Odśwież listę modeli" not in x] + [
+        f"{PA.LABEL} gotowy – „✨ Popraw opis” w palecie Inpaint (restart ComfyUI niepotrzebny)."]
+    r["restart_comfy"] = False
+    return r
+
+
+# Doctor actions without their own branch in app.py's /api/install/{what}: what -> installer(cfg)
+INSTALL_ACTIONS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
+    "prompt_assist": install_prompt_assist,
+    "flux3_klein": install_flux3_klein,
+    "klein_restore_lora": install_klein_restore_lora,
+    "qwen21": install_qwen21,
+    "colmap": install_colmap,
+    "seedvr2": install_seedvr2,
+    "void": install_void,
+    "vace": install_vace,
+    "vace_lightning": install_vace_lightning,
+    "ltx_inpaint": install_ltx_inpaint,
+    # ComfyUI from git (2026-11-10): engine/comfy_update.py
+    "comfy_update": lambda cfg: __import__("engine.comfy_update", fromlist=["update"]).update(cfg),
+    "comfy_rollback": lambda cfg: __import__("engine.comfy_update", fromlist=["rollback"]).rollback(cfg),
+}
+
+
+def install_git_node(cfg: Dict[str, Any], key: str, run: Callable[..., Any] = subprocess.run,
+                     constraints: Optional[Path] = None) -> Dict[str, Any]:
     comfy_dir = cfg.get("comfy_dir") or ""
     cn = Path(comfy_dir) / "custom_nodes"
     if not comfy_dir or not cn.is_dir():
@@ -385,7 +915,7 @@ def install_git_node(cfg: Dict[str, Any], key: str, run: Callable[..., Any] = su
         if r.returncode:
             _log_failure(r, log)
             return {"success": False, "log": log}
-    ok = _pip_requirements(cfg, name, dst, run, log)
+    ok = _pip_requirements(cfg, name, dst, run, log, constraints)
     ok = _run_install_py(cfg, name, dst, run, log) and ok
     log.append("Zrestartuj ComfyUI (Desktop: w aplikacji), potem „Odśwież test”.")
     return {"success": ok, "log": log, "restart_comfy": True}

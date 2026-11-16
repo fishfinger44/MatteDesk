@@ -253,6 +253,13 @@ def main() -> int:
         return 0
 
 
+def version_key(v: str) -> tuple:
+    """'0.60' -> (0, 60); the minor part always counts as two digits (0.4 was 0.40, CLAUDE.md versioning)."""
+    parts = (str(v or "0").strip().lstrip("v").split(".") + ["0"])[:2]
+    digits = ["".join(ch for ch in p if ch.isdigit()) or "0" for p in parts]
+    return int(digits[0]), int(digits[1].ljust(2, "0")[:2])
+
+
 def disk_version(app_dir: Path = APP_DIR) -> str:
     try:
         return (app_dir / "VERSION").read_text(encoding="utf-8").strip()
@@ -267,6 +274,10 @@ def replace_old_server(get_json: Callable[[str], Optional[dict]] = _get_json, as
     v = get_json("/api/version") or {}
     mine = disk_version()
     if not v or (str(v.get("version")) == mine and not v.get("stale")):
+        return False
+    if version_key(str(v.get("version"))) > version_key(mine):
+        # a NEWER MatteDesk runs (e.g. a git checkout while this shortcut is an older installed copy, 2026-11-10):
+        # never replace it by this older one – use it (its own window / start_v….bat restarts it)
         return False
     ask = ask or message
     job = running_job(get_json)

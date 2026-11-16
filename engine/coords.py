@@ -13,7 +13,7 @@ Complies with SPEC_INTERACTIVE_MATTE_TOOL.md (Section 3, 4, 5.1, 12: Stage E1):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Sequence, Tuple
 
 
 @dataclass(frozen=True)

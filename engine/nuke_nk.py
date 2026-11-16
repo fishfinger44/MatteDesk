@@ -70,6 +70,12 @@ def xy_knob(name: str, frames: Sequence[int], xs: Sequence[float], ys: Sequence[
     return f"{name} {{{curve(frames, xs, nd)} {curve(frames, ys, nd)}}}"
 
 
+def vec_knob(name: str, frames: Sequence[int], comps: Sequence[Sequence[float]], nd: int = 4) -> str:
+    """Any multi-component knob (XYZ translate / rotate / scaling): `name {{curve ..} {curve ..} {curve ..}}` – one
+    outer brace pair, a constant component collapses to its bare value (as xy_knob)."""
+    return f"{name} {{" + " ".join(curve(frames, c, nd) for c in comps) + "}"
+
+
 def corner_pin_knobs(frames: Sequence[int], matrices_nuke: Iterable[np.ndarray], w: int, h: int, nd: int = 3) -> List[str]:
     """to1..to4 / from1..from4 for a CornerPin2D whose 'from' = plate corners (Nuke coords, BL BR TR TL)."""
     corners = [(0.0, 0.0), (float(w), 0.0), (float(w), float(h)), (0.0, float(h))]
@@ -90,8 +96,9 @@ def corner_pin_knobs(frames: Sequence[int], matrices_nuke: Iterable[np.ndarray],
 _BAD_XY = re.compile(r"\}\}\s+\{\{curve")
 
 
-def validate_nk(text: str, group_name: str = "") -> List[str]:
-    """Structural checks of a generated Group .nk. Returns a list of problems (empty = OK)."""
+def validate_script(text: str) -> List[str]:
+    """Structural checks common to every generated .nk text: balanced braces outside strings, closed strings, the
+    animated XY knob syntax. Returns a list of problems (empty = OK)."""
     problems = []
     depth = 0
     in_str = False
@@ -114,6 +121,12 @@ def validate_nk(text: str, group_name: str = "") -> List[str]:
         problems.append("unterminated string")
     if _BAD_XY.search(text):
         problems.append("XY knob written as {{curve}} {{curve}} – must be {{curve ..} {curve ..}}")
+    return problems
+
+
+def validate_nk(text: str, group_name: str = "") -> List[str]:
+    """Structural checks of a generated Group .nk. Returns a list of problems (empty = OK)."""
+    problems = validate_script(text)
     if not text.lstrip().startswith("Group {"):
         problems.append("does not start with Group {")
     if not text.rstrip().endswith("end_group"):

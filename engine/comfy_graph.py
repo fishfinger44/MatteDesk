@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Set, Tuple, Union
 
 _SEED_CONTROL = {"fixed", "randomize", "increment", "decrement"}
 

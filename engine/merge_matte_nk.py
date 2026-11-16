@@ -7,8 +7,14 @@ node by node.
 MergeMatte = Merge(over) of a premultiplied FG with edge treatments: Alpha (choke, soften) → Decontaminate (decon,
 decon_spread) → Darken edge (darken, darken_width) → Match edge (match, match_exposure, match_saturation, match_width) →
 Light wrap (wrap, wrap_size, flare, flare_threshold, flare_softness) → Bleed colour (bleed, bleed_size) → Edge blur
-(edge_blur) → log (ACEScct), mix, bypass. Inputs: 0 = BG, 1 = FG. Operations re-created from the user's SD_Fuse v01
+(edge_blur) → log (curve `log_curve`), mix, bypass. Inputs: 0 = BG, 1 = FG. Operations re-created from the user's SD_Fuse v01
 (a rebuild of the L_Fuse light-wrap idea, Luma Pictures), knob names and order are MergeMatte's own.
+
+Log mode (user decisions 2026-11-03): the knob `log_curve` (none / ACEScct / Cineon / ARRI LogC3 / ARRI LogC4 / Sony
+S-Log3 / video sRGB) picks a lin ↔ log CURVE; the conversions are `Expression` nodes with the explicit formulas of
+engine/log_curves.py (one `?:` chain over the knob's index), so the group needs no OCIO colourspace names and works in
+Nuke's default config as in ACES 1.x / 2.x. Until then the bool knob `log` hard-wired OCIOColorSpace ACEScg ↔ ACEScct;
+an old `log: true` reads as `acescct`, `false` as `none`.
 
 `group_nk(knobs)` returns the text of a Group node (paste / Import Script); `write_group(path)` stores MergeMatte_v01.nk.
 """
@@ -17,6 +23,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+from engine import log_curves as lc
 
 NODE_NAME = "MergeMatte"
 VERSION = "v01"
@@ -51,19 +59,42 @@ KNOB_SPECS: List[Tuple[str, str, object, object, str]] = [
     ("t_edge", "<b><u>Edge blur</u></b>  (blurs the semi-transparent edge of the composite)", None, None, ""),
     ("edge_blur", "amount", (0, 10), 0.0, ""),
     ("div", "", None, None, ""),
-    ("log", "Apply operations in Log (ACEScct)", "bool", False, ""),
+    ("log_curve", "Apply operations in Log", "enum", lc.NONE,
+     "lin ↔ log curve of the edge operations (explicit formulas, no OCIO): none = linear"),
     ("mix", "mix", (0, 1), 1.0, ""),
     ("bypass", "Regular Over", "bool", False, "bypass: plain Merge over (after Alpha / Log)"),
 ]
-KNOB_DEFAULTS: Dict[str, float] = {n: (float(v) if r != "bool" else (1 if v else 0))
-                                   for n, _, r, v, _ in KNOB_SPECS if r is not None}
+# knob defaults: floats, bools as 0 / 1, the enum `log_curve` as its id (a string)
+KNOB_DEFAULTS: Dict[str, object] = {n: (v if r == "enum" else (1 if v else 0) if r == "bool" else float(v))
+                                    for n, _, r, v, _ in KNOB_SPECS if r is not None}
+ENUM_KNOBS = {n: lc.CURVE_IDS for n, _, r, _, _ in KNOB_SPECS if r == "enum"}
+
+
+def knob_value(name: str, v: object) -> object:
+    """A stored knob value as the node takes it: enum ids stay strings (unknown → the default), the rest floats."""
+    if name in ENUM_KNOBS:
+        s = str(v)
+        return s if s in ENUM_KNOBS[name] or s == lc.PROJECT else KNOB_DEFAULTS[name]
+    return float(v)
+
+
+def normalize_knobs(values: Mapping[str, object], project_curve: Optional[str] = None) -> Dict[str, object]:
+    """Stored / request knobs → node values: unknown names dropped, the old bool `log` (no `log_curve` given) mapped to
+    acescct / none, `log_curve` = `project` resolved to `project_curve` (ACEScct when none is known – what the preset meant
+    before the profiles existed)."""
+    out = {k: knob_value(k, v) for k, v in values.items() if k in KNOB_DEFAULTS}
+    if "log_curve" not in out and "log" in values:
+        out["log_curve"] = lc.legacy_curve(values["log"])
+    if out.get("log_curve") == lc.PROJECT:
+        out["log_curve"] = project_curve if project_curve in lc.CURVE_IDS else "acescct"
+    return out
 KNOB_RANGES: Dict[str, Tuple[float, float]] = {n: r for n, _, r, _, _ in KNOB_SPECS if isinstance(r, tuple)}
 # what a typed value may reach (user request 2026-10-30, as Nuke: the slider range is not a limit for a typed value):
 # 4x the slider's end on each side away from 0 (choke -80..80, decon_spread up to 400, amounts up to 4)
 KNOB_FIELD_RANGES: Dict[str, Tuple[float, float]] = {n: (lo * 4 if lo < 0 else lo, hi * 4 if hi > 0 else hi)
                                                      for n, (lo, hi) in KNOB_RANGES.items()}
 # the user's SH010 look (SD_Fuse v01 values, 2026-09-30) in MergeMatte names
-PRESET_SH010: Dict[str, float] = {**KNOB_DEFAULTS, "log": 1, "choke": 6.0, "soften": 2.5, "decon": 1.0, "decon_spread": 100.0,
+PRESET_SH010: Dict[str, object] = {**KNOB_DEFAULTS, "log_curve": lc.PROJECT, "choke": 6.0, "soften": 2.5, "decon": 1.0, "decon_spread": 100.0,
                                   "darken": 1.0, "darken_width": 23.2, "match": 0.155, "match_exposure": -0.75,
                                   "match_width": 4.0, "wrap": 0.355, "wrap_size": 5.0, "flare": 0.3,
                                   "flare_threshold": 1.0, "flare_softness": 0.0, "edge_blur": 2.0}
@@ -91,6 +122,11 @@ def user_knobs(values: Mapping[str, float]) -> List[str]:
         elif rng == "bool":
             out.append(f" addUserKnob {{6 {name} l {_q(label)}{t} +STARTLINE}}")
             out.append(f" {name} {'true' if values.get(name, default) else 'false'}")
+        elif rng == "enum":
+            menu = " ".join(_q(m) if " " in m else m for m in lc.MENU)
+            out.append(f" addUserKnob {{4 {name} l {_q(label)}{t} M {{{menu}}}}}")
+            m = lc.MENU[lc.curve_index(str(values.get(name, default)))]
+            out.append(f" {name} {_q(m) if ' ' in m else m}")
         else:
             out.append(f" addUserKnob {{7 {name} l {_q(label)}{t} R {_fmt(rng[0])} {_fmt(rng[1])}}}")
             out.append(f" {name} {_fmt(float(values.get(name, default)))}")
@@ -141,15 +177,33 @@ def _wrap_stack(e: _Emit, src: str, size_expr: str, p: str, x: int, y: int) -> s
     return e.node("Merge2", f"{p}_add4", [f"{p}_add3", f"{p}_blur4"], x, y + 140)
 
 
-def group_nk(knobs: Optional[Mapping[str, float]] = None, name: str = NODE_NAME, xpos: int = 0, ypos: int = 0,
-             label: str = VERSION) -> str:
-    """Text of the MergeMatte group with `knobs` (MergeMatte names) written in; pasteable / importable in Nuke."""
+def log_expression(direction: str, var: str = "x") -> str:
+    """One Nuke expression for every curve of the knob: `parent.log_curve` (the enumeration's index) picks the formula
+    of engine/log_curves.py; index 0 (none) = the input. direction = `lin_to_log` | `log_to_lin`."""
+    import re
+    out = var
+    for cid in reversed(list(lc.LOG_CURVES)):
+        c = lc.LOG_CURVES[cid]
+        f = re.sub(r"\bx\b", var, c.nuke_lin_to_log if direction == "lin_to_log" else c.nuke_log_to_lin)
+        out = f"parent.log_curve=={lc.curve_index(cid)} ? ({f}) : {out}"
+    return out
+
+
+def _log_node(e: _Emit, name: str, src: str, direction: str, x: int, y: int, disable: str) -> str:
+    kw = {f"expr{i}": log_expression(direction, ch) for i, ch in enumerate("rgb")}
+    return e.node("Expression", name, [src], x, y, disable=disable, label=direction.replace("_", " "), **kw)
+
+
+def group_nk(knobs: Optional[Mapping[str, object]] = None, name: str = NODE_NAME, xpos: int = 0, ypos: int = 0,
+             label: str = VERSION, project_curve: Optional[str] = None) -> str:
+    """Text of the MergeMatte group with `knobs` (MergeMatte names) written in; pasteable / importable in Nuke.
+    `log_curve` = `project` is resolved to `project_curve` (the plate's colour profile; ACEScct when None)."""
     vals = dict(KNOB_DEFAULTS)
     if knobs:
-        vals.update({k: float(v) for k, v in knobs.items() if k in KNOB_DEFAULTS})
+        vals.update(normalize_knobs(knobs, project_curve))
     e = _Emit()
     off = "{{parent.choke==0 && parent.soften==0}}"
-    nolog = "{{1-parent.log}}"
+    nolog = "{{parent.log_curve==0}}"
     e.node("Input", "BG", [], 900, 0)
     e.node("Input", "FG", [], 0, 0, number=1)
     # Alpha
@@ -159,10 +213,10 @@ def group_nk(knobs: Optional[Mapping[str, float]] = None, name: str = NODE_NAME,
     e.node("Premult", "choke_premult", ["choke_soften"], 0, 180, disable=off)
     # Log
     e.node("Unpremult", "fg_unpremult_log", ["choke_premult"], 0, 260, disable=nolog)
-    e.node("OCIOColorSpace", "fg_to_log", ["fg_unpremult_log"], 0, 300, in_colorspace="ACES - ACEScg", out_colorspace="ACES - ACEScct", disable=nolog)
+    _log_node(e, "fg_to_log", "fg_unpremult_log", "lin_to_log", 0, 300, nolog)
     e.node("Premult", "fg_premult_log", ["fg_to_log"], 0, 340, disable=nolog)
     e.node("Dot", "Dot_fg", ["fg_premult_log"], 34, 400)
-    e.node("OCIOColorSpace", "bg_to_log", ["BG"], 900, 300, in_colorspace="ACES - ACEScg", out_colorspace="ACES - ACEScct", disable=nolog)
+    _log_node(e, "bg_to_log", "BG", "lin_to_log", 900, 300, nolog)
     e.node("Dot", "Dot_bg", ["bg_to_log"], 934, 400)
     e.node("Merge2", "regular_over", ["Dot_bg", "Dot_fg"], 1200, 460)
     e.node("Dot", "Dot_regular", ["regular_over"], 1234, 2280)
@@ -244,22 +298,22 @@ def group_nk(knobs: Optional[Mapping[str, float]] = None, name: str = NODE_NAME,
     e.node("Switch", "bypass_switch", ["edge_blur", "Dot_regular"], 0, 2280, which="{{parent.bypass}}")
     e.node("Dot", "Dot_bg4", ["Dot_bg2"], 934, 2330)
     e.node("Dissolve", "overall_mix", ["Dot_bg4", "bypass_switch"], 0, 2330, which="{{parent.mix}}")
-    e.node("OCIOColorSpace", "from_log", ["overall_mix"], 0, 2380, in_colorspace="ACES - ACEScct", out_colorspace="ACES - ACEScg", disable=nolog)
+    _log_node(e, "from_log", "overall_mix", "log_to_lin", 0, 2380, nolog)
     e.node("Output", "Output1", ["from_log"], 0, 2440)
     head = ["Group {", " inputs 2", f" name {name}", " tile_color 0x2f8f5fff", f" label {_q(label)}", " note_font_size 14",
             f" xpos {xpos}", f" ypos {ypos}"] + user_knobs(vals) + ["}"]
     return "\n".join(head + e.lines + ["end_group"]) + "\n"
 
 
-def paste_text(knobs: Optional[Mapping[str, float]] = None, **kw) -> str:
+def paste_text(knobs: Optional[Mapping[str, object]] = None, **kw) -> str:
     """Clipboard form (like a node copied in Nuke): paste with Ctrl+V or nuke.nodePaste(file)."""
     return "set cut_paste_input [stack 0]\nversion 15.0 v1\npush 0\npush $cut_paste_input\n" + group_nk(knobs, **kw)
 
 
-def write_group(path: Path, knobs: Optional[Mapping[str, float]] = None) -> Path:
+def write_group(path: Path, knobs: Optional[Mapping[str, object]] = None, **kw) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(paste_text(knobs), "utf-8", newline="\n")
+    path.write_text(paste_text(knobs, **kw), "utf-8", newline="\n")
     return path
 
 

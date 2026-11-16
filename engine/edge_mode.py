@@ -15,7 +15,7 @@ workflow available, no backlit) > matanyone (soft_frac >= 0.25 or a person/hair/
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import cv2
 import numpy as np

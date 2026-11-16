@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
-from engine.comfy_graph import find_nodes, load_workflow, one_node, ui_to_api
+from engine.comfy_graph import load_workflow, one_node, ui_to_api
 from engine.nuke_nk import validate_nk
 
 logger = logging.getLogger("matte_desk.depth")
@@ -75,7 +75,6 @@ def prepare_input(plate_pattern: str, frames: Sequence[int], out_dir: Path,
     by the stored maps exactly like the Nuke Group; without it the plate is used as is."""
     if not gain_pattern:
         return plate_pattern
-    from engine.clean import PlateCleaner
     from engine.exr_io import read_rgb, write_rgb_like
 
     out_dir.mkdir(parents=True, exist_ok=True)

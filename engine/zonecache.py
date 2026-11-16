@@ -3,7 +3,7 @@
 """engine/zonecache.py - cache of `matte` zone results per frame (docs/PLAN_HAIR_TOOL.md section 5, step 4).
 
 Key = hash of (zone definition incl. keys / engine / params, engine version, core of the frame, plate frame signature,
-region of the frame); per-frame engines (auto / clean / chroma / knn …) cache every frame on its own, the sequence engine
+region of the frame, forced background + holdout of the objects in front, by content); per-frame engines (auto / clean / chroma / knn …) cache every frame on its own, the sequence engine
 `matanyone` caches the whole range under one hash (its result depends on every frame). Stored as the bbox crop of the
 zone alpha in 16-bit PNG + a small JSON next to it: `<obj>/zones_cache/<zone_id>/<hash>/a_####.png`. "Zastosuj" /
 "Przelicz finalnie" compute only frames whose hash is missing. Transforms of the propagation (CoTracker3) are cached
@@ -40,6 +40,14 @@ def zone_signature(zone_dict: Dict[str, Any]) -> str:
     """Hash of everything in the zone that changes the result (not `enabled`, not the id)."""
     d = {k: v for k, v in zone_dict.items() if k not in ("enabled", "zone_id", "schema", "prompt_history")}
     return _sha(d, ENGINE_VERSION)[:16]
+
+
+def mask_token(mask: Optional[np.ndarray]) -> Optional[str]:
+    """Content of a mask for a cache key (a pixel count cannot tell two masks of one area apart, audit 2026-11-02 #5)."""
+    if mask is None:
+        return None
+    m = np.ascontiguousarray(mask).astype(bool)
+    return hashlib.sha1(np.packbits(m).tobytes() + str(m.shape).encode()).hexdigest()[:16]
 
 
 def frame_hash(zone_sig: str, core: np.ndarray, plate_sig: Any, region: np.ndarray, extra: Any = None) -> str:

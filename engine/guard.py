@@ -14,7 +14,7 @@ R = 2 x the mean point spacing (sqrt(mask area / N)). Pure functions; the tracke
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import cv2
 import numpy as np

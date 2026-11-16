@@ -11,17 +11,36 @@ Markers:
 
 import inspect
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
+
+# Temp of the tests on the workstation = disk F:, not C: (user decision 2026-11-03: pytest-of-<user> grew to 68.5 GB
+# on C:). Covers pytest's tmp_path (PYTEST_DEBUG_TEMPROOT, pytest keeps the last 3 runs there) and tempfile /
+# TemporaryDirectory in the code under test and its worker processes (TMP/TEMP are inherited). Only where that disk
+# exists; cloud sessions and other machines keep the system temp. Override: MD_TEST_TMP=<dir>.
+_TEST_TMP = Path(os.environ.get("MD_TEST_TMP", "F:/claude_code/_pytest_tmp"))
+if _TEST_TMP.drive and Path(_TEST_TMP.drive + "/").exists():
+    _TEST_TMP.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", str(_TEST_TMP))
+    os.environ["TMP"] = os.environ["TEMP"] = str(_TEST_TMP)
+    tempfile.tempdir = None  # re-read TMP on the next gettempdir()
 
 # Enable OpenEXR support in OpenCV before any other module imports cv2
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 # Plate alignment: the CPU code unless a test asks for the GPU (measure_sequence(device="gpu"/"auto"));
 # config `align_device` = auto would otherwise send these tests to the GPU worker on a workstation.
 os.environ.setdefault("MD_ALIGN_DEVICE", "cpu")
-os.environ.setdefault("MD_MODEL_GATE", "0")      # model gate of the stages (engine/stage_models.py): off – synthetic tests have no models
+os.environ.setdefault("MD_MODEL_GATE", "0")
+# FLUX 3 Image Klein variant by the card (stage_models.klein_preferred): fixed so the tests do not depend on this GPU;
+# tests/test_klein_variant.py sets int8 explicitly
+os.environ.setdefault("MD_KLEIN_VARIANT", "bf16")
+os.environ.setdefault("MD_SEEDVR2_VARIANT", "7b")   # SeedVR2 7B unless a test asks for the 3B (2026-11-11)
+os.environ.setdefault("MD_C3D_DEPTH_GPU", "0")   # depth cards force the GPU worker (render.depth_needs_gpu): off in tests
+os.environ.setdefault("MD_LAMA_FULL", "0")       # LaMa at full resolution (engine/lama_full.py): off – no worker in synthetic tests      # model gate of the stages (engine/stage_models.py): off – synthetic tests have no models
 os.environ.setdefault("MD_MB_DEVICE", "cpu")      # motion blur of the alpha: the same (tests/test_motion_blur.py asks for gpu)
+os.environ.setdefault("MD_DENOISE_DEVICE", "cpu")  # plate denoise of stage 0: the CPU code (tests/test_denoise_gpu.py asks for gpu)
 os.environ.setdefault("MD_DOCTOR_PREWARM", "0")  # app start: no background ComfyUI-Python checks of the Doctor in tests
 os.environ.setdefault("MD_SHARED_PROBE", "0")   # spilled-GPU-memory counter in the MatAnyone2 probe (engine/refine.py): off, no PowerShell in tests
 

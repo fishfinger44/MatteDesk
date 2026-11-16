@@ -1,17 +1,15 @@
 # MatteDesk – Copyright (C) 2026 Lech Gruszewski
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""engine/run_trash.py - Delete a version of an object (user request 2026-10-25: from the stage 5 "Version comparison").
+"""engine/run_delete.py - Delete a version of an object (user request 2026-10-25: from the stage 5 "Version comparison").
 
-A version is never deleted for real: its folder moves to <work>/trash/runs/<object>_<run>_<time> (recoverable by
-hand, like a deleted object). A version that something still uses is refused: the active version, the current
-result of a stage (tool.stage_runs) or anything else in the object's JSON that names it (e.g. another version made
-from it, Final Touch). The numbering never goes back: `runs/.last_run` keeps the highest number ever given, so a
-new version never takes the name of a deleted one (browser caches, notes and the trash name versions by it)."""
+The version's folder is deleted from disk for good (user decision 2026-11-13: no project trash any more; the UI warns
+first with its size – engine/deletion.py). A version that something still uses is refused: the active version, the
+current result of a stage (tool.stage_runs) or anything else in the object's JSON that names it (e.g. another version
+made from it, Final Touch). The numbering never goes back: `runs/.last_run` keeps the highest number ever given, so a
+new version never takes the name of a deleted one (browser caches and notes name versions by it)."""
 
 import json
 import re
-import shutil
-import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -64,8 +62,10 @@ def last_run_number(runs_dir: Path) -> int:
     return n
 
 
-def trash_run(obj_dir: Path, work_dir: Path, name: str, run: str) -> Path:
-    """Move version `run` of object `name` to <work>/trash/runs/; the caller checked run_refs first."""
+def delete_run(obj_dir: Path, run: str) -> int:
+    """Delete version `run` of the object from disk for good; the caller checked run_refs first. Returns the bytes
+    freed."""
+    from engine import deletion as DEL
     if not RUN_RE.fullmatch(run):
         raise ValueError(f"wersja: v###, jest {run!r}")
     runs = Path(obj_dir) / "runs"
@@ -73,8 +73,5 @@ def trash_run(obj_dir: Path, work_dir: Path, name: str, run: str) -> Path:
     if not d.is_dir():
         raise FileNotFoundError(f"brak wersji {run}")
     n = last_run_number(runs)
-    (runs / LAST_RUN).write_text(str(n), encoding="utf-8")   # before the move: the number stays taken
-    dest = Path(work_dir) / "trash" / "runs" / f"{name}_{run}_{time.strftime('%Y%m%d_%H%M%S')}"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(d), str(dest))
-    return dest
+    (runs / LAST_RUN).write_text(str(n), encoding="utf-8")   # before the delete: the number stays taken
+    return DEL.remove(d, inside=runs)

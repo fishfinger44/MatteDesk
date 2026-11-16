@@ -178,7 +178,7 @@ def test_ui_wiring():
     assert 'id="reportBtn"' in html and 'id="aboutReportBtn"' in html and '<script src="/static/report.js"></script>' in html
     js = (ROOT / "static" / "report.js").read_text(encoding="utf-8")
     assert "/api/report/preview" in js and "/api/report/send" in js and "rpConsent" in js
-    assert "data-report" in (ROOT / "static" / "app.js").read_text(encoding="utf-8")   # error windows offer a report
+    assert "data-report" in (ROOT / "static" / "ui.js").read_text(encoding="utf-8")    # error windows offer a report
     cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
     assert "report_endpoint" in cfg            # the proxy URL lives in config, never a token
     assert "token" not in json.dumps(cfg).lower()

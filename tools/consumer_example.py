@@ -17,7 +17,6 @@ import numpy as np
 
 
 def read_exr_plane(path, names=("R", "Y", "A")):
-    import Imath
     import OpenEXR
     f = OpenEXR.InputFile(str(path))
     hdr = f.header()

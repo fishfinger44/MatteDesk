@@ -72,9 +72,10 @@ def test_detach_delete_and_rename(store):
     groups.create_group(store, "body", ["head", "torso", "legs"])
     groups.set_member_source(store, "body", "legs", {"source": "matanyone"})
     assert groups.remove_member(store, "body", "legs")["success"]
-    assert store.get("legs").get("group") is None and store.get("legs").get("group_source") is None
+    # 2026-11-15: the mask choice stays the object's after it leaves the group (its default outside a group too)
+    assert store.get("legs").get("group") is None and store.get("legs").get("group_source") == {"source": "matanyone", "run": None}
     groups.add_member(store, "body", "legs")
-    assert store.get("legs")["group_source"] == {"source": "core", "run": None}   # re-joined: Core again
+    assert groups.member_source(store.get("legs")) == {"source": "matanyone", "run": None}   # back: its own choice (2026-11-15)
     store.remove("torso")                                                        # deleted member leaves the group
     assert store.get("body")["members"] == ["head", "legs"]
     store.rename("head", "glowa")
@@ -82,7 +83,8 @@ def test_detach_delete_and_rename(store):
     store.rename("body", "cialo")
     assert store.get("glowa")["group"] == "cialo" and groups.members(store, "cialo") == ["glowa", "legs"]
     r = groups.ungroup(store, "cialo")
-    assert r["success"] and Path(r["trash"]).exists() and groups.list_groups(store) == []
+    assert r["success"] and r["freed_bytes"] > 0 and groups.list_groups(store) == []
+    assert not store.dir("cialo").exists() and not (store.root.parent / "trash").exists()
     assert all(store.get(n).get("group") is None for n in ("glowa", "legs"))
     assert [o["depth_order"] for o in store.list()] == [0, 1, 2]
 
@@ -166,7 +168,7 @@ def test_group_api_palette(tmp_path, monkeypatch):
     r = api.post("/api/object/body/points/1", json={"points": []})
     assert r.status_code == 409 and "grupa" in r.json()["detail"]
     assert api.post("/api/object/body/core_fix").status_code == 409
-    # a whole result: detaching warns (409, nothing changed), ?confirm=1 trashes it
+    # a whole result: detaching warns (409, nothing changed), ?confirm=1 deletes it for good
     rd = s.dir("body") / "runs" / "v001"
     rd.mkdir(parents=True)
     (rd / "run.json").write_text(json.dumps({"stage": "matanyone", "segments_def": []}))
@@ -175,7 +177,8 @@ def test_group_api_palette(tmp_path, monkeypatch):
     assert r.status_code == 409 and r.json()["detail"]["needs_confirm"] and "matanyone" in r.json()["detail"]["whole_stages"]
     assert s.get("torso")["group"] == "body"
     r = api.delete("/api/group/body/members/torso?confirm=true")
-    assert r.status_code == 200 and r.json()["trash"] and s.get("torso").get("group") is None
+    assert r.status_code == 200 and r.json()["whole_deleted"] and s.get("torso").get("group") is None
+    assert not rd.exists()
     assert api.delete("/api/group/body").status_code == 200
     assert api.get("/api/objects").json()["groups"] == [] and s.get("head").get("group") is None
 

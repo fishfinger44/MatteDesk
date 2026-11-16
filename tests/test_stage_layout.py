@@ -263,10 +263,10 @@ def test_group_is_computed_as_a_whole_with_its_seam(proj):
     # a change of the composition (a member's source) -> the whole is stale (↻)
     groups.set_seam(store, "grp", 9)
     assert stage_run(store, "grp", "matanyone")[:2] == (run, False)
-    # detaching a member with a whole result: warning first, then the whole goes to the trash
+    # detaching a member with a whole result: warning first, then the whole is deleted for good
     r = groups.remove_member(store, "grp", "hand")
     assert r.get("needs_confirm") and "matanyone" in r["whole_stages"]
-    assert groups.remove_member(store, "grp", "hand", confirm=True)["trash"]
+    assert groups.remove_member(store, "grp", "hand", confirm=True)["whole_deleted"]
     assert stage_run(store, "grp", "matanyone")[0] is None
 
 

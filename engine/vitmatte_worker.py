@@ -17,10 +17,16 @@ numpy, torch and transformers – nothing from MatteDesk (run with `python -I`).
 MD_VITMATTE_FAKE=1: no torch / transformers, alpha = trimap channel (protocol tests in MatteDesk's .venv).
 """
 
-import json
+import importlib.util
 import os
 import sys
 import time
+from pathlib import Path
+
+# the common loop, loaded by its path: this file runs with -I, engine/ is not on the path (engine/worker_proto.py)
+_spec = importlib.util.spec_from_file_location("worker_proto", Path(__file__).with_name("worker_proto.py"))
+_wp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_wp)
 
 FAKE = os.environ.get("MD_VITMATTE_FAKE") == "1"
 
@@ -91,17 +97,11 @@ class _Model:
 
 def _serve(model_id):
     import numpy as np
-    proto = sys.stdout
-    sys.stdout = sys.stderr      # library prints must not break the protocol
-    m = _Model(model_id)
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-            if req.get("op") == "quit":
-                break
+
+    def make():
+        m = _Model(model_id)
+
+        def handle(req, ask):
             t0 = time.perf_counter()
             x = np.load(req["x"])
             t1 = time.perf_counter()
@@ -112,14 +112,11 @@ def _serve(model_id):
             t3 = time.perf_counter()
             # phases for the zone stats (plan A6); the one-time model load is reported apart, not as forward
             loaded = m.load_seconds - load0
-            resp = {"ok": True, "device": m.device, "load_seconds": round(m.load_seconds, 3),
+            return {"device": m.device, "load_seconds": round(m.load_seconds, 3),
                     "timings": {"read": round(t1 - t0, 4), "forward": round(t2 - t1 - loaded, 4),
                                 "load": round(loaded, 4), "write": round(t3 - t2, 4)}}
-        except Exception as e:
-            resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        proto.write(json.dumps(resp) + "\n")
-        proto.flush()
-    return 0
+        return handle
+    return _wp.serve(make)
 
 
 def main(argv):

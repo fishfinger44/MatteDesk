@@ -20,6 +20,7 @@ inside the zone, results stabilized in time, a user key wins in its frame.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -27,6 +28,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+from engine.jsonio import StateFileError, read_state, write_json
 
 ZONE_SCHEMA = "matte_desk/zone@1.2"
 # zone@1.2 (2026-10-24): params.outer_feather_px is literal like in every stage – 0 = a hard outer band edge; absent = as
@@ -78,11 +81,20 @@ class Zone:
         return asdict(self)
 
 
+ZONE_ID = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def zone_file(obj_dir: Path, zone_id: str) -> Path:
+    """`<obj>/zones/<zone_id>.json`; the id comes from the URL, so it is a plain name – never a path (audit 2026-11-02 #8)."""
+    if not ZONE_ID.match(zone_id or ""):
+        raise ValueError(f"Nieprawidłowy identyfikator strefy: {zone_id!r}")
+    return obj_dir / "zones" / f"{zone_id}.json"
+
+
 def save_zone(obj_dir: Path, z: Zone) -> Path:
-    d = obj_dir / "zones"
-    d.mkdir(parents=True, exist_ok=True)
-    p = d / f"{z.zone_id}.json"
-    p.write_text(json.dumps(z.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+    p = zone_file(obj_dir, z.zone_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_json(p, z.to_dict(), indent=2, ensure_ascii=False)
     return p
 
 
@@ -98,11 +110,17 @@ def load_zones(obj_dir: Path) -> List[Zone]:
         obj, root = None, None
     out = []
     for p in sorted(d.glob("z_*.json")) if d.exists() else []:
-        zd = json.loads(p.read_text(encoding="utf-8"))
+        zd = read_state(p)
+        if zd is None:   # removed since the glob
+            continue
         if obj is not None and isinstance(obj.get("band"), dict) and zd.get("criterion") == "matte" \
                 and (zd.get("params") or {}).get("region") == "outline":
             zd = {**zd, "params": zone_params(zd, obj, root or {})}
-        out.append(_migrated(Zone(**zd)))
+        try:
+            z = Zone(**zd)
+        except TypeError as e:   # fields of no zone: the same corrupt file for every reader (audit 2026-11-02 #21)
+            raise StateFileError(p, e) from e
+        out.append(_migrated(z))
     return out
 
 
@@ -1386,7 +1404,7 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
         return {}, {}, {"frames": 0, "engine": "vitmatte"}
 
     def extra(f: int) -> list:
-        e = [int(bgm(f).sum()), list(seg.crop)]
+        e = [*_forced_tokens(z, f, bgm, holdout), list(seg.crop)]
         if fg_sure is not None and f in fg_sure:     # parts = sure FG after the erosion (2026-10-15): another trimap
             e.append("fg_sure")
         if probs and f in probs:
@@ -1479,6 +1497,14 @@ def _vitmatte_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarra
     return alphas, flags, stats
 
 
+def _forced_tokens(z: Zone, f: int, bgm: Callable[[int], np.ndarray],
+                   holdout: Optional[Callable[[int], Optional[np.ndarray]]]) -> List[Optional[str]]:
+    """Part of a frame's cache key: what forces the trimap, by content – forced background, holdout of the objects in
+    front (a new version of the front used to return the old alpha from the cache, audit 2026-11-02 #5)."""
+    from engine.zonecache import mask_token
+    return [mask_token(bgm(f)), mask_token(holdout(f) if (holdout is not None and z.holdout) else None)]
+
+
 def _matanyone_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], images: Callable[[int], np.ndarray],
                         regions: Dict[int, np.ndarray], bgm: Callable[[int], np.ndarray],
                         holdout: Optional[Callable[[int], Optional[np.ndarray]]],
@@ -1495,7 +1521,7 @@ def _matanyone_sequence(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarr
         raise ValueError("silnik „matanyone” strefy wymaga ComfyUI (Finalizer) – niedostępny w tym kontekście")
     start = int(z.frame) if z.frame in frames else frames[0]
     hseq = sequence_hash(zsig, [core[f] for f in frames], [psig(f) for f in frames], [regions[f] for f in frames],
-                         extra=[int(bgm(f).sum()) for f in frames])
+                         extra=[_forced_tokens(z, f, bgm, holdout) for f in frames])
     if cache is not None and all(cache.has(hseq, f) for f in frames):
         alphas = {f: cache.get(hseq, f, shape) for f in frames}
         if all(a is not None for a in alphas.values()):
@@ -1554,7 +1580,7 @@ def _matte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], ima
     alphas inside the union bbox of the regions (memory: crops, not full frames). `matting=matanyone`: one MatAnyone2
     pass on the zone crop instead (matanyone_zone; the hint comes from the clean / chroma key at the zone's key frame)."""
     from engine.localmatte import local_matte
-    from engine.zonecache import frame_hash, sequence_hash, zone_signature
+    from engine.zonecache import frame_hash, zone_signature
     shape = core[frames[0]].shape
     _eng_params, _fin = finish_params(z.params)
     zsig = zone_signature({**z.to_dict(), "params": _eng_params})
@@ -1592,7 +1618,7 @@ def _matte_zone(z: Zone, frames: Sequence[int], core: Dict[int, np.ndarray], ima
         if not reg.any():
             continue
         bg = bgm(f)
-        h = frame_hash(zsig, core[f], psig(f), reg, extra=int(bg.sum()))
+        h = frame_hash(zsig, core[f], psig(f), reg, extra=_forced_tokens(z, f, bgm, holdout))
         hashes[f] = h
         if cache is not None:
             got = cache.get(h, f, shape)

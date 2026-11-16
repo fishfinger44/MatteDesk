@@ -163,3 +163,63 @@ def test_doctor_detects_another_comfy_on_the_port(monkeypatch, tmp_path):
     assert doc._other_comfy_on_port("http://127.0.0.1:8188") == str(other)
     running["custom_nodes"] = [str(mine / "custom_nodes")]
     assert doc._other_comfy_on_port("http://127.0.0.1:8188") is None
+
+
+def test_comfy_version_for_flux3_klein():
+    """FLUX 3 Image Klein needs ComfyUI >= 0.41 (read from /system_stats `system.comfyui_version`)."""
+    from doctor import parse_version
+    doc = EnvironmentDoctor(simulation={"simulate_comfy_offline": True})
+    old = doc.check_comfy_version({"system": {"comfyui_version": "0.40.3"}})
+    assert old.status == "warning" and "0.40.3" in old.message and "≥ 0.41" in old.message
+    assert "Zaktualizuj ComfyUI Desktop" in old.fix_suggestion and "Odśwież test" in old.fix_suggestion
+    assert doc.check_comfy_version({"system": {"comfyui_version": "0.40"}}).status == "warning"
+    assert doc.check_comfy_version({"system": {"comfyui_version": "0.41.0"}}).status == "ok"
+    assert doc.check_comfy_version({"system": {"comfyui_version": "v0.44.2"}}).status == "ok"
+    assert doc.check_comfy_version({"system": {}}).status == "info"
+    assert doc.check_comfy_version(None).status == "info"
+    assert parse_version("0.44.2") == (0, 44, 2) and parse_version("1.2") == (1, 2, 0) and parse_version("") is None
+
+
+def test_cleanup3d_model_items(tmp_path, monkeypatch):
+    """Missing FLUX 3 Image Klein / LoRA Restore files -> warning naming the files and sizes; present -> ok."""
+    from engine import installer, stage_models as G
+    monkeypatch.setattr(G, "KLEIN_FILES", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.KLEIN_FILES.items()})
+    monkeypatch.setattr(G, "KLEIN_LORA", {k: (a, b, c, d, 4) for k, (a, b, c, d, _n) in G.KLEIN_LORA.items()})
+    monkeypatch.setattr(installer, "COLMAP_DIR", tmp_path / "bin" / "colmap")
+    doc = EnvironmentDoctor(simulation={"simulate_comfy_offline": True})
+    doc.config["colmap_path"] = ""
+    md = tmp_path / "models"
+    k, lo, h3, vace, light, ltx, col = doc.check_cleanup3d_models(md)
+    assert (k.status, lo.status, col.status) == ("warning", "warning", "info")
+    assert h3.name == "Model: MiniMax-H3" and h3.status in ("info", "ok")   # optional, files in the real models_dir
+    # Wan 2.2 Fun VACE (Inpaint C1, 2026-11-11): optional, the Doctor installs it (ComfyUI-GGUF + 2 x 10.6 GB)
+    assert vace.name == "Model: Wan 2.2 Fun VACE" and vace.status in ("info", "ok")
+    assert vace.status == "ok" or (vace.action == "install_vace" and "10,6 GB" in vace.fix_suggestion)
+    # its Lightning LoRAs (2026-11-11): optional, 4 steps instead of 20
+    assert light.name == "LoRA Lightning (Wan 2.2 Fun VACE)" and (light.status == "ok" or light.action == "install_vace_lightning")
+    # LTX-2.5 IC-LoRA inpaint (Inpaint C1, 2026-11-13): optional, gated LoRA 1.31 GB
+    assert ltx.name == "LoRA inpaintu LTX-2.5 (Inpaint C1)" and (ltx.status == "ok" or (
+        ltx.action == "install_ltx_inpaint" and "gated" in ltx.fix_suggestion and "1,31 GB" in ltx.fix_suggestion))
+    assert "Brak 3 z 3 plików FLUX 3 Image Klein" in k.message
+    assert "diffusion_models/flux3-image-klein-bf16.safetensors" in k.message
+    assert "wariant dobrany do karty" in k.fix_suggestion and k.details["variant"] == "bf16"   # MD_KLEIN_VARIANT (conftest)
+    assert "gated" in k.fix_suggestion and "ComfyUI ≥ 0.41" in k.fix_suggestion
+    assert "loras/flux-3-image-klein-restore.safetensors" in lo.message and "161 MB" in lo.fix_suggestion
+    for folder, fn, *_ in list(G.KLEIN_FILES.values()) + list(G.KLEIN_LORA.values()):
+        (md / folder).mkdir(parents=True, exist_ok=True)
+        (md / folder / fn).write_bytes(b"x" * 4)
+    (tmp_path / "bin" / "colmap" / "bin").mkdir(parents=True)
+    (tmp_path / "bin" / "colmap" / "bin" / "colmap.exe").write_bytes(b"MZ")
+    k, lo, _h3, _vace, _light, _ltx, col = doc.check_cleanup3d_models(md)
+    assert (k.status, lo.status, col.status) == ("ok", "ok", "ok") and k.fix_suggestion is None
+
+
+def test_licence_summary_flux_kommunity_is_limited_not_research():
+    import doctor
+    rows = {r["name"]: r for r in doctor.licence_summary()}
+    assert rows["FLUX 3 Image Klein + LoRA Restore"]["use"] == "limited"
+    assert "5 mln USD" in rows["FLUX 3 Image Klein + LoRA Restore"]["license"]
+    # VOID (P12, 2026-11-10): CogVideoX License = commercial after a free registration -> limited, not research
+    assert rows["COLMAP"]["use"] == "commercial" and doctor.LICENSE_LIMITED == {"flux3_klein", "void"}
+    # Qwen-Image-2.1 (2026-11-10): Qwen Research License = non-commercial
+    assert rows["Qwen-Image-2.1"]["use"] == "research" and doctor.LICENSES["qwen21"][1] is True

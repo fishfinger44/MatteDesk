@@ -6,7 +6,8 @@ OpenCV on Windows opens files through the ANSI API, so any path with characters 
 (e.g. Polish "październik") makes cv2.imread return None and cv2.imwrite return False - silently. MatteDesk has
 ~70 call sites, so instead of touching each one, `install()` (called from engine/__init__.py) wraps both functions
 once: plain ASCII paths keep the native call, other paths go through np.fromfile + cv2.imdecode /
-cv2.imencode + ndarray.tofile. Flags and imwrite params are passed through unchanged.
+cv2.imencode + ndarray.tofile. Flags and imwrite params are passed through unchanged. Paths ending in .dpx are read
+by engine/dpx.py (OpenCV has no DPX codec) with the same flags semantics.
 """
 from __future__ import annotations
 
@@ -33,6 +34,13 @@ def install() -> None:
     native_read, native_write = cv2.imread, cv2.imwrite
 
     def imread(filename, flags=cv2.IMREAD_COLOR):
+        try:
+            is_dpx = os.fspath(filename).lower().endswith(".dpx")
+        except TypeError:
+            is_dpx = False
+        if is_dpx:                                 # OpenCV has no DPX codec: engine/dpx.py (any path, numpy reader)
+            from engine.dpx import imread as dpx_imread
+            return dpx_imread(filename, flags)
         if _is_ascii(filename):
             return native_read(filename, flags)
         try:

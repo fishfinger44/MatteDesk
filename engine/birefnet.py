@@ -70,20 +70,11 @@ _RUNNERS: Dict[str, ComfyBirefnetRunner] = {}
 
 def get_runner(model_id: str = DEFAULT_MODEL) -> ComfyBirefnetRunner:
     """Process-wide runner per model id (tests monkeypatch this to a mock)."""
-    r = _RUNNERS.get(model_id)
-    if r is None:
-        r = ComfyBirefnetRunner(model_id)
-        ok, why = r.available()
-        if not ok:
-            raise RuntimeError(f"{why} – Doktor → „{r.doctor_item}”")
-        _RUNNERS[model_id] = r
-    return r
+    return vitmatte.pooled_comfy_runner(_RUNNERS, ComfyBirefnetRunner, model_id)
 
 
 def close_runners() -> None:
-    for r in list(_RUNNERS.values()):
-        r.close()
-    _RUNNERS.clear()
+    vitmatte.close_pool(_RUNNERS)
 
 
 atexit.register(close_runners)

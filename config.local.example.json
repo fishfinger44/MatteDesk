@@ -3,5 +3,12 @@
   "comfy_dir": "",
   "models_dir": "",
   "comfy_port": 8000,
-  "ffmpeg_path": "ffmpeg"
+  "ffmpeg_path": "ffmpeg",
+  "_help_void_seedvr2": "Czyszczenie 3D (opcjonalne): VOID i SeedVR2 we własnych środowiskach Pythona. void_python = python.exe venv-a VOID, void_repo = repozytorium void-model (inference/cogvideox_fun/predict_v2v.py), void_models = folder z CogVideoX-Fun-V1.5-5b-InP/ i void_pass1.safetensors (puste = void_repo); seedvr2_python = python.exe venv-a SeedVR2, seedvr2_repo = folder z inference_cli.py, seedvr2_models = folder z seedvr2_ema_7b_sharp_fp8_e4m3fn.safetensors i ema_vae_fp16.safetensors (puste = <seedvr2_repo>/models/SEEDVR2). Puste = silnik niedostępny.",
+  "void_python": "",
+  "void_repo": "",
+  "void_models": "",
+  "seedvr2_python": "",
+  "seedvr2_repo": "",
+  "seedvr2_models": ""
 }

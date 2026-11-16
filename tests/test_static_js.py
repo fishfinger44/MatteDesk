@@ -86,7 +86,8 @@ def unrestored_saves(src: str):
     return bad
 
 
-@pytest.mark.parametrize("name", ["objects.js", "app.js", "stage0.js", "depth.js", "jobs.js", "zones.js", "brush.js"])
+@pytest.mark.parametrize("name", ["objects.js", "app.js", "stage0.js", "depth.js", "jobs.js", "zones.js", "brush.js",
+                                  "brushcore.js", "cleanup3d_areas.js"])
 def test_every_canvas_save_is_restored(name):
     src = (STATIC / name).read_text(encoding="utf-8")
     assert unrestored_saves(src) == [], f"{name}: save() bez restore() w tym samym bloku"
@@ -210,6 +211,194 @@ def test_no_native_confirm():
     assert not bad, bad
 
 
+def test_outline_zone_retries_after_transient_error_2026_11_03():
+    """Audit 2026-11-02 #17: the automatic whole-outline zone. A 409 (a job on the object) or a network error only waits:
+    a retry at the end of a job, on entering the stage or on an object reload; only another refusal stays until reload.
+    The retry never runs from the failing render itself (no POST loop) and never on a list not loaded yet."""
+    zones = (STATIC / "zones.js").read_text(encoding="utf-8")
+    fn = zones[zones.index("async function ensureOutlineZone()"):zones.index("function reset() {")]
+    assert re.search(r"e\.status\s*==\s*null\s*\|\|\s*e\.status\s*===\s*409", fn), "transient = network (no status) or 409"
+    assert "Z.autoWait" in fn and "Z.autoFailed" in fn
+    want = zones[zones.index("const wantsAutoZone"):zones.index("async function ensureOutlineZone()")]
+    assert "Z.autoWait" in want and "Z.autoFailed" in want, "a waiting object does not auto-create from a render"
+    assert re.search(r"addEventListener\('matte-job-finished',.*retryOutlineZone", zones), "retry at the end of a job"
+    stage = zones[zones.index("onStage() {"):zones.index("onStages() {")]
+    assert "retryOutlineZone" in stage, "retry on entering the stage"
+    reset = zones[zones.index("function reset() {"):zones.index("async function loadCleanplate()")]
+    assert "Z.loadedObj = null" in reset and "autoWait" in reset, "object reload: retry, but only after the list is loaded"
+
+
+def test_one_websocket_2026_11_02():
+    """Audit 2026-11-02 #14: one server event stream (app.js initWebSocket, with reconnect) – the other modules listen to
+    the `md-ws` DOM event; a second bare `new WebSocket` went silent after every server restart."""
+    bad = [p.name for p in JS if p.name != "app.js" and "new WebSocket(" in _strip_strings(p.read_text(encoding="utf-8"))]
+    assert not bad, bad
+    assert "new CustomEvent('md-ws'" in (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "addEventListener('md-ws'" in (STATIC / "objects.js").read_text(encoding="utf-8")
+    assert "addEventListener('md-ws'" in (STATIC / "depth.js").read_text(encoding="utf-8")
+
+
+def test_frame_range_keeps_frame_zero_2026_11_02():
+    """Audit 2026-11-02 #13: a shot starting at frame 0 (`m.first === 0`) must not become 1 (`||`)."""
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "m.first ?? 1" in app and "m.last ?? 100" in app
+    assert "m.first || 1" not in app
+
+
+def _html_templates(src):
+    """(line, text, ${} expressions) of the template literals of `src`, nested ones too."""
+    out, n = [], len(src)
+
+    def tpl(i):
+        start, text, exprs = i, [], []
+        i += 1
+        while i < n and src[i] != "`":
+            if src[i] == "\\":
+                i += 2
+            elif src.startswith("${", i):
+                j, depth = i + 2, 1
+                while j < n and depth:
+                    c = src[j]
+                    if c == "`":
+                        j = tpl(j)
+                        continue
+                    if c in "'\"":
+                        q, j = c, j + 1
+                        while j < n and src[j] != q and src[j] != "\n":
+                            j += 2 if src[j] == "\\" else 1
+                    elif c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                    j += 1
+                exprs.append(src[i + 2:j - 1])
+                i = j
+            else:
+                text.append(src[i])
+                i += 1
+        out.append((src.count("\n", 0, start) + 1, "".join(text), exprs))
+        return i + 1
+
+    i = 0
+    while i < n:
+        c = src[i]
+        if src.startswith("//", i):
+            i = src.find("\n", i)
+            i = n if i < 0 else i
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        elif c in "'\"":
+            q, i = c, i + 1
+            while i < n and src[i] != q and src[i] != "\n":
+                i += 2 if src[i] == "\\" else 1
+            i += 1
+        elif c == "`":
+            i = tpl(i)
+        elif c == "/" and i and src[i - 1] in "(,=:!&|?{};\n ":   # a regex literal, roughly
+            j = i + 1
+            while j < n and src[j] != "/" and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            i = j + 1 if j < n and src[j] == "/" else i + 1
+        else:
+            i += 1
+    return out
+
+
+def test_names_in_html_go_through_esc_2026_11_02():
+    """Audit 2026-11-02 #18: a name, label or server detail printed into HTML goes through esc() (a plate named `<x` broke
+    the card). A condition on a name (`sel.has(o.name) ? 'checked' : ''`) prints no name: only what a ternary gives counts."""
+    bad = []
+    for p in JS:
+        for line, text, exprs in _html_templates(p.read_text(encoding="utf-8")):
+            if "<" not in text:
+                continue
+            for e in exprs:
+                shown = e.split("?", 1)[1] if "?" in e and "?." not in e and "??" not in e else e
+                if re.search(r"\.(name|label|detail)\b", shown) and "esc(" not in shown and "`" not in shown:
+                    bad.append(f"{p.name}:{line}: {e[:80]}")
+    assert not bad, "\n".join(bad)
+
+
+def test_no_native_dialogs_2026_11_02():
+    """Chrome lets the user block page dialogs, then messages vanish silently: UI.dialog / UI.form, never prompt / confirm."""
+    for p in JS:
+        src = _strip_strings(p.read_text(encoding="utf-8"))
+        assert not re.search(r"(?<![\w.])(window\.)?(prompt|confirm)\(", src), p.name
+
+
+def test_one_api_toast_dialog_2026_11_02():
+    """Audit 2026-11-02 step 7: one api(), one toast, one dialog, in static/ui.js, loaded before every other script."""
+    html = HTML
+    assert html.index('/static/ui.js') < html.index('/static/i18n.js')
+    ui = (STATIC / "ui.js").read_text(encoding="utf-8")
+    assert "window.UI = " in ui
+    for name in ("api", "read", "toast", "dialog", "form"):
+        assert re.search(rf"function {name}\(", ui), name
+    all_js = {p.name: p.read_text(encoding="utf-8") for p in JS}
+    for name, src in all_js.items():
+        # no `(await fetch(x)).json()` – it reads an error body as if it were the answer (no res.ok)
+        assert not re.search(r"\(await fetch\([^\n]*\)\)\.json\(\)", src), name
+        if name == "ui.js":
+            continue
+        assert "md-modal-bg" not in src and "jobErrModal" not in src and "jobToast" not in src, name
+        assert "getElementById('mdToast')" not in src, name
+    assert "md-modal-bg" not in (STATIC / "index.css").read_text(encoding="utf-8")
+    assert "async function postJSON" not in all_js["report.js"]
+    obj = all_js["objects.js"]
+    assert "const api = window.UI.api;" in obj
+    app = all_js["app.js"]
+    assert "showToast(msg, ms = 3500) { window.UI.toast(msg, ms); }" in app
+
+
+def test_colours_are_tokens_2026_11_02():
+    """A colour equal to a token is the token; --footer-height is defined once (it was twice, the second one won)."""
+    css = (STATIC / "index.css").read_text(encoding="utf-8")
+    root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
+    tokens = {m.group(2).lower(): m.group(1) for m in re.finditer(r"(--[\w-]+):\s*(#[0-9a-fA-F]{6})\b", root)}
+    rest = css[:css.index(":root {")] + css[css.index("}", css.index(":root {")):]
+    used = {h.lower() for h in re.findall(r"#[0-9a-fA-F]{6}\b", rest)} & set(tokens)
+    assert not used, sorted(used)
+    assert len(re.findall(r"--footer-height:", css)) == 1
+    assert "--footer-height: 112px" in root
+
+
+def test_refresh_cycle_2026_11_02():
+    """loadStages renders each panel once (a whole line was doubled, every render ran twice); loadObject asks in parallel;
+    a change of the compared plate is md-compare-ref, md-plate is the plate itself."""
+    obj = (STATIC / "objects.js").read_text(encoding="utf-8")
+    body = obj[obj.index("async function loadStages()"):]
+    body = body[:body.index("window.dispatchEvent(new CustomEvent('md-object-stages'")]
+    for fn in ("renderStageBar", "updateViewTabs", "updateStageButtons", "renderSegsLane", "renderPointsPalette", "renderStageInfo",
+               "renderExportSource", "renderEdgePalette", "renderLtxPalette", "renderVmmPalette", "renderExpPalette"):
+        assert body.count(f"{fn}()") == 1, fn
+    lo = obj[obj.index("async function loadObject()"):]
+    lo = lo[:lo.index("function fillObjectForm()")]
+    assert "Promise.all(" in lo and "await loadEdge()" not in lo
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "prev: this.activePlate } }));" not in app and "new CustomEvent('md-compare-ref'" in app
+    assert "'md-compare-ref'" in (STATIC / "stage0.js").read_text(encoding="utf-8")
+
+
+def test_job_windows_let_browser_keys_through_2026_11_02():
+    """Audit 2026-11-02 #16: the progress / error windows swallow plain shortcuts only – Ctrl/Meta/Alt combinations and
+    F-keys (F5, F12, Ctrl+L, Ctrl+Z of the sliders) reach the browser."""
+    js = (STATIC / "jobs.js").read_text(encoding="utf-8")
+    assert js.count("if (browserKey(e)) return;") == 1           # the progress window; the error window is UI.dialog
+    assert "e.ctrlKey || e.metaKey || e.altKey" in js
+    ui = (STATIC / "ui.js").read_text(encoding="utf-8")
+    assert "if (browserKey(e)) return;" in ui and "e.ctrlKey || e.metaKey || e.altKey" in ui
+
+
+def test_letter_shortcuts_ignore_ctrl_2026_11_02():
+    """Audit 2026-11-02 #19: single-letter tool shortcuts never fire with Ctrl/Meta (Ctrl+P = print, Ctrl+V = paste)."""
+    js = (STATIC / "objects.js").read_text(encoding="utf-8")
+    for key in ("KeyG", "KeyK", "KeyL", "KeyP", "KeyV", "KeyN"):
+        hits = [l for l in js.splitlines() if f"e.code === '{key}'" in l and "else if" in l]
+        assert hits, key
+        assert all("plain" in l or "!e.ctrlKey" in l for l in hits), (key, hits)
+
+
 def test_other_objects_layers_wired():
     """Other computed objects as extra overlay layers (user idea 2026-10-15): drawn under the selected object, never in
     Comp, per-object colour / opacity / on-off kept in localStorage, panel refreshed when the selection changes."""
@@ -228,7 +417,7 @@ def test_other_objects_layers_wired():
 
 def test_new_and_delete_object_dialogs_wired():
     """New object = dialog in the middle (name + optional prompt), delete = 🗑 on the objects list / next to "+" with a
-    confirmation listing what goes to the trash; Enter never deletes."""
+    confirmation listing what is deleted for good (UI.confirmDelete); Enter never deletes."""
     src = (STATIC / "objects.js").read_text(encoding="utf-8")
     assert "$('objNewBtn').addEventListener('click', () => newObjectDialog());" in src
     assert "st1NewBox" not in src and "st1NewName" not in src
@@ -446,7 +635,8 @@ def test_one_band_drawing_2026_10_24():
     obj = (STATIC / "objects.js").read_text(encoding="utf-8")
     zon = (STATIC / "zones.js").read_text(encoding="utf-8")
     bp = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
-    assert "function strokeLines(ctx, k, L, opts = {})" in bp and "strokeLines(ctx, k, L, { alpha: dim ? 0.5 : null })" in bp
+    assert "function strokeLines(ctx, k, L, opts = {})" in bp and "strokeLines(ctx, k, L, { alpha: 0.5 })" in bp   # the previous lines dimmed until the new arrive (2026-11-11)
+    assert "function dirtyLines() { B.lines = {}; }" in bp
     assert "rgba(255,212,0" not in zon and "window.MD_BANDPTS.strokeLines(ctx, k, reg)" in zon
     assert bp.count("rgba(255,212,0") == 2                       # the band edge and the feather ends, once
     assert "function lineNote(f, params)" in bp and "if (L && L.error) return false;" in bp
@@ -532,7 +722,7 @@ def test_job_error_window_2026_10_28():
     VideoMaMa / a failed frame preview were only a short bar line or small red text), once per job, quiet jobs too;
     a Comfy error during the run is a red line in the progress window, not only in "Szczegóły"."""
     js = (STATIC / "jobs.js").read_text(encoding="utf-8")
-    assert "errModal.id = 'jobErrModal';" in js and "function showError(j)" in js
+    assert "function showError(j)" in js and "UI.dialog(" in js[js.index("function showError(j)"):]
     poll = js[js.index("async function poll()"):]
     assert "j.state === 'error' && j.ended && !errShown.has(j.id)" in poll
     assert poll.index("showError(failed[0])") < poll.index("if (busy && busy.quiet)")   # before the quiet-job return
@@ -608,3 +798,164 @@ def test_final_touch_finish_on_gpu_2026_10_30():
     # motion blur (server flow): the GPU draws the rest without it only while dragging / until the server's frame is in
     assert "function finishGpu(serverCur)" in ft and "(+n.mb_strength || 0) > 0) return !!F.liveFin || !serverCur" in ft
     assert "F.liveFin = { ...(F.liveFin || {}), [k]: +s.value }" in ft and "window.mdMmGpu.finish(raw" in ft
+
+
+def _class_method(src: str, sig: str) -> str:
+    """The text of a method of the viewer class (2-space indent), from `  <sig>` to its closing `  }`."""
+    i = src.index("\n  " + sig) + 1
+    return src[i:src.index("\n  }\n", i) + 4]
+
+
+def test_project_opened_applied_once_2026_11_03():
+    """Audit 2026-11-02 #15: the POST response and the WS `project_opened` of ONE open apply the project once, whichever
+    comes first (the WS path fetches /api/project/current, so its fetch can also finish last). Another open (a new
+    `open_id`) applies again, and loadCurrentProject() called directly (stage0.js after a plate change) still re-applies."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node nie jest zainstalowany – kolejność zdarzeń otwarcia projektu nie sprawdzona")
+    src = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "this.appliedOpenId = data.open_id" in _class_method(src, "applyProject(data) {")
+    post = _class_method(src, "async openOrCreateProject(")
+    assert "this.applyOpened(data)" in post and "this.applyProject(" not in post
+    methods = "\n".join(_class_method(src, s) for s in ("handleWsMessage(msg) {", "async loadCurrentProject(", "applyOpened(data) {"))
+    script = """
+globalThis.document = { dispatchEvent() {} };
+globalThis.CustomEvent = class { constructor(t, o) { this.detail = o && o.detail; } };
+let pending = [], current = null, fetches = 0;
+globalThis.fetch = () => { fetches++; const body = current;
+  return new Promise(res => pending.push(() => res({ json: async () => body }))); };
+class V { constructor() { this.applied = 0; }
+  applyProject(data) { this.applied++; this.appliedOpenId = data.open_id; }
+""" + methods + """
+}
+const settle = async () => { while (pending.length) pending.shift()(); await new Promise(r => setTimeout(r, 0)); };
+const opened = id => ({ loaded: true, open_id: id, manifest: {} });
+const ws = id => ({ type: 'project_opened', open_id: id });
+const out = {};
+(async () => {
+  let v = new V(); current = opened('a');          // WS first, its fetch finishes before the POST response
+  v.handleWsMessage(ws('a')); await settle(); v.applyOpened(opened('a')); out.ws_first = v.applied;
+  v = new V(); current = opened('b');              // WS first, the POST response overtakes its fetch
+  v.handleWsMessage(ws('b')); v.applyOpened(opened('b')); await settle(); out.response_overtakes = v.applied;
+  v = new V(); current = opened('c'); fetches = 0; // the POST response first: the event needs no fetch at all
+  v.applyOpened(opened('c')); v.handleWsMessage(ws('c')); await settle(); out.response_first = v.applied; out.fetches = fetches;
+  current = opened('d');                           // the same page, another open (other client / agent / same shot again)
+  v.handleWsMessage(ws('d')); await settle(); out.next_open = v.applied;
+  const forced = v.loadCurrentProject(); await settle(); await forced;    // stage0.js: same open, the plates changed -> always applied
+  out.forced = v.applied;
+  console.log(JSON.stringify(out));
+})();
+"""
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-1500:]
+    import json
+    assert json.loads(r.stdout) == {"ws_first": 1, "response_overtakes": 1, "response_first": 1, "fetches": 0,
+                                    "next_open": 2, "forced": 3}
+
+
+def test_project_switch_asks_for_no_old_object_2026_11_03():
+    """After a project switch the prefetch asked the NEW project for the objects of the OLD one (20 x 500 in the log):
+    applyProject moved to the first frame before anyone heard of the new project. md-project comes first now, and the
+    object list is emptied until refreshList brings the new one."""
+    src = (STATIC / "app.js").read_text(encoding="utf-8")
+    apply = _class_method(src, "applyProject(data) {")
+    assert apply.index("new CustomEvent('md-project'") < apply.index("this.goToFrame(this.firstFrame)")
+    objs = (STATIC / "objects.js").read_text(encoding="utf-8")
+    handler = re.search(r"addEventListener\('md-project', \(\) => \{(.*)", objs).group(1)
+    assert "S.objects = [];" in handler and handler.index("S.objects = [];") < handler.index("refreshList()")
+
+
+def test_plate_color_profile_in_stage0_2026_11_03():
+    """Plate colour profile (user decision 2026-11-03): a list next to the plates in stage 0 – auto (→ the proposed curve
+    with its reason) or a curve id – read / written through /api/project/color_profile (project.json only), and the
+    MergeMatte palette reloads its „z profilu plate'u” entry on the 'md-color-profile' event."""
+    js = (STATIC / "stage0.js").read_text(encoding="utf-8")
+    assert 'id="p0ColorProfile"' in js and 'id="p0ColorProfileInfo"' in js
+    assert "window.MD.api('GET', '/api/project/color_profile')" in js
+    assert "window.MD.api('PUT', '/api/project/color_profile', { color_profile: sel.value })" in js
+    assert "new CustomEvent('md-color-profile'" in js and "loadColorProfile();" in js[js.index("async function refresh()"):]
+    assert "project.json" in js and "shot_manifest" not in js.lower()
+
+
+def test_merge_matte_log_curve_list_2026_11_03():
+    """MergeMatte palette (user decisions 2026-11-03): the knob `log_curve` is a list „Krzywa log” – „z profilu plate'u”
+    (the stage-0 colour profile, relabelled on 'md-color-profile') or an override per object – and the GPU preview
+    computes the RESOLVED curve: mm_gpu.js carries every curve of engine/log_curves.py (l2g / g2l by the knob index,
+    uniform `curve`), no OCIO-only ACEScct path (cct / logOn) any more."""
+    mm = (STATIC / "mergematte.js").read_text(encoding="utf-8")
+    assert "s.range === 'enum'" in mm and "<select data-mm=" in mm and "z profilu plate'u (→ ${esc(curveLabel(projectCurveId()))})" in mm
+    assert "const resolvedCurve = (v) => (v === PROJECT ? projectCurveId() : v);" in mm
+    assert "const k = { ...M.knobs, curve: curveIndex(M.knobs.log_curve) };" in mm
+    assert "window.addEventListener('md-color-profile'" in mm and "M.info.project_curve = { id: p.id, label: p.label, reason: p.reason };" in mm
+    gpu = (STATIC / "mm_gpu.js").read_text(encoding="utf-8")
+    assert "vec3 l2g(vec3 x, int c){" in gpu and "vec3 g2l(vec3 y, int c){" in gpu
+    for i in range(1, 7):
+        assert f"if (c == {i})" in gpu[gpu.index("vec3 l2g("):gpu.index("vec3 g2l(")] and f"if (c == {i})" in gpu[gpu.index("vec3 g2l("):]
+    assert "logOn" not in gpu and "cct(" not in gpu
+    assert gpu.count("curve: { i: curve }") == 3                      # prepBg, fg, final
+    assert "const curve = k.curve !== undefined ? (k.curve | 0) : (k.log ? 1 : 0);" in gpu
+
+
+def test_camera_lock_switch_described_2026_11_04():
+    """Camera lock of the plate alignment (user decision 2026-11-04): the user decides – auto (default) / locked / moving –
+    and every choice has a plain description: the <select> tooltip and a visible help line under the row (p0LockHelp,
+    refreshed on change) that says auto decides for the WHOLE measured range, so a mixed shot (camera still, then
+    moving – SHOW) counts as moving; labels translated in en.json."""
+    import json
+    js = (STATIC / "stage0.js").read_text(encoding="utf-8")
+    sel = js[js.index('title="Czy kamera stała'):js.index("</select>", js.index('<select id="p0Lock"'))]
+    # 2026-11-10 (tidy panel): the select sits in a label „Kamera”, options auto / nieruchoma / ruchoma
+    for v, label in (("auto", "auto"), ("on", "nieruchoma"), ("off", "ruchoma")):
+        assert f'<option value="{v}">{label}</option>' in sel
+    assert ">Kamera<select id=\"p0Lock\"" in js
+    assert "CAŁEGO mierzonego zakresu" in sel and "ujęcie mieszane" in sel
+    assert 'id="p0LockHelp"' in js and "const LOCK_HELP = {" in js
+    for k in ("auto:", "on:", "off:"):
+        assert k in js[js.index("const LOCK_HELP = {"):js.index("};", js.index("const LOCK_HELP = {"))]
+    assert "lockHelp();" in js[js.index("function wire()"):]
+    assert "body.camera_lock = $('p0Lock').value || 'auto';" in js
+    en = json.loads((STATIC / "i18n/en.json").read_text(encoding="utf-8"))["strings"]
+    for label in ("Kamera", "nieruchoma", "ruchoma"):
+        assert en.get(label)
+    assert all(en.get(m.strip()) for m in __import__("re").findall(r"^\s+(?:auto|on|off): '(.*)',$", js[js.index("const LOCK_HELP"):], __import__("re").M))
+
+
+def test_one_number_field_for_every_slider_2026_11_11():
+    """User 2026-11-11: every slider gets the typed number field of the right-hand palette – ONE module for all
+    (static/slider_num.js, loaded on the page like range_fill.js), a converted label stays."""
+    js = (STATIC / "slider_num.js").read_text(encoding="utf-8")
+    for s in ("MutationObserver", "md-num", "typedStep", "dispatchEvent(new Event('input'", "dispatchEvent(new Event('change'",
+              "hasOwnField", "r.dataset.numDone = 'label'"):
+        assert s in js, s
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert html.index("/static/range_fill.js") < html.index("/static/slider_num.js")
+
+
+def test_final_touch_gpu_erode_is_the_ellipse_morphology_2026_11_11():
+    """User 2026-11-11: a positive Erode broke the mask – the GPU preview used MergeMatte's separable erode without its
+    uniforms (1 − alpha). Final Touch has its own disc min / max (cv2 MORPH_ELLIPSE)."""
+    js = (STATIC / "mm_gpu.js").read_text(encoding="utf-8")
+    assert "pass('morph', { S: T }" in js and "pass('erode', { S: T }, { r:" not in js
+    assert "m = dil == 1 ? max(m, v) : min(m, v)" in js
+
+
+def test_delete_key_in_cleanup_is_the_anchor_2026_11_11():
+    """User report 2026-11-11: 🔑✕ in Cleanup acted on the cut-out keys of the selected object. In Cleanup it deletes the
+    anchor of the frame (with the anchor's warning); the cut-out stage shortcuts are off there."""
+    js = (STATIC / "objects.js").read_text(encoding="utf-8")
+    # 2026-11-15: the anchor OR the C1 band key of the frame; both there = a window asks (test_cleanup_band_keys.py)
+    assert "if (cleanMode()) return deleteCleanKey(f);" in js and "window.MD_CU_ANCHORS.hasAt(f)" in js
+    assert "cleanKeyKinds(v.currentFrame).length > 0" in js and "updateDelKey: () => updateDelKeyBtn()," in js
+    an = (STATIC / "cleanup_anchors.js").read_text(encoding="utf-8")
+    assert "hasAt: (f) =>" in an and "removeAnchor(a.id)" in an and "window.MD.updateDelKey()" in an
+
+
+def test_frame_mask_preview_lines_and_popup_2026_11_11():
+    """User 2026-11-11: the frame mask shows the band lines and opens the big preview like the anchors – ONE popup
+    module (static/pop_view.js) any panel can use."""
+    pv = (STATIC / "pop_view.js").read_text(encoding="utf-8")
+    assert "window.MD_POPVIEW = { open, close" in pv and "cu-anc-pop md-popview" in pv
+    cu = (STATIC / "cleanup.js").read_text(encoding="utf-8")
+    assert "/api/cleanup/band/${f}/lines?grow_px=" in cu and "window.MD_POPVIEW.open(" in cu
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert html.index("/static/pop_view.js") < html.index("/static/cleanup.js")

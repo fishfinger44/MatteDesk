@@ -46,20 +46,8 @@
   const V = () => window.viewer;
   const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-  async function api(method, url, body) {
-    const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      const det = d.detail;
-      if (det && det.code === 'work_dir_missing' && Date.now() - (S.wdMissingAt || 0) > 15000) {   // project folder vanished: one toast, not one per request
-        S.wdMissingAt = Date.now(); toast(det.detail, 10000);
-      }
-      const e = new Error(det && typeof det === 'object' ? (det.detail || JSON.stringify(det)) : (det || r.statusText));
-      e.status = r.status; e.detail = det; throw e;
-    }
-    return d;
-  }
-  const toast = (t, ms) => V() && V().showToast(t, ms);
+  const api = window.UI.api;
+  const toast = (t, ms) => window.UI.toast(t, ms);
   function status(t, kind) {
     const box = $(S.stage === ST.SAM3 ? 'st1Status2' : `st${S.stage}Status`);   // st1Status = the object line
     if (box) { box.textContent = t; box.className = `stage-status ${kind || ''}`; }
@@ -270,6 +258,9 @@
   // the view the user picked on top, again (after a computation made it available); the stage default before any pick
   function restoreUserView() { setView(S.userView || S.view, true, false); }
   function setView(v, render = true, remember = true) {
+    // Cleanup mode (static/cleanup.js) shows the plate: the cutting view (Alpha / Comp / core) stays remembered in
+    // S.userView and comes back with „✂ Wycinanie” (user 2026-11-10: the Alpha view stayed on after the switch)
+    if (document.body.classList.contains('mode-clean')) { v = 'none'; remember = false; }
     S.view = viewAllowed(v) ? v : 'none';
     if (remember && S.view === v) S.userView = v;
     document.querySelectorAll('#viewModeTabs .tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === S.view));
@@ -456,7 +447,10 @@
   // ---- Z20: overlays ahead of the playhead + background sweep of the whole shot + load bar over the timeline
   // the core layer is drawn in the Rdzeń view AND on the plate in stages SAM 3.1 / CoTracker3 (user decision 2026-10-26:
   // the selected object shows its mask in every frame like the other objects; 👁 in the Objects palette hides it)
-  const coreView = () => S.view === 'core' || (S.view === 'none' && (S.stage === ST.SAM3 || S.stage === ST.BRUSH));
+  // Cleanup mode shows the plate: stages SAM 3.1 / brush draw their core with the view „none”, which put the SAM 3.1
+  // mask over the plate after a page reload in Cleanup (user report 2026-11-11)
+  const coreView = () => !document.body.classList.contains('mode-clean') &&
+    (S.view === 'core' || (S.view === 'none' && (S.stage === ST.SAM3 || S.stage === ST.BRUSH)));
   // Alpha / Comp in a stage with its own mask = exactly the mask of the stage (matteFor; user report 2026-10-22)
   const stageMaskView = () => !!(S.obj && !S.auxMode && !S.viewRun && (S.view === 'alpha' || S.view === 'comp')
     && [ST.SAM3, ST.BRUSH, ST.MATANYONE, ST.VIDEOMAMA, ST.VITMATTE, ST.LTX, ST.FINAL_TOUCH, ST.EXPORT].includes(S.stage));
@@ -617,6 +611,7 @@
   // stage Final Touch, palette „MergeMatte” on: its preview over the Comp view too, not only over „Na tle” (user report
   // 2026-10-30: sliders changed nothing in Comp) – static/mergematte.js decides whether it applies
   const mmOver = (ctx, img) => { if (window.MD_MM && window.MD_MM.ready) window.MD_MM.drawOver(ctx, img, compBgSpec()); };
+  const mmNoMatte = (f, m) => { if (window.MD_MM && window.MD_MM.ready) window.MD_MM.noMatte(f, m === 'loading'); };
   function compCanvas(img, ov, key, f) {
     let bg = compBgName(), bgImg = null;
     if (bg === 'bg') {   // the BG frame of this frame; green until it arrives (or when it cannot be read)
@@ -789,7 +784,9 @@
   function saveOthersCfg() { try { localStorage.setItem('md_other_layers', JSON.stringify(S.othersCfg)); } catch (e) { /* storage blocked */ } }
   const otherKind = (o) => (o.has && o.has.final ? 'alpha' : 'core');
   function otherObjs() {   // computed objects other than the selected one, depth order (a group = its members, drawn as themselves)
-    return (S.objects || []).filter((o) => o.name !== S.obj && !isGroup(o) && o.has && (o.has.final || o.has.core));
+    // Cleanup (2026-11-15): there is no selected cut-out object – the one picked in Wycinanie is an object like the
+    // others (it showed „brak wyniku” without its eye / opacity)
+    return (S.objects || []).filter((o) => (o.name !== S.obj || isCleanMode()) && !isGroup(o) && o.has && (o.has.final || o.has.core));
   }
   // a selected group shows only its own overlay (the composition), not its members (user request 2026-10-29)
   function inSelGroup(name) {
@@ -888,11 +885,12 @@
       const b = box.getBoundingClientRect(), wr = w.getBoundingClientRect();
       const dx = e.clientX - b.left, dy = e.clientY - b.top;
       box.classList.add('dragging');
-      const move = (ev) => placeFloating(box, w, { x: ev.clientX - wr.left - dx, y: ev.clientY - wr.top - dy });
+      let moved = false;   // a plain click on the head (no drag) saved {0,0} – the palette jumped to the corner on reload
+      const move = (ev) => { moved = true; placeFloating(box, w, { x: ev.clientX - wr.left - dx, y: ev.clientY - wr.top - dy }); };
       const up = () => {
         document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
         box.classList.remove('dragging');
-        pos.set({ x: parseFloat(box.style.left) || 0, y: parseFloat(box.style.top) || 0 });
+        if (moved) pos.set({ x: parseFloat(box.style.left) || 0, y: parseFloat(box.style.top) || 0 });
       };
       document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
     });
@@ -901,6 +899,7 @@
       pos.set(null); box.style.left = ''; box.style.top = ''; box.style.right = ''; box.style.bottom = '';
     });
     if (window.ResizeObserver) new ResizeObserver(() => placeFloating(box, w, pos.get())).observe(w);
+    if (window.MD_FOLD) window.MD_FOLD.attach(box, head);   // collapse ▾ – one script for every floating palette (static/palette_fold.js)
   }
   const othersPos = { get: () => othersCfg().pos, set: (p) => { othersCfg().pos = p; saveOthersCfg(); } };
   function placeOthersPanel(box, w) { placeFloating(box, w, othersCfg().pos); }
@@ -929,6 +928,24 @@
     if (!(mi.available || []).some((a) => a.source === mi.source)) opts.unshift(`<option value="${esc(mi.source)}" selected>${srcLabel(mi, mi.source)}${mi.run ? ` ${esc(mi.run)}` : ' – brak'}</option>`);
     const tip = mi.why ? `${mi.why}` : `Do złożenia grupy „${o.group}” idzie ${srcLabel(mi, mi.source)}${mi.run && mi.run !== 'core' ? ` (${mi.run})` : ''}`;
     return `<select class="ol-src ${mi.run ? (mi.valid ? '' : 'stale') : 'missing'}" title="Do grupy z: ${esc(tip)}">${opts.join('')}</select>`;
+  }
+  // the mask of an object OUTSIDE a group (user 2026-11-15): the same picker as „Do grupy z:” (o.mask_info from GET
+  // /api/objects) – the default when it joins a group and in Cleanup (removed / protected); not picked yet = the
+  // active version / mask 1+2 as before
+  function soloSelect(o) {
+    const mi = o.mask_info; if (!mi || isGroup(o) || o.group) return '';   // also in Cleanup: the ONE place to pick it
+    const opts = (mi.available || []).map((a) => `<option value="${a.source}" ${mi.own && a.source === mi.source ? 'selected' : ''}>${srcLabel(mi, a.source)}${a.valid ? '' : ' ↻'}</option>`);
+    if (!mi.own) opts.unshift('<option value="" selected>domyślna (aktywna / 1+2)</option>');
+    else if (!(mi.available || []).some((a) => a.source === mi.source)) opts.unshift(`<option value="${esc(mi.source)}" selected>${srcLabel(mi, mi.source)}${mi.run ? ` ${esc(mi.run)}` : ' – brak'}</option>`);
+    const tip = mi.own ? (mi.why || `Maska obiektu: ${srcLabel(mi, mi.source)}${mi.run && mi.run !== 'core' ? ` (${mi.run})` : ''}`) : 'jeszcze nie wybrana – aktywna wersja albo maska 1+2';
+    return `<select class="ol-src ${mi.own && !mi.run ? 'missing' : mi.own && !mi.valid ? 'stale' : ''}" title="Maska obiektu (domyślnie w grupie i w Czyszczeniu): ${esc(tip)}">${opts.join('')}</select>`;
+  }
+  // Cleanup mode (static/cleanup.js): 🧹 at the one thing being cleaned – a group or an object outside any group
+  const isCleanMode = () => !!(window.MD_CLEANUP && window.MD_CLEANUP.mode === 'clean');
+  function cleanMark(o) {
+    const c = window.MD_CLEANUP;
+    return isCleanMode() && o && c.target === o.name
+      ? '<span class="ol-clean" title="Czyszczenie usuwa tę grupę (klik innego wiersza = zmień)">🧹</span>' : '';   // a group row (2026-11-15: icon only)
   }
   // a group folded in the palette (▸): its members and seam hidden (user request 2026-10-29), kept in md_other_layers
   const grpFolded = (g) => !!(othersCfg().fold || {})[g];
@@ -967,11 +984,13 @@
         <span class="ol-title">Obiekty (${all.filter((o) => !isGroup(o)).length})</span>
         <label class="ol-all" title="Pokaż maski innych policzonych obiektów (pod maską wybranego obiektu; w widoku Comp ukryte)">
           <input type="checkbox" id="olAll" ${cfg.on ? 'checked' : ''} title="Włącz / wyłącz maski innych obiektów na podglądzie"> maski innych</label>
-        <button type="button" class="ol-btn" id="olNew" title="Nowy obiekt">＋</button>
-        <button type="button" class="ol-btn" id="olNewGrp" title="Nowa grupa – potem przeciągnij do niej obiekty (albo przeciągnij obiekt na środek innego)">🔗</button>
-        <button type="button" class="ol-fold" id="olFold" title="${cfg.open ? 'Zwiń listę' : 'Rozwiń listę'}">${cfg.open ? '▾' : '▸'}</button>
-      </div>` + (cfg.open ? paletteOrder(all).map((o) => {
-        const cur = o.name === S.obj;
+        ${isCleanMode() ? '' /* Cleanup (user 2026-11-15): new objects / groups are made in Wycinanie */ : `<button type="button" class="ol-btn" id="olNew" title="Nowy obiekt">＋</button>
+        <button type="button" class="ol-btn" id="olNewGrp" title="Nowa grupa – potem przeciągnij do niej obiekty (albo przeciągnij obiekt na środek innego)">🔗</button>`}
+      </div>` + paletteOrder(all).map((o) => {
+        // Cleanup mode: the highlight follows what is cleaned (static/cleanup.js), not the cutting selection
+        const cleanTgt = isCleanMode() ? (window.MD_CLEANUP.target || null) : undefined;
+        const cur = cleanTgt === undefined ? o.name === S.obj : false;
+        const cuOn = cleanTgt !== undefined && cleanTgt === o.name ? 'cu-on' : '';
         // a member of a group: switched on / off in the group's composition for now (user decision 2026-10-29); the
         // export takes the selected object / group (stage Eksport), not checkboxes
         const mOn = o.group ? (memberInfo(o) || {}).on !== false : true;
@@ -982,16 +1001,16 @@
           const gi = o.group_info || {}, n = (gi.members || []).length;
           const whole = (gi.whole_results || []).length ? ` · całość: ${gi.whole_results.join(', ')}` : '';
           const fold = grpFolded(o.name);
-          return `<div class="ol-row grp grp-head ${cur ? 'cur' : ''}" data-o="${esc(o.name)}" data-group="1" title="Grupa „${esc(o.name)}”: klik = jej etapy (przeliczenie całości, pas, Final Touch) · przeciągnij obiekt na ten wiersz = dodaj do grupy">
-            <button type="button" class="ol-gfold" title="${fold ? 'Rozwiń grupę (pokaż członków)' : 'Zwiń grupę (ukryj członków)'}">${fold ? '▸' : '▾'}</button>${exp}<input type="color" class="ol-color" value="${otherStyle(o).c}" title="Kolor nakładki grupy „${esc(o.name)}” (gdy grupa jest wybrana)"><span class="ol-name">🔗 ${esc(o.name)}</span><span class="ol-status">członkowie: ${n}${esc(whole)}</span>
-            <button type="button" class="ol-del" title="Rozgrupuj „${esc(o.name)}” (członkowie zostają z wynikami; wynik całości → kosz projektu)">🗑</button></div>` + (n && !fold ? '' : seamRow(o.name));
+          return `<div class="ol-row grp grp-head ${cur ? 'cur' : ''} ${cuOn}" data-o="${esc(o.name)}" data-group="1" title="Grupa „${esc(o.name)}”: klik = jej etapy (przeliczenie całości, pas, Final Touch) · przeciągnij obiekt na ten wiersz = dodaj do grupy">
+            <button type="button" class="ol-gfold" title="${fold ? 'Rozwiń grupę (pokaż członków)' : 'Zwiń grupę (ukryj członków)'}">${fold ? '▸' : '▾'}</button>${exp}<input type="color" class="ol-color" value="${otherStyle(o).c}" title="Kolor nakładki grupy „${esc(o.name)}” (gdy grupa jest wybrana)"><span class="ol-name">${cleanMark(o)}🔗 ${esc(o.name)}</span><span class="ol-status">członkowie: ${n}${esc(whole)}</span>
+            <button type="button" class="ol-del" title="Rozgrupuj „${esc(o.name)}” (członkowie zostają z wynikami; folder grupy z wynikiem całości – usunięty z dysku na stałe, z ostrzeżeniem)">🗑</button></div>` + (n && !fold ? '' : seamRow(o.name));
         }
         const g = o.group || null;
         const has = computed.has(o.name);
         const st = has ? otherStyle(o) : null;
         const inherit = false, selIn = false;
         const kind = has && otherKind(o) === 'core' ? ' <i>(rdzeń)</i>' : '';
-        const name = `<span class="ol-name">${g ? '<span class="ol-sub">↳</span> ' : ''}${o.depth_order}. ${esc(o.name)}${kind}</span>`;
+        const name = `<span class="ol-name">${g ? '<span class="ol-sub">↳</span> ' : ''}${o.depth_order}. ${esc(o.name)}${kind}</span>`;   // the cleaned object: 🧹 on the left (2026-11-15)
         const offRow = has && !cur && !selIn && (!(st.vis && cfg.on) || inSelGroup(o.name));
         const own = has && !cur && !inherit && !selIn;   // its own eye / colour / opacity
         const tail = own
@@ -1007,17 +1026,19 @@
         const gcls = g ? 'grp grp-part' : '';
         const gi = g ? (objByName(g) || {}).group_info : null;
         const lastOf = !!(gi && (gi.members || []).slice(-1)[0] && gi.members.slice(-1)[0].member === o.name);
-        return `<div class="ol-row ${cur ? 'cur' : ''} ${gcls} ${offRow ? 'off' : ''} ${mOn ? '' : 'grp-off'}" data-o="${esc(o.name)}" draggable="true"
+        const solo = !g && soloSelect(o) ? 'solo' : '';   // its mask picker takes a grid column (2026-11-15)
+        return `<div class="ol-row ${cur ? 'cur' : ''} ${cuOn} ${gcls} ${solo} ${offRow ? 'off' : ''} ${mOn ? '' : 'grp-off'}" data-o="${esc(o.name)}" draggable="true"
             title="Klik = wybierz obiekt · przeciągnij na środek innego = nowa grupa z nim, na wiersz grupy 🔗 = do grupy${g ? ', poza listę = odłącz z grupy' : ''} · na górną / dolną krawędź = kolejność głębi (0 = najbliżej kamery)">
-          <span class="ol-drag">⋮⋮</span>${exp}${eye}${name}${g ? srcSelect(o) + memberSeam(o) : ''}${tail}<button type="button" class="ol-del" title="Usuń obiekt ${esc(o.name)} (z potwierdzeniem)">🗑</button>
+          ${cuOn ? '<span class="ol-drag ol-clean-ico" title="Czyszczenie usuwa ten obiekt (klik innego wiersza = zmień)">🧹</span>' : '<span class="ol-drag">⋮⋮</span>'}${exp}${eye}${name}${g ? srcSelect(o) + memberSeam(o) : soloSelect(o)}${tail}<button type="button" class="ol-del" title="Usuń obiekt ${esc(o.name)} (z potwierdzeniem)">🗑</button>
         </div>` + (lastOf ? seamRow(g) : '');
-      }).join('') : '');
+      }).join('');
+    // the head is re-rendered: the shared collapse ▾ again (old md_other_layers `open: false` = folded until toggled)
+    if (window.MD_FOLD) window.MD_FOLD.attach(box, '.ol-head', 'otherLayers', { initial: cfg.open === false, onChange: () => placeOthersPanel(box, w) });
     placeOthersPanel(box, w);
     const redraw = () => { saveOthersCfg(); V() && V().render(); };
     $('olAll').addEventListener('change', (e) => { cfg.on = e.target.checked; renderOthersPanel(); redraw(); });
-    $('olFold').addEventListener('click', () => { cfg.open = !cfg.open; renderOthersPanel(); saveOthersCfg(); });
-    $('olNew').addEventListener('click', () => newObjectDialog());
-    $('olNewGrp').addEventListener('click', async () => {
+    if ($('olNew')) $('olNew').addEventListener('click', () => newObjectDialog());
+    if ($('olNewGrp')) $('olNewGrp').addEventListener('click', async () => {
       const name = await groupNameDialog(S.obj && !isGroup(objByName(S.obj)) && !(objByName(S.obj) || {}).group ? `${S.obj}_grp` : 'grupa');
       if (name) await makeGroup(name, S.obj && !isGroup(objByName(S.obj)) && !(objByName(S.obj) || {}).group ? [S.obj] : []);
     });
@@ -1037,6 +1058,14 @@
       sel.addEventListener('click', (e) => e.stopPropagation());
       sel.addEventListener('change', () => run('olSrc', async () => {
         const n = sel.closest('.ol-row').dataset.o, o = objByName(n);
+        if (!o.group) {   // an object outside a group: its own mask (2026-11-15)
+          if (!sel.value) return;
+          await api('PUT', `/api/object/${encodeURIComponent(n)}/mask_source`, { source: sel.value });
+          await refreshList(S.obj);
+          status(`„${n}”: maska ${srcLabel(o.mask_info || {}, sel.value)} – domyślnie w grupie i w Czyszczeniu`, 'ok');
+          if (window.MD_CLEANUP && window.MD_CLEANUP.reload) window.MD_CLEANUP.reload();
+          return;
+        }
         await api('PUT', `/api/group/${encodeURIComponent(o.group)}/members/${encodeURIComponent(n)}/source`, { source: sel.value });
         await refreshList(S.obj);
         status(`„${n}” do grupy „${o.group}” z: ${memberInfo(o) ? srcLabel(memberInfo(o), sel.value) : SRC_LABEL[sel.value] || sel.value} – przeliczenie całości grupy (jeśli jest) ↻`, 'ok');
@@ -1153,6 +1182,13 @@
       // cut-out on a comp background: the mask layers are skipped (they would tint the comp), the tools are still drawn –
       // brush strokes, polygons, zones, points, brush cursor (user report 2026-10-16: painting showed nothing in „Na tle”)
       updateMaskHud(f);   // „Maska: …” – also in the comp-background view
+      if (cleanMode()) {   // Cleanup (user 2026-11-15: a stage's mask / version A of the cut-out showed over the patch):
+        // only the other objects' masks (palette „maski innych”) and the C1 band points – nothing of the cut-out stages
+        if (!(v.compareCoversView && v.compareCoversView())) drawOthers(ctx, img, f);
+        if (window.MD_BANDPTS && window.MD_BANDPTS.ready) window.MD_BANDPTS.draw(ctx, img, k, f);
+        note('');
+        return;
+      }
       const covers = !!(v.compareCoversView && v.compareCoversView());
       if (!covers) {
       if (alphaBw()) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, img.width, img.height); }   // black where there is no alpha
@@ -1166,7 +1202,8 @@
       } else if (stageMask) {
         const m = matteFor(f);
         if (!m) noteTxt = S.matteNote || `Brak maski etapu w klatce ${f}`;
-        else if (m !== 'loading') {
+        if (S.view === 'comp' && (!m || m === 'loading')) mmNoMatte(f, m);   // the MergeMatte palette says why it shows nothing
+        if (m && m !== 'loading') {
           if (S.view === 'comp') { ctx.drawImage(compCanvas(img, m.img, `stg_${m.key}`, f), 0, 0); mmOver(ctx, img); }
           else drawTinted(ctx, m.img, 'alpha', `stg_${m.key}`, img.width, img.height);
         }
@@ -1337,8 +1374,7 @@
     let info = null;
     if (o) { try { info = await api('GET', `/api/object/${o}/stages`); } catch (e) { info = null; } }
     if (S.obj === o) { S.info = info; S.infoObj = o; }
-    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderVmmPalette();
-    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderExpPalette();
+    renderStageBar(); updateViewTabs(); updateStageButtons(); renderSegsLane(); renderPointsPalette(); renderStageInfo(); renderExportSource(); renderEdgePalette(); renderLtxPalette(); renderVmmPalette(); renderExpPalette();
     renderCmp();   // the version list's "in use" reasons read stage_runs
     if (window.MD_BRUSH && window.MD_BRUSH.ready) window.MD_BRUSH.onStages();
     if (window.MD_FT && window.MD_FT.ready) window.MD_FT.onStages();
@@ -1646,92 +1682,49 @@
   }
 
   function newObjectDialog() {
-    if ($('newObjModal')) { $('newObjName').focus(); return; }
+    if ($('newObjName')) { $('newObjName').focus(); return; }
     if (!(V() && V().projectLoaded)) { toast('Najpierw otwórz projekt (📁 Projekt)'); return; }
-    const bg = el(`<div class="md-modal-bg" id="newObjModal">
-      <div class="md-modal" role="dialog" aria-labelledby="newObjTitle">
-        <div class="md-modal-title" id="newObjTitle">＋ Nowy obiekt</div>
-        <label class="md-field">Nazwa <span class="muted">(litery bez polskich znaków, cyfry, _ i -)</span>
+    window.UI.form({
+      title: '＋ Nowy obiekt', ok: 'Dodaj obiekt', okTitle: 'Dodaj obiekt i przejdź do etapu 1 (Enter)', cancelTitle: 'Zamknij bez dodawania (Esc)', focus: 'newObjName',
+      html: `<label class="md-field">Nazwa <span class="muted">(litery bez polskich znaków, cyfry, _ i -)</span>
           <input id="newObjName" class="form-input" placeholder="np. osoba" maxlength="64" autocomplete="off" title="Nazwa obiektu = nazwa folderu i plików masek"></label>
         <label class="md-field">Prompt SAM 3.1 <span class="muted">(opcjonalnie, EN – krótka fraza rzeczownikowa)</span>
           <input id="newObjPrompt" class="form-input" placeholder="np. felt puppet with antennae" autocomplete="off" title="Opis dla SAM 3.1 przy „Wykryj kandydatów”; można dodać później"></label>
-        <div class="md-modal-err" id="newObjErr"></div>
-        <div class="muted md-modal-tip">💡 Wycinaj od pierwszego planu (najbliżej kamery) w stronę tła – gotowe maski z przodu pomagają obiektom za nimi.</div>
-        <div class="md-modal-btns">
-          <button type="button" class="btn btn-secondary" id="newObjCancel" title="Zamknij bez dodawania (Esc)">Anuluj</button>
-          <button type="button" class="btn btn-primary" id="newObjOk" title="Dodaj obiekt i przejdź do etapu 1 (Enter)">Dodaj obiekt</button>
-        </div>
-      </div></div>`);
-    document.body.appendChild(bg);
-    const nameEl = $('newObjName'), promptEl = $('newObjPrompt'), err = $('newObjErr'), ok = $('newObjOk');
-    const close = () => { document.removeEventListener('keydown', onKey, true); bg.remove(); };
-    const check = () => {
-      const n = nameEl.value.trim();
-      const msg = !n ? '' : !OBJ_NAME_RE.test(n) ? 'Nazwa: tylko litery bez polskich znaków, cyfry, _ i - (bez spacji)'
-        : (S.objects || []).some((o) => o.name === n) ? `Obiekt „${n}” już istnieje` : '';
-      err.textContent = msg; ok.disabled = !n || !!msg;
-      return !ok.disabled;
-    };
-    const submit = async () => {
-      if (!check()) { nameEl.focus(); return; }
-      const name = nameEl.value.trim(), prompt = promptEl.value.trim();
-      ok.disabled = true; err.textContent = '';
-      try {
-        await api('POST', '/api/object', { name, prompts: prompt ? [prompt] : [] });
-      } catch (e) { err.textContent = `Nie dodano: ${e.message}`; ok.disabled = false; return; }
-      close();
+        <div class="muted md-modal-tip">💡 Wycinaj od pierwszego planu (najbliżej kamery) w stronę tła – gotowe maski z przodu pomagają obiektom za nimi.</div>`,
+      check: () => {
+        const n = $('newObjName').value.trim();
+        if (!n) return null;
+        return !OBJ_NAME_RE.test(n) ? 'Nazwa: tylko litery bez polskich znaków, cyfry, _ i - (bez spacji)'
+          : (S.objects || []).some((o) => o.name === n) ? `Obiekt „${n}” już istnieje` : '';
+      },
+      submit: async () => {
+        const name = $('newObjName').value.trim(), prompt = $('newObjPrompt').value.trim();
+        try { await api('POST', '/api/object', { name, prompts: prompt ? [prompt] : [] }); }
+        catch (e) { throw new Error(`Nie dodano: ${e.message}`); }
+        return name;
+      },
+    }).then(async (name) => {
+      if (!name) return;
       await refreshList(name);
       setStage(ST.SAM3);
       status(`Dodano obiekt „${name}”. Kliknij na obiekt na klatce (punkt +) albo „Wykryj kandydatów”.`, 'ok');
-    };
-    const onKey = (e) => {
-      if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); close(); }
-      else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); submit(); }
-      else e.stopPropagation();   // typing here must not trigger the viewer's shortcuts
-    };
-    document.addEventListener('keydown', onKey, true);
-    bg.addEventListener('mousedown', (e) => { if (e.target === bg) close(); });
-    nameEl.addEventListener('input', check);
-    $('newObjCancel').addEventListener('click', close);
-    ok.addEventListener('click', submit);
-    check();
-    nameEl.focus();
+    });
   }
   // Groups (PLAN_GROUP_COMPOSE): name dialog, create, join, detach / ungroup with the warning about the whole result
   function groupNameDialog(def) {
-    return new Promise((resolve) => {
-      if ($('grpNameModal')) { resolve(null); return; }
-      const bg = el(`<div class="md-modal-bg" id="grpNameModal">
-        <div class="md-modal" role="dialog" aria-labelledby="grpNameTitle">
-          <div class="md-modal-title" id="grpNameTitle">🔗 Nowa grupa</div>
-          <label class="md-field">Nazwa grupy <span class="muted">(litery bez polskich znaków, cyfry, _ i -)</span>
+    if ($('grpNameIn')) return Promise.resolve(null);
+    return window.UI.form({
+      title: '🔗 Nowa grupa', ok: 'Utwórz grupę', okTitle: 'Utwórz grupę (Enter)', cancelTitle: 'Zamknij bez tworzenia grupy (Esc)', focus: 'grpNameIn', select: true,
+      html: `<label class="md-field">Nazwa grupy <span class="muted">(litery bez polskich znaków, cyfry, _ i -)</span>
             <input id="grpNameIn" class="form-input" maxlength="64" autocomplete="off" value="${esc(def || '')}" title="Nazwa grupy = nazwa folderu i masek grupy"></label>
-          <div class="muted md-modal-tip">Członkowie liczą swoje etapy sami; maska grupy = złożenie ich masek („Do grupy z:”) ze szwami. Grupę można też przeliczyć jako całość (jej etapy).</div>
-          <div class="md-modal-err" id="grpNameErr"></div>
-          <div class="md-modal-btns">
-            <button type="button" class="btn btn-secondary" id="grpNameCancel" title="Zamknij bez tworzenia grupy (Esc)">Anuluj</button>
-            <button type="button" class="btn btn-primary" id="grpNameOk" title="Utwórz grupę (Enter)">Utwórz grupę</button>
-          </div></div></div>`);
-      document.body.appendChild(bg);
-      const inp = $('grpNameIn'), err = $('grpNameErr'), ok = $('grpNameOk');
-      const close = (v) => { document.removeEventListener('keydown', onKey, true); bg.remove(); resolve(v); };
-      const check = () => {
-        const n = inp.value.trim();
-        const msg = !n ? '' : !OBJ_NAME_RE.test(n) ? 'Nazwa: tylko litery bez polskich znaków, cyfry, _ i - (bez spacji)'
+          <div class="muted md-modal-tip">Członkowie liczą swoje etapy sami; maska grupy = złożenie ich masek („Do grupy z:”) ze szwami. Grupę można też przeliczyć jako całość (jej etapy).</div>`,
+      check: () => {
+        const n = $('grpNameIn').value.trim();
+        if (!n) return null;
+        return !OBJ_NAME_RE.test(n) ? 'Nazwa: tylko litery bez polskich znaków, cyfry, _ i - (bez spacji)'
           : (S.objects || []).some((o) => o.name === n) ? `„${n}” już istnieje` : '';
-        err.textContent = msg; ok.disabled = !n || !!msg; return !ok.disabled;
-      };
-      const onKey = (e) => {
-        if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); close(null); }
-        else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); if (check()) close(inp.value.trim()); }
-        else e.stopPropagation();
-      };
-      document.addEventListener('keydown', onKey, true);
-      bg.addEventListener('mousedown', (e) => { if (e.target === bg) close(null); });
-      inp.addEventListener('input', check);
-      $('grpNameCancel').addEventListener('click', () => close(null));
-      ok.addEventListener('click', () => { if (check()) close(inp.value.trim()); });
-      check(); inp.focus(); inp.select();
+      },
+      submit: () => $('grpNameIn').value.trim(),
     });
   }
   const makeGroup = (name, members) => run('olGrp', async () => {
@@ -1744,12 +1737,13 @@
     await refreshList(S.obj);
     status(`„${name}” w grupie „${g}” (Do grupy z: Core) – przeliczenie całości grupy (jeśli jest) ↻`, 'ok');
   });
-  // the server answers 409 + needs_confirm when the group has a whole result: ask, then repeat with ?confirm=true
+  // the server answers 409 + needs_confirm when the group has a whole result: ask (it is deleted from disk for good,
+  // user decision 2026-11-13 – the server's warning says so and how much it frees), then repeat with ?confirm=true
   async function withWholeWarning(title, url) {
     try { return await api('DELETE', url); }
     catch (e) {
       if (!(e.status === 409 && e.detail && e.detail.needs_confirm)) throw e;
-      if (!(await V().uiConfirm(e.detail.warning, { title, ok: 'Tak, do kosza', tone: 'error' }))) return null;
+      if (!(await V().uiConfirm(e.detail.warning, { title, ok: 'Usuń na stałe', tone: 'danger' }))) return null;
       return api('DELETE', `${url}${url.includes('?') ? '&' : '?'}confirm=true`);
     }
   }
@@ -1757,67 +1751,46 @@
     const d = await withWholeWarning(`Odłączyć „${name}” od „${g}”?`, `/api/group/${encodeURIComponent(g)}/members/${encodeURIComponent(name)}`);
     if (!d) return;
     await refreshList(S.obj);
-    status(`„${name}” odłączony od „${g}” – jego wyniki bez zmian${d.trash ? '; wynik całości grupy → kosz projektu' : ''}`, 'ok');
+    status(`„${name}” odłączony od „${g}” – jego wyniki bez zmian${d.whole_deleted ? `; wynik całości grupy usunięty z dysku (zwolniono ${window.UI.bytes(d.freed_bytes)})` : ''}`, 'ok');
   });
   const ungroupDialog = (g) => run('olGrp', async () => {
     const o = objByName(g);
     if (!((o && o.group_info && o.group_info.whole_results || []).length) &&
-        !(await V().uiConfirm(`Grupa „${g}” zniknie z palety; jej członkowie zostają z własnymi wynikami.`, { title: `Rozgrupować „${g}”?`, ok: 'Rozgrupuj' }))) return;
+        !(await V().uiConfirm(`Grupa „${g}” zniknie z palety, a jej folder zostanie usunięty z dysku na stałe; jej członkowie zostają z własnymi wynikami.`, { title: `Rozgrupować „${g}”?`, ok: 'Rozgrupuj' }))) return;
     const d = await withWholeWarning(`Rozgrupować „${g}”?`, `/api/group/${encodeURIComponent(g)}`);
     if (!d) return;
     await refreshList(S.obj === g ? undefined : S.obj);
-    status(`Rozgrupowano „${g}” – folder grupy → kosz projektu`, 'ok');
+    status(`Rozgrupowano „${g}” – folder grupy usunięty z dysku (zwolniono ${window.UI.bytes(d.freed_bytes)})`, 'ok');
   });
-  // Delete an object (user request 2026-10-15): confirmation in the middle of the window with what goes where; the
-  // exported masks only when ticked (both go to the project trash, recoverable by hand).
+  // Delete an object (user request 2026-10-15): confirmation in the middle of the window with what goes; the exported
+  // masks only when ticked. Both are deleted from disk for good (user decision 2026-11-13: no project trash).
   async function deleteObjectDialog(name) {
-    if ($('delObjModal')) return;
+    if ($('delObjExports')) return;
     if (document.body.classList.contains('job-busy')) { toast('Trwa liczenie – usuwanie po jego zakończeniu'); return; }
     let info;
     try { info = await api('GET', `/api/object/${encodeURIComponent(name)}/delete_info`); }
     catch (e) { toast(`Nie można sprawdzić obiektu „${name}”: ${e.message}`, 6000); return; }
     const ex = info.exports || { files: 0, mb: 0, dirs: [] };
-    const bg = el(`<div class="md-modal-bg" id="delObjModal">
-      <div class="md-modal md-modal-danger" role="dialog" aria-labelledby="delObjTitle">
-        <div class="md-modal-title" id="delObjTitle">🗑 Usunąć obiekt „${esc(name)}”?</div>
-        <ul class="md-modal-list">
-          <li>Folder obiektu (klucze, strefy, rdzeń, wersje): <b>${info.folder.files} plików, ${info.folder.mb} MB</b> → kosz projektu
-            <span class="muted">matte_desk/trash/objects/</span></li>
+    window.UI.confirmDelete({   // UI.form with enter: false – Enter does NOT delete
+      title: `🗑 Usunąć obiekt „${name}”?`, ok: 'Usuń obiekt na stałe', okTitle: 'Usuń obiekt z dysku na stałe',
+      size: (+info.folder.mb || 0) * 1048576,
+      what: `<ul class="md-modal-list">
+          <li>Folder obiektu (klucze, strefy, rdzeń, wersje): <b>${info.folder.files} plików, ${info.folder.mb} MB</b></li>
           <li>Obiekty za nim, które używały go jako obiektu z przodu, dostaną status „do przeliczenia”.</li>
           ${info.parts && info.parts.length ? `<li>Części (${info.parts.map(esc).join(', ')}) staną się osobnymi obiektami.</li>` : ''}
-        </ul>
-        <label class="md-check ${ex.files ? '' : 'disabled'}" title="${ex.files ? esc(ex.dirs.join('\n')) : 'Obiekt nie ma wyeksportowanych masek'}">
-          <input type="checkbox" id="delObjExports" ${ex.files ? '' : 'disabled'} title="Przenieś też wyeksportowane maski obiektu do kosza projektu">
-          <span>Usuń też wyeksportowane maski: <b>${ex.files} plików, ${ex.mb} MB</b> → <span class="muted">matte_desk/trash/exports/</span></span></label>
-        <div class="muted md-modal-tip">Bez zaznaczenia maski zostają na dysku (np. użyte już w Nuke'u). Z kosza projektu można odzyskać ręcznie.</div>
-        <div class="md-modal-err" id="delObjErr"></div>
-        <div class="md-modal-btns">
-          <button type="button" class="btn btn-secondary" id="delObjCancel" title="Zamknij bez usuwania (Esc)">Anuluj</button>
-          <button type="button" class="btn btn-danger" id="delObjOk" title="Usuń obiekt">Usuń</button>
-        </div>
-      </div></div>`);
-    document.body.appendChild(bg);
-    const close = () => { document.removeEventListener('keydown', onKey, true); bg.remove(); };
-    const go = async () => {
-      const okb = $('delObjOk'); okb.disabled = true;
-      const withExports = $('delObjExports').checked;
-      try {
-        const d = await api('DELETE', `/api/object/${encodeURIComponent(name)}${withExports ? '?exports=1' : ''}`);
-        close();
-        const tail = (x) => String(x || '').split(/[\\/]/).slice(-3).join('/');   // matte_desk/trash/... is enough
-        toast(`Usunięto „${name}” → kosz: ${tail(d.trash)}${d.exports_moved ? ` · maski (${d.exports_moved}) → ${tail(d.exports_trash)}` : ''}`, 6000);
-        await refreshList(S.obj === name ? undefined : S.obj);
-      } catch (e) { $('delObjErr').textContent = `Nie usunięto: ${e.message}`; okb.disabled = false; }
-    };
-    const onKey = (e) => {
-      if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); close(); }
-      else e.stopPropagation();   // no viewer shortcuts while the dialog is open; Enter does NOT delete
-    };
-    document.addEventListener('keydown', onKey, true);
-    bg.addEventListener('mousedown', (e) => { if (e.target === bg) close(); });
-    $('delObjCancel').addEventListener('click', close);
-    $('delObjOk').addEventListener('click', go);
-    $('delObjCancel').focus();
+        </ul>`,
+      extra: `<label class="md-check ${ex.files ? '' : 'disabled'}" title="${ex.files ? esc(ex.dirs.join('\n')) : 'Obiekt nie ma wyeksportowanych masek'}">
+          <input type="checkbox" id="delObjExports" ${ex.files ? '' : 'disabled'} title="Usuń też wyeksportowane maski obiektu – z dysku na stałe">
+          <span>Usuń też wyeksportowane maski: <b>${ex.files} plików, ${ex.mb} MB</b> (też na stałe)</span></label>
+        <div class="muted md-modal-tip">Bez zaznaczenia maski zostają na dysku (np. użyte już w Nuke'u).</div>`,
+      submit: async () => {
+        const withExports = $('delObjExports').checked;
+        try {
+          const d = await api('DELETE', `/api/object/${encodeURIComponent(name)}${withExports ? '?exports=1' : ''}`);
+          toast(`Usunięto „${name}” z dysku${d.exports_deleted ? ` razem z maskami (${d.exports_deleted} plików)` : ''} – zwolniono ${window.UI.bytes(d.freed_bytes)}`, 6000);
+        } catch (e) { throw new Error(`Nie usunięto: ${e.message}`); }
+      },
+    }).then(async (done) => { if (done) await refreshList(S.obj === name ? undefined : S.obj); });
   }
   // „▶▶ Przelicz nieaktualne” (user decision 2026-10-15): points -> keys, crops when needed, core on the whole shot; again after
   // adding / removing keys = only the changed intervals (server cache). The mask is then visible in every frame.
@@ -1936,7 +1909,13 @@
   // switch the object (top select or a click in the list of objects): same stage, same view layer when the object has it
   // (alpha -> core when it has only a core), else Plate – the chosen layer comes back on the next object that has it
   async function selectObject(name) {
-    if (!name || name === S.obj) return;
+    if (!name) return;
+    // the Cleanup mode cleans what is picked in this (shared) palette – also a click on the already selected object
+    window.dispatchEvent(new CustomEvent('md-object-pick', { detail: { name } }));
+    // in Cleanup the click only picks what is cleaned: no object / stage loading, no stage palettes, no mask view
+    // (user 2026-11-10: „po wybraniu warstwy niech już nie przerzuca interfejsu na etap maski”)
+    if (document.body.classList.contains('mode-clean')) return;
+    if (name === S.obj) return;
     const want = S.userView || S.view || 'none';
     S.obj = name; S.vmPick = null;   // the stage engine's mask again
     const sel = $('objSelect'); if (sel && sel.value !== name) sel.value = name;
@@ -1977,13 +1956,11 @@
     S.exportSourceUser = false;
     fillObjectForm();
     if (S.obj) {
-      await loadCrops().catch(() => {});
-      await loadKeys().catch(() => {});
-      await loadEdge().catch(() => {});
-      await loadZones().catch(() => {});
-      if (window.MD_BRUSH && window.MD_BRUSH.ready) await window.MD_BRUSH.load().catch(() => {});
-      if (window.MD_FT && window.MD_FT.ready) await window.MD_FT.load().catch(() => {});
-      await loadQA().catch(() => {});
+      await Promise.all([loadCrops().catch(() => {}), loadKeys().catch(() => {})]);   // what the panels below read
+      await Promise.all([loadEdge(), loadZones(),
+        window.MD_BRUSH && window.MD_BRUSH.ready ? window.MD_BRUSH.load() : null,
+        window.MD_FT && window.MD_FT.ready ? window.MD_FT.load() : null,
+        loadQA()].map((p) => Promise.resolve(p).catch(() => {})));
     } else { renderKeysLane(); }
     await loadStages();
     await refreshOthersHas();
@@ -2061,7 +2038,32 @@
       : BAND_STAGES().includes(S.stage) && window.MD_BANDPTS && window.MD_BANDPTS.ready ? window.MD_BANDPTS
       : S.stage === ST.FINAL_TOUCH && window.MD_FT && window.MD_FT.ready ? window.MD_FT : null);
   function stageHasKey(f) { const m = stageKeyMod(); return m && m.hasKeyAt ? m.hasKeyAt(f) : S.keys.some((k) => k.frame === f); }
+  // Cleanup mode (user report 2026-11-11): 🔑✕ / Delete act on the MiniMax-H3 / Wan anchor of this frame – never on a
+  // cut-out key of the selected object (it used to delete the SAM 3.1 key while the user worked on the anchors)
+  const cleanMode = () => document.body.classList.contains('mode-clean');
+  // Cleanup (user decision 2026-11-15): two kinds of keys on their own lanes – the anchors ★ (cleanup_anchors.js) and
+  // the band keys ▲ (the sliders „Pas na zewnątrz” / „Wtopienie”, cleanup.js); 🔑✕ / Delete deletes the one in the
+  // frame, both in the same frame = a window asks which (or both)
+  function cleanKeyKinds(f) {
+    const out = [];
+    const B = window.MD_BANDPTS;   // the band keys (sliders + points) of the C1 band – the band system's own delete
+    if (B && B.ready && B.stage() === 'c1' && B.hasKeyAt(f)) out.push({ id: 'band', label: 'Klucz pasa łaty (▲ – suwaki „Pas na zewnątrz” / „Wtopienie” i punkty pasa)', del: (asked) => B.deleteKeyAt(f, asked ? { confirm: false } : undefined) });
+    if (window.MD_CU_ANCHORS && window.MD_CU_ANCHORS.hasAt(f)) out.push({ id: 'anchor', label: 'Kotwica wyglądu (★)', del: () => window.MD_CU_ANCHORS.deleteAt(f) });
+    return out;
+  }
+  async function deleteCleanKey(f) {
+    const kinds = cleanKeyKinds(f);
+    if (!kinds.length) return null;
+    if (kinds.length === 1) return kinds[0].del();
+    const pick = await window.UI.form({ title: `F${f}: co usunąć?`, ok: 'Usuń', cancel: 'Anuluj', tone: 'warn',
+      html: `<p>W tej klatce jest klucz pasa łaty i kotwica wyglądu.</p>${kinds.map((k, i) => `<label class="chk" style="display:block;margin:4px 0"><input type="radio" name="cuDelKind" value="${k.id}"${i === 0 ? ' checked' : ''}> ${esc(k.label)}</label>`).join('')}<label class="chk" style="display:block;margin:4px 0"><input type="radio" name="cuDelKind" value="both"> Oba</label>`,
+      submit: (root) => (root.querySelector('input[name="cuDelKind"]:checked') || {}).value || null });
+    if (!pick) return null;
+    for (const k of kinds) if (pick === 'both' || pick === k.id) await k.del(true);   // the band key: no second question
+    return true;
+  }
   function deleteStageKey(f) {
+    if (cleanMode()) return deleteCleanKey(f);
     const m = stageKeyMod();
     if ((m === window.MD_ZONES || m === window.MD_BANDPTS) && m) return m.deleteKeyAt(f);
     if (m === window.MD_BRUSH && m) return m.deleteKeysAt(f);
@@ -2072,7 +2074,8 @@
   // Final Touch key could not be deleted until the playhead moved – the lane was redrawn only on a frame change)
   function updateDelKeyBtn() {
     const bdk = $('btnDelKey'); const v = V(); if (!bdk || !v) return;
-    const has = !!(S.obj && !S.auxMode && stageHasKey(v.currentFrame));
+    const has = cleanMode() ? cleanKeyKinds(v.currentFrame).length > 0
+      : !!(S.obj && !S.auxMode && stageHasKey(v.currentFrame));
     bdk.disabled = !has; bdk.classList.toggle('has-key', has);
   }
   function renderKeysLane() {
@@ -2643,14 +2646,14 @@
   const nextBtn = (n) => `<button class="btn btn-primary next-btn" id="st${n}Next" disabled>Dalej →</button>`;
   // what the stage does / what it is best for – at the top of every stage pane (user request 2026-10-15)
   const descHtml = (key) => `<div class="stage-desc" title="Opis etapu">${STAGES[ST[key]].desc}</div>`;
-  const paneTitle = (key, sub) => `<div class="pane-title">${ST[key]} · ${STAGES[ST[key]].label}${sub ? ` <span class="muted">(${sub})</span>` : ''}</div>`;
+  const paneTitle = (key, sub) => `<div class="pane-title">${ST[key]} · ${esc(STAGES[ST[key]].label)}${sub ? ` <span class="muted">(${sub})</span>` : ''}</div>`;
   // ONE band palette (static/bandpoints.js slider, user decision 2026-10-24): the four band sliders of stages 3 / 4 / 7
   // share label, range and wording; a stage passes its element ids (kept: the wiring and the tests know them) and its model
   const bandRow = (kind, model, rangeId, numId, cls = '') => {
     const sl = window.MD_BANDPTS.slider(kind, model);
     // the inset row: off with „cały rdzeń”; the outer band / outer feather rows: the feather hidden there while the band is 0
     const c2 = [cls, { in: 'band-in-row', out: 'band-out-row', outFeather: 'band-outf-row' }[kind] || ''].filter(Boolean).join(' ');
-    return `<label class="edge-px${c2 ? ' ' + c2 : ''}" title="${sl.title}">${sl.label} <input id="${rangeId}" ${sl.range}><input id="${numId}" ${sl.num}> px</label>`;
+    return `<label class="edge-px${c2 ? ' ' + c2 : ''}" title="${sl.title}">${esc(sl.label)} <input id="${rangeId}" ${sl.range}><input id="${numId}" ${sl.num}> px</label>`;
   };
   // edge settings shared by stage MatAnyone and Eksperymenty: a floating palette over the view, left, like „Punkty SAM3”
   // (user request 2026-10-15), with a preview of the band before computing (GET edge_preview) that can be switched off
@@ -2674,7 +2677,7 @@
         <label title="Migotanie vs duchy przy ruchu">Wygładzanie<select id="o4Smooth" class="form-input"><option value="weak">słabe</option><option value="normal">normalne</option><option value="strong">mocne</option></select></label>
         <label title="Lupa na cienkich częściach (czułki, rogi, druty)">Lupa<select id="o4Lupa" class="form-input"><option value="auto">auto</option><option value="off">wył.</option><option value="box">ramka (ostatni wielokąt)</option></select></label>
       </div>
-      <label id="o4MaScaleL" title="Rozdzielczość, w której liczy MatAnyone2">Skala MatAnyone2<select id="o4MaScale" class="form-input"><option value="auto">auto</option><option value="1.0">1.0</option><option value="0.75">0.75</option><option value="0.5">0.5</option></select></label>
+      <label id="o4MaScaleL" title="Rozdzielczość, w której liczy MatAnyone2">Skala MatAnyone2<select id="o4MaScale" class="form-input"><option value="auto">auto</option><option value="1.0">1.0</option><option value="0.75">0.75</option><option value="0.5">0.5</option></select><span class="muted pp-hint" id="o4MaScaleHint" style="display:block;font-size:10px">auto = próba 9 klatek; długie ujęcie może i tak przelać się do RAM (bardzo wolno) – wtedy 0.75 / 0.5</span></label>
       </div>
       <div class="pp-btns"><button type="button" class="btn btn-secondary btn-sm" id="epStagePv" title="Policz MatAnyone2 tylko na kilku klatkach wokół bieżącej (±4 kl.) – szybkie sprawdzenie ustawień przed długim liczeniem całości. To NIE jest wynik etapu: nic się nie zapisuje jako wersja i nic się nie odblokowuje. Modele czasowe dostają mniej kontekstu niż w pełnym przebiegu – krawędź może się trochę różnić">👁 Podgląd klatek</button><button type="button" class="btn btn-primary btn-sm" id="epCompute" title="Policz z tymi ustawieniami (etap ${ST.MATANYONE}: „▶ Przelicz MatAnyone2”, etap ${ST.EXPERIMENTS}: „✔ Przelicz finalnie”)">▶ Przelicz</button></div>
     </div>`;
@@ -3236,7 +3239,7 @@
       ${paneTitle('SAM3', 'wykryj + rdzeń')}
       ${descHtml('SAM3')}
       <div class="pane-section" id="st1ObjBox">
-        <div class="row"><b id="st1Name"></b><button class="btn btn-ghost btn-xs" id="st1Delete" title="Usuń obiekt (folder do kosza projektu)">🗑 usuń</button></div>
+        <div class="row"><b id="st1Name"></b><button class="btn btn-ghost btn-xs" id="st1Delete" title="Usuń obiekt – folder z dysku na stałe (przed usunięciem pokażę rozmiar i zapytam)">🗑 usuń</button></div>
         <div class="muted" id="st1Status"></div>
       </div>
       <div class="muted pane-section">Lista obiektów (wybór, kolejność głębi, grupy 🔗, zaznaczenie do eksportu) – w palecie „Obiekty” nad obrazem.</div>
@@ -3320,7 +3323,7 @@
         <div class="muted">Narysuj obszar wielokątem (P) albo pędzlem na tej klatce, ustaw kryterium i zastosuj – działa na rdzeniu przed krawędzią, podąża za obiektem.</div>
         <div class="row"><select id="z4Mode" class="form-input"><option value="add">Dodaj</option><option value="remove">Usuń</option></select>
           <select id="z4Crit" class="form-input"><option value="dark">ciemne</option><option value="bright">jasne</option><option value="color">kolor</option><option value="all">wszystko</option></select></div>
-        <div class="row" id="z4ColorRow" style="display:none"><span id="z4Swatch" title="Kolor strefy (brak = mediana narysowanego obszaru)" style="display:inline-block;width:22px;height:22px;border-radius:4px;border:1px solid #6e6e75;background:repeating-linear-gradient(45deg,#3c3c42 0 4px,#2a2a2e 4px 8px)"></span>
+        <div class="row" id="z4ColorRow" style="display:none"><span id="z4Swatch" title="Kolor strefy (brak = mediana narysowanego obszaru)" style="display:inline-block;width:22px;height:22px;border-radius:4px;border:1px solid var(--text-dim);background:repeating-linear-gradient(45deg,#3c3c42 0 4px,#2a2a2e 4px 8px)"></span>
           <button class="btn btn-secondary btn-sm" id="z4Pick">🎯 Pipeta</button><span class="muted" id="z4ColorTxt">kolor: mediana obszaru</span></div>
         <label id="z4ParamL">próg: <span id="z4ParamV">0.15</span><input id="z4Param" type="range" min="0" max="1" step="0.01" value="0.15"></label>
         <div class="row"><label class="chk"><input type="checkbox" id="z4Soft"> miękko</label><label class="chk"><input type="checkbox" id="z4Static"> nieruchoma</label></div>
@@ -3374,6 +3377,9 @@
         <option value="final_touch" title="Baza + ręczne korekty z etapu ${ST.FINAL_TOUCH} (obiekt bez korekt = sama baza)">Final Touch (etap ${ST.FINAL_TOUCH})</option></select></label>
       <label id="e6RunL" style="display:none" title="Która wersja wybranego obiektu (tylko „⇪ Ten obiekt” / „⇪ Całość”; przy eksporcie wszystkich – aktywne wersje)">Wersja<select id="e6Run" class="form-input"></select></label>
       <div class="muted pp-hint" id="e6SrcInfo"></div>
+      <label id="e6FtNukeL" style="display:none" title="Jak korekty Final Touch trafiają do skryptu Nuke'a. Wpalony = alfa eksportu już z kreskami i wykończeniem. Grade jako węzły = kreski wpalone, czerń / biel / gamma, erode i blur jako węzły Grade / Dilate / Blur. + RotoPaint = także kreski pędzla jako RotoPaint (każda kreska tylko na swojej klatce). Alfa w programie się nie zmienia; kanał obiektu w multi-EXR zostaje wpalony">Final Touch w Nuke'u<select id="e6FtNuke" class="form-input" title="wpalony / Grade jako węzły / Grade + pędzel jako RotoPaint – działa przy eksporcie ze źródła Final Touch">
+        <option value="bake">wpalony w alfę</option><option value="grade">Grade jako węzły (kreski wpalone)</option><option value="paint">Grade + pędzel jako RotoPaint</option></select></label>
+      <div class="muted pp-hint" id="e6FtNukeWhy"></div>
       <div class="muted pp-hint">Alpha / Comp pokazują maskę tego źródła (bez odejmowania obiektów z przodu – to robi eksport).</div>
       </div>
       <div class="muted">Pełne klatki z wycinków: <code>mattes/&lt;obiekt&gt;/</code> (alpha: EXR albo PNG 8-bit – wg formatu) + przy EXR multi-EXR ujęcia (<code>&lt;obiekt&gt;.alpha</code>, <code>union.alpha</code>) i <code>outputs.json</code>. Obiekty z przodu są odejmowane od tych z tyłu (z tego samego źródła, a gdy go nie mają – z niższego etapu).</div>
@@ -3381,7 +3387,7 @@
       <div class="row"><label class="chk" title="Jeden plik EXR na klatkę z kanałami wszystkich obiektów"><input type="checkbox" id="e5Multi" checked> multi-EXR</label><label class="chk" title="Dodaj też rdzeń SAM 3.1 (twarda maska) do eksportu"><input type="checkbox" id="e5Core"> rdzeń</label><label class="chk" title="Dodaj kanał głębi"><input type="checkbox" id="e5Depth"> głębia</label></div>
       <label title="Format masek (project.json → export_format; manifest bez zmian). Auto: PNG 8-bit dla źródeł 8-bit (MP4 / PNG / JPG), EXR dla EXR. Multi-EXR tylko przy EXR">Format masek<select id="e5Format" class="form-input"><option value="auto">auto</option><option value="png">PNG 8-bit</option><option value="exr">EXR (half)</option></select></label>
       <label title="Katalog eksportu (project.json → export_dir; manifest bez zmian). Poza projektem – potwierdzenie">Katalog eksportu<input id="e5Dir" class="form-input" readonly></label>
-      <div class="row"><button class="btn btn-secondary btn-sm" id="e5DirPick" title="Wybierz katalog eksportu">📁 Wybierz…</button><button class="btn btn-ghost btn-sm" id="e5DirDefault" title="Przywróć domyślny katalog &lt;work&gt;/matte_desk/export">domyślny</button><button class="btn btn-ghost btn-sm" id="e5NkOnly" title="Tylko skrypt Nuke'a (backdrop MASKI, anchory + stampy) dla istniejącego eksportu – bez ponownego zapisu EXR">tylko .nk</button></div>
+      <div class="row"><button class="btn btn-secondary btn-sm" id="e5DirPick" title="Wybierz katalog eksportu">📁 Wybierz…</button><button class="btn btn-ghost btn-sm" id="e5DirDefault" title="Przywróć domyślny katalog &lt;work&gt;/matte_desk/export">domyślny</button><button class="btn btn-ghost btn-sm" id="e5NkOnly" title="Skrypt istniejącego eksportu (backdrop MASKI, anchory + stampy, węzły Final Touch) – do schowka albo jako plik .nk, bez ponownego zapisu EXR">⇪ Export .nk</button></div>
       <label title="Które klatki eksportować. „całość” wymaga wyniku na całym ujęciu – inaczej okno z listą brakujących klatek (nic nie zapisuje się z dziurami). Zakres pracy = znaczniki [ ] na osi czasu (Shift+B / Shift+N, Alt+X = całe ujęcie)">Zakres eksportu<select id="e5Scope" class="form-input" title="całość = całe ujęcie (wymaga wyniku na wszystkich klatkach); work area = tylko zakres pracy z osi czasu"><option value="all">całość (całe ujęcie)</option><option value="work_area">work area (zakres pracy)</option></select></label>
       <label class="chk" id="e5MembersL" style="display:none" title="Przy eksporcie grupy zapisz też osobno maski jej członków włączonych w palecie Obiekty (checkbox przy członku)"><input type="checkbox" id="e5Members" title="Zapisz też osobno maski włączonych członków grupy"> + osobno członkowie grupy (włączeni)</label>
       <button class="btn btn-primary" id="st5Export" style="width:100%" title="Eksport maski wybranego obiektu albo grupy z wybranego źródła (liczony w kontekście wszystkich obiektów: z przodu odejmowane od tych z tyłu)">⇪ Eksport</button>
@@ -3521,7 +3527,7 @@
     $('cmpShowA').disabled = !a; $('cmpShowB').disabled = !b; $('cmpDiff').disabled = !a || !b || a === b;
     $('cmpRunsTitle').textContent = `Wersje etapu ${S.stage} · ${nm[S.stage]} (klik = A, 🗑 = usuń)`;
     // delete (2026-10-25): a version the object still uses (active, a stage's current result, base of another version)
-    // cannot go – the server also checks every other reference before moving it to the trash
+    // cannot go – the server also checks every other reference before deleting it for good
     const sr = (S.info && S.info.stage_runs) || {};
     const why = (r) => [r.run === S.activeRun ? T('aktywna') : '',
       Object.entries(sr).some(([k, v]) => v === r.run && k !== 'active') ? T('wynik etapu') : '',
@@ -3532,7 +3538,7 @@
       return `<div class="row-item cmp-run ${isA ? 'cur' : ''}" data-a-run="${esc(r.run)}" title="${esc(isA ? `${r.run} jest w polu A` : `Klik = ${r.run} do pola A i na podgląd`)}">
         <span class="cmp-run-txt"><span class="cmp-run-name">${esc(runLabel(r))}</span>${w ? `<span class="cmp-run-why">${esc(w)}</span>` : ''}</span>
         ${act ? '' : `<button type="button" class="btn btn-ghost btn-xs cmp-run-act" data-act-run="${esc(r.run)}" title="${esc(`Ustaw ${r.run} jako aktywną wersję (★) – eksport i obiekty zależne`)}">★</button>`}
-        <button type="button" class="btn btn-ghost btn-xs cmp-run-del" data-del-run="${esc(r.run)}" ${w ? 'disabled' : ''} title="${esc(w ? `Wersja ${r.run} jest w użyciu (${w}) – nie można jej usunąć` : `Usuń wersję ${r.run} do kosza projektu (trash/runs) – pokażę rozmiar przed usunięciem`)}">🗑</button></div>`; }).join('')
+        <button type="button" class="btn btn-ghost btn-xs cmp-run-del" data-del-run="${esc(r.run)}" ${w ? 'disabled' : ''} title="${esc(w ? `Wersja ${r.run} jest w użyciu (${w}) – nie można jej usunąć` : `Usuń wersję ${r.run} z dysku na stałe – pokażę rozmiar i zapytam przed usunięciem`)}">🗑</button></div>`; }).join('')
       : `brak wersji – policz etap ${S.stage}`;
     lb.querySelectorAll('button[data-del-run]').forEach((bt) => bt.addEventListener('click', (e) => { e.stopPropagation(); run('cmpRuns', () => cmpDelete(bt.dataset.delRun)); }));
     lb.querySelectorAll('button[data-act-run]').forEach((bt) => bt.addEventListener('click', (e) => {
@@ -3561,13 +3567,13 @@
     if (!run || !S.obj) return;
     const d = await api('DELETE', `/api/object/${S.obj}/runs/${run}?dry=1`);
     if (d.refs && d.refs.length) { status(`Wersja ${run} jest w użyciu – nie usuwam (${d.refs.slice(0, 3).join('; ')})`, 'warn'); return; }
-    const mb = (d.bytes / 1048576).toFixed(1);
-    if (!(await V().uiConfirm(`Usunąć wersję ${run}? ${d.files} plików, ${mb} MB.\nFolder trafia do kosza projektu (trash/runs) – można go przywrócić ręcznie.`, { ok: 'Usuń wersję' }))) return;
-    await api('DELETE', `/api/object/${S.obj}/runs/${run}`);
+    if (!(await window.UI.confirmDelete({ title: `Usunąć wersję ${run}?`, ok: 'Usuń wersję na stałe', size: d.bytes,
+      what: `Wersja ${esc(run)} obiektu „${esc(S.obj)}”: ${esc(d.files)} plików, ${esc(window.UI.bytes(d.bytes))}. Jej numer nie zostanie użyty ponownie.` }))) return;
+    const r = await api('DELETE', `/api/object/${S.obj}/runs/${run}`);
     if (S.cmpDiff && (S.cmpDiff.a === run || S.cmpDiff.b === run)) S.cmpDiff = null;
     if (S.viewRun === run) showRun(null);
     await loadRuns(); renderCmp(); V().render();
-    status(`Wersja ${run} przeniesiona do kosza projektu (${mb} MB)`, 'ok');
+    status(`Wersja ${run} usunięta z dysku (zwolniono ${window.UI.bytes(r.freed_bytes)})`, 'ok');
   }
   function cmpShow(which) {
     if (!cmpStage()) return;
@@ -3602,7 +3608,7 @@
       </div>
       <div class="row"><button type="button" class="btn btn-secondary btn-sm cmp-diff" id="cmpDiff" title="Różnica |A − B| na czerwono (×3, żeby słabe różnice półprzezroczystości były widoczne) na wersji A (klawisz D)">Różnica (D)</button>
         <button type="button" class="btn btn-ghost btn-sm" id="cmpOff" title="Koniec porównania – podgląd klatek etapu (jeśli świeży), poza nim wynik etapu">★ Aktywna</button></div>
-      <details class="cmp-runs" open><summary id="cmpRunsTitle" title="Wersje tylko tego etapu; klik = do pola A; ★ = ustaw jako aktywną; 🗑 = do kosza projektu (trash/runs) po pokazaniu rozmiaru. Wersji w użyciu (aktywnej, wyniku etapu, bazy innej wersji) nie da się usunąć">Wersje etapu</summary>
+      <details class="cmp-runs" open><summary id="cmpRunsTitle" title="Wersje tylko tego etapu; klik = do pola A; ★ = ustaw jako aktywną; 🗑 = usuń z dysku na stałe po pokazaniu rozmiaru. Wersji w użyciu (aktywnej, wyniku etapu, bazy innej wersji) nie da się usunąć">Wersje etapu</summary>
         <div id="cmpRuns" class="muted"></div></details>
       <div class="muted" id="cmpInfo"></div>
     </div>`;
@@ -3644,6 +3650,24 @@
       ltx: runs.ltx ? `Wersja ${runs.ltx} (LTX-2.5)` : '', videomama: runs.videomama ? `Wersja ${runs.videomama} (VideoMaMa)` : '',
       version: 'Przy eksporcie wszystkich obiektów: aktywne wersje', active: runs.active ? `Wersja ${runs.active}` : '',
       final_touch: S.info.final_touch ? `Baza + korekty w ${(S.info.final_touch.frames || []).length} klatkach (bazę wybierasz w etapie ${ST.FINAL_TOUCH})` : '' }[sel.value] || '';
+    renderFtNuke();
+  }
+  // „Final Touch w Nuke'u” (engine/ft_nuke, 2026-11-16): per object, shown with the source Final Touch
+  async function renderFtNuke() {
+    const l = $('e6FtNukeL'); if (!l) return;
+    const on = $('e6Source').value === 'final_touch' && !!S.obj;
+    l.style.display = on ? '' : 'none'; $('e6FtNukeWhy').textContent = '';
+    if (!on) return;
+    let d; try { d = await api('GET', `/api/object/${S.obj}/final_touch`); } catch (e) { return; }
+    const nk = d.nuke || { mode: 'bake', available: true, why: '' };
+    const sel = $('e6FtNuke');
+    sel.querySelectorAll('option').forEach((o) => { o.disabled = o.value !== 'bake' && !nk.available; });
+    sel.value = nk.available ? nk.mode : 'bake';
+    const n = Object.keys(d.frames || {}).length;
+    $('e6FtNukeWhy').textContent = !nk.available ? `Tylko wpalony: ${nk.why}`
+      : nk.mode === 'paint' && !n ? 'Brak kresek – RotoPaint pusty, w skrypcie same węzły Grade.'
+      : nk.mode === 'paint' ? "Kreski w Nuke'u ≈ aplikacja (średnio < 1 % alfy; różnice na końcach kresek i tam, gdzie kreski się nakładają)."
+      : nk.mode === 'grade' && +((d.finish || {}).erode_px || 0) ? "Erode w Nuke'u = Dilate (kwadrat zamiast koła) – w narożnikach drobne różnice." : '';
   }
   const exportBody = (single) => {
     const src = $('e6Source') ? $('e6Source').value : 'active';
@@ -4104,14 +4128,24 @@
       showExportFormat(d); status(`Format masek: ${d.format}${d.format === 'auto' ? ` (→ ${d.resolved})` : ''}`, 'ok');
     }));
     $('e5DirDefault').addEventListener('click', () => run('e5DirDefault', async () => { const d = await api('PUT', '/api/project/export_dir', { path: null }); await loadExportDir(); status(`Katalog eksportu: ${d.path} (domyślny)`, 'ok'); }));
-    $('e5NkOnly').addEventListener('click', () => run('e5NkOnly', async () => { const d = await api('POST', '/api/export/nk'); status(`Skrypt Nuke'a: ${d.nk}`, 'ok'); }));
+    $('e5NkOnly').addEventListener('click', (e) => { e.stopPropagation(); window.UI.exportMenu($('e5NkOnly'), { what: "Skrypt Nuke'a eksportu", status,
+      get: async () => { const d = await api('GET', '/api/export/nk_text'); return { text: d.text, path: d.nk }; } }); });
+    $('e6FtNuke').addEventListener('change', () => run('e6FtNuke', async () => {
+      await api('PUT', `/api/object/${S.obj}/final_touch/nuke`, { mode: $('e6FtNuke').value });
+      await renderFtNuke(); status(`Final Touch w Nuke'u: ${$('e6FtNuke').selectedOptions[0].textContent} (działa przy eksporcie)`, 'ok');
+    }));
     $('st5LibSave').addEventListener('click', () => run('st5LibSave', async () => { const d = await api('POST', '/api/library', { object: S.obj }); status(`Zapisano w bibliotece: ${d.path}`, 'ok'); }));
     $('st5LibAdd').addEventListener('click', () => run('st5LibAdd', async () => {
       const d = await api('GET', '/api/library');
       if (!d.items.length) { status('Biblioteka pusta', 'warn'); return; }
-      const pick = prompt('Dodaj z biblioteki (wpisz numer):\n' + d.items.map((x, i) => `${i}: ${x.id} – ${x.prompts.join(', ')}`).join('\n'), '0');
-      if (pick === null) return;
-      const it = d.items[+pick]; const r = await api('POST', '/api/library/add', { item: it.id });
+      const item = await window.UI.form({
+        title: 'Dodaj z biblioteki', ok: 'Dodaj', focus: 'libPick',
+        html: `<label class="md-field">Obiekt z biblioteki
+          <select id="libPick" class="form-input" title="Obiekt do dodania (prompt i ustawienia; klucze i strefy nie są przenoszone)">${d.items.map((x) => `<option value="${esc(x.id)}">${esc(x.id)} – ${esc(x.prompts.join(', '))}</option>`).join('')}</select></label>`,
+        submit: () => $('libPick').value,
+      });
+      if (!item) return;
+      const r = await api('POST', '/api/library/add', { item });
       await refreshList(r.object.name); status(`Dodano ${r.object.name} z biblioteki (klucze i strefy nie są przenoszone)`, 'ok');
     }));
     $('st5QAdd').addEventListener('click', () => run('st5QAdd', async () => { const d = await api('POST', '/api/queue', { object: S.obj }); status(`Kolejka: ${d.report.pending} zadań, ETA ~${Math.round(d.report.eta_s / 60)} min`, 'ok'); }));
@@ -4317,16 +4351,23 @@
       }
     });
     window.addEventListener('keydown', async (e) => {
-      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || !S.obj || S.auxMode) return;
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+      if (cleanMode()) {   // Cleanup: no cut-out stage shortcut (Enter = SAM 3.1, G / R = tools …); Delete = this frame's anchor
+        if ((e.code === 'Delete' || e.code === 'Backspace') && !e.ctrlKey && !e.metaKey && V() &&
+            cleanKeyKinds(V().currentFrame).length) { e.preventDefault(); deleteCleanKey(V().currentFrame); }
+        return;
+      }
+      if (!S.obj || S.auxMode) return;
       const f = V() && V().currentFrame;
       const brushKeys = [ST.BRUSH, ST.VITMATTE, ST.EXPERIMENTS, ST.FINAL_TOUCH].includes(S.stage);   // G / R / P = brush / polygon (SAM3: points)
       const sam3 = S.stage === ST.SAM3;
+      const plain = !e.ctrlKey && !e.metaKey;   // letter shortcuts never eat Ctrl+P / Ctrl+V / Ctrl+K… (audit 2026-11-02 #19)
       if (sam3 && (e.code === 'Enter' || e.code === 'NumpadEnter') && !S.poly && !e.ctrlKey && e.target.tagName !== 'BUTTON') { e.preventDefault(); computePoints(f); }
-      else if (sam3 && e.code === 'KeyG') setTool('pt_add');
+      else if (sam3 && plain && e.code === 'KeyG') setTool('pt_add');
       else if (sam3 && e.code === 'KeyR' && !e.ctrlKey) setTool('pt_remove');
-      else if (sam3 && e.code === 'KeyK') setTool('corr_add');
-      else if (sam3 && e.code === 'KeyL') setTool('corr_remove');
-      else if (sam3 && e.code === 'KeyP') setTool('poly');
+      else if (sam3 && plain && e.code === 'KeyK') setTool('corr_add');
+      else if (sam3 && plain && e.code === 'KeyL') setTool('corr_remove');
+      else if (sam3 && plain && e.code === 'KeyP') setTool('poly');
       else if ((S.stage === ST.BRUSH || S.stage === ST.FINAL_TOUCH) && e.code === 'KeyE' && !e.ctrlKey) setTool('brush_erase');
       else if (e.code === 'Escape' && S.tool !== 'none' && !S.poly) setTool(S.tool);   // Esc = tool off (only panning) – Z6: every tool
       else if ((e.code === 'Delete' || e.code === 'Backspace') && !e.ctrlKey && !e.metaKey) {   // Z6
@@ -4336,12 +4377,12 @@
         else if (S.stage === ST.FINAL_TOUCH && window.MD_FT && window.MD_FT.ready) window.MD_FT.deleteKeysAt(f);
         else if (sam3 || [ST.VITMATTE, ...BAND_STAGES()].includes(S.stage)) run('btnDelKey', () => deleteStageKey(f));
       }
-      else if (bandStage() && e.code === 'KeyG') setTool('band_add');
+      else if (bandStage() && plain && e.code === 'KeyG') setTool('band_add');
       else if (bandStage() && e.code === 'KeyR' && !e.ctrlKey) setTool('band_remove');
-      else if (brushKeys && e.code === 'KeyG') setTool('brush_add');
+      else if (brushKeys && plain && e.code === 'KeyG') setTool('brush_add');
       else if (brushKeys && e.code === 'KeyR' && !e.ctrlKey) setTool('brush_remove');
-      else if (brushKeys && S.stage !== ST.BRUSH && S.stage !== ST.FINAL_TOUCH && e.code === 'KeyP') setTool('poly');
-      else if (e.code === 'KeyN' && !e.shiftKey) nextFlag();
+      else if (brushKeys && plain && S.stage !== ST.BRUSH && S.stage !== ST.FINAL_TOUCH && e.code === 'KeyP') setTool('poly');
+      else if (e.code === 'KeyN' && !e.shiftKey && plain) nextFlag();
       else if (e.code === 'KeyC' && !e.ctrlKey && !e.metaKey && S.stage !== ST.PLATES && S.stage !== ST.SAM3 && (V().activePlate || 'beauty') === 'beauty') { if (!S.holdC) { S.holdC = true; V().render(); } }   // Z9
       else if (e.code === 'KeyO' && !e.ctrlKey && !e.metaKey) { S.onion = !S.onion; toast(S.onion ? 'Onion skin ±1: czerwony = poprzednia, niebieski = następna klatka' : 'Onion skin wyłączony'); V().render(); }
       else if (e.code === 'KeyM' && !e.ctrlKey && !e.metaKey && versionStage()) { S.flicker = !S.flicker; toast(S.flicker ? 'Mapa migotania wersji (M wyłącza)' : 'Mapa migotania wyłączona'); V().render(); }
@@ -4353,7 +4394,7 @@
       }
       else if (e.code === 'KeyA' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && cmpStage()) cmpKey('a');
       else if (e.code === 'KeyD' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && cmpStage()) cmpKey('diff');
-      else if (e.code === 'KeyV' && viewAllowed('comp')) { const n = nextCompBg(); if (S.view !== 'comp') setView('comp', false); toast(`Tło compu: ${n}`); V().render(); }
+      else if (e.code === 'KeyV' && plain && viewAllowed('comp')) { const n = nextCompBg(); if (S.view !== 'comp') setView('comp', false); toast(`Tło compu: ${n}`); V().render(); }
       else if (drawStage() && e.code === 'BracketLeft') setRadius(S.radius / 1.25);
       else if (drawStage() && e.code === 'BracketRight') setRadius(S.radius * 1.25 + 1);
       else if (e.code === 'Enter' && S.poly && S.poly.p.length >= 3) {
@@ -4400,7 +4441,7 @@
       if (window.MD_ZONES && window.MD_ZONES.compareMode) window.MD_ZONES.compareMode(e.detail.covers);
       renderEdgePalette(); renderVmmPalette(); renderLtxPalette(); renderExpPalette(); if (V()) V().render();
     });
-    window.addEventListener('md-project', () => { S.projectGen = (S.projectGen || 0) + 1; clearOverlays(); S.obj = null; refreshList().then(() => { setAuxMode((V().activePlate || 'beauty') !== 'beauty'); }); });
+    window.addEventListener('md-project', () => { S.projectGen = (S.projectGen || 0) + 1; clearOverlays(); S.obj = null; S.objects = []; refreshList().then(() => { setAuxMode((V().activePlate || 'beauty') !== 'beauty'); }); });
     window.addEventListener('matte-job-finished', (e) => {
       if (!S.obj) return;
       if (pendingPointFrames().length) setTimeout(() => flushPendingPoints().catch(() => {}), 300);
@@ -4419,9 +4460,12 @@
   // ------------------------------------------------------------------------------------------------ public
   window.MD = {
     S, ST, STAGES, api, el, esc, toast, setStage, setView, restoreUserView, loadStages, refreshList, renderStageBar,
+    renderOthersPanel: () => renderOthersPanel(), selectObject: (n) => selectObject(n),
+    objColor: (n) => objColor(n),   // the object's palette colour (Cleanup „Złożenie” → Ochrona, 2026-11-15)
     makeFloating: (...a) => makeFloating(...a), placeFloating: (...a) => placeFloating(...a),
     registerPane(n, pane) { pane.el.style.display = 'none'; $('stagePanel').appendChild(pane.el); PANES[n] = pane; },
     get stage() { return S.stage; }, get auxMode() { return S.auxMode; },
+    updateDelKey: () => updateDelKeyBtn(),
     status(t, kind) { status(t, kind); },
   };
   window.addEventListener('DOMContentLoaded', () => {
@@ -4466,8 +4510,7 @@
     if (window.MD_FT) window.MD_FT.init(hooks);
     renderStageBar(); updateViewTabs(); updateDrawTools();
     setStage(ST.SAM3);
-    const ws = new WebSocket(`ws://${location.host}/ws/events`);
-    ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.type === 'object_progress') status(`${m.step}: ${m.done}/${m.total}`); };
+    document.addEventListener('md-ws', (ev) => { const m = ev.detail; if (m.type === 'object_progress') status(`${m.step}: ${m.done}/${m.total}`); });
     setTimeout(() => { if (v0.projectLoaded && !S.objects.length) refreshList(); }, 1200);
   });
 })();

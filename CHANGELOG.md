@@ -1,5 +1,35 @@
 # MatteDesk – changelog
 
+## 0.60 – 2026-11-16
+- **New (beta): Cleanup mode – C1 Inpaint.** The "✂ Cut-out / 🧹 Cleanup" switch in the header: pick an object or group in
+  the Objects palette and remove or replace it in the plate. The mask comes from MatteDesk (any version, the same band
+  system as the cut-out stages: outside / feather sliders and band points); kept objects are protected by their soft alpha.
+  Engines: MiniMax-H3 (video-to-video under the mask), Wan 2.2 Fun VACE (fits 12 GB; "fast" = 4 Lightning steps),
+  LTX-2.5 (IC-LoRA inpainting), VOID (remove only, whole shot at once) and LaMa. Look anchors made with Qwen-Image-2.1 (main
+  + linked anchors, transitions between anchors, history of generations, import / export), a local prompt assistant
+  (Qwen3-VL-4B) that checks and writes the description, patch levelling (one gain per channel for the shot) and grain,
+  "⟲ Recompose" without the model, SeedVR2 upscale of a version. Versions keep their model, description, anchors and seed;
+  results in <work>/inpaint (RGBA patch for a Merge over in Nuke, full composite, the plate "cleaned" for A/B). Cleanup 3D
+  (3D camera, cards, keys, projection) is still being built and is switched off in this release.
+- **New: Final Touch to Nuke, section by section.** Every palette section has an "⇪ Export" button: Nuke clipboard
+  (Ctrl+V connects to the selected node), a .nk file, After Effects later. Grade = Grade → Dilate → Blur with the current
+  values, Brush = the strokes as a RotoPaint (each stroke on its own frame), MergeMatte = its node. In the export, "Final
+  Touch in Nuke" turns the corrections into live nodes in the MASKI column (baked / Grade as nodes / + RotoPaint); the
+  object's multi-EXR channel stays baked. Calibrated against Nuke 15 renders: Grade exact, Blur within 0.0004, the brush
+  within 1 % of the alpha on average. The motion blur stays baked (no node equivalent).
+- **Plates:** DPX (8 / 10 / 12 / 16-bit) read natively; stage 0 denoise on the GPU (CPU fallback, "Przerwij" works);
+  the shutter angle measured on the plate for the motion blur; clear-plate alignment "transform only" (no local warp);
+  cleanup renders keep 10–16-bit depth.
+- **Doctor:** model weights in a folder of your choice outside ComfyUI (models already downloaded by ComfyUI nodes are
+  found); update / roll back ComfyUI installed from git; installs Wan 2.2 Fun VACE (+ Lightning LoRAs), VOID natively in
+  ComfyUI, Qwen-Image-2.1, the prompt assistant; ViTMatte is "ready" only with its weights.
+- **Deleting is permanent everywhere** (object, version, anchor…): a red warning says what goes and how much space it frees;
+  version numbers are never reused.
+- UI: one number field for every slider, one collapse button for every floating palette, the timeline playhead drags with a
+  tablet pen, the restart bar replaces the old server, MergeMatte says why the Comp view shows the plain cut-out.
+- Fixes: the GPU manager retries a ComfyUI prompt once after running out of memory; plate proxies follow their source; the
+  LTX-2.5 VRAM verdict no longer overwrites stage 7's; Final Touch GPU erode.
+
 ## 0.50 – 2026-10-30
 - **New (testing): object groups.** Several objects (e.g. face, hair, dress, earrings) join one group – its own entry in the
   Objects palette. Every member computes its stages on its own and brings the result it is set to ("Into group from":

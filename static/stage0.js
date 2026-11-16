@@ -19,6 +19,8 @@
     <div class="pane-section">
       <div class="sec-title">Plate'y w projekcie</div>
       <div id="p0Plates"></div>
+      <div class="row"><label title="Krzywa lin ↔ log plate'u (tylko krzywa, bez gamutu): domyślna krzywa trybu Log w palecie MergeMatte i w eksporcie .nk; auto = propozycja z typu źródła / colorspace manifestu / nagłówka EXR (ACES, ARRI, Sony, RED). Zapis w project.json, nie w manifeście">Profil koloru<select id="p0ColorProfile" class="form-input input-sm" title="auto = propozycja (powód w nawiasie) albo krzywa wybrana ręcznie; MergeMatte „z profilu plate'u” i eksport .nk używają tej krzywej"></select></label></div>
+      <div id="p0ColorProfileInfo" class="muted"></div>
       <div class="row"><button class="btn btn-secondary btn-sm" id="p0Manage">⚙ Zarządzaj plate'ami</button><button class="btn btn-secondary btn-sm" id="p0Proxy" title="Proxy 1920 px dla oglądanego plate'u">⚡ Proxy (ten plate)</button></div>
     </div>
     <div class="pane-section" id="p0QaSec">
@@ -41,15 +43,42 @@
       <div class="muted">Z tych plate'ów nic nie wycinamy – służą jako miarka krawędzi (clear plate) i źródło sylwetki (backlit). Motion control potrafi nie trzymać ruchu między przejazdami: sprawdź, czy plate pasuje do beauty, a jeśli nie – „Zmierz dopasowanie” i obejrzyj wynik zanim zapiszesz.</div>
       <div class="muted">Plate'y i przyciski porównań (Plate / A/B / Wipe / Różnica / Kontury) są w rzędzie pod górnym paskiem, pod wyborem plate'ów (lewy ↔ prawy). Pomiar dotyczy clear plate'u / backlitu z pary na górze.</div>
       <div class="status-card" id="p0AlignCard"><span class="badge badge-info" id="p0AlignBadge">Nie mierzono</span><div id="p0AlignText" class="muted"></div></div>
+      <label class="chk" id="p0BacklitForceL" style="display:none" title="Backlit (X2) to ten sam przebieg kamery motion control co beauty – z założenia jest 1:1, różnice to szum światła, nie przesunięcie (decyzja użytkownika 2026-11-03). Pomiar tylko na jawne życzenie"><input type="checkbox" id="p0BacklitForce" title="Zmierz backlit mimo założenia 1:1 z beauty"> Backlit: zmierz mimo to (domyślnie 1:1 z beauty, bez wyrównania)</label>
       <label class="chk" id="p0AlignedL" title="Proxy plate'u przekształcone pomiarem – podgląd wyniku „Skoryguj plate” bez zapisu na dysk"><input type="checkbox" id="p0Aligned"> Pokaż po dopasowaniu</label>
-      <div class="row">
-        <button class="btn btn-primary btn-sm" id="p0Measure">📐 Zmierz dopasowanie</button>
-        <select id="p0Device" class="input-sm" title="Gdzie liczyć wyrównanie: Auto = GPU (Python ComfyUI), gdy działa i ComfyUI nic nie liczy, inaczej CPU (wszystkie rdzenie)">
-          <option value="">Auto</option><option value="gpu">GPU</option><option value="cpu">CPU</option>
-        </select>
-        <button class="btn btn-warning btn-sm" id="p0Apply" disabled title="Zapisuje wyrównaną sekwencję <plate>_align obok oryginału i wpisuje ją do project.json">⚡ Skoryguj plate (_align)</button>
+      <label class="chk" id="p0ResidualL" title="Mapa reszty wyrównania na tej klatce: korelacja łatek 64 px co 48 px między beauty a plate'em PO dopasowaniu (pełna rozdzielczość, bez obiektów wykluczonych). Niebieski = 0 px, czerwony ≥ 1 px, przezroczysty = bez tekstury / wykluczone. Pokazuje, gdzie wyrównanie jest słabe (paralaksa, ruch planu)"><input type="checkbox" id="p0Residual" title="Pokaż mapę reszty wyrównania na bieżącej klatce"> Mapa reszty <span id="p0ResidualInfo" class="muted"></span></label>
+      <!-- layout 2026-11-10 (user: „uporządkuj tę paletę”): blocks stacked, one control per line where it was squeezed -->
+      <div class="p0-block">
+        <div class="p0-block-t">Wykluczenia z pomiaru</div>
+        <div class="p0-line" id="p0ExclRow">
+          <label class="chk" title="Pomiar omija maski 1+2 (rdzeń SAM 3.1 + poprawki) zaznaczonych obiektów na KAŻDEJ klatce, poszerzone o podany margines (cienie kontaktowe, miękkie krawędzie); obszar statyczny modelu lokalnego liczony ze wszystkich klatek kotwicznych. Zmiana maski obiektu po pomiarze = „Zmierz ponownie”"><input type="checkbox" id="p0ExclObj" checked title="Omijaj maski 1+2 zaznaczonych obiektów (na każdej klatce)"> Wyklucz obiekty</label>
+          <label class="p0-inline" title="Margines wokół maski obiektu w px plate'u (domyślnie 32)">margines +<input type="number" id="p0ExclDilate" class="input-sm p0-excl-px" value="32" min="0" max="400" step="4" title="Margines wokół maski obiektu w px plate'u (domyślnie 32)"> px</label>
+        </div>
+        <div id="p0ExclList" class="p0-excl-list muted"></div>
+        <div class="p0-line" id="p0ExclBoxRow">
+          <button class="btn btn-secondary btn-sm" id="p0ExclRect" title="Prostokąt wykluczony z pomiaru (np. obszar bez rdzenia, nieostry pierwszy plan): kliknij, potem przeciągnij na obrazie">▭ Prostokąt wykluczenia</button>
+          <span id="p0ExclRectInfo" class="muted"></span>
+          <button class="btn btn-secondary btn-xs" id="p0ExclRectClear" title="Usuń prostokąt wykluczenia" style="display:none">✕</button>
+        </div>
       </div>
-      <div class="row"><button class="btn btn-secondary btn-sm" id="p0Nk" disabled title="Group Align_<plate> do Nuke'a (Transform / CornerPin / STMap z siatki wg metody)">💾 Zapisz .nk</button></div>
+      <div class="p0-block">
+        <div class="p0-block-t">Pomiar</div>
+        <div class="p0-grid2">
+          <label class="p0-inline" title="Gdzie liczyć wyrównanie: Auto = GPU (Python ComfyUI), gdy działa i ComfyUI nic nie liczy, inaczej CPU (wszystkie rdzenie)">Liczenie<select id="p0Device" class="input-sm" title="Gdzie liczyć wyrównanie: Auto / GPU / CPU">
+            <option value="">Auto</option><option value="gpu">GPU</option><option value="cpu">CPU</option>
+          </select></label>
+          <label class="p0-inline" title="Czy kamera stała nieruchomo w obu przejazdach (beauty i ten plate). Nieruchoma = jedno dopasowanie dla całego ujęcia z mediany klatek kotwicznych (kilka razy szybciej, odporne na szum). Ruchoma = osobne śledzenie każdej klatki (CoTracker3; najdokładniej, wolniej). Auto = decyzja z drgania modeli między klatkami (próg 0,5 px) dla CAŁEGO mierzonego zakresu – ujęcie mieszane (kamera stoi, potem rusza) auto traktuje jak ruchome">Kamera<select id="p0Lock" class="input-sm" title="Kamera w obu przejazdach: auto / nieruchoma / ruchoma – opis wyboru pod spodem">
+            <option value="auto">auto</option><option value="on">nieruchoma</option><option value="off">ruchoma</option>
+          </select></label>
+        </div>
+        <label class="chk" title="Motion control: clear plate z drugiego przejazdu ma zwykle stałe przesunięcie kamery – wystarczy Transform / CornerPin. Zaznaczone = bez modelu lokalnego (siatka / STMap), plate nie jest zniekształcany warpem; reszta, którą poprawiłaby siatka, zostaje i jest podana w raporcie"><input type="checkbox" id="p0GlobalOnly" title="Tylko Transform / CornerPin, bez warpa siatką"> Tylko transform (bez warpa)</label>
+        <label class="chk" title="Opcja (krok 6a): po modelu globalnym i lokalnym zmierz resztę na punktach kontrolnych w pełnej rozdzielczości na klatkach kotwicznych (jak „Mapa reszty”); ta reszta decyduje też, czy liczyć model lokalny. Kilka sekund na klatkę kotwiczną"><input type="checkbox" id="p0FullCheck" title="Reszta w pełnej rozdzielczości na kotwicach (wolniej, uczciwiej)"> Reszta w pełnej rozdzielczości</label>
+        <div class="muted" id="p0LockHelp"></div>
+        <div class="p0-btns">
+          <button class="btn btn-primary btn-sm" id="p0Measure">📐 Zmierz dopasowanie</button>
+          <button class="btn btn-warning btn-sm" id="p0Apply" disabled title="Zapisuje wyrównaną sekwencję <plate>_align obok oryginału i wpisuje ją do project.json">⚡ Skoryguj plate (_align)</button>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="p0Nk" disabled title="Group Align_<plate> do Nuke'a (Transform / CornerPin / STMap z siatki wg metody)">💾 Zapisz .nk</button>
+      </div>
       <div class="progress-bar-container" id="p0AlignProg" style="display:none"><div class="progress-bar-fill" id="p0AlignFill" style="width:0%"></div><span class="progress-text" id="p0AlignTxt"></span></div>
     </div>
     <div class="pane-section">
@@ -80,19 +109,57 @@
     try { info = await window.MD.api('GET', '/api/project/stages'); } catch (e) { info = null; }
     render();
     window.MD.renderStageBar();
+    loadColorProfile();
+  }
+  // plate colour profile (project.json color_profile, 2026-11-03): auto (→ the proposed curve, reason) / a curve id;
+  // MergeMatte's „z profilu plate'u” and the .nk export read it (static/mergematte.js reloads on 'md-color-profile')
+  let profile = null;
+  async function loadColorProfile() {
+    const sel = $('p0ColorProfile'); if (!sel) return;
+    if (!info) { profile = null; sel.innerHTML = ''; $('p0ColorProfileInfo').textContent = ''; return; }
+    try { profile = await window.MD.api('GET', '/api/project/color_profile'); } catch (e) { profile = null; }
+    renderColorProfile();
+  }
+  function renderColorProfile() {
+    const sel = $('p0ColorProfile'), inf = $('p0ColorProfileInfo');
+    if (!sel || !profile) return;
+    sel.innerHTML = profile.options.map((o) => `<option value="${window.MD.esc(o.id)}" title="${window.MD.esc(o.note || '')}">${window.MD.esc(o.label)}</option>`).join('');
+    sel.value = profile.setting;
+    inf.textContent = `Teraz: ${profile.effective.label} (${profile.effective.reason}).`;
+  }
+  // content check actions (NEXT_STEPS 5, 2026-11-07): measure again; „użyj mimo to” for a plate wrongly flagged „inne ujęcie”
+  function contentButtons(p) {
+    const c = p.content || {};
+    if (!c.state || c.state === 'pending') return '';
+    const b = (act, txt, tip) => `<button class="btn btn-small p0-content-act" data-p="${window.MD.esc(p.name)}" data-act="${act}" title="${tip}">${txt}</button>`;
+    let out = b('remeasure', '↻', "Zmierz zgodność z beauty ponownie (np. po podmianie plików plate'u)");
+    if (c.state === 'other' && !c.override) out += b('override', 'Użyj mimo to', 'To jest plate z tego ujęcia – sprawdzanie się pomyliło. Etapy zaczną go używać.');
+    if (c.state === 'other' && c.override) out += b('clear_override', 'Cofnij „użyj mimo to”', 'Wróć do wyniku sprawdzania: plate nie będzie używany w etapach.');
+    return out;
   }
   function render() {
     if (!info) { $('p0Plates').innerHTML = '<div class="muted">Otwórz projekt.</div>'; return; }
     const cur = V().activePlate || 'beauty';
     $('p0Plates').innerHTML = info.plates.map((p) => `
-      <div class="row-item plate-row ${p.name === cur ? 'cur' : ''}" data-p="${p.name}" title="Kliknij: pokaż ten plate">
-        <span class="plate-badge plate-badge-${p.name.replace('_align', '')}">${p.name}</span>
-        <span class="plate-name">${label(p.name)}</span>
+      <div class="row-item plate-row ${p.name === cur ? 'cur' : ''}" data-p="${window.MD.esc(p.name)}" title="Kliknij: pokaż ten plate">
+        <span class="plate-badge plate-badge-${window.MD.esc(p.name.replace('_align', ''))}">${window.MD.esc(p.name)}</span>
+        <span class="plate-name">${window.MD.esc(label(p.name))}</span>
         <span class="pill ${p.exists ? 'ok' : 'warn'}">${p.exists ? `${p.frame_count} kl.` : 'brak plików'}</span>
         <span class="pill ${p.proxy_count ? 'ok' : ''}" title="proxy 1920 px">${p.proxy_count ? `proxy ${p.proxy_count}` : 'bez proxy'}</span>
         ${p.mismatch ? `<span class="pill warn" title="Inna rozdzielczość niż beauty – ten plate nie jest używany w żadnym etapie (pewnie z innego ujęcia). Podmień go albo usuń.">⚠ ${p.mismatch}</span>` : ''}
+        ${p.content_note ? `<span class="pill ${{ ok: 'ok', shifted: 'warn', other: 'warn' }[(p.content || {}).state] || ''}" title="Zgodność treści z beauty (krawędzie obrazu na 3 klatkach, niezależnie od ekspozycji): „inne ujęcie” = plate nie jest używany w żadnym etapie (jak przy złej rozdzielczości); „przesunięty” = użyj „Dopasuj” (wyrównanie)">${window.MD.esc(p.content_note)}</span>` : ''}
+        ${contentButtons(p)}
       </div>`).join('');
+    // the content check runs in the background on the server: ask again until every plate has its answer
+    clearTimeout(render.contentT);
+    if (info.plates.some((p) => (p.content || {}).state === 'pending')) render.contentT = setTimeout(() => refresh().catch(() => {}), 4000);
     $('p0Plates').querySelectorAll('.plate-row').forEach((r) => r.addEventListener('click', () => V().setActivePlate(r.dataset.p)));
+    $('p0Plates').querySelectorAll('.p0-content-act').forEach((b) => b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      b.disabled = true;
+      try { await window.MD.api('POST', `/api/project/plate/${encodeURIComponent(b.dataset.p)}/content`, { action: b.dataset.act }); } catch (err) { window.MD.toast(`Zgodność plate'u: ${err.message || err}`, 6000); }
+      refresh().catch(() => {});
+    }));
 
     // alignment section: only for the auxiliary plates present
     const auxes = info.plates.filter((p) => AUX.includes(p.name)).map((p) => p.name);
@@ -106,7 +173,7 @@
     // cleaning per plate
     $('p0Clean').innerHTML = info.plates.map((p) => {
       const c = info.clean[p.name] || {};
-      return `<div class="row-item"><span>${label(p.name)}</span><span class="pill ${c.done ? 'ok' : ''}">${c.done ? `−${c.reduction_pct}% migotania${c.noise_reduction_pct ? `, −${c.noise_reduction_pct}% szumu` : ''}${c.nk ? ' · .nk' : ''}` : 'nie czyszczono'}</span></div>`;
+      return `<div class="row-item"><span>${window.MD.esc(label(p.name))}</span><span class="pill ${c.done ? 'ok' : ''}">${c.done ? `−${c.reduction_pct}% migotania${c.noise_reduction_pct ? `, −${c.noise_reduction_pct}% szumu` : ''}${c.nk ? ' · .nk' : ''}` : 'nie czyszczono'}</span></div>`;
     }).join('');
     renderDenoise();
     $('p0Camera').textContent = info.camera.done ? `Policzono: ${info.camera.motion_type}, reszta ${info.camera.residual_median_px} px` : 'Nie policzono (opcjonalne – tło nieruchome przy QA i strefach).';
@@ -130,14 +197,138 @@
       : `Wyłączone globalnie (defaults.json → mplate.enabled = false).`;
   }
 
+  // ---- exclusions of the measurement (align_v2 step 1, 2026-11-03): objects with a core (checkbox list), margin, box
+  const excl = { objects: new Set(), box: null, arming: false, drag: null };
+  function exclObjects() { return (info && info.align_objects) || []; }
+  function renderExcl() {
+    const objs = exclObjects();
+    const list = $('p0ExclList');
+    for (const o of objs) if (!excl._seen || !excl._seen.has(o.name)) excl.objects.add(o.name);   // new object = ticked
+    excl._seen = new Set(objs.map((o) => o.name));
+    list.innerHTML = objs.length ? objs.map((o) => `<label class="chk p0-excl-obj" title="Maska 1+2 obiektu „${window.MD.esc(o.name)}” wykluczona z pomiaru"><input type="checkbox" data-o="${window.MD.esc(o.name)}" ${excl.objects.has(o.name) ? 'checked' : ''}> ${window.MD.esc(o.name)}</label>`).join('')
+      : '<span title="Obiekty z rdzeniem SAM 3.1 pojawią się tu po etapie 1 – wtedy warto zmierzyć ponownie">(brak obiektów z rdzeniem – pomiar omija tylko to, co różni się od beauty)</span>';
+    list.querySelectorAll('input').forEach((c) => c.addEventListener('change', () => { if (c.checked) excl.objects.add(c.dataset.o); else excl.objects.delete(c.dataset.o); }));
+    const b = excl.box;
+    $('p0ExclRectInfo').textContent = b ? `${b[0]},${b[1]} → ${b[2]},${b[3]} px` : (excl.arming ? 'przeciągnij na obrazie…' : '');
+    $('p0ExclRectClear').style.display = b ? '' : 'none';
+    $('p0ExclRect').classList.toggle('active', excl.arming);
+  }
+  function exclBody() {
+    const body = {};
+    body.exclude_objects = $('p0ExclObj').checked ? exclObjects().map((o) => o.name).filter((n) => excl.objects.has(n)) : [];
+    body.exclude_dilate_px = Math.max(0, Math.min(400, +$('p0ExclDilate').value || 0));
+    if (excl.box) body.exclude_box = excl.box;
+    return body;
+  }
+  const LOCK_HELP = {   // user decision 2026-11-04: the choice is the user's, with a plain description (default auto)
+    auto: 'Auto: jedna decyzja dla całego mierzonego zakresu – kamera nieruchoma tylko, gdy modele klatek drgają < 0,5 px; ujęcie mieszane (kamera stoi, potem rusza) liczy jak ruchome. Wynik pomiaru mówi, co wybrało.',
+    on: 'Nieruchoma: jedno dopasowanie dla całego ujęcia z mediany klatek kotwicznych – kilka razy szybciej, szum uśredniony; złe, gdy kamera lub plan ruszają się w trakcie (także częściowo).',
+    off: 'Ruchoma: każda klatka śledzona osobno (CoTracker3) – najdokładniej i bezpiecznie dla ujęć mieszanych, najwolniej.',
+  };
+  function lockHelp() { const el = $('p0LockHelp'); if (el) el.textContent = LOCK_HELP[$('p0Lock').value] || LOCK_HELP.auto; }
+  function lockText(cl) {   // step 2: the camera-lock decision and its gain
+    if (!cl) return '';
+    const base = `kamera ${cl.locked ? 'nieruchoma' : 'ruchoma'} (${cl.mode === 'auto' ? 'auto: ' : ''}${cl.reason || ''})`;
+    if (!cl.locked || cl.anchors == null) return base;
+    return `${base} · pole z mediany ${cl.anchors} kl. kotwicznych, reszta kotwic ${(+cl.local_before_px).toFixed(2)} → ${(+cl.local_after_px).toFixed(2)} px`;
+  }
+  function exclText(ex) {
+    if (!ex) return '';
+    const parts = [];
+    if (ex.objects && ex.objects.length) parts.push(`obiekty ${ex.objects.join(', ')} +${ex.dilate_px} px`);
+    if (ex.box) parts.push(`prostokąt ${ex.box.join(',')}`);
+    if (ex.static_mask === 'all_anchors') parts.push(`obszar statyczny z klatek kotwicznych${ex.static_frac != null ? ` (${Math.round(ex.static_frac * 100)} % kadru)` : ''}`);
+    return parts.length ? `wykluczono: ${parts.join(' · ')}` : 'bez wykluczeń';
+  }
+  function wireExcl() {
+    $('p0ExclRect').addEventListener('click', () => { excl.arming = !excl.arming; V().canvas.style.cursor = excl.arming ? 'crosshair' : ''; renderExcl(); });
+    $('p0ExclRectClear').addEventListener('click', () => { excl.box = null; renderExcl(); V().render(); });
+    const cv = V().canvas;
+    cv.addEventListener('pointerdown', (e) => {
+      if (!excl.arming || e.button !== 0 || window.MD.stage !== 0) return;
+      const p = window.MD.canvasToPlate(e); if (!p) return;
+      e.preventDefault(); e.stopPropagation(); e.mdHandled = true;
+      try { cv.setPointerCapture(e.pointerId); } catch (er) { /* not capturable */ }
+      excl.drag = { pid: e.pointerId, x0: p[0], y0: p[1], x: p[0], y: p[1] };
+    }, true);
+    cv.addEventListener('pointermove', (e) => {
+      const d = excl.drag; if (!d || e.pointerId !== d.pid) return;
+      const p = window.MD.canvasToPlate(e); if (!p) return;
+      d.x = p[0]; d.y = p[1]; V().render();
+    });
+    cv.addEventListener('pointerup', (e) => {
+      const d = excl.drag; if (!d || e.pointerId !== d.pid) return;
+      excl.drag = null; excl.arming = false; V().canvas.style.cursor = '';
+      const ps = window.MD.plateSize() || [1, 1];
+      const cl = (v, m) => Math.round(Math.max(0, Math.min(m, v)));
+      const x0 = cl(Math.min(d.x0, d.x), ps[0]), x1 = cl(Math.max(d.x0, d.x), ps[0]), y0 = cl(Math.min(d.y0, d.y), ps[1]), y1 = cl(Math.max(d.y0, d.y), ps[1]);
+      excl.box = (x1 - x0 >= 8 && y1 - y0 >= 8) ? [x0, y0, x1, y1] : null;
+      renderExcl(); V().render();
+    });
+    V().overlayHooks.push((ctx, img) => {
+      if (window.MD.stage !== 0) return;
+      const ps = window.MD.plateSize(); if (!ps) return;
+      const d = excl.drag, b = d ? [Math.min(d.x0, d.x), Math.min(d.y0, d.y), Math.max(d.x0, d.x), Math.max(d.y0, d.y)] : excl.box;
+      if (!b) return;
+      const sx = img.width / ps[0], sy = img.height / ps[1], z = V().zoom;
+      ctx.save();
+      ctx.strokeStyle = '#f87171'; ctx.lineWidth = 2 / z; ctx.setLineDash([6 / z, 4 / z]);
+      ctx.fillStyle = 'rgba(248,113,113,0.15)';
+      ctx.fillRect(b[0] * sx, b[1] * sy, (b[2] - b[0]) * sx, (b[3] - b[1]) * sy);
+      ctx.strokeRect(b[0] * sx, b[1] * sy, (b[2] - b[0]) * sx, (b[3] - b[1]) * sy);
+      ctx.restore();
+    });
+  }
+
+  // ---- residual map overlay (align_v2 step 3): PNG per frame from /api/plate/align/residual/{f}, drawn over the plate
+  const resid = { on: false, cache: new Map(), loading: new Set(), stats: new Map() };
+  function residKey(f) { return `${aux}|${f}|${(report && report.created_at) || ''}`; }
+  function residImg(f) {
+    const key = residKey(f);
+    if (resid.cache.has(key)) return resid.cache.get(key);
+    if (resid.loading.has(key)) return null;
+    resid.loading.add(key);
+    const img = new Image();
+    img.onload = () => { resid.loading.delete(key); resid.cache.set(key, img); if (resid.cache.size > 24) resid.cache.delete(resid.cache.keys().next().value); residInfo(); V().render(); };
+    img.onerror = () => { resid.loading.delete(key); resid.cache.set(key, 'missing'); residInfo(); };
+    img.src = `/api/plate/align/residual/${f}?plate=${encodeURIComponent(aux)}&side=1024&t=${encodeURIComponent(key)}`;
+    window.MD.api('GET', `/api/plate/align/residual_stats/${f}?plate=${encodeURIComponent(aux)}&side=1024`).then((s) => { resid.stats.set(key, s); residInfo(); }).catch(() => {});
+    return null;
+  }
+  function residInfo() {
+    const el = $('p0ResidualInfo'); if (!el) return;
+    if (!resid.on) { el.textContent = ''; return; }
+    const f = V().currentFrame, key = residKey(f), s = resid.stats.get(key), im = resid.cache.get(key);
+    el.textContent = im === 'missing' ? '(brak – zmierz dopasowanie)' : s ? `F${f}: mediana ${(+s.median).toFixed(2)} px · p95 ${(+s.p95).toFixed(2)} · max ${(+s.max).toFixed(1)} · ${Math.round(100 * s.frac_ok)} % < 0,3 px (${s.n} pkt)` : '(liczenie…)';
+  }
+  function wireResidual() {
+    $('p0Residual').addEventListener('change', (e) => { resid.on = e.target.checked; residInfo(); V().render(); });
+    V().overlayHooks.push((ctx, img) => {
+      if (!resid.on || window.MD.stage !== 0 || !report || !AUX.includes(V().activePlate)) return;
+      const im = residImg(V().currentFrame);
+      if (!im || im === 'missing') return;
+      ctx.save(); ctx.globalAlpha = 0.75; ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(im, 0, 0, img.width, img.height);
+      ctx.restore();
+    });
+    window.addEventListener('md-frame', () => { if (resid.on) residInfo(); });
+  }
+
   function renderAlign() {
     const a = info && info.align[aux];
     const badge = $('p0AlignBadge'), txt = $('p0AlignText');
     report = null;
+    renderExcl();
+    const backlit = aux === 'backlit';
+    $('p0BacklitForceL').style.display = backlit ? '' : 'none';
+    $('p0Measure').disabled = backlit && !$('p0BacklitForce').checked;
     if (!a || !a.measured) {
-      badge.className = 'badge badge-info'; badge.textContent = 'Nie mierzono';
-      txt.textContent = 'Porównaj wzrokowo (Wipe / Różnica), potem „Zmierz dopasowanie” – pomiar tylko na statycznych obszarach, model od przesunięcia do dopasowania lokalnego (siatka przesunięć → STMap w Nuke).';
+      badge.className = 'badge badge-info'; badge.textContent = backlit ? '1:1 z beauty (nie mierzymy)' : 'Nie mierzono';
+      txt.textContent = backlit
+        ? 'Backlit to ten sam przebieg kamery co beauty – z założenia 1:1 (różnice to szum światła). Bez wyrównania; pomiar tylko po zaznaczeniu „zmierz mimo to”.'
+        : 'Porównaj wzrokowo (Wipe / Różnica), potem „Zmierz dopasowanie” – pomiar tylko na statycznych obszarach, model od przesunięcia do dopasowania lokalnego (siatka przesunięć → STMap w Nuke).';
       $('p0Apply').disabled = true; $('p0Nk').disabled = true; $('p0Aligned').disabled = true; $('p0Aligned').checked = false;
+      $('p0Residual').disabled = true; $('p0Residual').checked = false; resid.on = false; residInfo();
       if (V().alignedPreview) V().setAlignedPreview(false);
       return;
     }
@@ -151,10 +342,15 @@
     txt.innerHTML = (a.stale ? `<span class="p0-stale">⚠ ${window.MD.esc(a.stale)}</span><br>` : '') +
       `${window.MD.esc(a.recommendation || '')}<br>metoda <b>${a.method}</b> · reszta mediana <b>${(+a.residual_median).toFixed(2)} px</b>, max <b>${(+a.residual_max).toFixed(2)} px</b> · F${a.frame_range[0]}–${a.frame_range[1]}${dev}` +
       (a.device_note ? `<br>${window.MD.esc(a.device_note)}` : '') +
-      (over.length ? `<br>klatki > 0.3 px: ${over.slice(0, 12).join(', ')}${over.length > 12 ? '…' : ''}` : '');
+      (a.global_only ? '<br><span class="muted">tylko transform – bez warpa siatką</span>' : '') +
+      (over.length ? `<br>klatki > 0.3 px: ${over.slice(0, 12).join(', ')}${over.length > 12 ? '…' : ''}` : '') +
+      ((a.frames_no_texture || []).length ? `<br><span class="p0-stale">⚠ bez tekstury w obszarze statycznym (nic nie zmierzono): ${a.frames_no_texture.slice(0, 12).join(', ')}${a.frames_no_texture.length > 12 ? '…' : ''}</span>` : '') +
+      `<br><span class="muted">${window.MD.esc(exclText(a.exclusions))}</span>` +
+      (a.camera_lock && a.camera_lock.mode ? `<br><span class="muted">${window.MD.esc(lockText(a.camera_lock))}</span>` : '');
     $('p0Apply').disabled = !a.needs_correction || a.applied;
     $('p0Nk').disabled = false;
     $('p0Aligned').disabled = false;
+    $('p0Residual').disabled = false; residInfo();
     $('p0Aligned').checked = !!V().alignedPreview;
   }
 
@@ -374,12 +570,22 @@
     $('p0Proxy').addEventListener('click', () => V().triggerProxyGeneration().then(refresh));
     $('p0Aligned').addEventListener('change', (e) => V().setAlignedPreview(e.target.checked));
     try { $('p0Device').value = localStorage.getItem('md.alignDevice') || ''; } catch (e) { /* no storage */ }
+    try { $('p0Lock').value = localStorage.getItem('md.alignLock') || 'auto'; } catch (e) { /* no storage */ }
+    lockHelp();
+    $('p0Lock').addEventListener('change', (e) => { try { localStorage.setItem('md.alignLock', e.target.value); } catch (err) { /* no storage */ } lockHelp(); });
     $('p0Device').addEventListener('change', (e) => { try { localStorage.setItem('md.alignDevice', e.target.value); } catch (err) { /* no storage */ } });
+    try { $('p0GlobalOnly').checked = localStorage.getItem('md.alignGlobalOnly') === '1'; } catch (e) { /* no storage */ }
+    $('p0GlobalOnly').addEventListener('change', (e) => { try { localStorage.setItem('md.alignGlobalOnly', e.target.checked ? '1' : '0'); } catch (err) { /* no storage */ } });
+    $('p0BacklitForce').addEventListener('change', () => renderAlign());
     $('p0Measure').addEventListener('click', async () => {
+      if (aux === 'backlit' && !$('p0BacklitForce').checked) return;
       const b = $('p0Measure'); b.disabled = true; prog(true, 0, 'Pomiar…');
       try {
-        const body = { plate: aux, aux_plate_type: aux === 'backlit' ? 'backlit' : 'cleanplate' };
+        const body = { plate: aux, aux_plate_type: aux === 'backlit' ? 'backlit' : 'cleanplate', ...exclBody() };
         if ($('p0Device').value) body.device = $('p0Device').value;
+        body.camera_lock = $('p0Lock').value || 'auto';
+        body.fullres_check = !!$('p0FullCheck').checked;
+        body.global_only = !!$('p0GlobalOnly').checked;
         const r = await window.MD.api('POST', '/api/plate/align/measure', body);
         await refresh();
         $('p0Aligned').checked = true; V().setAlignedPreview(true);
@@ -412,14 +618,25 @@
       } catch (err) { window.MD.toast(`Odszumianie: ${err.message}`, 6000); }
       finally { await refresh(); }
     });
+    $('p0ColorProfile').addEventListener('change', async (e) => {
+      const sel = e.target; sel.disabled = true;
+      try {
+        profile = await window.MD.api('PUT', '/api/project/color_profile', { color_profile: sel.value });
+        renderColorProfile();
+        window.MD.toast(`Profil koloru plate'u: ${profile.effective.label}`, 5000);
+        window.dispatchEvent(new CustomEvent('md-color-profile', { detail: profile }));
+      } catch (err) { window.MD.toast(`Profil koloru: ${err.message}`, 6000); await loadColorProfile(); }
+      finally { sel.disabled = false; }
+    });
     $('p0CleanOpen').addEventListener('click', () => V().openCleanModal());
     $('p0CameraOpen').addEventListener('click', () => V().openCameraModal());
     $('p0DepthOpen').addEventListener('click', () => window.openDepthModal && window.openDepthModal());
     window.addEventListener('md-plate', (e) => {
       if (info) render(); V().syncCompareUi();
       const p = info && e.detail && info.plates.find((x) => x.name === e.detail.plate);
-      if (p && e.detail.plate !== e.detail.prev && info.n_frames && p.proxy_count < info.n_frames) window.MD.toast(`„${p.name}”: proxy ${p.proxy_count}/${info.n_frames} klatek – brakujące liczone na żywo (wolniej); pełne proxy: „Proxy (ten plate)”`, 6000);
+      if (p && info.n_frames && p.proxy_count < info.n_frames) window.MD.toast(`„${p.name}”: proxy ${p.proxy_count}/${info.n_frames} klatek – brakujące liczone na żywo (wolniej); pełne proxy: „Proxy (ten plate)”`, 6000);
     });
+    window.addEventListener('md-compare-ref', () => { if (info) render(); V().syncCompareUi(); });
     window.addEventListener('md-project', refresh);
     window.addEventListener('md-plates-updated', refresh);
     window.addEventListener('matte-job-finished', refresh);
@@ -456,6 +673,8 @@
     buildPalette(); showPalette(window.MD.stage);
     wire();
     wireQa();
+    wireExcl();
+    wireResidual();
     setTimeout(() => { if (V() && V().projectLoaded) refresh(); }, 1000);
   });
 })();

@@ -1,0 +1,8 @@
+{
+  "name": "matte-desk-js-tests",
+  "private": true,
+  "description": "jsdom for tests/js/zones_harness.mjs (tests/test_zones_js_harness.py). Install: cd tests/js && npm ci",
+  "devDependencies": {
+    "jsdom": "24.1.3"
+  }
+}

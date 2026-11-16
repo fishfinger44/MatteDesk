@@ -27,8 +27,17 @@
 
   async function grabWindow() {
     const h2c = await loadH2C();
-    const canvas = await h2c(document.body, { backgroundColor: '#111113', logging: false, useCORS: true,
-      width: window.innerWidth, height: window.innerHeight, windowWidth: window.innerWidth, windowHeight: window.innerHeight });
+    // html2canvas 1.4.1 throws "Error parsing CSS component value, unexpected EOF" on a pseudo-element of an <input>
+    // (the tick of a ticked checkbox, index.css; user report 2026-11-06). It reads the live page's styles while cloning,
+    // so the pseudo-elements go off in the page itself for the capture (onclone is too late); the box keeps its colour.
+    const noPseudo = document.createElement('style');
+    noPseudo.textContent = 'input::before, input::after { content: none !important; }';
+    document.head.appendChild(noPseudo);
+    let canvas;
+    try {
+      canvas = await h2c(document.body, { backgroundColor: '#111113', logging: false, useCORS: true,
+        width: window.innerWidth, height: window.innerHeight, windowWidth: window.innerWidth, windowHeight: window.innerHeight });
+    } finally { noPseudo.remove(); }
     let c = canvas;
     if (c.width > MAX_W) {
       const s = MAX_W / c.width;
@@ -40,13 +49,7 @@
     return c.toDataURL('image/png');
   }
 
-  async function postJSON(url, body) {
-    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    let data = null;
-    try { data = await r.json(); } catch (e) { data = null; }
-    if (!r.ok) throw new Error((data && data.detail) || `HTTP ${r.status}`);
-    return data;
-  }
+  const postJSON = (url, body) => window.UI.api('POST', url, body);
 
   // header ladybug: now and then the wing cases open and the wings flutter (random 4-10 s, off with reduced motion)
   const BUG_SVG = `<svg class="rp-bug" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
@@ -88,21 +91,21 @@
     bg.className = 'md-dialog';
     bg.style.cssText = 'position:fixed;inset:0;z-index:26000;background:rgba(10,10,12,.7);display:flex;align-items:center;justify-content:center;';
     const errBox = context.error_title || context.error_text
-      ? `<div class="rp-err" style="margin-bottom:10px;padding:8px 10px;border-left:3px solid #ef4444;background:rgba(239,68,68,.08);font-size:12px;">
+      ? `<div class="rp-err" style="margin-bottom:10px;padding:8px 10px;border-left:3px solid var(--accent-danger);background:rgba(239,68,68,.08);font-size:12px;">
            <b>Dołączony błąd:</b> ${esc(context.error_title || '')}<br><span style="color:#a8a8ae;">${esc((context.error_text || '').slice(0, 400))}</span></div>` : '';
-    bg.innerHTML = `<style>${BUG_CSS}#mdReport [hidden] { display: none !important; } #mdReport textarea, #mdReport input[type=email] { background: #101012; color: #dcdcdf; border: 1px solid #3c3c42; border-radius: 4px; padding: 6px 8px; font: inherit; resize: vertical; }</style><div role="dialog" aria-label="Zgłoś problem" style="width:min(720px,94vw);max-height:90vh;display:flex;flex-direction:column;background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-top:4px solid #e8a33d;border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.6);">
+    bg.innerHTML = `<style>${BUG_CSS}#mdReport [hidden] { display: none !important; } #mdReport textarea, #mdReport input[type=email] { background: #101012; color: #dcdcdf; border: 1px solid #3c3c42; border-radius: 4px; padding: 6px 8px; font: inherit; resize: vertical; }</style><div role="dialog" aria-label="Zgłoś problem" style="width:min(720px,94vw);max-height:90vh;display:flex;flex-direction:column;background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-top:4px solid var(--border-focus);border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.6);">
         <div style="padding:14px 18px 4px;font-size:16px;font-weight:700;display:flex;align-items:center;gap:7px;">${BUG_SVG}<span>Zgłoś problem</span></div>
-        <div style="padding:4px 18px 0;font-size:12px;color:#9a9aa0;">Zgłoszenie trafia do autora MatteDesk (prywatne repozytorium na GitHubie). Ścieżki, nazwy ujęć i obiektów, nazwa użytkownika i komputera są zastępowane znacznikami – przed wysłaniem zobaczysz wszystko, co wyjdzie z komputera.</div>
+        <div style="padding:4px 18px 0;font-size:12px;color:var(--text-muted);">Zgłoszenie trafia do autora MatteDesk (prywatne repozytorium na GitHubie). Ścieżki, nazwy ujęć i obiektów, nazwa użytkownika i komputera są zastępowane znacznikami – przed wysłaniem zobaczysz wszystko, co wyjdzie z komputera.</div>
         <div style="padding:10px 18px;overflow:auto;font-size:13px;display:flex;flex-direction:column;gap:8px;">
           ${errBox}
-          <label>Co się stało? <span style="color:#ef4444;">*</span>
+          <label>Co się stało? <span style="color:var(--accent-danger);">*</span>
             <textarea id="rpWhat" rows="4" style="width:100%;box-sizing:border-box;margin-top:4px;" placeholder="Np. po kliknięciu „Przelicz finalnie” okno postępu zniknęło i nic się nie policzyło"></textarea></label>
           <label>Kroki, żeby to powtórzyć (opcjonalnie)
             <textarea id="rpSteps" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px;" placeholder="1. Otwórz projekt… 2. Wybierz obiekt… 3. …"></textarea></label>
           <label>E-mail do odpowiedzi (opcjonalnie)
             <input id="rpEmail" type="email" style="width:100%;box-sizing:border-box;margin-top:4px;" placeholder="tylko jeśli chcesz odpowiedź"></label>
           <label style="display:flex;gap:6px;align-items:center;"><input id="rpShot" type="checkbox"> Dołącz zrzut okna MatteDesk (bez tego okienka)</label>
-          <div id="rpShotInfo" style="font-size:12px;color:#9a9aa0;"></div>
+          <div id="rpShotInfo" style="font-size:12px;color:var(--text-muted);"></div>
           <div id="rpPreview" hidden style="display:flex;flex-direction:column;gap:6px;">
             <b>Tak wygląda całe zgłoszenie:</b>
             <pre id="rpText" translate="no" style="max-height:260px;overflow:auto;background:#101012;border:1px solid #2a2a2e;padding:8px;font-size:11px;white-space:pre-wrap;word-break:break-word;margin:0;"></pre>
@@ -116,7 +119,7 @@
           <button type="button" class="btn btn-secondary" id="rpCopy" hidden title="Kopiuje całe zgłoszenie (tekst) do schowka – np. do wklejenia na GitHubie">Kopiuj zgłoszenie</button>
           <button type="button" class="btn btn-secondary" id="rpCancel">Zamknij</button>
           <button type="button" class="btn btn-secondary" id="rpShow">Pokaż, co zostanie wysłane</button>
-          <button type="button" class="btn btn-primary" id="rpSend" style="background:#e8a33d;border-color:#e8a33d;">Wyślij</button>
+          <button type="button" class="btn btn-primary" id="rpSend" style="background:var(--border-focus);border-color:var(--border-focus);">Wyślij</button>
         </div></div>`;
     document.body.appendChild(bg);
     flapNowAndThen(bg);

@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 from engine.clean import PlateCleaner, as_bgr
-from engine.flicker_measure import FlickerMeasure, MaskSpec, measure_flicker
+from engine.flicker_measure import MaskSpec, measure_flicker
 
 try:   # the proxies' display transform (ACES -> sRGB-ish); a plain curve when unavailable
     from engine.ingest import tonemap_plate_to_display as _tonemap

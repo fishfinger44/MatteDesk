@@ -70,23 +70,24 @@
       <label title="Wersja, na którą nakładają się korekty: dowolny policzony wynik (jak źródło eksportu). Zmiana bazy w każdej chwili – korekty zostają i nakładają się na nową bazę (sprawdź miejsca korekt)">Baza<select id="ftBase" class="form-input"></select></label>
       <label id="ftRunL" style="display:none" title="Która wersja z listy jest bazą">Wersja<select id="ftRun" class="form-input"></select></label>
       <div class="muted pp-hint" id="ftBaseInfo"></div>
-      <div class="pp-chk"><label class="chk" title="Warstwa korekt tej klatki na obrazie (zielone = dodaje, czerwone = odejmuje; gumka ją wymazuje). Wyłącz, żeby oceniać samą alfę"><input type="checkbox" id="ftShow" ${F.showStrokes ? 'checked' : ''}> 👁 kreski pędzla</label>
-        <input type="range" id="ftShowO" min="0" max="100" step="5" value="${F.strokesOpacity}" style="width:70px" title="Krycie podglądu kresek (%)"><span class="muted" id="ftShowOV">${F.strokesOpacity} %</span></div>
       <div class="pp-sec">
-        <div class="zp-sub" title="Grading alfy – cała alfa, po kreskach pędzla; na żywo, bez przeliczania modeli; to samo idzie do eksportu">Grade</div>
+        <div class="zp-sub" title="Grading alfy – cała alfa, po kreskach pędzla; na żywo, bez przeliczania modeli; to samo idzie do eksportu">Grade <button type="button" class="btn btn-ghost btn-xs sec-export" data-ftexp="grade" title="Grade / Dilate / Blur z tymi wartościami do Nuke'a – schowek albo plik .nk (Ctrl+V podłącza do zaznaczonego węzła)">⇪ Export</button></div>
         ${FIN.filter(([k]) => GRADE.includes(k)).map(finRow).join('')}
         <button type="button" class="btn btn-ghost btn-xs" id="ftFinReset" title="Wyzeruj grade i motion blur (baza bez zmian)">↺ bez wykończenia</button>
       </div>
       <div class="pp-sec">
-        <div class="zp-sub" title="Rozmycie ruchu alfy wzdłuż ruchu obiektu (po grade, przed rozmyciem Gaussa)">Motion blur</div>
+        <div class="zp-sub" title="Rozmycie ruchu alfy wzdłuż ruchu obiektu (po grade, przed rozmyciem Gaussa)">Motion blur <button type="button" class="btn btn-ghost btn-xs sec-export" data-ftexp="mb" title="Motion blur Final Touch nie ma odpowiednika w węzłach Nuke'a – zostaje wpalony w alfę eksportu">⇪ Export</button></div>
         ${FIN.filter(([k]) => !GRADE.includes(k)).map(finRow).join('')}
         <div class="row"><label class="chk" title="Hybryda (plan 2026-10-22): kierunek rozmycia z ruchu obiektu, SIŁA per odcinek krawędzi zmierzona na plate'cie – szerokość przejścia 10–90 % w poprzek krawędzi wobec rozmycia przewidzianego z prędkości i migawki (łapie obrót, palce, rolling shutter, defocus). Wyłączone = jedna siła na cały obiekt"><input type="checkbox" id="ftMbMeasured" checked> siła z pomiaru plate'u</label>
-          <button type="button" class="btn btn-ghost btn-xs" id="ftMbShutterManifest" title="Shutter z manifestu ujęcia">↺ z manifestu</button></div>
+          <button type="button" class="btn btn-ghost btn-xs" id="ftMbShutterManifest" title="Shutter ujęcia: zmierzony na plate'cie, a bez pomiaru z manifestu">↺ ujęcia</button>
+          <button type="button" class="btn btn-ghost btn-xs" id="ftMbShutterMeasure" title="Zmierz kąt migawki na plate'cie ujęcia (pary klatek o różnej prędkości kamery; wynik w project.json, manifest bez zmian)">📏 Zmierz</button></div>
       </div>
       <div class="pp-sec">
-        <div class="zp-sub" title="Dodaj (G) / Usuń (R) / Gumka (E) na lewym pasku; kreska = tylko ta klatka">Pędzel</div>
+        <div class="zp-sub" title="Dodaj (G) / Usuń (R) / Gumka (E) na lewym pasku; kreska = tylko ta klatka">Pędzel <button type="button" class="btn btn-ghost btn-xs sec-export" data-ftexp="paint" title="Kreski pędzla jako RotoPaint (każda kreska tylko na swojej klatce) – schowek albo plik .nk">⇪ Export</button></div>
         <label title="Twardość pędzla: 100 % = ostra krawędź kreski, 0 % = miękka (krycie spada od środka do krawędzi kreski; nic nie wychodzi poza promień)">Twardość <span id="ftHardN">${Math.round(F.hardness * 100)} %</span>
           <input type="range" id="ftHard" min="0" max="100" value="${Math.round(F.hardness * 100)}" style="width:100%"></label>
+        <div class="pp-chk"><label class="chk" title="Warstwa korekt tej klatki na obrazie (zielone = dodaje, czerwone = odejmuje; gumka ją wymazuje). Wyłącz, żeby oceniać samą alfę"><input type="checkbox" id="ftShow" ${F.showStrokes ? 'checked' : ''}> 👁 kreski pędzla</label>
+          <input type="range" id="ftShowO" min="0" max="100" step="5" value="${F.strokesOpacity}" style="width:70px" title="Krycie podglądu kresek (%)"><span class="muted" id="ftShowOV">${F.strokesOpacity} %</span></div>
       </div>
     </div>`;
   }
@@ -157,7 +158,8 @@
       const s = document.querySelector(`#ftPalette [data-fin="${k}"]`), v = document.querySelector(`#ftPalette [data-finv="${k}"]`);
       const val = k === 'mb_shutter_deg' && fin[k] == null ? shM : fin[k];
       if (s && document.activeElement !== s) s.value = val;
-      if (v) v.textContent = finFmt(k, val) + (k === 'mb_shutter_deg' && fin[k] == null ? ' (manifest)' : '');
+      const src = { measured: ' (zmierzona)', manifest: ' (manifest)', default: ' (domyślna)' }[(F.info && F.info.shutter_source) || 'manifest'];
+      if (v) v.textContent = finFmt(k, val) + (k === 'mb_shutter_deg' && fin[k] == null ? src : '');
     }
     const cb = $('ftMbMeasured'); if (cb) cb.checked = fin.mb_measured !== false;
     const bm = $('ftMbShutterManifest'); if (bm) bm.disabled = fin.mb_shutter_deg == null;
@@ -171,6 +173,15 @@
       renderFinish(); H.loadStages().catch(() => {}); V().render();
       status(`Wykończenie: ${what} – podgląd i eksport biorą to od razu`, 'ok');
     } catch (e) { status(`Wykończenie NIE zapisane: ${e.message}`, 'err'); renderFinish(); }
+  }
+  // „⇪ Export” of a palette section (user decision 2026-11-16): the section's nodes to Nuke (clipboard / .nk file)
+  const EXP_WHAT = { grade: 'Grade / Dilate / Blur', paint: 'RotoPaint (kreski pędzla)', mb: 'Motion blur' };
+  function sectionExport(btn) {
+    const part = btn.dataset.ftexp;
+    const off = part === 'mb' ? "motion blur Final Touch (siła z ruchu / pomiaru plate'u) nie ma odpowiednika w węzłach Nuke'a – zostaje wpalony w alfę eksportu"
+      : part === 'paint' && !framesOf().length ? 'brak kresek pędzla w tym obiekcie' : '';
+    window.UI.exportMenu(btn, { what: EXP_WHAT[part], off, status,
+      get: async () => { await flush(); return api('GET', `/api/object/${obj()}/final_touch/nk?part=${part}`); } });
   }
   function renderAll() { renderBase(); renderFinish(); renderList(); renderPalette(); }
   function reset() {
@@ -454,6 +465,10 @@
     $('ftFinReset').addEventListener('click', () => H.run('ftFinReset', () => putFinish({ ...FIN_DEF, mb_shutter_deg: undefined, mb_shutter_manifest: true }, 'wyzerowane')));
     $('ftMbMeasured').addEventListener('change', () => H.run('ftPanel', () => putFinish({ mb_measured: $('ftMbMeasured').checked }, $('ftMbMeasured').checked ? 'siła motion bluru z pomiaru plate\'u' : 'jedna siła motion bluru')));
     $('ftMbShutterManifest').addEventListener('click', () => H.run('ftMbShutterManifest', () => putFinish({ mb_shutter_manifest: true }, 'shutter z manifestu')));
+    $('ftMbShutterMeasure').addEventListener('click', () => H.run('ftMbShutterMeasure', async () => {
+      const r = await api('POST', '/api/project/shutter/measure');
+      await putFinish({ mb_shutter_manifest: true }, `migawka zmierzona: ${Math.round(r.deg)}°`);
+    }));
     $('ftDelFrame').addEventListener('click', () => H.run('ftDelFrame', () => deleteKeysAt(curFrame())));
     $('ftBase').addEventListener('change', () => H.run('ftBase', async () => {
       const src = $('ftBase').value;
@@ -467,6 +482,7 @@
       } else await setBase(src, null);
     }));
     $('ftRun').addEventListener('change', () => H.run('ftRun', () => setBase('version', $('ftRun').value)));
+    document.querySelectorAll('#ftPalette [data-ftexp]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); sectionExport(b); }));
     window.addEventListener('md-frame', () => { renderLane(); });
   }
   function init(hooks) {

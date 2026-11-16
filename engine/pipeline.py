@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -91,10 +91,15 @@ from engine.bandmap import crop_points
 from engine.crop import CropSegment, extract_crop, load_crops, pad_border, paste_crop
 from engine.depth import frame_path
 from engine.export import seam_px
+from engine.jsonio import write_json
+from engine.lru import LockedLRU
 from engine.objects import ObjectStore
-from engine.refine import Finalizer, contiguous_chunks, core_soft_start_on, next_run_dir, write_run_json
+from engine.refine import Finalizer, _tick, contiguous_chunks, core_soft_start_on, next_run_dir, write_run_json
 from engine.sam3 import Sam3Runner
 from engine.segment import CorePropagator, CoreResult
+
+if TYPE_CHECKING:
+    from engine.objband import BandSettings
 
 
 def default_display(lin: np.ndarray) -> np.ndarray:
@@ -146,6 +151,11 @@ def aux_plate_mismatch(pattern: Optional[str], w: int, h: int) -> Optional[str]:
         return None
     return f"{size[0]}x{size[1]} ≠ beauty {int(w)}x{int(h)}"
 
+
+
+class CoreChanged(ValueError):
+    """The core a version was computed from differs from today's (apply_zone): „Przelicz finalnie”, or for the mask 1+2
+    base a fresh base version (apply_zone retries)."""
 
 class PlateCropLoader:
     """Model-input crops: full-resolution plate frame (x 4c gain maps) -> display -> square crop (mirror pad).
@@ -334,11 +344,15 @@ class ObjectPipeline:
         self.w, self.h = plate_w, plate_h
         self.client = client
         self.shutter = shutter_deg
+        self.shutter_source = "manifest"   # from_project: measured | manifest | default (engine/shutter.resolve)
         # backlit / clear plate of another resolution than the beauty = a wrong plate: not used anywhere (QA of every
         # stage, auto edge mode, backlit edge, matte zones' clean plate), the reason in `plates_skipped` -> run.json / UI
         self.plates_skipped: Dict[str, str] = {}
+        # ... and one the content check found to be another shot (engine/plate_match.py – the stored result only,
+        # computed in stage 0; 2026-11-06)
+        from engine.plate_match import content_mismatch
         for kind, pat in (("cleanplate", cleanplate_pattern), ("backlit", backlit_pattern)):
-            why = aux_plate_mismatch(pat, plate_w, plate_h)
+            why = aux_plate_mismatch(pat, plate_w, plate_h) or content_mismatch(self.work, plate_pattern, pat)
             if why:
                 self.plates_skipped[kind] = why
                 logger.warning("%s %s not used: %s", kind, pat, why)
@@ -355,6 +369,48 @@ class ObjectPipeline:
         self.backlit = PlateCropLoader(backlit_pattern, identity_display) if backlit_pattern else None
         self.backlit_params = backlit_params or {}
         self.ltx_workflow = ltx_workflow
+        # align_v2 step 4: which aux plates (aligned or raw, alignment signature) this pipeline reads -> run.json
+        # `aux_plates` of stages 3 / 5 and the auto clean plate (engine/align_state.py); from_project fills it
+        from engine.align_state import aux_plate_state
+        self.aux_plates = aux_plate_state(self.work, {"backlit": backlit_pattern, "cleanplate": cleanplate_pattern})
+
+    @classmethod
+    def from_project(cls, proj: Any, client: Any, *, defaults: Optional[Dict[str, Any]] = None,
+                     display: Callable[[np.ndarray], np.ndarray] = default_display,
+                     ltx_workflow: Optional[Dict[str, Any]] = None, work_frames: Optional[Sequence[int]] = None,
+                     sam3_ckpt: Optional[str] = None) -> "ObjectPipeline":
+        """The ONE way to build the pipeline of an open shot (audit 2026-11-02 #1): the UI („Przelicz”, previews) and
+        the night queue („Policz wszystko”) call this, so both compute with the same inputs – beauty (or the exported
+        `beauty_clean`), gain maps when no clean beauty, backlit / clean plate (aligned versions first), shutter,
+        plate-to-mask denoise from project.json, Comfy io mode from the source bit depth, the shot's frames.
+        `proj` = engine.project.ShotProject; `defaults` = defaults.json (read when None); `work_frames` = the work
+        area of the UI (None = whole shot: the queue)."""
+        from engine.comfy_io import io_mode_for
+        from engine.mplate import DENOISE_KEY, global_enabled, resolve_mask_plate_denoise
+        from engine.project import load_defaults
+        d = defaults if defaults is not None else load_defaults()
+        m = proj.effective_manifest()
+        w, h = proj.plate_size
+        plates = m.get("plates", {})
+        work = Path(proj.work_dir)
+        plate = plates.get("beauty_clean") or plates["beauty"]   # exported _deflicker EXR, if chosen (4b pkt 1)
+        gain_dir = work / "deflicker" / "gain_beauty"
+        gain = str(gain_dir / "gain_%04d.exr") if (not plates.get("beauty_clean") and gain_dir.exists()) else None
+        use_mplate = resolve_mask_plate_denoise(proj.data.get(DENOISE_KEY), m, global_enabled(d))["effective"]
+        frames = list(range(int(m.get("first", 1)), int(m.get("last", 1)) + 1))
+        from engine.shutter import resolve as resolve_shutter
+        shutter, shutter_src = resolve_shutter(m, proj.data)   # plate measurement > manifest > 180 (2026-11-08)
+        pipe = cls(work, plate, w, h, client, display=display, sam3_ckpt=sam3_ckpt,
+                   backlit_pattern=plates.get("backlit_align") or plates.get("backlit") or None,
+                   backlit_params=d.get("backlit", {}), ltx_workflow=ltx_workflow, use_mplate=use_mplate,
+                   gain_pattern=gain, frames=frames, shutter_deg=float(shutter),
+                   cleanplate_pattern=plates.get("cleanplate_align") or plates.get("cleanplate") or None,
+                   io_mode=io_mode_for(m))
+        pipe.shutter_source = shutter_src
+        pipe.work_frames = list(work_frames) if work_frames is not None else None   # band previews = work-area batch
+        from engine.align_state import aux_plate_state
+        pipe.aux_plates = aux_plate_state(work, plates)
+        return pipe
 
     def _finalizer(self) -> Finalizer:
         return Finalizer(self.client, self.work / "comfy_io", self.w, self.h,
@@ -552,7 +608,7 @@ class ObjectPipeline:
                 lsegs += l_
             user = {f for f, k in self.store.keys(name).items() if k.get("author") == "user"}
             res.core.update({f: m for f, m in merged.items() if f not in user})  # auto keys may be refined
-            (self.store.dir(name) / "lupa.json").write_text(json.dumps([s.to_dict() for s in lsegs], indent=1))
+            write_json(self.store.dir(name) / "lupa.json", [s.to_dict() for s in lsegs], indent=1)
         # objects in front (smaller depth_order): their cores are subtracted (MatteSubtractFront on the core,
         # 5.2 pkt 6); a jump of the tracker onto a front object (IoU > 0.3) is flagged
         res.front_flags = {}
@@ -639,14 +695,14 @@ class ObjectPipeline:
             sdir.mkdir(parents=True, exist_ok=True)
             for f, p in res.soft.items():
                 cv2.imwrite(str(sdir / f"p_{f:04d}.png"), p)
-        (cdir / "core.json").write_text(json.dumps({
+        write_json(cdir / "core.json", {
             "fwd_bwd_iou": {str(k): round(v, 4) for k, v in res.fwd_bwd_iou.items()},
             "uncertain": res.uncertain, "suggested_keys": res.suggested_keys,
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals, "keys_sig": keys_sig,
             "mask_plate_denoise": self.use_mplate, "soft_frames": len(res.soft),
             "correction_regions": getattr(res, "region_stats", {}), "coverage": coverage,
             "frames": [int(frames[0]), int(frames[-1])], "life": life, "life_hints": res.life_hints,
-            "front_missing": res.front_missing}, indent=1))
+            "front_missing": res.front_missing}, indent=1)
         self.store.update(name, tool={"status": "rdzeń gotowy", "final_valid": False})
         return res
 
@@ -709,14 +765,14 @@ class ObjectPipeline:
         `probs_out`: filled with the stabilised probability maps (soft start of the band). `only`: previews – just
         these frames stabilised (corestab `only`)."""
         from engine.corestab import stabilize_core
-        gcache = self.__dict__.setdefault("_stab_gray", {})   # one plate read per frame for every group member (preview)
+        gcache = self.__dict__.setdefault("_stab_gray", LockedLRU(17))   # one plate read per frame for every group member (preview)
 
         def gray(f):
-            if f not in gcache:
-                if len(gcache) > 16:
-                    gcache.clear()
-                gcache[f] = cv2.cvtColor((np.clip(self.loader.read(f), 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
-            return gcache[f]
+            g = gcache.get(f)
+            if g is None:
+                g = cv2.cvtColor((np.clip(self.loader.read(f), 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+                gcache.put(f, g)
+            return g
         user_keys = [f for f, k in keys.items()] if keys else []
         me = self.store.get(name)
         fronts = [o["name"] for o in self.store.list()
@@ -849,9 +905,9 @@ class ObjectPipeline:
                 cv2.imwrite(str(d / f"c_{f:04d}.png"), stab[f].astype(np.uint8) * 255, png)
             for f, p in soft.items():
                 cv2.imwrite(str(d / f"p_{f:04d}.png"), np.asarray(p, np.uint8), png)
-            (d / "corestab.json").write_text(json.dumps({"sig": sig, "frames": [int(f) for f in frames],
-                                                         "soft_frames": sorted(int(f) for f in soft),
-                                                         "stats": stats}, default=float), encoding="utf-8")
+            write_json(d / "corestab.json", {"sig": sig, "frames": [int(f) for f in frames],
+                                            "soft_frames": sorted(int(f) for f in soft),
+                                            "stats": stats}, default=float)
             os.utime(d)
             old = sorted((p for p in root.iterdir() if p.is_dir() and p.name != sig), key=lambda p: p.stat().st_mtime,
                          reverse=True)
@@ -1040,7 +1096,7 @@ class ObjectPipeline:
             n += int((core[f] & ~cover).sum())
         return n
 
-    def core_base_run(self, name: str, frames: Sequence[int], progress_cb=None) -> str:
+    def core_base_run(self, name: str, frames: Sequence[int], progress_cb=None, force: bool = False) -> str:
         """The mask 1+2 (+ the shrink / grow slider, exactly the core the edge pass would get) written as a version
         runs/v### (stage "core": alpha = alpha_base = the hard mask, crops of the object's segments) – the base of
         ViTMatte on 1+2 (vitmatte_base = core). Reused while current (tool.stage_runs.core_base); not made active."""
@@ -1048,7 +1104,7 @@ class ObjectPipeline:
         from engine.stages import mask_sig, settings_sig, stage_run
         from engine.workarea import intervals_from_frames, object_life
         cur, ok, _ = stage_run(self.store, name, "core_base")
-        if cur and ok:
+        if cur and ok and not force:
             return cur
         obj = self.store.get(name)
         frames = self._visible(name, frames)
@@ -1144,7 +1200,7 @@ class ObjectPipeline:
         return acc
 
     def ltx_run(self, name: str, frames: Sequence[int], settings: Optional[Dict[str, Any]] = None,
-                progress_cb=None, models: Optional[Dict[str, str]] = None) -> str:
+                progress_cb=None, models: Optional[Dict[str, str]] = None, cond_path: Optional[str] = None) -> str:
         """Stage „LTX-2.5 Alpha-Gen” (user decision 2026-10-16, a stage of its own before the export): LTX-2.5 IC-LoRA
         Alpha-Gen on every crop segment of the object, guided by the plate-to-mask crop (other objects painted out),
         limited to the object by its mask 1+2 -> a version runs/v### (stage "ltx", alpha = alpha_base) ->
@@ -1174,7 +1230,7 @@ class ObjectPipeline:
         from engine.gpu_manager import before_stage
         before_stage("comfy", self.client, "LTX-2.5 Alpha-Gen")
         gen = AlphaGen(self.client, self.work / "comfy_io", s, models=models,
-                       progress=lambda t, d, n: job_progress(t, d, n))
+                       progress=lambda t, d, n: job_progress(t, d, n), cond_path=cond_path)
         crop_pts = lambda f, seg: crop_points(pts_at, f, seg)   # noqa: E731
         run_dir = next_run_dir(self.store.dir(name))
         for seg in segs:
@@ -1590,7 +1646,7 @@ class ObjectPipeline:
                 "coverage": intervals_from_frames(frames), "changed_px": changed,
                 "zones": [z["zone_id"] for z in zone_dicts(self.store.dir(name), ("brush",))],
                 "created_at": datetime.now().isoformat(timespec="seconds")}
-        (d / "core_fix.json").write_text(json.dumps(info, indent=1), encoding="utf-8")
+        write_json(d / "core_fix.json", info, indent=1)
         if progress_cb:
             progress_cb("Zastosuj poprawki", len(frames), len(frames))
         return info
@@ -1663,11 +1719,12 @@ class ObjectPipeline:
                             shutil.copyfile(a, b)
             rj = run_dir / "run.json"
             d = json.loads(rj.read_text(encoding="utf-8"))
-            d.update(stage="matanyone", core_fix_sig=mask_sig(self.store, name), settings_sig=settings_sig(obj))
+            d.update(stage="matanyone", core_fix_sig=mask_sig(self.store, name), settings_sig=settings_sig(obj),
+                     aux_plates=self.aux_plates)
             if members:
                 d.update(group=members, group_seam_px=seam_px(obj),
                          group_outside_crop_px=self._crop_outside(segs, frames, core2))
-            rj.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+            write_json(rj, d, indent=2, ensure_ascii=False)
         tq = _tick(tm, "alpha_base_link", tq)
         # 7.8 pkt 1: edge position vs the plate -> report + saved measurements; backlit mode is never corrected
         job_progress("Raport krawędzi", 0, len(frames))
@@ -1677,10 +1734,10 @@ class ObjectPipeline:
         fixable = bool(edge["n_fix"]) and mode != "backlit"
         qa.edge = {**qa.edge, "before": edge["median_abs"], "pieces_to_fix": edge["n_fix"], "corrected": False,
                    "fix_available": fixable, "pieces": edge["pieces"]}
-        (run_dir / "edge" / "edge.json").write_text(json.dumps(
+        write_json(run_dir / "edge" / "edge.json",
             {"schema": "matte_desk/edge_fix@1.0", "mode": mode, "fix": [p["id"] for p in edge["pieces"]],
-             "attempts": attempts0}, indent=1), encoding="utf-8")
-        (run_dir / "qa.json").write_text(json.dumps(qa.to_dict(), indent=1, ensure_ascii=False), encoding="utf-8")
+             "attempts": attempts0}, indent=1)
+        write_json(run_dir / "qa.json", qa.to_dict(), indent=1, ensure_ascii=False)
         attempts = attempts0 + (0 if qa.gate_ok else 1)
         extra = {}
         if stage == "matanyone":
@@ -1710,7 +1767,7 @@ class ObjectPipeline:
         rj = run_dir / "run.json"
         d = json.loads(rj.read_text(encoding="utf-8"))
         d["timings"] = out
-        rj.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_json(rj, d, indent=2, ensure_ascii=False)
 
     def apply_edge_fix(self, name: str, frames: Sequence[int], base_run: Optional[str] = None,
                        skip: Sequence[str] = (), progress_cb=None):
@@ -1761,10 +1818,10 @@ class ObjectPipeline:
         before = json.loads(base_qa.read_text(encoding="utf-8")).get("edge", {}).get("before") if base_qa.exists() else None
         qa.edge = {**qa.edge, "before": before, "pieces_to_fix": len(fix), "corrected": True, "after": after["median_abs"],
                    "base_run": run, "skipped": sorted(skip), "fix_available": False, "pieces": after["pieces"]}
-        (run_dir / "qa.json").write_text(json.dumps(qa.to_dict(), indent=1, ensure_ascii=False), encoding="utf-8")
-        (run_dir / "edge" / "edge.json").write_text(json.dumps(
+        write_json(run_dir / "qa.json", qa.to_dict(), indent=1, ensure_ascii=False)
+        write_json(run_dir / "edge" / "edge.json",
             {"schema": "matte_desk/edge_fix@1.0", "mode": info["mode"], "fix": [], "attempts": int(info.get("attempts", 0)),
-             "applied_from": run, "skipped": sorted(skip)}, indent=1), encoding="utf-8")
+             "applied_from": run, "skipped": sorted(skip)}, indent=1)
         attempts = int(obj["tool"].get("auto_attempts", 0)) + (0 if qa.gate_ok else 1)
         self.store.update(name, ma_scale=rep.ma_scale, tool={"active_run": run_dir.name, "final_valid": True,
                                                              "status": "QA OK" if qa.gate_ok else "QA: flagi",
@@ -1855,7 +1912,7 @@ class ObjectPipeline:
             rj = run_dir / "run.json"
             d = json.loads(rj.read_text(encoding="utf-8"))
             d["coverage"], d["life"] = intervals_from_frames(frames), life
-            rj.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+            write_json(rj, d, indent=2, ensure_ascii=False)
         if (zres and (zres.stats or zres.flags)) or core_stabilize_on(obj):
             rj = run_dir / "run.json"
             d = json.loads(rj.read_text(encoding="utf-8"))
@@ -1864,7 +1921,7 @@ class ObjectPipeline:
             if core_stabilize_on(obj):
                 d["core_stabilize"] = True
                 d["core_stabilize_stats"] = getattr(self, "_corestab_stats", None)
-            rj.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+            write_json(rj, d, indent=2, ensure_ascii=False)
             for f, fl in (zres.flags.items() if zres else ()):   # zone hints as yellow QA flags (e.g. engines disagree, no holdout)
                 if f in qa.flags:
                     qa.flags[f].extend(("yellow", x) for x in fl)
@@ -2000,11 +2057,6 @@ class ObjectPipeline:
                 "n_fix": int(sum(fix.values())), "pieces": edge_pieces(meas_by_f, fix)}
 
     # ------------------------------------------------------------------ stage Eksperymenty: analysis of a chosen base
-    def analysis_fix_why(self, rj: Dict[str, Any]) -> str:
-        """'' when the edge correction can start from this version (2026-10-16: „Przelicz z tej bazy” shifts the BASE's
-        edge and computes it with the chosen engine – any version), else why not."""
-        return ""   # kept as the hook for future limits; every base can be shifted and recomputed today
-
     def edge_recount(self, rdir: Path, thr_px: float = 0.5, min_frames: int = 5) -> Dict[str, Any]:
         """Edge-correction proposals of a version from its SAVED measurements (edge/e_####.npz) with these thresholds:
         |median| > thr_px for >= min_frames frames (fast – no measuring, the palette sliders)."""
@@ -2053,23 +2105,22 @@ class ObjectPipeline:
             job_progress("Pomiar krawędzi", 0, len(frames))
             self.edge_report(segs, frames, full, None, save_dir=rdir / "edge")
         rc = self.edge_recount(rdir, thr_px, min_frames)
-        why = self.analysis_fix_why(rj)
         qa = json.loads((rdir / "qa.json").read_text(encoding="utf-8"))
         prev = qa.get("edge") or {}
         if not prev.get("corrected"):
             qa["edge"] = {**prev, "before": rc["median_abs"], "pieces_to_fix": rc["n_fix"], "corrected": False,
-                          "fix_available": bool(rc["n_fix"]) and not why, "fix_why": why, "pieces": rc["pieces"],
+                          "fix_available": bool(rc["n_fix"]), "fix_why": "", "pieces": rc["pieces"],
                           "thr_px": float(thr_px), "min_frames": int(min_frames)}
-            (rdir / "qa.json").write_text(json.dumps(qa, indent=1, ensure_ascii=False), encoding="utf-8")
+            write_json(rdir / "qa.json", qa, indent=1, ensure_ascii=False)
             ej = rdir / "edge" / "edge.json"
             old = json.loads(ej.read_text(encoding="utf-8")) if ej.exists() else {}
             (rdir / "edge").mkdir(parents=True, exist_ok=True)
-            ej.write_text(json.dumps({"schema": "matte_desk/edge_fix@1.0", "mode": old.get("mode", rj.get("edge_mode")),
-                                      "fix": [p["id"] for p in rc["pieces"]], "attempts": old.get("attempts", 0),
-                                      "thr_px": float(thr_px), "min_frames": int(min_frames)}, indent=1), encoding="utf-8")
+            write_json(ej, {"schema": "matte_desk/edge_fix@1.0", "mode": old.get("mode", rj.get("edge_mode")),
+                            "fix": [p["id"] for p in rc["pieces"]], "attempts": old.get("attempts", 0),
+                            "thr_px": float(thr_px), "min_frames": int(min_frames)}, indent=1)
         if progress_cb:
             progress_cb("Analiza wersji", len(frames), len(frames))
-        return {"run": run, "frames": [frames[0], frames[-1]], "edge": qa.get("edge"), "fix_why": why,
+        return {"run": run, "frames": [frames[0], frames[-1]], "edge": qa.get("edge"), "fix_why": "",
                 "flicker_median": qa.get("flicker_median"), "gate_ok": qa.get("gate_ok")}
 
     EXPERIMENT_MODES = ("matanyone", "backlit", "core")
@@ -2127,15 +2178,15 @@ class ObjectPipeline:
                    "fix_available": bool(edge["n_fix"]) and mode != "backlit" and not members,
                    "fix_why": "" if not members else "wersja grupy – poprawkę licz „z tej bazy” na nowej wersji",
                    "pieces": edge["pieces"], **({"base_run": base_run} if fix else {})}
-        (run_dir / "qa.json").write_text(json.dumps(qa.to_dict(), indent=1, ensure_ascii=False), encoding="utf-8")
-        (run_dir / "edge" / "edge.json").write_text(json.dumps(
+        write_json(run_dir / "qa.json", qa.to_dict(), indent=1, ensure_ascii=False)
+        write_json(run_dir / "edge" / "edge.json",
             {"schema": "matte_desk/edge_fix@1.0", "mode": mode, "fix": [p["id"] for p in edge["pieces"]], "attempts": 0},
-            indent=1), encoding="utf-8")
+            indent=1)
         rj = run_dir / "run.json"
         d = json.loads(rj.read_text(encoding="utf-8"))
         d.update(stage="experiment", base_run=base_run, base_stage=brj.get("stage") or "final",
                  base_edge_fix=fix, **({"group": members, "group_seam_px": brj.get("group_seam_px")} if members else {}))
-        rj.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_json(rj, d, indent=2, ensure_ascii=False)
         self.store.update(name, ma_scale=rep.ma_scale, tool={"active_run": run_dir.name, "final_valid": True,
                                                              "status": "QA OK" if qa.gate_ok else "QA: flagi",
                                                              "stale_from": None})
@@ -2342,7 +2393,7 @@ class ObjectPipeline:
         t0 = time.perf_counter()
         from engine.zonecache import ZoneCache, _sha
         from engine.stages import zone_kind
-        from engine.zones import (LocalWarp, outline_without_drawing, propagate_regions, region_mode, track_mode,
+        from engine.zones import (LocalWarp, outline_without_drawing, propagate_regions, track_mode,
                                   zone_keys)
         shape = core[frames[0]].shape
         cache = ZoneCache(self.store.dir(name), z.zone_id)
@@ -2682,7 +2733,6 @@ class ObjectPipeline:
                 return False
 
             def run():
-                import time
                 try:
                     # CPU-only, read-only work (plate reads + stabilisation): it does not wait for the job list – the
                     # previews' own quiet jobs (a zone region every few seconds) kept it waiting for ever (2026-10-24)
@@ -2696,9 +2746,8 @@ class ObjectPipeline:
                         pass
                     for f, m in masks.items():
                         cv2.imwrite(str(d / f"m_{f:04d}.png"), np.asarray(m).astype(np.uint8) * 255)
-                    (d / "mask12.json").write_text(json.dumps({"sig": sig, "frames": sorted(int(f) for f in masks)}),
-                                                   encoding="utf-8")
-                except Exception as e:   # noqa: BLE001 – a preview helper: the one-frame stand-in stays
+                    write_json(d / "mask12.json", {"sig": sig, "frames": sorted(int(f) for f in masks)})
+                except Exception as e:     # a preview helper: the one-frame stand-in stays
                     logging.getLogger("matte_desk").warning("mask 1+2 of the work area (%s): %s", name, e)
             t = threading.Thread(target=run, name=f"mask12-{name}", daemon=True)
             _MASK12_WARM[tkey] = t
@@ -2902,14 +2951,7 @@ class ObjectPipeline:
                 regions_by_zone[z.zone_id], bg_by_zone[z.zone_id] = r, b
                 region_s[z.zone_id] = time.perf_counter() - tq
                 region_steps[z.zone_id] = rt
-        tracker = self.zone_tracker
-        if tracker is None:
-            try:
-                from engine.tracking import make_point_tracker
-                t = make_point_tracker()
-                tracker = t if t.engine == "cotracker3" else None   # spec: CoTracker3, fallback = core bbox shift
-            except Exception:
-                tracker = None
+        tracker = self._zone_tracker()
         s = min(1.0, 1024.0 / max(self.w, self.h))
         frames_small = lambda: ([cv2.resize(self.loader.frame(f), None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
                                  for f in frames], s)
@@ -2962,6 +3004,21 @@ class ObjectPipeline:
 
     def apply_zone(self, name: str, frames: Sequence[int], zone_id: Optional[str] = None, progress_cb=None,
                    stage: Optional[str] = None):
+        """See _apply_zone. ViTMatte on the mask 1+2 (vitmatte_base = core): the base is only the mask 1+2 written as a
+        version – when the core it holds differs from today's (an older version kept by its signature while the
+        stabilised core changed, user report 2026-11-11 „Hair”, v001 of 2026-10-29), it is written again and the apply
+        retried once instead of asking for „Przelicz finalnie” of a stage the user does not use."""
+        try:
+            return self._apply_zone(name, frames, zone_id, progress_cb, stage)
+        except CoreChanged:
+            from engine.stages import vitmatte_base
+            if stage != "vitmatte" or vitmatte_base(self.store.get(name)) != "core":
+                raise
+            self.core_base_run(name, frames, progress_cb, force=True)
+            return self._apply_zone(name, frames, zone_id, progress_cb, stage)
+
+    def _apply_zone(self, name: str, frames: Sequence[int], zone_id: Optional[str] = None, progress_cb=None,
+                    stage: Optional[str] = None):
         """„Zastosuj” (plan step 4): recompute ONLY the zones (cache: frames with an unchanged hash cost nothing) on the
         base alpha of the active version (runs/v###/alpha_base, written by "Przelicz finalnie" when zones exist) -> a new
         version runs/v### with QA + edge report. The core must be unchanged since that version (else 'Przelicz finalnie').
@@ -3052,8 +3109,8 @@ class ObjectPipeline:
                     continue
                 c0 = cv2.imread(str(rdir / "core" / seg.seg_id / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
                 if c0 is None or not np.array_equal(c0 > 127, extract_crop(cmp[f].astype(np.float32), seg) > 0.5):
-                    raise ValueError("rdzeń (albo poprawki pędzlem) zmienił się od tej wersji – „Przelicz finalnie” "
-                                     "(etap 3: „▶ Przelicz MatAnyone2”) zamiast „Zastosuj”")
+                    raise CoreChanged("rdzeń (albo poprawki pędzlem) zmienił się od tej wersji – „Przelicz finalnie” "
+                                      "(etap 3: „▶ Przelicz MatAnyone2”) zamiast „Zastosuj”")
         new_dir = next_run_dir(self.store.dir(name))
         tq = tick("core_check", tq)
         per_seg: Dict[str, Dict[int, np.ndarray]] = {}
@@ -3111,7 +3168,7 @@ class ObjectPipeline:
         for k in ("stage", "core_fix_sig", "settings_sig", "gpu_spill_gb"):   # the spill: this job's own
             rj2.pop(k, None)
         if stage == "vitmatte":
-            rj2.update(stage="vitmatte", base=vbase, matte_sig=matte_sig(self.store.dir(name)))
+            rj2.update(stage="vitmatte", base=vbase, matte_sig=matte_sig(self.store.dir(name)), aux_plates=self.aux_plates)
         write_run_json(new_dir, rj2)
         tq = time.perf_counter()
         qa_t: Dict[str, float] = {}
@@ -3132,10 +3189,9 @@ class ObjectPipeline:
         mode = rj.get("edge_mode", "matanyone")
         qa.edge = {**qa.edge, "before": edge["median_abs"], "pieces_to_fix": edge["n_fix"], "corrected": False,
                    "fix_available": bool(edge["n_fix"]) and mode != "backlit", "pieces": edge["pieces"]}
-        (new_dir / "edge" / "edge.json").write_text(json.dumps({"schema": "matte_desk/edge_fix@1.0", "mode": mode,
-                                                                 "fix": [p["id"] for p in edge["pieces"]], "attempts": 0}, indent=1),
-                                                    encoding="utf-8")
-        (new_dir / "qa.json").write_text(json.dumps(qa.to_dict(), indent=1, ensure_ascii=False), encoding="utf-8")
+        write_json(new_dir / "edge" / "edge.json", {"schema": "matte_desk/edge_fix@1.0", "mode": mode,
+                                                    "fix": [p["id"] for p in edge["pieces"]], "attempts": 0}, indent=1)
+        write_json(new_dir / "qa.json", qa.to_dict(), indent=1, ensure_ascii=False)
         extra = {}
         if stage == "vitmatte":
             extra["stage_runs"] = {**(self.store.get(name)["tool"].get("stage_runs") or {}), f"vitmatte@{vbase}": new_dir.name,
@@ -3222,7 +3278,7 @@ class ObjectPipeline:
         if timings is not None and cur["label"] is not None:
             k = f"qa:{cur['label']}"
             timings[k] = timings.get(k, 0.0) + (time.perf_counter() - cur["t"])
-        (run_dir / "qa.json").write_text(json.dumps(qa.to_dict(), indent=1, ensure_ascii=False), encoding="utf-8")
+        write_json(run_dir / "qa.json", qa.to_dict(), indent=1, ensure_ascii=False)
         return qa
 
 
@@ -3264,14 +3320,6 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         os.link(src, dst)
     except OSError:
         shutil.copyfile(src, dst)
-
-
-def _tick(tm: Dict[str, float], key: str, t0: float) -> float:
-    """Adds the wall seconds since t0 to tm[key]; returns now (phase timings, plan A6b)."""
-    import time
-    t1 = time.perf_counter()
-    tm[key] = tm.get(key, 0.0) + (t1 - t0)
-    return t1
 
 
 # ----------------------------------------------------------------------------- edge pieces (Z27 pkt 1)

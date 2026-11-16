@@ -18,10 +18,16 @@ MD_SAPIENS2_FAKE=1: no torch / transformers, classes from the luminance (protoco
     < 0.25 -> 4 (Hair), < 0.6 -> 3 (Face_Neck), else 1 (Apparel).
 """
 
-import json
+import importlib.util
 import os
 import sys
 import time
+from pathlib import Path
+
+# the common loop, loaded by its path: this file runs with -I, engine/ is not on the path (engine/worker_proto.py)
+_spec = importlib.util.spec_from_file_location("worker_proto", Path(__file__).with_name("worker_proto.py"))
+_wp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_wp)
 
 FAKE = os.environ.get("MD_SAPIENS2_FAKE") == "1"
 DEFAULT_MODEL = "facebook/sapiens2-seg-0.4b"
@@ -120,27 +126,18 @@ class _Model:
 
 def _serve(model_id):
     import numpy as np
-    proto = sys.stdout
-    sys.stdout = sys.stderr      # library prints must not break the protocol
-    m = _Model(model_id)
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-            if req.get("op") == "quit":
-                break
+
+    def make():
+        m = _Model(model_id)
+
+        def handle(req, ask):
             x = np.load(req["x"])
             if x.ndim != 3 or x.shape[2] != 3:
                 raise ValueError(f"wejście musi być (H, W, 3) RGB, jest {x.shape}")
             np.save(req["out"], m.forward(x.astype(np.float32)))
-            resp = {"ok": True, "device": m.device, "dtype": m.dtype, "load_seconds": round(m.load_seconds, 3)}
-        except Exception as e:
-            resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        proto.write(json.dumps(resp) + "\n")
-        proto.flush()
-    return 0
+            return {"device": m.device, "dtype": m.dtype, "load_seconds": round(m.load_seconds, 3)}
+        return handle
+    return _wp.serve(make)
 
 
 def main(argv):

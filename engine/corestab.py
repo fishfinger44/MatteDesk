@@ -15,7 +15,7 @@ object option `core_stabilize` is on; off = the old path untouched).
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import cv2
 import numpy as np

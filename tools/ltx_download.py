@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engine.config import load_config            # noqa: E402
-from engine import installer                     # noqa: E402
+from engine.config import load_config
+from engine import installer
 
 
 def main() -> int:

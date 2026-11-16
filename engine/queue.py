@@ -11,7 +11,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 QUEUE_SCHEMA = "matte_desk/queue@1.0"
 

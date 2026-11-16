@@ -10,7 +10,7 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.50/MatteDesk-0.50-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.60/MatteDesk-0.60-setup.exe)
 
 Windows 10 / 11 · karta NVIDIA (CUDA): **minimum 12 GB VRAM, zalecane 24 GB** (etap 7 LTX-2.5 wymaga 24 GB + 64 GB RAM) · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 
@@ -149,7 +149,7 @@ Przycisk **Doktor** sprawdza ComfyUI, węzły, modele, ffmpeg i GPU. Gdy czegoś
 daje przycisk **Zainstaluj** z paskiem postępu (MB, prędkość, czas do końca) oraz zbiorczy **„Zainstaluj wszystkie brakujące”**.
 Jest też przełącznik między **ComfyUI Desktop** a **ComfyUI z gita** (folder, folder modeli i port do zmiany w obu; puste = wykrywane
 automatycznie), ostrzeżenie, gdy na porcie odpowiada **inny** ComfyUI (dwie instalacje na jednym komputerze), i licencja każdego
-składnika. **Zainstalowane modele** (LTX-2.5, VideoMaMa, MatAnyone2, ViTMatte, Sapiens2, MiniMax-Remover, LaMa) mają przycisk 🗑, który
+składnika. **Zainstalowane modele** (LTX-2.5, VideoMaMa, MatAnyone2, ViTMatte, Sapiens2, LaMa) mają przycisk 🗑, który
 usuwa **tylko ich wagi** po pokazaniu każdego pliku z rozmiarem – etap, który potrzebuje modelu, jest wtedy zablokowany. SAM 3.1,
 CoTracker3 i BiRefNet_HR-matting / Lucida (silnik etapu 5, który zostaje bez ViTMatte) nie mają kosza. Nic nie instaluje się samo –
 tylko po kliknięciu.
@@ -210,10 +210,13 @@ dobra) zostają u artysty w interfejsie. Eksport i inne zapisy wymagają jawnej 
 | **Wyrównanie plate'ów na GPU** (`engine/align_gpu_worker.py` w Pythonie ComfyUI; tylko sprawdzenie – używa torcha i CUDA z ComfyUI) | – | 0 | nie (przyspieszenie; bez tego CPU) |
 | Węzły **VideoHelperSuite** (`VHS_LoadImagesPath` – ujęcia 8-bit PNG/JPG w SAM 3.1, MatAnyone2, strefach) | GitHub `Kosinkadink/ComfyUI-VideoHelperSuite` + jego wymagania (`imageio-ffmpeg` ~30 MB) | ~1 MB | ✅ dla ujęć 8-bit |
 | Węzły **DepthCrafter** (funkcja „Głębia”) | GitHub `akatz-ai` (model 4–6 GB pobiera się przy 1. użyciu) | < 1 MB | opcjonalnie |
-| Węzły + wagi **MiniMax-Remover** (przyszły moduł Inpainting) | GitHub `1038lab` + Hugging Face `zibojia/minimax-remover` | 2,6 GB | nie (jeszcze nieużywane) |
 | Węzły `comfyui-inpaint-nodes` + wagi **LaMa** | GitHub `Acly` + `big-lama.pt` | 196 MB | opcjonalnie |
 | Węzeł **ComfyUI-VideoMaMa** + wagi (etap 4 „VideoMaMa”: UNet VideoMaMa, image encoder + VAE SVD-xt fp16 → `models/videomama/`) | `git clone` github.com/okdalto/ComfyUI-VideoMaMa do custom_nodes (+ `requirements.txt`) i Hugging Face `SammyLim/VideoMaMa` + części `stabilityai/stable-video-diffusion-img2vid-xt`; po instalacji węzła restart ComfyUI; nie wchodzi do „Zainstaluj wszystkie” | ~7,1 GB | opcjonalnie (~8 GB VRAM przy kadrze 448 px, ~16 GB przy 1280 px) |
 | Modele **LTX-2.5 Alpha-Gen** (etap 7 „LTX-2.5”: transformer int8, Gemma int8, VAE wideo + audio, IC-LoRA Alpha-Gen; węzły są w rdzeniu ComfyUI ≥ 0.39) | Hugging Face `Lightricks/LTX-2.5` + `Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen` – repo „gated”: najpierw `hf auth login` i „Agree and Access” (licencja LTX-2.x); pobieranie wznawia się po przerwaniu; nie wchodzi do „Zainstaluj wszystkie” | ~40 GB | opcjonalnie (24 GB VRAM + ≥ 64 GB RAM) |
+| Modele **FLUX 3 Image Klein** (tryb Czyszczenie: silnik dogenerowania klucza „FLUX 3 Image Klein + LoRA Restore”; model `flux3-image-klein-bf16` 11,1 GB → `diffusion_models/`, koder Qwen3-VL `qwen3vl_4b_bf16` 8,9 GB → `text_encoders/`, VAE `flux2-vae` 0,34 GB → `vae/`; wymaga ComfyUI ≥ 0.41 – Doktor sprawdza wersję) | Hugging Face `black-forest-labs/flux-3-image-klein-comfy` – repo „gated”: najpierw `hf auth login` i akceptacja dostępu na stronie modelu; pobieranie wznawia się po przerwaniu; nie wchodzi do „Zainstaluj wszystkie” | ~20,3 GB | opcjonalnie (FLUX Kommunity License: **komercyjnie tylko przy rocznym przychodzie < 5 mln USD**) |
+| **LoRA Restore** do FLUX 3 Image Klein (ten sam silnik; `flux-3-image-klein-restore.safetensors` → `loras/`) | Hugging Face `ausboss/FLUX-3-Image-Klein-Restore-LoRA` (publiczne); nie wchodzi do „Zainstaluj wszystkie” | 161 MB | opcjonalnie (FLUX Kommunity License, jak wyżej) |
+| Modele **Qwen-Image-2.1** (tryb Czyszczenie: silnik dogenerowania klucza „Qwen-Image-2.1” – edycja poleceniem wycinka wokół zaznaczenia, zalecany do usuwania obiektu z dużych obszarów; model `qwen_image_2.1_int8_convrot` 7,3 GB → `diffusion_models/`, koder Qwen3-VL 8B `qwen3vl_8b_int8_convrot` 9,4 GB → `text_encoders/`, VAE `qwen_image_2.1_vae_bf16` 0,68 GB → `vae/`; wymaga ComfyUI z węzłem `TextEncodeQwenImage21`, sprawdzone na 0.44.2) | Hugging Face `Comfy-Org/Qwen-Image-2.1`; pobieranie wznawia się po przerwaniu; nie wchodzi do „Zainstaluj wszystkie” | ~17,3 GB | opcjonalnie (Qwen Research License: **tylko niekomercyjnie**) |
+| **COLMAP (CUDA)** (przyszłe liczenie kamery Czyszczenia 3D) | oficjalne wydanie z GitHuba `colmap-x64-windows-cuda.zip` 4.2.1, sprawdzane SHA-256, rozpakowane do `bin/colmap`; nie wchodzi do „Zainstaluj wszystkie” | ~415 MB | opcjonalnie (BSD) |
 
 Nie instaluje: samego ComfyUI (gdy go brak, Doktor pokazuje pozycję „ComfyUI (instalacja)” z linkiem do ComfyUI Desktop: https://www.comfy.org/download) ani Pythona (MatteDesk na nim działa – instaluje go `start_v….bat`). MatteDesk **nie ma własnego PyTorcha** – wszystko, co liczy na GPU (SAM3.1, MatAnyone2, DepthCrafter, CoTracker3), działa w Pythonie ComfyUI (ViTMatte też – jako stały proces `engine/vitmatte_worker.py`; wyrównanie plate'ów – `engine/align_gpu_worker.py`,
 `align_device` = auto | gpu | cpu w `config.local.json`, wersja CPU zostaje jako zapasowa; ten sam worker liczy „Motion blur alfy” –
@@ -342,7 +345,7 @@ Po zmianach w interfejsie odśwież przeglądarkę (Ctrl+F5).
 - 🎬 **Eksport do After Effects** (maski + comp).
 - 🗺 **Mapa drogowa specyfikacji** – głębia (E1e), kadrowanie i obiekty (E2–E3b), klucze i propagacja (E4), QA i dokładność krawędzi (E5–E5b), eksport i kontrakt danych (E6).
 - 🌍 **Generalizacja (E7)** – ujęcia bez backlitu i wideo 8-bit z człowiekiem (reklamy), bez zmian w kodzie.
-- 🧙 **Dokończenie instalatora** – węzły DepthCrafter i MiniMax-Remover w „Zainstaluj wszystkie” i kreator pierwszego uruchomienia.
+- 🧙 **Dokończenie instalatora** – węzły DepthCrafter w „Zainstaluj wszystkie” i kreator pierwszego uruchomienia.
 - 💬 **Polecenia tekstowe po polsku** (opcjonalnie) – „dodaj / usuń X”, tłumaczone na frazę dla SAM3.
 
 **Osobne narzędzia na wspólnym rdzeniu** *(nie budowane bez decyzji)*

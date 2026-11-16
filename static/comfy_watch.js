@@ -41,7 +41,7 @@
 
   async function poll() {
     let h = null;
-    try { h = await (await fetch('/api/comfy/health')).json(); } catch (e) { /* MatteDesk itself gone */ }
+    try { h = await window.UI.api('GET', '/api/comfy/health'); } catch (e) { /* MatteDesk itself gone */ }
     if (h) handle(h);
     setTimeout(poll, POLL_MS);
   }
@@ -81,7 +81,7 @@
     if (reloading && h.launch === 'failed') {
       reloading = null;
       let err = '';
-      try { err = (await (await fetch('/api/comfy/launch')).json()).error || ''; } catch (e) { /* ignore */ }
+      try { err = (await window.UI.api('GET', '/api/comfy/launch')).error || ''; } catch (e) { /* ignore */ }
       show('Nie udało się uruchomić ComfyUI', err || 'Sprawdź okno ComfyUI.');
       return;
     }

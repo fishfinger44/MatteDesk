@@ -58,6 +58,10 @@ LTX_NODES = ("UNETLoader", "LoraLoaderModelOnly", "GetICLoRAParameters", "CLIPLo
              "EmptyLTXVLatentVideo", "LTXVAddGuide", "LTXVEmptyLatentAudio", "LTXVConcatAVLatent", "CFGGuider",
              "ManualSigmas", "SamplerCustomAdvanced", "LTXVSeparateAVLatent", "LTXVCropGuides", "VAEDecodeTiled",
              "SaveImageAdvanced", "PlateLoadEXR")
+# the empty prompt encoded once (2026-11-06): Gemma runs on the first batch, the pair ("" / " ") is saved by our
+# PlateMatte node next to the models, later graphs load it instead of CLIPLoader + CLIPTextEncode
+COND_DIR = "ltx_conditioning"
+COND_NODES = ("ConditioningPairSave", "ConditioningPairLoad")
 SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 GUIDES = ("plain", "isolate", "steer")
 COMBINES = ("band", "raw")   # band = the one band of every stage (engine/bandsys.py); raw = no band (user decision 2026-10-24)
@@ -159,17 +163,35 @@ def band_u8(mask: np.ndarray, s: Dict[str, Any], pts=None) -> np.ndarray:
 
 
 def models_status(models_dir: Optional[Path]) -> List[Dict[str, Any]]:
-    """Every LTX-2.5 model file: {key, folder, file, repo, gb, present}."""
+    """Every LTX-2.5 model file: {key, folder, file, repo, gb, present, needed}. The text encoder (Gemma) is not needed
+    once the empty prompt it encodes is saved (cond_file, 2026-11-06: the file = Gemma bit for bit on CLIP2_A)."""
+    cf = cond_file(models_dir)
+    have_cond = bool(cf and cf.exists())
     out = []
     for key, (folder, fn, repo, gb) in LTX_MODELS.items():
         p = Path(models_dir) / folder / fn if models_dir else None
         out.append({"key": key, "folder": folder, "file": fn, "repo": repo, "gb": gb,
-                    "present": bool(p and p.exists() and p.stat().st_size > 0.9 * gb * 1e9)})
+                    "present": bool(p and p.exists() and p.stat().st_size > 0.9 * gb * 1e9),
+                    "needed": not (key == "text_encoder" and have_cond)})
     return out
+
+
+def missing_models(models_dir: Optional[Path]) -> List[Dict[str, Any]]:
+    """The model files the stage still needs and does not have."""
+    return [m for m in models_status(models_dir) if m["needed"] and not m["present"]]
 
 
 def missing_nodes(object_info: Optional[Dict[str, Any]]) -> List[str]:
     return [n for n in LTX_NODES if not object_info or n not in object_info]
+
+
+def cond_file(models_dir: Optional[Path], text_encoder: Optional[str] = None) -> Optional[Path]:
+    """Where the empty-prompt conditioning of this text encoder lives (one file per encoder: another Gemma = another
+    file, never a stale one)."""
+    if not models_dir:
+        return None
+    te = text_encoder or LTX_MODELS["text_encoder"][1]
+    return Path(models_dir) / COND_DIR / f"{Path(te).stem}.empty_prompt.safetensors"
 
 
 # ----------------------------------------------------------------------------- batching
@@ -294,8 +316,11 @@ def finish(alpha: np.ndarray, core: np.ndarray, s: Dict[str, Any], pts=None) -> 
 
 # ----------------------------------------------------------------------------- Comfy graph
 def alphagen_graph(load_pattern: str, n_frames: int, side_w: int, side_h: int, out_prefix: str, seed: int = 1234,
-                   models: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """API graph: PlateLoadEXR (guide frames 0..n-1, display 0..1) -> Alpha-Gen (OFX recipe) -> 16-bit PNG."""
+                   models: Optional[Dict[str, str]] = None, cond_load: Optional[str] = None,
+                   cond_save: Optional[str] = None) -> Dict[str, Any]:
+    """API graph: PlateLoadEXR (guide frames 0..n-1, display 0..1) -> Alpha-Gen (OFX recipe) -> 16-bit PNG.
+    cond_load = the saved empty-prompt pair replaces CLIPLoader + both CLIPTextEncode (no Gemma); cond_save = Gemma
+    encodes as usual and the pair is also written to that file."""
     m = {k: v[1] for k, v in LTX_MODELS.items()}
     m.update(models or {})
     L = lambda nid, slot=0: [str(nid), slot]
@@ -334,6 +359,13 @@ def alphagen_graph(load_pattern: str, n_frames: int, side_w: int, side_h: int, o
                                                              "format": "png", "format.bit_depth": "16-bit",
                                                              "format.input_color_space": "sRGB"}},
     }
+    if cond_load:
+        for nid in ("32", "35", "36"):
+            del g[nid]
+        g["52"] = {"class_type": "ConditioningPairLoad", "inputs": {"path": cond_load}}
+        g["37"]["inputs"].update(positive=L(52, 0), negative=L(52, 1))
+    elif cond_save:
+        g["52"] = {"class_type": "ConditioningPairSave", "inputs": {"positive": L(35), "negative": L(36), "path": cond_save}}
     return g
 
 
@@ -350,14 +382,18 @@ def decode_matte(png_bytes: bytes) -> np.ndarray:
 
 
 class AlphaGen:
-    """Runs Alpha-Gen on one crop segment. `client` = ComfyClient (queue_prompt / wait_for_prompt / download_output)."""
+    """Runs Alpha-Gen on one crop segment. `client` = ComfyClient (queue_prompt / wait_for_prompt / download_output).
+    cond_path = the empty-prompt conditioning file (cond_file): loaded when it exists, otherwise Gemma encodes and the
+    first batch writes it; None = Gemma on every batch (the graph before 2026-11-06)."""
 
     def __init__(self, client: Any, io_dir: Path, settings: Dict[str, Any], models: Optional[Dict[str, str]] = None,
-                 progress: Optional[Callable[[str, int, int], None]] = None, cancelled: Optional[Callable[[], bool]] = None):
+                 progress: Optional[Callable[[str, int, int], None]] = None, cancelled: Optional[Callable[[], bool]] = None,
+                 cond_path: Optional[Path] = None):
         self.client = client
         self.io = Path(io_dir)
         self.s = settings
         self.models = models
+        self.cond_path = Path(cond_path).resolve() if cond_path else None
         self.progress = progress or (lambda *a: None)
         self.log: List[Dict[str, Any]] = []
 
@@ -398,13 +434,17 @@ class AlphaGen:
             self.progress(f"LTX-2.5: paczka {bi + 1}/{len(bl)} ({nb} kl., {side_w}×{side_h})", bi, len(bl))
             t0 = time.time()
             prefix = f"matte_desk_ltx/{tag}_{bi:02d}_{int(t0)}"
+            cond = self.cond_path.as_posix() if self.cond_path else None
+            have = bool(cond) and self.cond_path.exists()
             res = self._run(alphagen_graph(str(job / "g_####.exr").replace("\\", "/"), length, side_w, side_h,
-                                           prefix, self.s["seed"], self.models))
+                                           prefix, self.s["seed"], self.models,
+                                           cond_load=cond if have else None, cond_save=cond if cond and not have else None))
             files = sorted(res.get("outputs", {}).get("50", {}).get("images", []), key=lambda i: i["filename"])
             if len(files) < nb:
                 raise RuntimeError(f"LTX-2.5: paczka {bi + 1} zwróciła {len(files)} klatek z {nb}")
             self.log.append({"batch": bi, "frames": [a, b], "length": length, "side": [side_w, side_h],
-                             "seconds": round(time.time() - t0, 1)})
+                             "seconds": round(time.time() - t0, 1),
+                             "prompt": "file" if have else ("gemma+save" if cond else "gemma")})
             for i in range(nb):
                 m = decode_matte(self.client.download_output(files[i]))[:sh, :sw]   # padding off
                 m = cv2.resize(m, out_size, interpolation=cv2.INTER_LINEAR)

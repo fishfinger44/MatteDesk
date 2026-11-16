@@ -18,7 +18,7 @@ contour of one group one point. Pure numpy / cv2; the class map comes from engin
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np

@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from engine.segment import iou
 from mock_comfy import MockComfyClient, MockOutputs
-from synth import display, make_shot, sam3_handlers
+from synth import align_texture, display, make_shot, sam3_handlers
 
 
 def _open(tmp_path, monkeypatch, n=8):
@@ -95,6 +95,7 @@ def test_points_are_the_key(tmp_path, monkeypatch):
     assert mf.read_bytes() == before
 
 
+
 def test_aligned_proxy_preview_and_project_stages(tmp_path, monkeypatch):
     import app as app_module
     api = TestClient(app_module.app)
@@ -102,12 +103,12 @@ def test_aligned_proxy_preview_and_project_stages(tmp_path, monkeypatch):
     plates_dir = work_dir / "plates"
     plates_dir.mkdir(parents=True)
     for f in range(1, 4):
-        b = np.zeros((120, 160, 3), np.float32); b[40:80, 50:110] = 1.0; b[20:25, 10:150] = 0.5
+        b = align_texture(240, 320); b[80:160, 100:220] = 1.0; b[40:50, 20:300] = 0.5   # textured set (NO_TEXTURE rule)
         cv2.imwrite(str(plates_dir / f"b_{f:04d}.exr"), b)
-        a = np.zeros((120, 160, 3), np.float32); a[44:84, 50:110] = 1.0; a[24:29, 10:150] = 0.5   # 4 px down
+        a = np.zeros_like(b); a[4:] = b[:-4]   # 4 px down
         cv2.imwrite(str(plates_dir / f"cp_{f:04d}.exr"), a)
     mf = work_dir / "shot_manifest_TEST_AL.json"
-    mf.write_text(json.dumps({"shot": "TEST_AL", "fps": 24, "first": 1, "last": 3, "plate_w": 160, "plate_h": 120,
+    mf.write_text(json.dumps({"shot": "TEST_AL", "fps": 24, "first": 1, "last": 3, "plate_w": 320, "plate_h": 240,
                               "colorspace": "ACES2065-1",
                               "plates": {"beauty": str(plates_dir / "b_####.exr"), "cleanplate": str(plates_dir / "cp_####.exr")},
                               "work": str(work_dir)}), encoding="utf-8")
@@ -148,14 +149,14 @@ def test_aligned_proxy_preview_and_project_stages(tmp_path, monkeypatch):
     for fr in rep["frames"]:
         fr.update({"method": "translation", "dx": 0.0, "dy": -8.0, "transform_matrix": None, "grid_rel_path": None})
     (work_dir / "matte_desk" / "align" / "Align_cleanplate.json").write_text(json.dumps(rep), encoding="utf-8")
-    monkeypatch.setattr(app_module, "_plate_size", lambda: (320, 240))
+    monkeypatch.setattr(app_module, "_plate_size", lambda: (640, 480))
     r = api.get("/api/frame/2?plate=cleanplate&aligned=1")
     assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
     plain = cv2.imdecode(np.frombuffer(api.get("/api/frame/2?plate=cleanplate").content, np.uint8), cv2.IMREAD_GRAYSCALE)
     al = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_GRAYSCALE)
     beauty = cv2.imdecode(np.frombuffer(api.get("/api/frame/2?plate=beauty").content, np.uint8), cv2.IMREAD_GRAYSCALE)
     assert np.abs(plain.astype(float) - beauty).mean() > 5
-    assert np.abs(al.astype(float)[8:, :] - beauty[8:, :]).mean() < 2.0   # JPEG noise only (top rows: border fill)
+    assert np.abs(al.astype(float)[8:-8, :] - beauty[8:-8, :]).mean() < 2.0   # JPEG noise only (edge rows: border fill)
     # cached next to the proxies; nothing written into the plate folder; manifest untouched
     assert (work_dir / "matte_desk" / "proxy" / "cleanplate_aligned_preview" / "p_0002.jpg").exists()
     assert sorted(p.name for p in plates_dir.iterdir()) == sorted([f"b_{f:04d}.exr" for f in range(1, 4)] + [f"cp_{f:04d}.exr" for f in range(1, 4)])
@@ -270,8 +271,8 @@ def test_objects_list_says_which_results_exist(tmp_path, monkeypatch):
 
 
 def test_delete_object_dialog_info_and_optional_exports(tmp_path, monkeypatch):
-    """Delete from the objects list (user request 2026-10-15): delete_info for the dialog; the folder always goes to the
-    project trash, the exported masks only with exports=1 (to trash/exports/, recoverable); other objects untouched."""
+    """Delete from the objects list (user request 2026-10-15): delete_info for the dialog; the folder is always deleted
+    for good, the exported masks only with exports=1 (user decision 2026-11-13: no trash); other objects untouched."""
     import app as app_module
     from engine.outputs import load_outputs, update_outputs
     api, shot, mf = _open(tmp_path, monkeypatch)
@@ -292,15 +293,14 @@ def test_delete_object_dialog_info_and_optional_exports(tmp_path, monkeypatch):
     assert info["exports"]["files"] == 3 and info["folder"]["files"] >= 1 and info["parts"] == []
     assert api.get("/api/object/nope/delete_info").status_code == 404
 
-    # without exports: folder -> trash, masks stay, entry gone
+    # without exports: folder deleted, masks stay, entry gone
     r = api.delete("/api/object/rock").json()
-    assert r["exports_moved"] == 0 and Path(r["trash"]).is_dir()
+    assert r["exports_deleted"] == 0 and r["freed_bytes"] > 0 and not (work / "objects" / "rock").exists()
     assert sorted(p.name for p in (work / "export" / "mattes" / "rock").iterdir()) == ["notes.txt", "rock_0001.exr", "rock_0002.exr", "rock_0003.exr"]
-    # with exports: the sequence moves to trash/exports, other files stay
+    # with exports: the sequence is deleted for good, other files stay
     r = api.delete("/api/object/tree?exports=1").json()
-    assert r["exports_moved"] == 3
-    moved = sorted(p.name for p in Path(r["exports_trash"]).rglob("*.exr"))
-    assert moved == ["tree_0001.exr", "tree_0002.exr", "tree_0003.exr"]
+    assert r["exports_deleted"] == 3 and r["exports_freed_bytes"] == 3000 and r["freed_bytes"] > 3000
+    assert not (work / "trash").exists()
     assert sorted(p.name for p in (work / "export" / "mattes" / "tree").iterdir()) == ["notes.txt"]
     assert [e["name"] for e in load_outputs(work)["objects"]] == []
     assert [o["name"] for o in api.get("/api/objects").json()["objects"]] == ["puppet"]

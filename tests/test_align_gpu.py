@@ -25,12 +25,18 @@ FAKE_ENV = {**os.environ, "MD_ALIGN_GPU_FAKE": "1"}
 FAKE_CRASH_ENV = {**FAKE_ENV, "MD_ALIGN_GPU_FAKE_CRASH": "1"}
 
 
-def _gpu_ready():
+@pytest.fixture(scope="module")
+def gpu_worker():
+    """Checked lazily, in the test – not at collection, where it used to start ComfyUI's Python with CUDA on every
+    `pytest` run, also under `-m "not real"` (audit 2026-11-02 #12)."""
     ok, info = align_gpu.check_worker()
-    return ok and info.startswith("cuda")
+    if not (ok and info.startswith("cuda")):
+        pytest.skip("ComfyUI's Python with CUDA not available")
 
 
-needs_gpu = pytest.mark.skipif(not _gpu_ready(), reason="ComfyUI's Python with CUDA not available")
+def needs_gpu(fn):
+    """GPU test = `real` (station only) + the lazy worker check."""
+    return pytest.mark.real(pytest.mark.usefixtures("gpu_worker")(fn))
 
 
 def _square(x):
@@ -264,7 +270,7 @@ def test_gpu_cancel_in_local_stage(tmp_path):
 
     with pytest.raises(Stop):
         AlignmentPipeline.measure_sequence(aux_plate_type="cleanplate", device="gpu", tracker=LKTracker(),
-                                           grid_dir=tmp_path / "grid", step_cb=step_cb, **kw)
+                                           grid_dir=tmp_path / "grid", step_cb=step_cb, camera_lock="off", **kw)
     assert not align_gpu._OPEN
     assert not (tmp_path / "grid" / "grid_0001.exr").exists()
 
@@ -278,3 +284,75 @@ def test_doctor_align_gpu_check(monkeypatch):
     monkeypatch.setattr(align_gpu, "check_worker", lambda *a, **k: (False, "brak torch"))
     it = d.check_align_gpu()
     assert it.status == "warning" and "brak torch" in it.message and "Wymagane teraz: NIE" in it.fix_suggestion
+
+
+# ------------------------------------------------------------------------- align_v2 (2026-11-03): GPU = CPU twins
+
+def test_fake_worker_median_disp(tmp_path):
+    g = _fake(tmp_path)
+    try:
+        v = np.array([[[1.0, 2.0, 0.5], [np.nan, np.nan, np.nan]], [[3.0, 0.0, 0.7], [1.0, 1.0, 0.2]],
+                      [[2.0, 1.0, np.nan], [np.nan, np.nan, np.nan]]])
+        out = str(tmp_path / "m.npy")
+        r = g.call({"op": "median_disp", "vals": _npy(tmp_path, "v", v), "out": out})
+        m = np.load(out)
+        assert r["n"] == 2 and r["anchors"] == 3
+        assert np.allclose(m[0], [2.0, 1.0, 0.6]) and np.allclose(m[1], [1.0, 1.0, 0.2])
+    finally:
+        g.close()
+
+
+@needs_gpu
+def test_gpu_median_disp_matches_numpy(tmp_path):
+    """The worker's nanmedian over the anchors (torch sort) = np.nanmedian: even counts average the middle pair."""
+    rng = np.random.default_rng(3)
+    v = rng.normal(0, 1, (6, 500, 3))
+    v[rng.random(v.shape) < 0.3] = np.nan
+    v[:, 7] = np.nan
+    g = align_gpu.GpuAligner()
+    try:
+        med = align_gpu.make_median(g)(v)
+    finally:
+        g.close()
+    want = np.nanmedian(v, axis=0)
+    ok = np.isfinite(want)
+    assert np.array_equal(np.isfinite(med), ok) and np.abs(med[ok] - want[ok]).max() < 1e-12
+
+
+@needs_gpu
+def test_gpu_matches_cpu_exclusions_and_locked_camera(tmp_path):
+    """align_v2 steps 1 + 2 on the GPU: the objects' exclusion mask in the worker's static mask, the per-anchor
+    patches, the median over the anchors and the one field of a locked camera = the CPU code within 0.02 px."""
+    from engine.align_exclude import exclusion_spec
+    from tests.synth import make_align_shot
+    shot = make_align_shot(tmp_path / "shot", n=9, w=800, h=450, shift=(2.4, -1.2), rot_deg=0.2, local_amp=1.5)
+    work = tmp_path / "work"
+    shot.write_object_cores(work, "puppet")
+    frames = list(range(shot.first, shot.last + 1))
+    spec = exclusion_spec(work, ["puppet"], frames, dilate_px=32)
+    kw = dict(beauty_pattern=shot.beauty_pattern, aux_pattern=shot.aux_pattern, first_frame=shot.first,
+              last_frame=shot.last, plate_name="cleanplate", aux_plate_type="cleanplate", plate_w=shot.w, plate_h=shot.h,
+              workers=1, exclusion=spec, camera_lock="on", anchor_every=4)
+    cpu = AlignmentPipeline.measure_sequence(device="cpu", grid_dir=tmp_path / "s_cpu", tracker=LKTracker(), **kw)
+    gpu = AlignmentPipeline.measure_sequence(device="gpu", grid_dir=tmp_path / "s_gpu", tracker=LKTracker(), **kw)
+    assert gpu.device == "cuda" and cpu.camera_lock["locked"] and gpu.camera_lock["locked"]
+    assert cpu.exclusions["objects"] == gpu.exclusions["objects"] == ["puppet"]
+    assert cpu.camera_lock["anchors"] == gpu.camera_lock["anchors"] == 3
+    assert abs(cpu.camera_lock["local_after_px"] - gpu.camera_lock["local_after_px"]) < 0.02
+    for a, b in zip(cpu.frames, gpu.frames):
+        assert a.method == b.method == "local_stmap" and a.global_method == b.global_method
+        assert _corner_diff(a, b, shot.w, shot.h) < 0.02
+        assert abs(a.residual_px - b.residual_px) < 0.02 and abs(a.n_rejected - b.n_rejected) <= 1
+    g1 = align_grid.read_grid(tmp_path / "s_cpu" / cpu.frames[0].grid_rel_path)
+    g2 = align_grid.read_grid(tmp_path / "s_gpu" / gpu.frames[0].grid_rel_path)
+    assert cpu.frames[0].grid_rel_path == gpu.frames[0].grid_rel_path == "grid_lock.exr"
+    assert np.abs(g1.dx - g2.dx).max() < 0.02 and np.abs(g1.dy - g2.dy).max() < 0.02
+    # the tracked path with the exclusion (per-anchor masks, per-frame veto) on both devices
+    kw["camera_lock"] = "off"
+    cpu = AlignmentPipeline.measure_sequence(device="cpu", grid_dir=tmp_path / "t_cpu", tracker=LKTracker(), **kw)
+    gpu = AlignmentPipeline.measure_sequence(device="gpu", grid_dir=tmp_path / "t_gpu", tracker=LKTracker(), **kw)
+    for a, b in zip(cpu.frames, gpu.frames):
+        assert a.n_points == b.n_points and abs(a.residual_px - b.residual_px) < 0.02
+        g1 = align_grid.read_grid(tmp_path / "t_cpu" / a.grid_rel_path)
+        g2 = align_grid.read_grid(tmp_path / "t_gpu" / b.grid_rel_path)
+        assert np.abs(g1.dx - g2.dx).max() < 0.02 and np.abs(g1.dy - g2.dy).max() < 0.02

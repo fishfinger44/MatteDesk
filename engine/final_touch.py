@@ -46,6 +46,9 @@ FINISH_DEFAULT = {"black": 0.0, "white": 1.0, "gamma": 1.0, "erode_px": 0.0, "bl
 FINISH_RANGE = {"black": (0.0, 0.9), "white": (0.1, 1.0), "gamma": (0.2, 5.0), "erode_px": (-50.0, 50.0), "blur_px": (0.0, 50.0),
                 "mb_strength": (0.0, 10.0), "mb_shutter_deg": (0.0, 720.0)}
 FINISH_FLAGS = ("mb_measured",)
+# how the corrections go to Nuke in the export's .nk (engine/ft_nuke.py, user decision 2026-11-16): baked into the
+# alpha, the finish as nodes (strokes baked), or the strokes as a RotoPaint + the finish as nodes
+NUKE_MODES = ("bake", "grade", "paint")
 # plate context of the motion blur (gray frames, the shot's shutter), given by the app (set_context_provider) – the
 # alpha loaders of the export / preview have no plate of their own; None = the motion blur is skipped
 _CONTEXT_PROVIDER: Optional[Callable[[], Optional[Dict[str, Any]]]] = None
@@ -78,6 +81,8 @@ def load(obj_dir: Path) -> Dict[str, Any]:
     d.setdefault("frames", {})
     d["finish"] = {**FINISH_DEFAULT, **{k: v for k, v in (d.get("finish") or {}).items() if k in FINISH_DEFAULT}}
     d["finish"]["mb_measured"] = bool(d["finish"].get("mb_measured", True))
+    if d.get("nuke_mode") not in NUKE_MODES:
+        d["nuke_mode"] = "bake"
     return d
 
 
@@ -121,6 +126,15 @@ def set_base(obj_dir: Path, source: Optional[str], run: Optional[str] = None) ->
         raise ValueError(f"source: {' | '.join(BASE_SOURCES)}")
     d = load(obj_dir)
     d["base"] = {"source": source, "run": run if source == "version" else None}
+    return save(obj_dir, d)
+
+
+def set_nuke_mode(obj_dir: Path, mode: str) -> Dict[str, Any]:
+    """How the object's corrections go to Nuke (NUKE_MODES); the alpha of the app never changes."""
+    if mode not in NUKE_MODES:
+        raise ValueError(f"nuke_mode: {' | '.join(NUKE_MODES)}")
+    d = load(obj_dir)
+    d["nuke_mode"] = mode
     return save(obj_dir, d)
 
 
@@ -348,22 +362,48 @@ def ft_loader(obj_dir: Path, base_loader: Callable[[int], np.ndarray]) -> Callab
     return load_f
 
 
+def partial_loader(obj_dir: Path, base_loader: Callable[[int], np.ndarray], strokes: bool) -> Callable[[int], np.ndarray]:
+    """Loader of what the Nuke nodes start from (engine/ft_nuke): the base, with the strokes when `strokes` (mode
+    grade), never the finish."""
+    d = load(obj_dir)
+
+    def load_f(f: int) -> np.ndarray:
+        a = base_loader(f)
+        st = (d.get("frames") or {}).get(str(int(f))) or [] if strokes else []
+        if st:
+            h, w = a.shape[:2]
+            a = compose(a, layer(st, w, h))
+        return a
+    return load_f
+
+
 # ---------------------------------------------------------------- MergeMatte settings (PLAN_FINAL_TOUCH.md §11)
 # Comp settings of the object for Nuke: they never change the alpha (no signature, no ↻) – the Final Touch palette
 # „MergeMatte” previews them on the Comp view and the Nuke export writes them into the MergeMatte group's knobs.
-def merge_matte_settings(d: Dict[str, Any]) -> Dict[str, Any]:
-    """{"node", "on", "knobs"} of a loaded final_touch.json – knobs = the node defaults + the stored values."""
-    from engine.merge_matte_nk import KNOB_DEFAULTS, NODE_NAME, VERSION
+def merge_matte_settings(d: Dict[str, Any], project_curve: Optional[str] = None) -> Dict[str, Any]:
+    """{"node", "on", "knobs", "log_curve_effective"} of a loaded final_touch.json – knobs = the node defaults + the
+    stored values. `log_curve` stays as stored (`project` = the plate's colour profile, `none`, or a curve id; an old
+    bool `log` reads as acescct / none); `log_curve_effective` = the id the port / the Nuke group get (`project`
+    resolved to `project_curve`, ACEScct when none is known)."""
+    from engine import log_curves as lc
+    from engine.merge_matte_nk import KNOB_DEFAULTS, NODE_NAME, VERSION, knob_value
     mm = d.get("merge_matte") or {}
-    knobs = {**KNOB_DEFAULTS, **{k: float(v) for k, v in (mm.get("knobs") or {}).items() if k in KNOB_DEFAULTS}}
-    return {"node": f"{NODE_NAME}_{VERSION}", "on": bool(mm.get("on", False)), "knobs": knobs}
+    stored = mm.get("knobs") or {}
+    knobs = {**KNOB_DEFAULTS, **{k: knob_value(k, v) for k, v in stored.items() if k in KNOB_DEFAULTS}}
+    if "log_curve" not in stored and "log" in stored:
+        knobs["log_curve"] = lc.legacy_curve(stored["log"])
+    eff = knobs["log_curve"]
+    if eff == lc.PROJECT:
+        eff = project_curve if project_curve in lc.CURVE_IDS else "acescct"
+    return {"node": f"{NODE_NAME}_{VERSION}", "on": bool(mm.get("on", False)), "knobs": knobs, "log_curve_effective": eff}
 
 
 def set_merge_matte(obj_dir: Path, on: Optional[bool] = None, knobs: Optional[Dict[str, Any]] = None,
-                    reset: Optional[str] = None) -> Dict[str, Any]:
-    """Store the object's MergeMatte settings. knobs = changed values (clamped to the node's ranges, unknown names →
-    ValueError); reset = "default" | "sh010" replaces all knobs by a preset."""
-    from engine.merge_matte_nk import KNOB_DEFAULTS, KNOB_FIELD_RANGES as KNOB_RANGES, PRESET_SH010   # typed values may pass the slider
+                    reset: Optional[str] = None, project_curve: Optional[str] = None) -> Dict[str, Any]:
+    """Store the object's MergeMatte settings. knobs = changed values (clamped to the node's ranges, unknown names /
+    unknown curve ids → ValueError); reset = "default" | "sh010" replaces all knobs by a preset."""
+    from engine import log_curves as lc
+    from engine.merge_matte_nk import ENUM_KNOBS, KNOB_DEFAULTS, KNOB_FIELD_RANGES as KNOB_RANGES, PRESET_SH010   # typed values may pass the slider
     d = load(obj_dir)
     cur = merge_matte_settings(d)
     k = dict(cur["knobs"])
@@ -373,25 +413,34 @@ def set_merge_matte(obj_dir: Path, on: Optional[bool] = None, knobs: Optional[Di
             raise ValueError(f"nieznany preset {reset}")
         k = dict(presets[reset])
     for n, v in (knobs or {}).items():
+        if n == "log" and "log_curve" not in (knobs or {}):   # an old client: the bool
+            n, v = "log_curve", lc.legacy_curve(v)
         if n not in KNOB_DEFAULTS:
             raise ValueError(f"nieznany knob MergeMatte: {n}")
-        v = float(v)
-        if n in KNOB_RANGES:
-            lo, hi = KNOB_RANGES[n]
-            v = min(max(v, lo), hi)
+        if n in ENUM_KNOBS:
+            v = str(v)
+            if v not in ENUM_KNOBS[n] and v != lc.PROJECT:
+                raise ValueError(f"nieznana krzywa log: {v}")
+        else:
+            v = float(v)
+            if n in KNOB_RANGES:
+                lo, hi = KNOB_RANGES[n]
+                v = min(max(v, lo), hi)
         k[n] = v
     d["merge_matte"] = {"on": cur["on"] if on is None else bool(on),
                         "knobs": {n: v for n, v in k.items() if v != KNOB_DEFAULTS[n]}}   # only what differs from the node
     save(obj_dir, d)
-    return merge_matte_settings(d)
+    return merge_matte_settings(d, project_curve)
 
 
-def merge_matte_export(work_dir: Path, names: Sequence[str], plate: str, colorspace: str) -> Optional[Dict[str, Any]]:
-    """`merge` argument of engine/nuke_mattes.mattes_nk: the exported objects whose MergeMatte is on, with their knobs;
-    None when no object has it on (the .nk then holds MASKI only, as before)."""
+def merge_matte_export(work_dir: Path, names: Sequence[str], plate: str, colorspace: str,
+                       project_curve: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """`merge` argument of engine/nuke_mattes.mattes_nk: the exported objects whose MergeMatte is on, with their knobs
+    (`log_curve` resolved: `project` → `project_curve`, the plate's colour profile); None when no object has it on (the
+    .nk then holds MASKI only, as before)."""
     objs = {}
     for n in names:
-        mm = merge_matte_settings(load(Path(work_dir) / "objects" / n))
+        mm = merge_matte_settings(load(Path(work_dir) / "objects" / n), project_curve)
         if mm["on"]:
-            objs[n] = mm["knobs"]
+            objs[n] = {**mm["knobs"], "log_curve": mm["log_curve_effective"]}
     return {"plate": plate, "colorspace": colorspace, "objects": objs} if objs and plate else None

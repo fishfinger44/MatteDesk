@@ -1,0 +1,187 @@
+{
+ "_about": "Peak GPU memory per model pass (engine/vram_forecast.py). x = work width * height * frames / 1e6; peak_gb = whole card (nvidia-smi, every 100 ms) during the pass, base_gb = the card before it (Comfy freed). Filled by tools/measure_vram.py (raw log: local_results/vram_measure_4090.log). 1536 px x 24 frames filled the 24 GB card and spilled into RAM (not stored - a full card is not the need).",
+ "models": {
+  "videomama": {
+   "default": [
+    {
+     "x": 4.817,
+     "side": 448,
+     "frames": 24,
+     "peak_gb": 8.31,
+     "base_gb": 1.87,
+     "gpu": "RTX 4090",
+     "seconds": 15.9,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 14.156,
+     "side": 768,
+     "frames": 24,
+     "peak_gb": 12.34,
+     "base_gb": 2.0,
+     "gpu": "RTX 4090",
+     "seconds": 26.3,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 25.166,
+     "side": 1024,
+     "frames": 24,
+     "peak_gb": 17.65,
+     "base_gb": 2.03,
+     "gpu": "RTX 4090",
+     "seconds": 38.3,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 39.322,
+     "side": 1280,
+     "frames": 24,
+     "peak_gb": 23.3,
+     "base_gb": 2.09,
+     "gpu": "RTX 4090",
+     "seconds": 56.9,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 2.408,
+     "side": 448,
+     "frames": 12,
+     "peak_gb": 7.56,
+     "base_gb": 1.37,
+     "gpu": "RTX 4090",
+     "seconds": 12.6,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 7.078,
+     "side": 768,
+     "frames": 12,
+     "peak_gb": 11.87,
+     "base_gb": 1.4,
+     "gpu": "RTX 4090",
+     "seconds": 17.6,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 12.583,
+     "side": 1024,
+     "frames": 12,
+     "peak_gb": 16.78,
+     "base_gb": 1.43,
+     "gpu": "RTX 4090",
+     "seconds": 24.0,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 19.661,
+     "side": 1280,
+     "frames": 12,
+     "peak_gb": 23.09,
+     "base_gb": 1.46,
+     "gpu": "RTX 4090",
+     "seconds": 32.7,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    }
+   ],
+   "offload": [
+    {
+     "x": 4.817,
+     "side": 448,
+     "frames": 24,
+     "peak_gb": 5.56,
+     "base_gb": 1.18,
+     "gpu": "RTX 4090",
+     "seconds": 21.8,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 14.156,
+     "side": 768,
+     "frames": 24,
+     "peak_gb": 8.52,
+     "base_gb": 1.34,
+     "gpu": "RTX 4090",
+     "seconds": 32.6,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 25.166,
+     "side": 1024,
+     "frames": 24,
+     "peak_gb": 13.93,
+     "base_gb": 1.34,
+     "gpu": "RTX 4090",
+     "seconds": 70.6,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 39.322,
+     "side": 1280,
+     "frames": 24,
+     "peak_gb": 19.43,
+     "base_gb": 1.37,
+     "gpu": "RTX 4090",
+     "seconds": 61.8,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 2.408,
+     "side": 448,
+     "frames": 12,
+     "peak_gb": 4.9,
+     "base_gb": 1.37,
+     "gpu": "RTX 4090",
+     "seconds": 18.9,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 7.078,
+     "side": 768,
+     "frames": 12,
+     "peak_gb": 8.18,
+     "base_gb": 1.37,
+     "gpu": "RTX 4090",
+     "seconds": 23.9,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 12.583,
+     "side": 1024,
+     "frames": 12,
+     "peak_gb": 14.78,
+     "base_gb": 1.37,
+     "gpu": "RTX 4090",
+     "seconds": 30.4,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    },
+    {
+     "x": 19.661,
+     "side": 1280,
+     "frames": 12,
+     "peak_gb": 19.18,
+     "base_gb": 1.37,
+     "gpu": "RTX 4090",
+     "seconds": 39.2,
+     "date": "2026-11-06",
+     "source": "tools/measure_vram.py"
+    }
+   ]
+  }
+ }
+}

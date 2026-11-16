@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 SHARED = REPO_DIR / "config.json"
@@ -26,6 +26,7 @@ LOCAL = REPO_DIR / "config.local.json"
 
 DEFAULTS: Dict[str, Any] = {
     "comfy_flavor": "desktop",
+    "feature_cleanup3d": True,     # engine/features.py: Cleanup 3D steps C2–C6 (the public copy writes false)
     "comfy_dir": "",
     "comfy_host": "127.0.0.1",
     "comfy_port": 8000,
@@ -39,10 +40,16 @@ DEFAULTS: Dict[str, Any] = {
     "sam3_checkpoint": "sam3.1_multiplex_fp16.safetensors",
     "align_device": "auto",       # plate alignment: auto (GPU in ComfyUI's Python when it runs) | gpu | cpu
     "mb_device": "auto",          # motion blur of the alpha (the same GPU worker): auto | gpu | cpu
+    "denoise_device": "auto",     # plate denoise of stage 0 (the same GPU worker, engine/denoise_gpu.py): auto | gpu | cpu
     "gpu_idle_release_s": 180,    # engine/gpu_manager: our GPU workers unused this long are closed (0 = never)
 }
 
-PATH_KEYS = ("comfy_dir", "models_dir", "comfy_python", "ffmpeg_path", "git_path", "depth_workflow", "ltx_alpha_workflow")
+PATH_KEYS = ("comfy_dir", "models_dir", "comfy_python", "ffmpeg_path", "git_path", "depth_workflow", "ltx_alpha_workflow",
+             # weights MatteDesk downloads outside ComfyUI's model folders (Hugging Face cache: ViTMatte, BiRefNet,
+             # Sapiens2 …) – weights_dir(); empty = the HF_HOME variable, else <models_dir>/huggingface
+             "hf_home",
+             # Cleanup 3D P12: VOID / SeedVR2 in their own Python environments (engine/cleanup3d/void_engine.TOOL_KEYS)
+             "void_python", "void_repo", "void_models", "seedvr2_python", "seedvr2_repo", "seedvr2_models")
 
 
 def resolve_path(v: str, base: Path = REPO_DIR) -> str:
@@ -174,6 +181,31 @@ def load_config(shared: Optional[Path] = None, local: Optional[Path] = None, app
         sources["models_dir"] = "comfy_dir/models"
     cfg["_sources"] = sources
     return cfg
+
+
+USER_HF_HOME = os.environ.get("HF_HOME", "")   # the variable as the process started (before apply_weights_dir)
+
+
+def weights_dir(cfg: Dict[str, Any]) -> Tuple[str, str]:
+    """(folder, source) of the weights MatteDesk keeps outside ComfyUI's model folders = the Hugging Face cache
+    (HF_HOME) of MatteDesk and its GPU workers. User decision 2026-11-10 (the HF cache in the user profile on C: was
+    wiped while freeing disk space): the Doctor's choice (config.local `hf_home`) > the HF_HOME variable >
+    <models_dir>/huggingface (next to ComfyUI's models, on the drive the user picked for models) > the HF default."""
+    if cfg.get("hf_home"):
+        return str(cfg["hf_home"]).replace("\\", "/"), "config.local.json"
+    if USER_HF_HOME:
+        return USER_HF_HOME.replace("\\", "/"), "zmienna HF_HOME"
+    if cfg.get("models_dir"):
+        return (str(Path(cfg["models_dir"]) / "huggingface")).replace("\\", "/"), "folder modeli ComfyUI"
+    return str(Path.home() / ".cache" / "huggingface").replace("\\", "/"), "domyślny Hugging Face"
+
+
+def apply_weights_dir(cfg: Dict[str, Any]) -> str:
+    """HF_HOME of this process (and so of every worker it starts) = weights_dir(cfg); returns it."""
+    d, _src = weights_dir(cfg)
+    os.environ["HF_HOME"] = d
+    os.environ.pop("HF_HUB_CACHE", None)
+    return d
 
 
 def write_local(values: Dict[str, Any], local: Optional[Path] = None) -> Path:

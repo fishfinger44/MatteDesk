@@ -81,13 +81,17 @@ def test_background_motion_is_not_used():
 
 
 # ------------------------------------------------------------------ GPU (the alignment worker in ComfyUI's Python)
-def _gpu_ready():
+@pytest.fixture(scope="module")
+def gpu_worker():
+    """Lazy, in the test – not at collection (audit 2026-11-02 #12); `real` = station only."""
     from engine import align_gpu
     ok, info = align_gpu.check_worker()
-    return ok and info.startswith("cuda")
+    if not (ok and info.startswith("cuda")):
+        pytest.skip("ComfyUI's Python with CUDA not available")
 
 
-@pytest.mark.skipif(not _gpu_ready(), reason="ComfyUI's Python with CUDA not available")
+@pytest.mark.real
+@pytest.mark.usefixtures("gpu_worker")
 @pytest.mark.parametrize("speed,shutter,strength", [(12, 180, 1.0), (30, 360, 1.5), (0, 180, 1.0)])
 def test_gpu_equals_cpu(speed, shutter, strength):
     """The vector blur in the GPU worker = the CPU code within the bilinear rounding of cv2.remap (1/32 px)."""

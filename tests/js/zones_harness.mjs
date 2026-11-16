@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // tests/js/zones_harness.mjs – headless run of static/zones.js (stage ViTMatte zone panel) and static/brush.js (stage
 // CoTracker brush corrections, 2026-10-15) in jsdom with a fake API / viewer.
-// Exercises the whole panel flow without a browser or server: first stroke -> new zone + preview, preset PATCH,
-// region in a frame without a key, "-" stroke there -> key from the propagated region, Ctrl+Z, apply 409 missing_front
-// -> dialog -> "bez holdoutu" -> apply ok, overlays (alpha / comp / trimap / engines), clean plate row, delete.
-// Run: NODE_PATH=<dir with jsdom> node tests/js/zones_harness.mjs   (tests/test_zones_js_harness.py wraps it; skipped without jsdom)
+// Exercises the panel flow that ships, without a browser or server: the automatic whole-outline zone (a 409 waits for the
+// end of the job), palette controls -> PATCH, band area per frame, overlays (alpha / comp / trimap / engines), apply 409
+// missing_front -> dialog -> "bez holdoutu" -> apply ok, one zone per object, clean plate row, delete.
+// NOT covered: the zone drawing hidden since 2026-10-21 (DRAW_TOOLS = false in zones.js, code kept) – its assertions were
+// dropped when this harness was revived on 2026-11-03; they are in git history (tests/js/zones_harness.mjs before that).
+// Run: cd tests/js && npm ci && node zones_harness.mjs   (tests/test_zones_js_harness.py wraps it; skipped without jsdom)
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -20,7 +22,7 @@ const html = `<!doctype html><html><body>
   <div id="stagePanel"><div class="stage-pane"><div class="pane-section" id="st4ZonePanel"><div id="z4Panel"></div>
   <details id="z4Adv"><summary>adv</summary></details></div><div class="stage-status" id="st4Status"></div><div id="st4Runs"></div></div>
   <div class="stage-pane"><div id="b2Panel"></div></div></div>
-  <div id="timelineKeys"></div><canvas id="cv" width="640" height="360"></canvas></body></html>`;
+  <div id="timelineKeys"></div><div id="canvasWrapper"><canvas id="cv" width="640" height="360"></canvas></div></body></html>`;
 const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://127.0.0.1:8765/' });
 const { window } = dom;
 const { document } = window;
@@ -75,8 +77,11 @@ async function fakeApi(method, url, body) {
       proposals: [{ id: 0, polygon: [[300, 100], [420, 100], [420, 240], [300, 240]], area_px: 9000, bbox: [300, 100, 420, 240], side: 'prawo', source: 'sam3' },
                   { id: 1, polygon: [[100, 100], [160, 100], [160, 240], [100, 240]], area_px: 4000, bbox: [100, 100, 160, 240], side: 'lewo', source: 'soft' }] };
   }
-  if (url === '/api/object/obj/zones/new' && method === 'POST') {   // stage-2 brush correction (no preview)
-    if (body.criterion !== 'all' || !body.params || body.params.source !== 'brush') throw err(400, 'harness: only brush zones here');
+  if (method === 'GET' && url === '/api/zones/preset_defaults/hair') return { params: { temporal: 'none', outline_in_px: 2 } };
+  if (/^\/api\/object\/obj\/zones\/new/.test(url) && method === 'POST' && srv.refuseNew && srv.refuseNew.length) throw srv.refuseNew.shift();
+  if (url === '/api/object/obj/zones/new' && method === 'POST') {   // no preview: the automatic outline zone, stage-2 brush correction
+    const outline = body.criterion === 'matte' && body.params && body.params.region === 'outline';
+    if (!outline && (body.criterion !== 'all' || !body.params || body.params.source !== 'brush')) throw err(400, 'harness: only outline / brush zones here');
     const z = { zone_id: `z_${String(srv.next++).padStart(2, '0')}`, schema: 'matte_desk/zone@1.1', keys: {}, prompt_history: [], engine_hints: {}, enabled: true,
       bg_static: true, holdout: true, preset: 'hair', matting: 'matanyone', prompt: '', ...body };
     srv.zones[z.zone_id] = z;
@@ -176,7 +181,8 @@ const hooks = {
   tintCanvas: () => { const c = document.createElement('canvas'); c.width = 640; c.height = 360; return c; },
   compCanvas: () => { const c = document.createElement('canvas'); c.width = 640; c.height = 360; return c; },
   drawVarStroke: () => {}, plateSize: () => [1280, 720],
-  loadStages: async () => {}, loadQA: () => {}, setView: (v) => views.push(v), ensurePointsSaved: async () => {},
+  loadStages: async () => {}, loadQA: () => {}, setView: (v) => views.push(v), ensurePointsSaved: async () => {}, restoreUserView: () => views.push('restored'),
+  putComp: (k, c) => { S.compCache[k] = c; },
   tileOverlays: (kind) => { tileCalls.push(kind); return { reg: { kp: 2, chunks: [{ x: 0, y: 0, w: 640, h: 360 }] }, tiles: [{ c: { x: 0, y: 0, w: 640, h: 360 }, img: fakeImg }] }; },
 };
 const tileCalls = [];
@@ -193,251 +199,143 @@ ZN.init(hooks);
 assert(ZN.ready, 'init');
 for (const id of ['st4Zones', 'z4New', 'z4Presets', 'z4Prompt', 'z4Engine', 'z4Holdout', 'z4CleanRow', 'z4Ov', 'z4Refresh', 'z4Loupe', 'z4ApplyShot', 'z4KeyDel']) assert($(id), `id ${id}`);
 assert($('z4Engine').value === 'matanyone', 'default engine matanyone');
+srv.refuseNew = [err(409, 'Obiekt „obj” jest teraz liczony')];   // a job on the object while stage ViTMatte opens (block 1)
 await ZN.load();
 assert($('st4Zones').textContent.includes('brak stref'), 'empty list text');
 ZN.onShow(); await wait(5);
 assert($('z4CleanTxt').textContent.includes('brak'), 'clean plate row: brak');
 assert($('z4CleanRow').classList.contains('warn'), 'clean plate row warns');
 
-// 1. first stroke = new zone (preset fibres chosen first), preview at once, card + lane
-$('z4Presets').querySelector('[data-preset="fibres"]').click();
-$('z4Prompt').value = 'włosy bez linii'; $('z4Prompt').dispatchEvent(new window.Event('change'));
-S.strokes[115] = [{ mode: 'add', radius_px: 12, p: [[500, 200], [520, 230]] }, { mode: 'remove', radius_px: 4, p: [[600, 300], [610, 300]] }];
-assert(ZN.wantsDraw(), 'zone flow on (advanced closed)');
-ZN.onDraw(115);
-await wait(750);
-const st = ZN.state;
-assert(st.active === 'z_01', `active after first stroke: ${st.active}`);
-const post = calls.find((c) => c[0] === 'POST' && c[1].startsWith('/api/object/obj/zones/new'));
-assert(post && post[2].preset === 'fibres' && post[2].prompt === 'włosy bez linii' && post[2].matting === 'matanyone' && post[2].strokes.length === 1 && post[2].bg_strokes.length === 1, 'POST new body');
-assert(st.preview && st.preview.f === 115 && st.preview.zid === 'z_01', 'preview set');
-assert(invalidated.includes(115) && cleared === 0, 'only frame 115 invalidated, no clearOverlays');
-assert(document.querySelectorAll('.zone-card').length === 1 && document.querySelector('.zone-card').classList.contains('cur'), 'one active card');
-assert(document.querySelector('.zone-card .zone-name b').textContent === 'włosy bez linii', 'card name from prompt');
-assert($('z4PvInfo').textContent.includes('F115') && $('z4PvInfo').textContent.includes('podpowiedź klucza'), 'preview info + matanyone note');
-assert($('timelineZones').querySelectorAll('.zone-key').length === 1 && $('timelineZones').querySelector('.zone-range'), 'lane: 1 diamond + range');
-assert(toasts.some((t) => /Nowa strefa z_01/.test(t)), 'toast new zone');
-assert(S.strokes[115].length === 0, 'local strokes consumed');
-
-// 2. preset / engine change on the active zone -> PATCH + preview
+// 1. stage ViTMatte opens on the whole-outline zone, created by itself (user decision 2026-10-21): no preview, no key on
+// the lane. A job on the object refuses it with a 409: it waits and tries again when the job ends (audit 2026-11-02 #17)
+assert(!ZN.drawTools && !ZN.wantsDraw(), 'zone drawing hidden (DRAW_TOOLS = false)');
+await wait(30);
+assert(ZN.state.autoWait && ZN.state.autoWait.obj && !Object.keys(srv.zones).length, 'a passing 409 waits, no zone yet');
+assert(lastStatus()[1] === 'warn' && lastStatus()[0].includes('po końcu zadania'), `status says it retries: ${lastStatus()[0]}`);
+assert($('zpNone').style.display === '' && $('zpNewOutline').style.display === '', 'palette offers the zone meanwhile');
 calls.length = 0;
-$('z4Presets').querySelector('[data-preset="hair"]').click(); await wait(30);
-assert(calls.some((c) => c[0] === 'PATCH' && c[2].preset === 'hair'), 'PATCH preset');
-assert(srv.zones.z_01.preset === 'hair', 'server preset');
-$('z4Engine').value = 'auto'; $('z4Engine').dispatchEvent(new window.Event('change')); await wait(30);
-assert(srv.zones.z_01.matting === 'auto', 'engine auto');
-assert(calls.some((c) => c[0] === 'POST' && c[1].endsWith('/preview/115')), 'preview after PATCH');
-assert($('z4PvInfo').textContent.includes('chroma 70 %'), `engine share shown: ${$('z4PvInfo').textContent}`);
-// 2b. card "Wygładzanie w czasie" (ViTMatte only) + "Wykończenie": PATCH merges into the zone's params
-assert($('z4TempSec').style.display === 'none', 'temporal section hidden for a non-ViTMatte engine');
-assert(!$('z4Black').disabled && $('z4BlackV').textContent === '0.00', 'finish: default black shown');
-srv.zones.z_01.params = { fg_erode_px: 4 }; ZN.state.list.find((z) => z.zone_id === 'z_01').params = { fg_erode_px: 4 };   // a param set elsewhere (CLI)
-$('z4Black').value = '0.12'; $('z4Black').dispatchEvent(new window.Event('input'));
-assert($('z4BlackV').textContent === '0.12', 'live number while dragging');
-$('z4Black').dispatchEvent(new window.Event('change')); await wait(30);
-assert(srv.zones.z_01.params.alpha_black === 0.12 && srv.zones.z_01.params.fg_erode_px === 4, `black merged into params: ${JSON.stringify(srv.zones.z_01.params)}`);
-$('z4Engine').value = 'vitmatte'; $('z4Engine').dispatchEvent(new window.Event('change')); await wait(30);
-assert($('z4TempSec').style.display === '', 'temporal section shown for ViTMatte');
+window.dispatchEvent(new window.CustomEvent('matte-job-finished')); await wait(40);
+const post = calls.find((c) => c[0] === 'POST' && c[1] === '/api/object/obj/zones/new');
+assert(post && post[2].criterion === 'matte' && post[2].matting === 'vitmatte' && post[2].params.region === 'outline' && post[2].polygon.length === 0 && post[2].frame === 115,
+  `automatic outline zone body: ${JSON.stringify(post && post[2])}`);
+assert(calls.some((c) => c[1] === '/api/zones/preset_defaults/hair'), 'the preset defaults asked for');
+const st = ZN.state;
+assert(st.active === 'z_01' && !st.autoWait.obj, `active after the retry: ${st.active}`);
+assert(document.querySelectorAll('.zone-card').length === 1 && document.querySelector('.zone-card').classList.contains('cur'), 'one active card');
+assert($('timelineZones').querySelectorAll('.zone-key').length === 0, 'an outline zone without a drawing has no key on the lane');
+
+// 2. the floating palette „Strefa”: every control of the zone; PATCH merges into the zone's params
+const z1 = srv.zones.z_01;
+assert($('zonePalette') && $('zonePalette').contains($('z4Inset')) && !$('z4Panel').contains($('z4Inset')), 'sliders on the palette, not in the card');
+assert($('zonePalette').style.display === '' && $('zpNone').style.display === 'none' && $('z4Tune').style.display === '', 'palette shown with an active zone');
+assert($('zpTitle').textContent.includes('cały obrys'), `title says outline: ${$('zpTitle').textContent}`);
+assert($('z4OutRow').style.display === '' && $('z4ExclRow').style.display === '' && $('z4BandRow').style.display === '', 'outline controls shown');
+for (const id of ['z4Region', 'z4Brush', 'z4TrackRow', 'zpNewPaint', 'z4Propose']) assert($(id).style.display === 'none', `hidden with the drawing: ${id}`);
+assert($('z4BlackAfterRow').style.display === 'none', 'finish sliders live in Final Touch');
+z1.params.fg_erode_px = 4; st.list.find((z) => z.zone_id === 'z_01').params.fg_erode_px = 4;   // a param set elsewhere (CLI)
+calls.length = 0;
 $('z4Temporal').value = 'flow_mean'; $('z4Temporal').dispatchEvent(new window.Event('change')); await wait(30);
 $('z4TRadius').value = '5'; $('z4TRadius').dispatchEvent(new window.Event('change')); await wait(30);
 $('z4TScale').checked = true; $('z4TScale').dispatchEvent(new window.Event('change')); await wait(30);
-const zp = srv.zones.z_01.params;
-assert(zp.temporal === 'flow_mean' && zp.temporal_radius === 5 && zp.temporal_scale === 2 && zp.alpha_black === 0.12 && zp.fg_erode_px === 4,
-  `temporal params: ${JSON.stringify(zp)}`);
-// 2c. "Wcięcie w rdzeń": live preview on the mask while dragging, release -> fg_erode_px + force_core_erode_px, trimap overlay
-assert($('z4AreaSec').style.display === '' && $('z4InsetV').textContent === '4 px', `inset shown for ViTMatte: ${$('z4InsetV').textContent}`);
+assert(z1.params.temporal === 'flow_mean' && z1.params.temporal_radius === 5 && z1.params.temporal_scale === 2 && z1.params.fg_erode_px === 4 && z1.params.region === 'outline',
+  `temporal params merged: ${JSON.stringify(z1.params)}`);
+assert(calls.filter((c) => c[0] === 'PATCH').length === 3, 'one PATCH per control');
+// live band while dragging, release -> saved, the live band stays with the saved values
 $('z4Inset').value = '8'; $('z4Inset').dispatchEvent(new window.Event('input')); await wait(10);
-assert(ZN.state.inset && ZN.state.inset.n === 8 && $('z4InsetV').textContent === '8 px', 'live inset preview state');
+assert(st.inset && st.inset.n === 8 && $('z4InsetV').textContent === '8 px', 'live inset state');
 ZN.draw(fakeCtx(), fakeImg, 1, viewer.currentFrame);                    // the preview draws without throwing
-assert(ZN.state.insetDist && ZN.state.insetDist.w === 640, 'core distance map computed once');
 $('z4Inset').dispatchEvent(new window.Event('change')); await wait(30);
-assert(srv.zones.z_01.params.fg_erode_px === 8 && srv.zones.z_01.params.force_core_erode_px === 8 && ZN.state.inset === null && ZN.state.ov === 'trimap',
-  `inset saved: ${JSON.stringify(srv.zones.z_01.params)} ov ${ZN.state.ov}`);
-// 2d. floating palette „Strefa” (user decision 2026-10-15): every slider there; area "outline" = band around the whole core,
-// the drawing and the chosen objects are exclusions
-assert($('zonePalette') && $('zonePalette').contains($('z4Black')) && !$('z4Panel').contains($('z4Black')), 'sliders on the palette, not in the card');
-assert($('zonePalette').style.display === '' && $('zpNone').style.display === 'none', 'palette shown with an active zone');
-assert($('z4AreaSec').style.display === '' && $('z4OutRow').style.display === 'none', 'area section for ViTMatte; band slider only in outline mode');
+assert(z1.params.fg_erode_px === 8 && z1.params.force_core_erode_px === 8 && st.inset && st.inset.live === false, `inset saved: ${JSON.stringify(z1.params)}`);
+$('z4Out').value = '60'; $('z4Out').dispatchEvent(new window.Event('input')); await wait(5);
+assert(st.inset && st.inset.out === 60 && $('z4OutV').textContent === '60 px', 'live band state');
+ZN.draw(fakeCtx(), fakeImg, 1, viewer.currentFrame);
+$('z4Out').dispatchEvent(new window.Event('change')); await wait(40);
+assert(z1.params.outline_out_px === 60 && z1.params.fg_erode_px === 8, `band saved, params merged: ${JSON.stringify(z1.params)}`);
+// other objects can be cut out of the band; one without a mask cannot
 S.objects = [{ name: 'obj', has: { core: true } }, { name: 'hand', has: { core: true, final: false } }, { name: 'face', has: { core: false, final: false } }];
-confirms.length = 0;
-$('z4Region').querySelector('[data-r="outline"]').click(); await wait(100);
-assert(confirms.length === 1 && /BEZ włosów/.test(confirms[0]), 'switching a drawn zone to outline asks to clear the drawing');
-const z1 = srv.zones.z_01;
-assert(z1.params.region === 'outline' && z1.polygon.length === 0 && z1.strokes.length === 0 && z1.bg_strokes.length === 1 && z1.params.fg_erode_px === 8,
-  `outline, hair drawing cleared, "-" kept: ${JSON.stringify({ p: z1.params, poly: z1.polygon, s: z1.strokes, b: z1.bg_strokes })}`);
-assert($('z4OutRow').style.display === '' && $('z4ExclRow').style.display === '' && $('z4RegionHint').textContent.includes('NIE'), 'outline controls + hint');
-assert($('zpTitle').textContent.includes('cały obrys') && $('z4Hint').textContent.includes('BEZ włosów'), 'title + card hint say outline');
+await ZN.load();
 const exBoxes = $('z4Excl').querySelectorAll('input[data-ex]');
 assert(exBoxes.length === 2 && !exBoxes[0].disabled && exBoxes[1].disabled, 'other objects listed (not this one), one without a mask disabled');
 exBoxes[0].checked = true; exBoxes[0].dispatchEvent(new window.Event('change', { bubbles: true })); await wait(40);
-assert(JSON.stringify(srv.zones.z_01.params.exclude_objects) === '["hand"]', `hand excluded: ${JSON.stringify(srv.zones.z_01.params)}`);
-$('z4Out').value = '60'; $('z4Out').dispatchEvent(new window.Event('input')); await wait(5);
-assert(ZN.state.inset && ZN.state.inset.out === 60 && $('z4OutV').textContent === '60 px', 'live band preview state');
-ZN.draw(fakeCtx(), fakeImg, 1, viewer.currentFrame);
-assert(ZN.state.insetDist && ZN.state.insetDist.dOut, 'outside distance map for the band');
-$('z4Out').dispatchEvent(new window.Event('change')); await wait(40);
-assert(srv.zones.z_01.params.outline_out_px === 60 && srv.zones.z_01.params.fg_erode_px === 8 && srv.zones.z_01.params.exclude_objects.length === 1, 'band saved, params merged');
-$('z4BlackAfter').value = '0.1'; $('z4BlackAfter').dispatchEvent(new window.Event('change')); await wait(30);
-assert(srv.zones.z_01.params.alpha_black_after === 0.1 && $('z4BlackAfterV').textContent === '0.10', 'black after smoothing');
-calls.length = 0;
-viewer.goToFrame(118); await wait(450);
-assert(ZN.state.regionCache.z_01[118] && ZN.state.regionCache.z_01[118].exclude_contours.length === 1, 'outline region with exclusion contours');
-ZN.draw(fakeCtx(), fakeImg, 1, 118);
-S.strokes[118] = [{ mode: 'add', radius_px: 6, p: [[200, 200]] }]; ZN.onDraw(118); await wait(750);
-const putEx = calls.filter((c) => c[0] === 'PUT' && c[1].endsWith('/keys/118')).pop();
-assert(putEx && putEx[2].polygon[0][0] === 50 && putEx[2].strokes.length === 1, `new key starts from the exclusion, not from the band: ${JSON.stringify(putEx && putEx[2])}`);
-viewer.goToFrame(115); await wait(30); calls.length = 0;
-$('z4PvFrame').click(); await wait(30);
-assert(calls.some((c) => c[0] === 'POST' && c[1].endsWith('/preview/115')), '"Przelicz klatkę" = preview of the current frame');
-assert($('z4PvInfo').textContent.includes('cały obrys'), `preview info says outline: ${$('z4PvInfo').textContent}`);
-await fakeApi('DELETE', '/api/object/obj/zones/z_01/keys/118'); await ZN.load();
-$('z4Region').querySelector('[data-r="draw"]').click(); await wait(60);
-assert(srv.zones.z_01.params.region === 'draw' && $('z4OutRow').style.display === 'none', 'back to the drawn area');
-srv.zones.z_01.polygon = [[300, 100], [420, 100], [420, 240], [300, 240]]; await ZN.load();
-// 2e. rotobrush-like painted band (user decision 2026-10-15): brush paint / erase / bg on the palette, local tracking
-assert($('z4Region').querySelector('[data-r="draw"]').classList.contains('active') && $('z4TrackRow').style.display === '', 'painted area: tracking option shown');
-$('z4Track').checked = true; $('z4Track').dispatchEvent(new window.Event('change')); await wait(40);
-assert(srv.zones.z_01.params.track === 'local' && srv.zones.z_01.params.fg_erode_px === 8, `local tracking saved: ${JSON.stringify(srv.zones.z_01.params)}`);
-$('z4Brush').querySelector('[data-b="erase"]').click();
-assert(ZN.state.brush === 'erase' && $('z4Brush').querySelector('[data-b="erase"]').classList.contains('active'), 'erase brush on');
-const bgBefore = srv.zones.z_01.bg_strokes.length; calls.length = 0;
-S.strokes[115] = [{ mode: 'remove', radius_px: 5, p: [[310, 120]] }]; ZN.onDraw(115); await wait(750);
-const putE = calls.filter((c) => c[0] === 'PUT' && c[1].endsWith('/keys/115')).pop();
-assert(putE && putE[2].strokes.some((x) => x.erase) && putE[2].bg_strokes.length === bgBefore, `erase stroke stored in the drawing: ${JSON.stringify(putE && putE[2])}`);
-ZN.draw(fakeCtx(), fakeImg, 1, 115);
-$('z4Brush').querySelector('[data-b="erase"]').click(); assert(ZN.state.brush === null, 'erase brush off');
-ZN.state.ov = 'alpha';
-$('z4Engine').value = 'auto'; $('z4Engine').dispatchEvent(new window.Event('change')); await wait(30);
-assert($('z4AreaSec').style.display === 'none' && $('z4BlackAfterRow').style.display === 'none', 'area / black-after hidden for a non-ViTMatte engine');
-
-// 3. overlays draw without throwing for every view
-const ctx = fakeCtx();
-for (const ov of ['alpha', 'comp', 'trimap', 'engines', 'none']) { $('z4Ov').querySelector(`[data-ov="${ov}"]`).click(); ZN.draw(ctx, fakeImg, 0.5, 115); }
-$('z4Ov').querySelector('[data-ov="alpha"]').click();
-$('z4Loupe').click(); assert(ZN.state.loupe, 'loupe on');
-const Ev = window.PointerEvent || window.MouseEvent; canvas.dispatchEvent(new Ev('pointermove', { clientX: 100, clientY: 80 }));
-ZN.state.mouse = [100, 80]; canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 640, height: 360 });
-ZN.drawLoupe(ctx, fakeImg, 0.5); $('z4Loupe').click(); assert(!ZN.state.loupe, 'loupe off');
-
-// 4. frame without a key: region fetched; a "-" stroke there creates a key from the propagated region
+assert(JSON.stringify(z1.params.exclude_objects) === '["hand"]', `hand excluded: ${JSON.stringify(z1.params)}`);
+// the engine of the palette; no one-frame model preview on a change (FRAME_PV off, its button hidden)
+$('zpEngine').value = 'auto'; $('zpEngine').dispatchEvent(new window.Event('change')); await wait(30);
+assert(z1.matting === 'auto', 'engine auto');
+$('zpEngine').value = 'vitmatte'; $('zpEngine').dispatchEvent(new window.Event('change')); await wait(30);
+assert(z1.matting === 'vitmatte', 'engine back on ViTMatte');
+assert($('z4PvFrame').style.display === 'none' && !calls.some((c) => /\/preview\/\d+$/.test(c[1])), 'no one-frame preview');
+// a frame change fetches the band area of that frame
 calls.length = 0;
 viewer.goToFrame(120); await wait(450);
 assert(calls.some((c) => c[0] === 'GET' && c[1].endsWith('/region/120')), 'region fetched on frame change');
-assert(ZN.state.regionCache.z_01[120].contours.length === 2, 'region cached');
-assert($('z4Hint').textContent.includes('bez klucza'), 'hint: no key here');
-ZN.draw(ctx, fakeImg, 0.5, 120);
-S.strokes[120] = [{ mode: 'remove', radius_px: 3, p: [[350, 150], [360, 160]] }];
-ZN.onDraw(120); await wait(750);
-const put = calls.find((c) => c[0] === 'PUT' && c[1].endsWith('/keys/120'));
-assert(put && put[2].polygon.length === 4 && put[2].polygon[0][0] === 300 && put[2].bg_strokes.length === 1 && put[2].strokes.length === 0, 'key from the largest region contour + "-" stroke');
-assert(sortedKeys(srv.zones.z_01).join() === '115,120', 'server keys');
-assert($('timelineZones').querySelectorAll('.zone-key').length === 2, 'lane: 2 diamonds');
-assert(toasts.some((t) => /Klucz strefy F120/.test(t)), 'toast new key');
-assert(document.querySelector('.zone-card .zone-meta').textContent.includes('🔑 2'), 'card keys = 2');
-// a "+" stroke in the key frame extends the key (no new polygon); step 7: the iteration note goes with it into the key
-assert($('z4Iter') && $('z4Iter').title, 'iteration note field with tooltip');
-$('z4Iter').value = 'mniej tła przy uchu';
-S.strokes[120] = [{ mode: 'add', radius_px: 8, p: [[400, 200]] }]; ZN.onDraw(120); await wait(750);
-assert(srv.zones.z_01.keys['120'].strokes.length === 1 && srv.zones.z_01.keys['120'].bg_strokes.length === 1, 'key extended');
-const putNote = calls.filter((c) => c[0] === 'PUT' && c[1].endsWith('/keys/120')).pop();
-assert(putNote[2].prompt === 'mniej tła przy uchu' && srv.zones.z_01.keys['120'].prompt === 'mniej tła przy uchu', 'note sent with the key');
-assert(srv.zones.z_01.prompt_history.includes('mniej tła przy uchu'), 'note in prompt_history');
-assert($('z4Iter').value === '', 'note field cleared after the key');
-assert($('z4Hint').textContent.includes('uwaga: mniej tła przy uchu'), `hint shows the key note: ${$('z4Hint').textContent}`);
-assert([...$('timelineZones').querySelectorAll('.zone-key')].some((d) => d.title.includes('mniej tła')), 'lane diamond tooltip has the note');
-assert(lastStatus()[0].includes('uwaga „mniej tła przy uchu”'), 'status mentions the note');
-// the alpha overlay draws on the plate tiles when the viewer has them (Z8): tileOverlays hook used
-tileCalls.length = 0; ZN.draw(ctx, fakeImg, 0.5, 120); assert(tileCalls.length === 1 && tileCalls[0] === 'zone_alpha', 'zone alpha asked for tile overlays');
-// Ctrl+Z twice: stroke (restores the key WITHOUT the note), then the key itself
-assert(await ZN.undo(120), 'undo handled'); await wait(20);
-assert(srv.zones.z_01.keys['120'].strokes.length === 0 && !srv.zones.z_01.keys['120'].prompt, 'undo removed the + stroke and the note');
-assert(await ZN.undo(120), 'undo 2 handled'); await wait(20);
-assert(sortedKeys(srv.zones.z_01).join() === '115', 'undo deleted the created key');
+assert(st.regionCache.z_01[120] && st.regionCache.z_01[120].exclude_contours.length === 1, 'outline region with its exclusion contours cached');
+viewer.goToFrame(115); await wait(30);
 
-// 4b. step 9: prompt rules line, Hough "-" strokes into the key, proposals -> zone
-for (const id of ['z4Plan', 'z4Propose', 'z4Props']) assert($(id), `id ${id}`);
-viewer.goToFrame(115); await wait(50);
-calls.length = 0;
-$('z4Prompt').value = 'włosy bez linii'; $('z4Prompt').dispatchEvent(new window.Event('change')); await wait(60);
-assert(calls.some((c) => c[0] === 'PATCH' && c[2].prompt === 'włosy bez linii'), 'prompt PATCH');
-assert($('z4Plan').textContent.includes('preset:') && $('z4Plan').textContent.includes('włosy / futro'), `plan line: ${$('z4Plan').textContent}`);
-assert(calls.some((c) => c[1] === '/api/object/obj/zones/interpret' && c[2].frame === 115), 'lines searched automatically for a line prompt');
-const lb = $('z4Lines'); assert(lb && lb.textContent.includes('Dodaj 1'), `lines button: ${lb && lb.textContent}`);
-lb.click(); await wait(60);
-const putL = calls.filter((c) => c[0] === 'PUT' && c[1].endsWith('/keys/115')).pop();
-assert(putL && putL[2].bg_strokes.length === 2 && putL[2].bg_strokes[1].p[0][0] === 100, 'Hough stroke appended to the key as "-"');
-assert(srv.zones.z_01.keys['115'].bg_strokes.length === 2, 'server key has 2 "-" strokes');
-assert(await ZN.undo(115), 'undo lines'); await wait(20);
-assert(srv.zones.z_01.keys['115'].bg_strokes.length === 1, 'undo removed the Hough stroke');
-$('z4Propose').click(); await wait(60);
-assert(calls.some((c) => c[1] === '/api/object/obj/zones/propose' && c[2].frame === 115), 'propose called');
-assert(document.querySelectorAll('.zone-prop').length === 2 && ZN.state.props.list.length === 2, 'two proposals listed');
-ZN.draw(ctx, fakeImg, 0.5, 115);
-document.querySelector('.zone-prop[data-i="1"] button[data-rej]').click(); assert(document.querySelectorAll('.zone-prop').length === 1, 'rejected one');
-document.querySelector('.zone-prop[data-i="0"] button[data-acc]').click(); await wait(60);
-const newZ = calls.filter((c) => c[0] === 'POST' && /zones\/new/.test(c[1])).pop();
-assert(newZ && newZ[2].polygon.length === 4 && newZ[2].polygon[0][0] === 300 && newZ[2].preset === 'hair', 'zone created from the proposal');
-assert(Object.keys(srv.zones).length === 2 && ZN.state.active === 'z_02' && ZN.state.props === null, 'proposal zone active, proposals gone');
-assert(document.querySelectorAll('.zone-card').length === 2, 'two cards');
-await fakeApi('DELETE', '/api/object/obj/zones/z_02'); await ZN.load(); ZN.state.active = 'z_01'; await wait(10);
-viewer.goToFrame(120); await wait(50);
+// 3. overlays draw without throwing for every view; the loupe
+const ctx = fakeCtx();
+for (const ov of ['alpha', 'comp', 'trimap', 'engines', 'none']) { $('z4Ov').querySelector(`[data-ov="${ov}"]`).click(); ZN.draw(ctx, fakeImg, 0.5, 115); }
+$('z4Ov').querySelector('[data-ov="alpha"]').click();
+$('z4Loupe').click(); assert(st.loupe, 'loupe on');
+const Ev = window.PointerEvent || window.MouseEvent; canvas.dispatchEvent(new Ev('pointermove', { clientX: 100, clientY: 80 }));
+st.mouse = [100, 80]; canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 640, height: 360 });
+ZN.drawLoupe(ctx, fakeImg, 0.5); $('z4Loupe').click(); assert(!st.loupe, 'loupe off');
 
-// 5. "Zastosuj": 409 missing_front -> dialog -> "bez holdoutu" -> PATCH + apply ok
+// 4. "Zastosuj": 409 missing_front -> dialog -> "bez holdoutu" -> PATCH + apply ok
 srv.hand = true; calls.length = 0; statuses.length = 0;
 $('z4ApplyShot').click(); await wait(60);
 const modal = $('zoneFrontModal');
 assert(modal && modal.style.display === 'flex' && modal.textContent.includes('hand'), 'objects-in-front dialog shown');
 modal.querySelector('[data-act="noholdout"]').click(); await wait(120);
-assert(srv.zones.z_01.holdout === false, 'holdout off via PATCH');
+assert(z1.holdout === false, 'holdout off via PATCH');
 assert(srv.activeRun === 'v002' && srv.holdoutRefusals === 1, 'apply retried and succeeded');
 assert(lastStatus()[0].includes('Wersja v002') && lastStatus()[0].includes('przeliczone 12') && lastStatus()[1] === 'ok', `status after apply: ${lastStatus()[0]}`);
 assert(cleared === 1, 'overlays cleared once after the new version');
 assert(document.querySelector('.zone-card .zs').textContent.includes('policzona'), 'card state policzona');
 assert(document.querySelector('.zone-card .zone-meta').textContent.includes('s/kl.'), 'card shows s/frame');
 // the queue button of the dialog
-srv.zones.z_01.holdout = true; calls.length = 0;
-$('z4ApplyShot').click(); await wait(60);
+z1.holdout = true; calls.length = 0;
+$('zpApply').click(); await wait(60);
 $('zoneFrontModal').querySelector('[data-act="queue"]').click(); await wait(60);
 assert(calls.some((c) => c[1] === '/api/queue/preset/all') && calls.some((c) => c[1] === '/api/queue/run'), 'queue-all + run');
 assert(lastStatus()[0].includes('Policz wszystko'), 'queue status');
 srv.hand = false;
 
-// 6. enable / disable from the card; version details html; delete key (last) refused; delete zone
+// 5. enable / disable from the card; version details html; one outline zone per object; clean plate row; delete
 document.querySelector('.zone-card input[data-en]').click(); await wait(30);
-assert(srv.zones.z_01.enabled === false && document.querySelector('.zone-card').classList.contains('off'), 'disabled');
+assert(z1.enabled === false && document.querySelector('.zone-card').classList.contains('off'), 'disabled');
 document.querySelector('.zone-card input[data-en]').click(); await wait(30);
-assert(srv.zones.z_01.enabled === true, 'enabled again');
+assert(z1.enabled === true, 'enabled again');
 const det = ZN.runDetailsHtml({ run: 'v002', applied_from: 'v001', zones: { z_01: { engine: 'auto', frames: 40, seconds: 48, s_per_frame: 1.2, computed: 12, cached: 28, engine_share: { chroma: 0.6, knn: 0.4 } } } });
 assert(det.includes('1.2 s/kl.') && det.includes('chroma 60 %') && det.includes('v001'), 'run details html');
-viewer.goToFrame(115); await wait(10);
-$('z4KeyDel').click(); await wait(20);
-assert(toasts.some((t) => /Ostatniego klucza/.test(t)), 'last key refused');
+st.active = null; ZN.onStage();
+assert($('zpNone').style.display === '' && $('zpNewOutline').style.display === 'none' && $('zpPickZone').textContent === 'Wybierz z_01', 'an object with a zone offers to pick it, not another one');
+$('zpPickZone').click(); await wait(20);
+assert(st.active === 'z_01', 'zone picked');
 $('z4CpNone').click(); await wait(20);
 assert($('z4CleanTxt').textContent.includes('pominięty'), 'clean plate skipped text');
 $('z4CpFile').click(); assert(opened.length === 1, 'Mam plik -> plates modal');
-document.querySelector('.zone-card button[data-del]').click(); await wait(40);
-assert(Object.keys(srv.zones).length === 0 && ZN.state.active === null && $('st4Zones').textContent.includes('brak stref'), 'zone deleted');
+// the automatic zone refused for good (not a passing refusal): deleting the zone leaves the button, which creates it with a preview
+srv.refuseNew = [err(500, 'zepsute')];
+calls.length = 0; statuses.length = 0;
+document.querySelector('.zone-card button[data-del]').click(); await wait(60);
 assert(confirms.some((m) => /^Usunąć strefę z_01/.test(m)), 'zone delete asks through viewer.uiConfirm');
-// palette without a zone: "＋ Strefa ViTMatte: cały obrys" creates an outline zone without any drawing
-assert($('zpNone').style.display === '' && $('z4Tune').style.display === 'none', 'palette offers a new outline zone');
+assert(!srv.zones.z_01 && st.autoFailed && st.autoFailed.obj && $('zpNone').style.display === '' && $('zpNewOutline').style.display === '', 'palette offers a new outline zone');
+assert($('st4Zones').textContent.includes('brak stref'), 'empty list again');
 calls.length = 0;
 $('zpNewOutline').click(); await wait(80);
-const postO = calls.find((c) => c[0] === 'POST' && /zones\/new/.test(c[1]));
+const postO = calls.find((c) => c[0] === 'POST' && /zones\/new\?preview_frame=115$/.test(c[1]));
 assert(postO && postO[2].polygon.length === 0 && postO[2].matting === 'vitmatte' && postO[2].params.region === 'outline', `outline zone body: ${JSON.stringify(postO && postO[2])}`);
-assert(ZN.state.active && srv.zones[ZN.state.active].params.region === 'outline' && $('z4Tune').style.display === '', 'outline zone active, sliders shown');
-await fakeApi('DELETE', `/api/object/obj/zones/${ZN.state.active}`); await ZN.load();
-// "🖌 Maluj obszar włosów (ViTMatte)": the first paint stroke creates a ViTMatte zone with local tracking
-$('zpNewPaint').click(); assert(ZN.state.newPainted && ZN.state.brush === 'paint', 'painted-zone mode armed');
-calls.length = 0;
-S.strokes[115] = [{ mode: 'add', radius_px: 20, p: [[300, 100], [420, 110]] }]; ZN.onDraw(115); await wait(750);
-const postP = calls.find((c) => c[0] === 'POST' && /zones\/new/.test(c[1]));
-assert(postP && postP[2].matting === 'vitmatte' && postP[2].params.track === 'local' && postP[2].strokes.length === 1 && !ZN.state.newPainted,
-  `painted zone body: ${JSON.stringify(postP && postP[2])}`);
-await fakeApi('DELETE', `/api/object/obj/zones/${ZN.state.active}`); ZN.state.active = null; await ZN.load(); $('z4Brush').querySelector('[data-b="paint"]').click();
-// another stage (Eksperymenty: the old threshold criteria live there) -> no zone flow
-S.stage = ST.EXPERIMENTS; assert(!ZN.wantsDraw(), 'stage Eksperymenty = no zone flow');
+assert(st.active && srv.zones[st.active].params.region === 'outline' && $('z4Tune').style.display === '', 'outline zone active, sliders shown');
+assert(toasts.some((t) => /Nowa strefa z_02/.test(t)), 'toast new zone');
+assert(st.preview && st.preview.f === 115 && st.preview.zid === 'z_02', 'the button shows the preview computed with the zone');
+assert($('z4PvInfo').textContent.includes('F115'), `preview info: ${$('z4PvInfo').textContent}`);
+for (const ov of ['alpha', 'comp', 'trimap', 'engines']) { $('z4Ov').querySelector(`[data-ov="${ov}"]`).click(); ZN.draw(ctx, fakeImg, 0.5, 115); }   // with a preview to show
+// another stage -> no palette
+S.stage = ST.EXPERIMENTS; ZN.onStage();
+assert($('zonePalette').style.display === 'none' && !ZN.wantsDraw(), 'stage Eksperymenty = no zone palette');
 
 // ---------------------------------------------------------------- stage CoTracker: brush corrections (static/brush.js)
+window.eval(readFileSync(path.join(STATIC, 'brushcore.js'), 'utf-8'));   // stroke geometry shared with the Cleanup 3D area editor
 window.eval(readFileSync(path.join(STATIC, 'brush.js'), 'utf-8'));
 const BR = window.MD_BRUSH;
 BR.init(hooks); assert(BR.ready, 'brush init');
@@ -470,35 +368,41 @@ assert(calls.some((c) => c[0] === 'GET' && c[1] === `/api/object/obj/zones/${zAd
 const put120 = calls.find((c) => c[0] === 'PUT' && c[1] === `/api/object/obj/zones/${zAdd.zone_id}/keys/120`);
 assert(put120 && put120[2].polygon.length === 4 && put120[2].strokes.length === 1, `key 120 from the region: ${JSON.stringify(put120 && put120[2])}`);
 assert(toasts.some((t) => t.includes('2 części')), 'toast: region of several parts');
-// d. "Zmaż" in F120 -> erase strokes into the keys of both zones (remove zone: from its propagated region)
+// d. "Zmaż" in F120 -> erase strokes only into the key of the active layer (fix layers, user decision 2026-10-30)
 calls.length = 0;
 S.strokes[120] = [{ mode: 'erase', radius_px: 8, p: [[315, 115]] }];
 BR.onDraw(120); await wait(500);
 const puts = calls.filter((c) => c[0] === 'PUT' && /\/keys\/120$/.test(c[1]));
-assert(puts.length === 2 && puts.every((c) => c[2].strokes.some((s) => s.erase)), `erase in both zones: ${puts.length}`);
+assert(puts.length === 1 && puts[0][1].includes(zAdd.zone_id) && puts[0][2].strokes.some((s) => s.erase), `erase in the active layer: ${puts.length}`);
 // e. Ctrl+Z restores the key before the erase
 calls.length = 0;
 assert(await BR.undo(120), 'brush undo handled');
 assert(calls.some((c) => (c[0] === 'PUT' || c[0] === 'DELETE') && /\/keys\/120$/.test(c[1])), 'undo touched the key 120');
-// f. empty key = end of the corrections in F130 (both zones)
+// f. empty key = end of the corrections in F130 (the active layer)
 calls.length = 0;
 viewer.goToFrame(130);
 $('b2EmptyKey').click(); await wait(50);
 const empt = calls.filter((c) => c[0] === 'PUT' && /\/keys\/130$/.test(c[1]));
-assert(empt.length === 2 && empt.every((c) => !c[2].polygon.length && !c[2].strokes.length), 'empty keys in F130');
-// g. drawing in stage 2 (keys + propagated regions) does not throw; the lane shows the keys
+assert(empt.length === 1 && empt[0][1].includes(zAdd.zone_id) && !empt[0][2].polygon.length && !empt[0][2].strokes.length, `empty key in F130: ${empt.length}`);
+// g. drawing in stage 2 (keys + propagated regions) does not throw; the lane shows the keys of the active layer (F110, F120, F130)
 BR.draw(window.HTMLCanvasElement.prototype.getContext(), fakeImg, 0.5, 120);
 BR.draw(window.HTMLCanvasElement.prototype.getContext(), fakeImg, 0.5, 125);
-assert($('timelineBrush') && $('timelineBrush').querySelectorAll('.zone-key').length >= 4, 'brush lane diamonds');
-// h. „Zastosuj poprawki” -> POST core_fix, view Rdzeń
+assert($('timelineBrush') && $('timelineBrush').querySelectorAll('.zone-key').length === 3, `brush lane diamonds: ${$('timelineBrush') && $('timelineBrush').querySelectorAll('.zone-key').length}`);
+// h. „Zastosuj poprawki” -> POST core_fix, the user's view back
 calls.length = 0; views.length = 0;
 $('b2Apply').click(); await wait(50);
-assert(srv.coreFix === 1 && views.includes('core') && lastStatus()[0].includes('Maska 1+2'), `apply: ${lastStatus()[0]}`);
-// i. Delete in F130 -> DELETE keys/130 of both zones (with a confirmation)
+assert(srv.coreFix === 1 && views.includes('restored') && lastStatus()[0].includes('Maska 1+2'), `apply: ${lastStatus()[0]}`);
+// i. Delete in F130 -> DELETE keys/130 of the active layer (with a confirmation)
 calls.length = 0; confirms.length = 0;
 await BR.deleteKeysAt(130);
-assert(confirms.length === 1 && calls.filter((c) => c[0] === 'DELETE' && /\/keys\/130$/.test(c[1])).length === 2, 'delete keys in F130');
+assert(confirms.length === 1 && calls.filter((c) => c[0] === 'DELETE' && /\/keys\/130$/.test(c[1])).length === 1, 'delete key in F130');
 // j. brush zones never appear in the ViTMatte list
 assert(!ZN.state.list.some((z) => z.params && z.params.source === 'brush'), 'brush zones hidden from the ViTMatte panel');
+// k. „＋ warstwa”: the next stroke of that mode starts a new layer
+const before = BR.state.list.length; calls.length = 0;
+$('b2NewAdd').click();
+S.strokes[120] = [{ mode: 'add', radius_px: 10, p: [[500, 300], [520, 310]] }];
+BR.onDraw(120); await wait(500);
+assert(BR.state.list.length === before + 1 && calls.some((c) => c[0] === 'POST' && c[1] === '/api/object/obj/zones/new'), `new fix layer: ${BR.state.list.length}`);
 
 console.log(`OK zones harness: ${calls.length + 1} api calls in the last block, ${toasts.length} toasts, ${statuses.length} statuses, renders ${viewer.renders}`);

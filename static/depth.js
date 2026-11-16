@@ -57,7 +57,7 @@
 
   async function refresh() {
     try {
-      const d = await (await fetch('/api/depth/report')).json();
+      const d = await window.UI.api('GET', '/api/depth/report');
       show(d.exists ? d.report : null);
     } catch (e) { console.error(e); }
   }
@@ -80,8 +80,10 @@
   }
 
   async function exportNk() {
-    const d = await (await fetch('/api/depth/export_nk', { method: 'POST' })).json();
-    alert(d.success ? `Zapisano: ${d.nk_path}` : `Błąd: ${d.detail}`);
+    try {
+      const d = await window.UI.api('POST', '/api/depth/export_nk');
+      alert(`Zapisano: ${d.nk_path}`);
+    } catch (e) { alert(`Błąd: ${e.message}`); }
   }
 
   window.addEventListener('DOMContentLoaded', () => {
@@ -95,14 +97,13 @@
     document.getElementById('btnDepthRun').addEventListener('click', run);
     document.getElementById('btnDepthNk').addEventListener('click', exportNk);
     // progress from the shared WebSocket stream
-    const ws = new WebSocket(`ws://${location.host}/ws/events`);
-    ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data);
+    document.addEventListener('md-ws', (ev) => {
+      const m = ev.detail;
       if (m.type !== 'depth_progress') return;
       const pct = m.total ? Math.round(100 * m.done / m.total) : 0;
       document.getElementById('depthProgressBar').style.display = 'flex';
       document.getElementById('depthProgressFill').style.width = `${pct}%`;
       document.getElementById('depthProgressText').textContent = `${m.step} (${pct}%)`;
-    };
+    });
   });
 })();

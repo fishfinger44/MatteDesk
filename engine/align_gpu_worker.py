@@ -28,6 +28,12 @@ CPU stays responsible for EXR decoding, luma, the INTER_AREA downscales and the 
         {"op": "local_frame", ...}  full-res refinement of tracked offsets + thin-plate field -> out .npy (2, H, W)
         {"op": "vector_blur", ...}  motion blur of the alpha (engine/motionblur.py, 2026-10-16): crop of the alpha +
                                     the object's velocity at flow scale -> blurred crop .npy
+        {"op": "median_disp", ...}  locked camera (align_v2 step 2, 2026-11-03): per grid point the median over the
+                                    anchors of (dx, dy, response), NaN = not measured on that anchor -> (N, 3) .npy
+                                    (= numpy nanmedian: the mean of the two middle values of an even count)
+        {"op": "denoise_mc", ...}   plate denoise of stage 0 (engine/clean.py DenoiseEngine, 2026-11-10): one output
+                                    frame from its +-radius window (frames in shared memory, kept on the GPU between
+                                    requests) + the DIS flows computed by MatteDesk -> denoised frame in shared memory
         {"op": "release"}           frees cached GPU memory;  {"op": "quit"}
     Errors: {"ok": false, "error": "..."}.
 
@@ -36,13 +42,19 @@ MD_ALIGN_GPU_FAKE=1: no torch, fixed fake results (protocol tests in MatteDesk's
 "fake_sleep": s sleeps first.
 """
 
-import json
+import importlib.util
 import math
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
+
+# the common loop, loaded by its path: this file runs with -I, engine/ is not on the path (engine/worker_proto.py)
+_spec = importlib.util.spec_from_file_location("worker_proto", Path(__file__).with_name("worker_proto.py"))
+_wp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_wp)
 
 FAKE = os.environ.get("MD_ALIGN_GPU_FAKE") == "1"
 torch = None
@@ -166,8 +178,9 @@ def features(luma, mode):
     return (c / mx if mx > 1e-6 else c).float()
 
 
-def static_mask(lm_b, lm_a, mode, border_xy, box, kernel):
-    """compute_static_mask at scale 0.5 from the INTER_AREA-resized lumas (the caller computed the integers)."""
+def static_mask(lm_b, lm_a, mode, border_xy, box, kernel, exclude=None):
+    """compute_static_mask at scale 0.5 from the INTER_AREA-resized lumas (the caller computed the integers);
+    `exclude` (h, w) tensor > 0.5 = excluded (objects / user mask, align_v2 step 1), applied before the difference."""
     h, w = lm_b.shape
     mask = torch.ones((h, w), dtype=torch.float32, device=DEV)
     bx, by = border_xy
@@ -178,6 +191,8 @@ def static_mask(lm_b, lm_a, mode, border_xy, box, kernel):
     if box is not None:
         sx0, sy0, sx1, sy1 = box
         mask[sy0:sy1, sx0:sx1] = 0
+    if exclude is not None:
+        mask[exclude > 0.5] = 0
     if mode == "cleanplate":
         sel = mask > 0.5
         mb = percentile(lm_b[sel], 50)
@@ -200,15 +215,13 @@ def static_mask(lm_b, lm_a, mode, border_xy, box, kernel):
 # ------------------------------------------------------------------------------------------- phase correlation
 
 def _fftshift_cv(c):
-    """cv's fftShift (quadrant swap with cx = cols / 2, cy = rows / 2) on (N, M, N') tensors."""
+    """cv's fftShift on (N, M, N') tensors = a circular shift by ceil(rows / 2), ceil(cols / 2): the quadrant swap for
+    even sizes, and for ODD sizes the extra row / column goes first (2026-11-03: the old quadrant-swap port left the
+    last row / column in place for odd DFT sizes - e.g. a 450 px plate at work scale, 225 rows - and the peak landed a
+    row off / at the wrong corner: GPU translation 397 px vs CPU 2.5 px; checked against cv2.phaseCorrelate on
+    225x400, 226x400, 375x600, 224x401)."""
     m, n = c.shape[-2], c.shape[-1]
-    cy, cx = m // 2, n // 2
-    out = c.clone()
-    out[:, :cy, :cx] = c[:, cy:2 * cy, cx:2 * cx]
-    out[:, cy:2 * cy, cx:2 * cx] = c[:, :cy, :cx]
-    out[:, :cy, cx:2 * cx] = c[:, cy:2 * cy, :cx]
-    out[:, cy:2 * cy, :cx] = c[:, :cy, cx:2 * cx]
-    return out
+    return torch.roll(c, shifts=(-((m + 1) // 2), -((n + 1) // 2)), dims=(-2, -1))
 
 
 def phase_correlate(a, b, win=None):
@@ -468,8 +481,8 @@ class GlobalGPU:
         gy, gx = torch.meshgrid(torch.arange(step // 2, h, step, device=DEV),
                                 torch.arange(step // 2, w, step, device=DEV), indexing="ij")
         valid = edge[gy, gx]
-        if not bool(valid.any()):
-            return 0.0, 0.0
+        if int(valid.sum()) < MIN_EVAL_POINTS:
+            return float("nan"), float("nan")     # = engine.align: no texture -> no measurement
         px, py = gx[valid], gy[valid]
         inside = (px >= pr) & (px < w - pr) & (py >= pr) & (py < h - pr)
         px, py = px[inside], py[inside]
@@ -485,9 +498,8 @@ class GlobalGPU:
                 dx, dy, resp = phase_correlate(p_w[keep], p_b[keep])
                 ok = (resp > 0.1) & torch.isfinite(dx) & torch.isfinite(dy)
                 res = (torch.hypot(dx[ok], dy[ok]) / s).float()
-        if res.numel() == 0:
-            diff = float(torch.abs(fb[edge] - wa[edge]).double().mean())
-            return diff, diff * 2.0
+        if res.numel() < MIN_EVAL_POINTS:
+            return float("nan"), float("nan")
         return percentile(res, 50), percentile(res, 95)
 
     def ecc(self, kind, fa, fb, mask, init_shift, iters=50, eps=1e-4):
@@ -666,6 +678,7 @@ def grid_nodes(plate_w, plate_h, step=16):
 
 MIN_FIT_POINTS = 8
 MIN_KEPT_FRAC = 0.2
+MIN_EVAL_POINTS = 6    # = engine.align.MIN_EVAL_POINTS
 OUTLIER_RESP_MIN = 0.1
 OUTLIER_CLIP_PX = 8.0
 OUTLIER_NBR_K = 8
@@ -731,7 +744,7 @@ def rbf_field(points, disps, plate_w, plate_h, step=16, smoothing=0.1, resp=None
     xs, ys = grid_nodes(plate_w, plate_h, step)
     zeros = torch.zeros((2, len(ys), len(xs)), dtype=torch.float32, device=DEV)
     if n < MIN_FIT_POINTS or n < MIN_KEPT_FRAC * n_all:
-        return zeros, 0.0, 0.0, 0.0, n_rej, info
+        return zeros, 0.0, 0.0, 0.0, n_rej, {**info, "fitted": False}
     perm = np.random.RandomState(42).permutation(n)      # = np.random.seed(42); np.random.permutation(n)
     n_ho = max(4, int(round(n * 0.1)))
     tr, ho = perm[n_ho:], perm[:n_ho]
@@ -757,7 +770,7 @@ def rbf_field(points, disps, plate_w, plate_h, step=16, smoothing=0.1, resp=None
     try:
         coef = torch.linalg.solve(lhs, rhs)
     except Exception:                      # singular (collinear / duplicate points): = the CPU code's zero grid
-        return zeros, 0.0, 0.0, 0.0, n_rej, info
+        return zeros, 0.0, 0.0, 0.0, n_rej, {**info, "fitted": False}
 
     def ev(x, chunk=2048):
         return torch.cat([_tps(_sqdist(x[s:s + chunk], y)) @ coef[:p] + poly(x[s:s + chunk]) @ coef[p:]
@@ -785,7 +798,8 @@ def op_global(req, ask_sift):
     mode = req["mode"]
     fb = features(_load(req["lf_b"]), mode)
     fa = features(_load(req["lf_a"]), mode)
-    mask = static_mask(_load(req["lm_b"]), _load(req["lm_a"]), mode, req["border"], req.get("box"), req.get("kernel"))
+    mask = static_mask(_load(req["lm_b"]), _load(req["lm_a"]), mode, req["border"], req.get("box"), req.get("kernel"),
+                       _load(req["exclude"]) if req.get("exclude") else None)
 
     def sift():
         paths = {k: os.path.join(req["dump_dir"], f"{k}.npy") for k in ("feat_a", "feat_b", "mask")}
@@ -794,7 +808,8 @@ def op_global(req, ask_sift):
         return ask_sift(paths)
 
     method, params, med, mx = GlobalGPU(float(req["scale"])).select_best_model(fa, fb, mask, sift)
-    return {"method": method, "params": params, "med": float(med), "max": float(mx)}
+    fin = math.isfinite(float(med)) and math.isfinite(float(mx))
+    return {"method": method, "params": params, "med": float(med) if fin else None, "max": float(mx) if fin else None}
 
 
 def op_patches(req):
@@ -837,9 +852,30 @@ def op_local_frame(req):
             refined[k] = True
     f, ho_med, ho_max, frac, n_rej, info = rbf_field(pts, disp, int(req["plate_w"]), int(req["plate_h"]), resp=response)
     np.save(req["out"], f.cpu().numpy())
-    return {"ho_med": ho_med, "ho_max": ho_max, "ho_frac_ok": frac,
+    return {"ho_med": ho_med, "ho_max": ho_max, "ho_frac_ok": frac, "fitted": bool(info.get("fitted", True)),
             "refined_frac": float(refined.mean()) if len(refined) else 0.0,
             "n_points": int(len(pts)), "n_rejected": n_rej, "reject": info}
+
+
+def nanmedian_stack(v):
+    """np.nanmedian(v, axis=0) of a (A, N, C) float64 tensor on the device: NaN to +inf, sort, the mean of the two
+    middle finite values (even count) or the middle one (odd); NaN where nothing is finite."""
+    fin = torch.isfinite(v)
+    cnt = fin.sum(dim=0)                                        # (N, C)
+    s, _ = torch.sort(torch.where(fin, v, torch.full_like(v, float("inf"))), dim=0)
+    k = cnt.clamp(min=1)
+    lo = torch.gather(s, 0, ((k - 1) // 2)[None]).squeeze(0)
+    hi = torch.gather(s, 0, (k // 2)[None]).squeeze(0)
+    med = 0.5 * (lo + hi)
+    return torch.where(cnt > 0, med, torch.full_like(med, float("nan")))
+
+
+def op_median_disp(req):
+    v = torch.from_numpy(np.load(req["vals"]).astype(np.float64)).to(DEV)
+    if v.dim() != 3:
+        raise ValueError("median_disp: vals must be (anchors, points, channels)")
+    np.save(req["out"], nanmedian_stack(v).cpu().numpy())
+    return {"n": int(v.shape[1]), "anchors": int(v.shape[0])}
 
 
 def op_vector_blur(req):
@@ -885,6 +921,248 @@ def op_vector_blur(req):
     return {"moving_px": moving, "max_px": round(float(ln.max()), 2), "samples": n}
 
 
+# ------------------------------------------------------------------------------------------ plate denoise
+
+# Frames of the denoise window kept between requests: j -> (shared memory name, (C, H, W) float32 tensor / array).
+_DN = {}
+
+
+_ATT = {}         # shared memory attachments kept open (name -> SharedMemory): the client reuses its slots, so their
+ATT_KEEP = 24     # pages stay mapped here (a fresh mapping of 100 MB cost ~0.1 s of page faults per frame)
+
+
+def _shm_attach(name):
+    shm = _ATT.pop(name, None)
+    if shm is None:
+        from multiprocessing import shared_memory
+        try:
+            shm = shared_memory.SharedMemory(name=name, track=False)    # Python >= 3.13: no resource tracker
+        except TypeError:
+            shm = shared_memory.SharedMemory(name=name)
+            if os.name != "nt":                                         # older Python on posix: do not unlink at exit
+                try:
+                    from multiprocessing import resource_tracker
+                    resource_tracker.unregister(shm._name, "shared_memory")
+                except Exception:
+                    pass
+    _ATT[name] = shm                                                    # most recent last
+    while len(_ATT) > ATT_KEEP:
+        old = _ATT.pop(next(iter(_ATT)))
+        try:
+            old.close()
+        except Exception:
+            pass
+    return shm
+
+
+def _shm_forget():
+    for shm in _ATT.values():
+        try:
+            shm.close()
+        except Exception:
+            pass
+    _ATT.clear()
+
+
+def _shm_read(name, shape, dtype):
+    """Copy of an array in shared memory (float32)."""
+    buf = _shm_attach(name).buf
+    return np.ndarray(tuple(shape), dtype=np.dtype(dtype), buffer=buf).astype(np.float32)   # copy (f16: exact)
+
+
+def _shm_to_device(name, shape, dtype):
+    """Array in shared memory (H, W, C) -> (C, H, W) float32 on the device: the raw bytes are copied up (float16
+    frames: half the transfer) and converted / transposed there."""
+    view = np.ndarray(tuple(shape), dtype=np.dtype(dtype), buffer=_shm_attach(name).buf)
+    t = torch.from_numpy(view).to(DEV)                                  # a copy: the slot may be reused
+    del view
+    return t.float().permute(2, 0, 1).contiguous()
+
+
+def _device_to_shm(name, t):
+    """(C, H, W) float32 tensor -> (H, W, C) float32 in shared memory (one device -> host copy into the mapping)."""
+    hwc = t.permute(1, 2, 0).contiguous()
+    view = np.ndarray(tuple(hwc.shape), dtype=np.float32, buffer=_shm_attach(name).buf)
+    torch.from_numpy(view).copy_(hwc)
+    del view
+
+
+def _shm_write(name, arr):
+    dst = np.ndarray(arr.shape, dtype=arr.dtype, buffer=_shm_attach(name).buf)
+    dst[...] = arr
+    del dst
+
+
+def resize_linear_taps(src_n, dst_n):
+    """cv2.resize INTER_LINEAR taps along one axis (float images): src = (d + 0.5) * scale - 0.5 rounded to float,
+    floor, clamped to the edge with weight 0 there -> (i0, i1, w0, w1)."""
+    scale = 1.0 / (float(dst_n) / float(src_n))
+    f = ((np.arange(dst_n, dtype=np.float64) + 0.5) * scale - 0.5).astype(np.float32)
+    i0 = np.floor(f).astype(np.int64)
+    a = (f - i0.astype(np.float32)).astype(np.float32)
+    lo = i0 < 0
+    i0[lo], a[lo] = 0, 0.0
+    hi = i0 >= src_n - 1
+    i0[hi], a[hi] = src_n - 1, 0.0
+    i1 = np.minimum(i0 + 1, src_n - 1)
+    return i0, i1, (np.float32(1.0) - a).astype(np.float32), a
+
+
+def denoise_window(xp, cur, nbs, flows, taps, i, sigma, blur):
+    """The per-pixel part of DenoiseEngine.denoise_frame_fn for one output frame, with array ops `xp` (numpy or the
+    torch adapter below). cur (C, H, W); nbs [(j, (C, H, W))] ascending; flows {j: (fx_small, fy_small)} at flow scale,
+    already multiplied by sx / sy like the CPU code; taps = resize taps (rows, cols). Mirrors, in the same order:
+    cv2.resize INTER_LINEAR of the flow, cv2.remap INTER_LINEAR (coordinates rounded to 1/32 px, BORDER_REPLICATE),
+    exp(-|cur - warped| / 0.0501) averaged over the channels, temporal weight 1 / (|i - j| + 0.5), the weighted
+    average and cv2.GaussianBlur(sigma) (BORDER_REFLECT_101)."""
+    C, H, W = cur.shape
+    (r0, r1, rw0, rw1), (c0, c1, cw0, cw1) = taps
+    gx, gy = xp.grid(H, W)
+    acc_v = xp.copy(cur)
+    acc_w = xp.ones((1, H, W))
+    flat_n = H * W
+    for j, nb in nbs:
+        fxs, fys = flows[j]
+        full = []
+        for fs in (fxs, fys):
+            t = fs[:, c0] * cw0[None, :] + fs[:, c1] * cw1[None, :]              # horizontal pass (lh, W)
+            full.append(t[r0] * rw0[:, None] + t[r1] * rw1[:, None])             # vertical pass (H, W)
+        X = xp.round_int((gx + full[0]) * 32.0)
+        Y = xp.round_int((gy + full[1]) * 32.0)
+        ix, iy = X >> 5, Y >> 5
+        ax = xp.f32(X & 31) / 32.0
+        ay = xp.f32(Y & 31) / 32.0
+        x0, x1 = xp.clip(ix, 0, W - 1), xp.clip(ix + 1, 0, W - 1)
+        y0, y1 = xp.clip(iy, 0, H - 1) * W, xp.clip(iy + 1, 0, H - 1) * W
+        bx, by = 1.0 - ax, 1.0 - ay
+        flat = nb.reshape(C, flat_n)
+
+        def tap(yy, xx):
+            return xp.take(flat, (yy + xx).reshape(flat_n)).reshape(C, H, W)
+        warped = (tap(y0, x0) * (by * bx)[None] + tap(y0, x1) * (by * ax)[None]
+                  + tap(y1, x0) * (ay * bx)[None] + tap(y1, x1) * (ay * ax)[None])
+        e = xp.exp(-xp.abs(cur - warped) / (0.05 + 1e-4))
+        wgt = e[0:1]
+        for k in range(1, C):
+            wgt = wgt + e[k:k + 1]
+        wgt = wgt / float(C)
+        w_total = wgt * (1.0 / (abs(i - j) + 0.5))
+        acc_v = acc_v + warped * w_total
+        acc_w = acc_w + w_total
+    out = acc_v / acc_w
+    if sigma > 0:
+        out = blur(out, sigma)
+    return out
+
+
+class _NpOps:
+    """numpy side of denoise_window (fake worker / reference in MatteDesk's .venv)."""
+
+    @staticmethod
+    def grid(H, W):
+        return np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+
+    copy = staticmethod(lambda a: a.copy())
+    ones = staticmethod(lambda shape: np.ones(shape, np.float32))
+    round_int = staticmethod(lambda a: np.rint(a).astype(np.int64))
+    f32 = staticmethod(lambda a: a.astype(np.float32))
+    clip = staticmethod(np.clip)
+    take = staticmethod(lambda flat, idx: flat[:, idx])
+    exp = staticmethod(np.exp)
+    abs = staticmethod(np.abs)
+
+
+class _TorchOps:
+    """torch side of denoise_window (CUDA)."""
+
+    @staticmethod
+    def grid(H, W):
+        ys = torch.arange(H, dtype=torch.float32, device=DEV)
+        xs = torch.arange(W, dtype=torch.float32, device=DEV)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        return gx, gy
+
+    copy = staticmethod(lambda a: a.clone())
+    ones = staticmethod(lambda shape: torch.ones(shape, dtype=torch.float32, device=DEV))
+    round_int = staticmethod(lambda a: torch.round(a).long())             # half to even = cvRound
+    f32 = staticmethod(lambda a: a.float())
+    clip = staticmethod(lambda a, lo, hi: a.clamp(lo, hi))
+    take = staticmethod(lambda flat, idx: flat[:, idx])
+    exp = staticmethod(lambda a: torch.exp(a))
+    abs = staticmethod(lambda a: torch.abs(a))
+
+
+def _blur_np(x, sigma):
+    """cv2.GaussianBlur(x, (0, 0), sigma) per channel of (C, H, W) float32 in numpy (separable, BORDER_REFLECT_101)."""
+    ksize = int(round(sigma * 8 + 1)) | 1
+    k = gaussian_kernel(ksize, sigma)
+    r = (ksize - 1) // 2
+    out = np.empty_like(x)
+    for c in range(x.shape[0]):
+        p = np.pad(x[c], ((0, 0), (r, r)), mode="reflect")
+        t = sum(p[:, q:q + x.shape[2]] * k[q] for q in range(ksize)).astype(np.float32)
+        p = np.pad(t, ((r, r), (0, 0)), mode="reflect")
+        out[c] = sum(p[q:q + x.shape[1]] * k[q] for q in range(ksize)).astype(np.float32)
+    return out
+
+
+def _blur_torch(x, sigma):
+    return torch.stack([gaussian_blur(x[c], sigma) for c in range(x.shape[0])])
+
+
+def op_denoise_mc(req, fake=False):
+    """One output frame of the plate denoise: req = {i, h, w, c, frames: [{j, shm, dtype}] (ascending, i included),
+    flows: {shm, shape (k, lh, lw, 2)} in the order of the neighbours, sigma, out: shm name}. Frames already on the
+    device under the same shared memory name are reused; frames not in this request are dropped."""
+    H, W, C = int(req["h"]), int(req["w"]), int(req["c"])
+    i = int(req["i"])
+    tm = {}
+
+    def mark(k, t0):
+        if not fake and DEV.type == "cuda":
+            torch.cuda.synchronize()
+        tm[k] = round(time.time() - t0, 4)
+        return time.time()
+
+    t0 = time.time()
+    want = {int(f["j"]): f for f in req["frames"]}
+    for j in [j for j in _DN if j not in want or _DN[j][0] != want[j]["shm"]]:
+        del _DN[j]
+    loaded = 0
+    for j, f in want.items():
+        if j not in _DN:
+            if fake:
+                a = np.ascontiguousarray(_shm_read(f["shm"], (H, W, C), f["dtype"]).transpose(2, 0, 1))
+            else:
+                a = _shm_to_device(f["shm"], (H, W, C), f["dtype"])
+            _DN[j] = (f["shm"], a)
+            loaded += 1
+    t0 = mark("load", t0)
+    fl = _shm_read(req["flows"]["shm"], req["flows"]["shape"], "float32")
+    lh, lw = fl.shape[1], fl.shape[2]
+    rows, cols = resize_linear_taps(lh, H), resize_linear_taps(lw, W)
+    nb_js = [j for j in sorted(want) if j != i]
+    if fake:
+        xp, blur = _NpOps, _blur_np
+        flows = {j: (fl[k, ..., 0], fl[k, ..., 1]) for k, j in enumerate(nb_js)}
+        taps = (rows, cols)
+    else:
+        xp, blur = _TorchOps, _blur_torch
+        flt = torch.from_numpy(fl).to(DEV)
+        flows = {j: (flt[k, ..., 0], flt[k, ..., 1]) for k, j in enumerate(nb_js)}
+        taps = tuple(tuple(torch.from_numpy(np.ascontiguousarray(v)).to(DEV) for v in t) for t in (rows, cols))
+    t0 = mark("flows", t0)
+    out = denoise_window(xp, _DN[i][1], [(j, _DN[j][1]) for j in nb_js], flows, taps, i, float(req.get("sigma", 1.0)),
+                         blur)
+    t0 = mark("compute", t0)
+    if fake:
+        _shm_write(req["out"], np.ascontiguousarray(out.transpose(1, 2, 0)).astype(np.float32))
+    else:
+        _device_to_shm(req["out"], out)
+    mark("out", t0)
+    return {"loaded": loaded, "cached": len(_DN), "timing": tm}
+
+
 def _fake(req):
     if req.get("fake_sleep"):
         time.sleep(float(req["fake_sleep"]))
@@ -909,35 +1187,27 @@ def _fake(req):
     if op == "vector_blur":
         np.save(req["out"], np.load(req["alpha"]))
         return {"moving_px": 0, "max_px": 0.0, "samples": 0}
+    if op == "median_disp":
+        v = np.load(req["vals"]).astype(np.float64)
+        np.save(req["out"], np.nanmedian(v, axis=0))
+        return {"n": int(v.shape[1]), "anchors": int(v.shape[0])}
+    if op == "denoise_mc":                     # the numpy twin of the CUDA code (same function, numpy arrays)
+        return op_denoise_mc(req, fake=True)
     if op == "release":
+        _DN.clear()
+        _shm_forget()
         return {}
     raise ValueError(f"unknown op {op}")
 
 
 def _serve():
-    proto = sys.stdout
-    sys.stdout = sys.stderr      # library prints must not break the protocol
-    device = "fake" if FAKE else str(_init_torch())
+    def make():
+        device = "fake" if FAKE else str(_init_torch())
 
-    def send(obj):
-        proto.write(json.dumps(obj) + "\n")
-        proto.flush()
-
-    def ask_sift(paths):
-        send({"ok": True, "need_sift": True, "dump": paths})
-        line = sys.stdin.readline()
-        msg = json.loads(line) if line.strip() else {}
-        return msg.get("models") or {}
-
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
+        def handle(req, ask):
+            def ask_sift(paths):
+                return ask({"ok": True, "need_sift": True, "dump": paths}).get("models") or {}
             op = req.get("op")
-            if op == "quit":
-                break
             t0 = time.time()
             if FAKE:
                 out = _fake(req)
@@ -949,20 +1219,25 @@ def _serve():
                 out = op_local_frame(req)
             elif op == "vector_blur":
                 out = op_vector_blur(req)
+            elif op == "median_disp":
+                out = op_median_disp(req)
+            elif op == "denoise_mc":
+                out = op_denoise_mc(req)
             elif op == "release":
+                _DN.clear()
+                _shm_forget()
                 if DEV.type == "cuda":
                     torch.cuda.empty_cache()
                 out = {}
             else:
                 raise ValueError(f"unknown op {op}")
-            resp = {"ok": True, "device": device, "seconds": round(time.time() - t0, 4), **out}
+            resp = {"device": device, "seconds": round(time.time() - t0, 4), **out}
             if not FAKE and DEV.type == "cuda":
                 resp["gpu_mem_peak_mb"] = round(torch.cuda.max_memory_allocated() / 2 ** 20)
                 resp["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / 2 ** 20)
-        except Exception as e:
-            resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        send(resp)
-    return 0
+            return resp
+        return handle
+    return _wp.serve(make)
 
 
 def _check():

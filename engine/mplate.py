@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -183,6 +183,11 @@ class MaskPlate:
 # defaults.json mplate.enabled = false stays a global kill-switch (effective value off regardless).
 DENOISE_CHOICES = ("auto", "on", "off")
 DENOISE_KEY = "mask_plate_denoise"
+
+
+def global_enabled(defaults) -> bool:
+    """defaults.json mplate.enabled: the global kill-switch of the plate-to-mask denoise (false = off everywhere)."""
+    return bool((defaults or {}).get("mplate", {}).get("enabled", True))
 
 
 def resolve_mask_plate_denoise(setting: Optional[str], manifest: Optional[Dict], global_enabled: bool = True) -> Dict:

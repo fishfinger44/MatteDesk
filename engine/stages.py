@@ -33,6 +33,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from engine.jsonio import read_state
+
 ORDER = ["detect", "crops", "core", "cotracker", "matanyone", "videomama", "vitmatte", "final", "ltx", "final_touch", "export"]
 LABEL = {"detect": "Wykryj (SAM 3.1)", "crops": "Kadry", "core": "Rdzeń SAM 3.1", "cotracker": "CoTracker3 (poprawki pędzlem)",
          "matanyone": "MatAnyone2 (krawędź)", "videomama": "VideoMaMa (kosmyki)", "vitmatte": "ViTMatte (strefy)", "final": "Eksperymenty (Przelicz finalnie)",
@@ -98,15 +100,13 @@ def zone_kind(z: Any) -> str:
 
 
 def zone_dicts(od: Path, kinds: Tuple[str, ...]) -> List[Dict[str, Any]]:
-    """Enabled zones of the given kinds (raw JSON dicts, creation order)."""
+    """Enabled zones of the given kinds (raw JSON dicts, creation order). A corrupt zone file raises StateFileError like
+    load_zones – skipping it here made the bar say „current” while every run failed (audit 2026-11-02 #21)."""
     d = Path(od) / "zones"
     out = []
     for p in sorted(d.glob("z_*.json")) if d.exists() else []:
-        try:
-            z = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if z.get("enabled", True) and zone_kind(z) in kinds:
+        z = read_state(p)
+        if z is not None and z.get("enabled", True) and zone_kind(z) in kinds:
             out.append(z)
     return out
 
@@ -248,13 +248,34 @@ def stage_run(store: Any, name: str, stage: str, base: Optional[str] = None) -> 
                                 else "rdzeń albo poprawki pędzlem zmienione – maska 1+2 do przeliczenia")
         if rj.get("settings_sig") != settings_sig(obj):
             return run, False, "ustawienia krawędzi zmienione od ostatniego liczenia " + ("MatAnyone2" if stage == "matanyone" else "maski 1+2")
+        if stage == "matanyone":
+            why = aux_align_stale(store, rj, ("backlit",), " – „▶ Policz MatAnyone2” ponownie")
+            if why:
+                return run, False, why
         return run, True, ""
     b_run, b_ok, _ = stage_run(store, name, {"matanyone": "matanyone", "videomama": "videomama"}.get(base, "core_base"))
     if rj.get("applied_from") != b_run or not b_ok:
         return run, False, f"baza ({BASE_LABEL.get(base, base)}) zmieniona od tej wersji – „Zastosuj na ujęcie” ponownie"
     if rj.get("matte_sig") != matte_sig(od):
         return run, False, "strefy ViTMatte zmienione od ostatniego „Zastosuj na ujęcie”"
+    why = aux_align_stale(store, rj, ("cleanplate",), " – „Zastosuj na ujęcie” ponownie")
+    if why:
+        return run, False, why
     return run, True, ""
+
+
+def aux_align_stale(store: Any, rj: Dict[str, Any], used: Tuple[str, ...], what: str = "") -> str:
+    """align_v2 step 4: the run's `aux_plates` (which backlit / clear plate it read, aligned or not, the alignment
+    report's signature) vs the project now (engine/align_state.current_state) for the plates the stage `used`.
+    "" = current; older runs without `aux_plates` stay current. Never recomputes anything."""
+    rec = rj.get("aux_plates")
+    if not rec:
+        return ""
+    from engine.align_state import current_state, stale_reason
+    work = Path(store.root).parent if hasattr(store, "root") else None
+    if work is None:
+        return ""
+    return stale_reason(rec, current_state(work), used, what)
 
 
 def core_fix_state(store: Any, name: str) -> Tuple[bool, bool]:

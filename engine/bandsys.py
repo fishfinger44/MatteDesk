@@ -74,6 +74,121 @@ def band_widths(core: np.ndarray, out_px: float, in_px: float, pts: Optional[Seq
     return o, (np.inf if whole else i)
 
 
+# ---- slider keys (user decision 2026-11-15, first used by the Cleanup C1 band): the band sliders keyed per frame –
+# {"<frame>": {field: value}}, linear between keys, held before the first / after the last key; no keys = the sliders.
+# ONE arithmetic for every band owner (the JS twin: MD_BANDPTS.keyedAt in static/bandpoints.js).
+def clean_slider_keys(keys: Any, limits: Dict[str, Tuple[float, float]]) -> Dict[str, Dict[str, float]]:
+    """Keys with every field of `limits` present and clamped to its (lo, hi); anything else dropped; sorted by frame."""
+    out: Dict[str, Dict[str, float]] = {}
+    for k, v in dict(keys or {}).items():
+        try:
+            f = int(k)
+            out[str(f)] = {n: float(min(hi, max(lo, float(v[n])))) for n, (lo, hi) in limits.items()}
+        except (TypeError, ValueError, KeyError):
+            continue
+    return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
+
+
+def keyed_at(keys: Optional[Dict[str, Dict[str, float]]], f: Optional[int], base: Dict[str, float]) -> Dict[str, float]:
+    """The values of the fields of `base` in frame f: the keys interpolated linearly (held outside them); no keys /
+    f None = `base` (the sliders)."""
+    if not keys or f is None:
+        return {n: float(v) for n, v in base.items()}
+    fs = sorted(int(k) for k in keys)
+    f = int(f)
+    if f <= fs[0] or f >= fs[-1]:
+        k = keys[str(fs[0] if f <= fs[0] else fs[-1])]
+        return {n: float(k.get(n, base[n])) for n in base}
+    i = next(j for j in range(1, len(fs)) if fs[j] >= f)
+    a, b = fs[i - 1], fs[i]
+    t = (f - a) / float(b - a)
+    ka, kb = keys[str(a)], keys[str(b)]
+    return {n: float(ka.get(n, base[n])) + t * (float(kb.get(n, base[n])) - float(ka.get(n, base[n]))) for n in base}
+
+
+# ---- local band points over a signed base (user decision 2026-11-15, the C1 band at a NEGATIVE „Pas na zewnątrz”):
+# away from the points the edge is the slider (`base`, < 0 = inside the object), at a point the edge is its whisker
+# length from the outline (`out`, plate px), blended smoothly over `local_reach` around the point. A NEW function: the
+# point geometry of the stages (band_widths / bandmap.width_maps) is not touched.
+LOCAL_REACH_MIN = 48.0      # px – the smallest reach of a point's influence
+LOCAL_REACH_K = 1.5         # reach = max(LOCAL_REACH_MIN, k × |whisker − base|)
+
+
+def local_offsets(shape: Tuple[int, int], pts: Sequence[Tuple[float, ...]], base: float) -> np.ndarray:
+    """float32 map of the signed edge offset (px from the objects' outline; < 0 = inside): `base` everywhere, rising /
+    falling to each point's whisker `out` near it (smoothstep over its reach; the strongest point wins)."""
+    h, w = int(shape[0]), int(shape[1])
+    off = np.full((h, w), float(base), np.float32)
+    if not pts:
+        return off
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    for p in pts:
+        x, y, out = float(p[0]), float(p[1]), float(p[2])       # p[2] = the signed offset (tip_offsets)
+        delta = out - float(base)
+        reach = max(LOCAL_REACH_MIN, LOCAL_REACH_K * abs(delta))
+        t = np.clip(1.0 - np.hypot(xx - x, yy - y) / reach, 0.0, 1.0)
+        k = t * t * (3.0 - 2.0 * t)
+        cand = float(base) + delta * k
+        off = np.maximum(off, cand) if delta > 0 else np.minimum(off, cand)
+    return off
+
+
+def tip_offsets(core: np.ndarray, pts: Sequence[Tuple[float, ...]]) -> List[Tuple[float, ...]]:
+    """The points with their whisker turned into a signed offset (2026-11-15, the C1 whisker turns all round): the
+    signed distance of the whisker's TIP from the objects' outline (> 0 outside, < 0 inside) – a whisker along the
+    normal gives its length, one pointed into the object a cut. Normal = the gradient of the signed distance at the
+    point, tangent = the normal turned +90° (static/bandpoints.js wdir). Items: (x, y, offset, in[, ang])."""
+    c = np.asarray(core).astype(np.uint8)
+    if not pts or not c.any():
+        return list(pts or [])
+    d_in = cv2.distanceTransform(np.pad(c, 1, mode="edge"), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
+    d_out = cv2.distanceTransform(1 - c, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    sd = (d_out - d_in).astype(np.float32)
+    sm = cv2.GaussianBlur(sd, (0, 0), 3.0)
+    gx, gy = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=3)
+    h, w = c.shape
+    out: List[Tuple[float, ...]] = []
+    for p in pts:
+        x, y, ln = float(p[0]), float(p[1]), float(p[2])
+        a = float(p[4]) if len(p) > 4 else 0.0
+        xi, yi = int(min(w - 1, max(0, round(x)))), int(min(h - 1, max(0, round(y))))
+        nx, ny = float(gx[yi, xi]), float(gy[yi, xi])
+        nn = (nx * nx + ny * ny) ** 0.5
+        nx, ny = (nx / nn, ny / nn) if nn > 1e-6 else (1.0, 0.0)
+        tx, ty = -ny, nx
+        r = np.deg2rad(a)
+        dx, dy = nx * np.cos(r) + tx * np.sin(r), ny * np.cos(r) + ty * np.sin(r)
+        tipx = float(min(w - 1, max(0.0, x + dx * ln))); tipy = float(min(h - 1, max(0.0, y + dy * ln)))
+        off = float(cv2.getRectSubPix(sd, (1, 1), (tipx, tipy))[0, 0])
+        out.append((x, y, off) + tuple(p[3:]))
+    return out
+
+
+def offset_mask(core: np.ndarray, off: Any) -> np.ndarray:
+    """bool: the objects (`core`) moved by the signed offset (scalar or map): inside pixels kept where their depth >
+    −off, outside pixels added where their distance <= off. The frame edge does not erode (padded with the core)."""
+    c = np.asarray(core).astype(np.uint8)
+    if not c.any():
+        return c.astype(bool)
+    o = np.asarray(off, np.float32)
+    if o.ndim == 0:
+        d_in = cv2.distanceTransform(np.pad(c, 1, mode="edge"), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
+        d_out = cv2.distanceTransform(1 - c, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        return np.where(c > 0, d_in > -float(o), d_out <= float(o))
+    # a map: every pixel takes the offset of ITS NEAREST OUTLINE PIXEL (as bandmap.width_maps), so a point's whisker is
+    # measured along the normal from the outline, not shortened by the pixel's own distance from the point
+    d_in, lab_in = cv2.distanceTransformWithLabels(np.pad(c, 1, mode="edge"), cv2.DIST_L2, 5,
+                                                   labelType=cv2.DIST_LABEL_PIXEL)
+    d_in, lab_in = d_in[1:-1, 1:-1], lab_in[1:-1, 1:-1]
+    d_out, lab_out = cv2.distanceTransformWithLabels(1 - c, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    op = np.pad(o, 1, mode="edge")
+    zin = np.argwhere(np.pad(c, 1, mode="edge") == 0)       # label k = the k-th zero pixel in scan order
+    zout = np.argwhere(c > 0)                               # the zero pixels of 1 - c = the core
+    o_in = op[zin[lab_in - 1, 0], zin[lab_in - 1, 1]] if len(zin) else np.full(c.shape, np.inf, np.float32)
+    o_out = o[zout[lab_out - 1, 0], zout[lab_out - 1, 1]]
+    return np.where(c > 0, d_in > -o_in, d_out <= o_out)
+
+
 def is_whole(in_w: Any) -> bool:
     """The inset width means „cały rdzeń” (an infinite scalar)."""
     return np.isscalar(in_w) and bool(np.isinf(float(in_w)))

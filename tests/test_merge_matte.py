@@ -105,38 +105,74 @@ def test_keyer_luminance_ramp():
     assert k[10] == 0 and abs(k[30] - 0.5) < 1e-5 and k[50] == 1 and abs(k[70] - 0.5) < 1e-5 and k[90] == 0
 
 
-def test_filter_erode_shrinks_and_expands_a_disc():
-    yy, xx = np.mgrid[0:101, 0:101]
-    disc = (np.hypot(xx - 50, yy - 50) < 30).astype(np.float32)
-    assert 0.6 < fuse.filter_erode(disc, 6).sum() / disc.sum() < 0.7
-    assert 1.3 < fuse.filter_erode(disc, -6).sum() / disc.sum() < 1.5
+# Nuke 11.1v3 FilterErode (filter gaussian) renders, x = -10 .. 9 around the profile's edge at x = 0
+# (tools/filtererode_probe.py, 2026-11-06); the port must match within 1/255
+NUKE_FE = {
+    ("step", 6): [0.806, 0.735, 0.65, 0.552, 0.446, 0.336, 0.231, 0.137, 0.064, 0.016] + [0.0] * 10,
+    ("step", -1): [1.0] * 10 + [0.735, 0.292, 0.062, 0.007] + [0.0] * 6,
+    ("ramp10", -6): [1.0] * 6 + [0.984, 0.936, 0.863, 0.776, 0.692, 0.615, 0.538, 0.464, 0.398, 0.332, 0.277, 0.224, 0.179, 0.14],
+    ("line3", 3): [0.0] * 10 + [0.055, 0.203, 0.055] + [0.0] * 7,
+    ("ramp40", 6): [0.719, 0.696, 0.672, 0.649, 0.625, 0.602, 0.579, 0.555, 0.532, 0.508, 0.484, 0.459, 0.434, 0.41, 0.385,
+                    0.361, 0.336, 0.311, 0.287, 0.262],
+}
+
+
+def test_filter_erode_matches_nuke():
+    """FilterErode 1:1 (2026-11-06): a hard edge gets a gaussian tail (not a disc erosion), a soft ramp barely moves,
+    a 3 px line erodes to a small peak, dilate = max of the attenuated neighbours."""
+    x = np.arange(64, dtype=np.float32) - 32
+    prof = {"step": (x < 0).astype(np.float32), "ramp10": np.clip(0.5 - x / 10, 0, 1), "ramp40": np.clip(0.5 - x / 40, 0, 1),
+            "line3": ((x >= 0) & (x < 3)).astype(np.float32)}
+    for (name, size), want in NUKE_FE.items():
+        a = np.repeat(prof[name][None].astype(np.float32), 80, 0)       # 1-D profile, tall enough for the 2-D kernel
+        got = fuse.filter_erode(a, size)[40, 22:42]
+        assert np.abs(got - np.array(want, np.float32)).max() <= 1 / 255, (name, size, got.round(3).tolist())
+    disc = (np.hypot(*np.mgrid[-50:51, -50:51]) < 30).astype(np.float32)
     assert fuse.filter_erode(disc, 0).tolist() == disc.tolist()
+    assert np.allclose(fuse.filter_erode(disc, 6), 1 - fuse.filter_erode(1 - disc, -6), atol=1e-6)   # erode = 1 − dilate(1 − a)
 
 
 def _all_off(**over):
-    """Every section off."""
-    k = {n: 0 for n in fuse.KNOB_DEFAULTS}
-    k.update(mix=1, log=0)
+    """Every section off (linear)."""
+    k = {n: 0 for n in fuse.KNOB_RANGES}
+    k.update(mix=1, bypass=0, log_curve="none")
     k.update(over)
     return k
 
 
-def test_everything_off_is_a_plain_over_linear_and_log():
+@pytest.mark.parametrize("curve", list(fuse.LOG_CURVES))
+def test_everything_off_is_a_plain_over_linear_and_log(curve):
     fg, bg = _rgba(seed=7), _rgba(seed=8)
     bg[..., 3] = 0
     out = fuse.merge_matte(fg, bg, _all_off())
     assert np.allclose(out[..., :3], fuse.merge_over(fg, bg)[..., :3], atol=1e-6)
-    out_log = fuse.merge_matte(fg, bg, _all_off(log=1))
+    out_log = fuse.merge_matte(fg, bg, _all_off(log_curve=curve))
     assert np.abs(out_log[..., :3] - out[..., :3]).max() > 1e-3   # log over differs from linear over in the edge…
     solid = fg[..., 3] > 0.999
     if solid.any():                                                # …but not where the FG is opaque
         assert np.allclose(out_log[solid, :3], out[solid, :3], atol=1e-4)
 
 
+def test_old_bool_log_reads_as_acescct_and_project_resolves():
+    """Settings written before 2026-11-03 (`log: 1`) give the same pixels as `log_curve: acescct`; `project` needs the
+    profile's curve (knobs(..., project_curve=)), ACEScct when none is known."""
+    fg, bg = _rgba(seed=7), _rgba(seed=8)
+    bg[..., 3] = 0
+    k_old = _all_off(log=1)
+    del k_old["log_curve"]                                            # as stored before 2026-11-03: only the bool
+    old = fuse.merge_matte(fg, bg, k_old)
+    assert fuse.knobs({"log": 1})["log_curve"] == "acescct" and fuse.knobs({"log": 0})["log_curve"] == "none"
+    new = fuse.merge_matte(fg, bg, _all_off(log_curve="acescct"))
+    assert np.array_equal(old, new)
+    assert fuse.knobs({"log_curve": "project"})["log_curve"] == "acescct"
+    assert fuse.knobs({"log_curve": "project"}, project_curve="logc3")["log_curve"] == "logc3"
+    assert fuse.knobs({"log_curve": "nonsense"})["log_curve"] == "none"
+
+
 def test_bypass_and_mix():
     fg, bg = _rgba(seed=9), _rgba(seed=10)
     bg[..., 3] = 0
-    k = fuse.knobs({"bypass": 1, "log": 0, "choke": 0, "soften": 0})   # the bypass sits after Alpha / Log
+    k = fuse.knobs({"bypass": 1, "log_curve": "none", "choke": 0, "soften": 0})   # the bypass sits after Alpha / Log
     assert np.allclose(fuse.merge_matte(fg, bg, k)[..., :3], fuse.merge_over(fg, bg)[..., :3], atol=1e-6)
     assert np.allclose(fuse.merge_matte(fg, bg, fuse.knobs({"mix": 0}))[..., :3], bg[..., :3], atol=1e-6)
 
@@ -155,7 +191,7 @@ def test_choke_only_changes_alpha_and_interior_colour_stays():
 def test_knobs_only_accept_mergematte_names_and_ranges_cover_them():
     k = fuse.knobs({"choke": 2, "nonsense": 5})
     assert k["choke"] == 2 and "nonsense" not in k
-    assert set(fuse.KNOB_RANGES) == set(fuse.KNOB_DEFAULTS) - {"log", "bypass"}
+    assert set(fuse.KNOB_RANGES) == set(fuse.KNOB_DEFAULTS) - {"log_curve", "bypass"}
 
 
 def test_comp_srgb_interior_is_the_plate():

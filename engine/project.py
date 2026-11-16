@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+from engine.jsonio import StateFileError, read_state, write_json  # noqa: F401 - StateFileError: its public name here too
+
 PROJECT_SCHEMA = "matte_desk/project@1.0"
 DEFAULT_WORK_SUBDIR = "matte_desk"
 
@@ -81,13 +83,7 @@ class ShotProject:
             (work_dir / sub).mkdir(parents=True, exist_ok=True)
 
         pj = work_dir / "project.json"
-        data: Dict[str, Any] = {}
-        if pj.exists():
-            try:
-                with open(pj, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, ValueError):
-                data = {}
+        data: Dict[str, Any] = read_state(pj) or {}
         data.setdefault("schema", PROJECT_SCHEMA)
         data.setdefault("plates_added", {})
         data.setdefault("plates_hidden", [])
@@ -114,10 +110,7 @@ class ShotProject:
 
     def save(self) -> Path:
         pj = self.work_dir / "project.json"
-        tmp = pj.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
-        tmp.replace(pj)
+        write_json(pj, self.data, indent=2, ensure_ascii=False)
         return pj
 
     # ------------------------------------------------------------------ views

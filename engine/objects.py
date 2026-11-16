@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -19,9 +20,13 @@ from typing import Any, Dict, List, Optional, Union
 import cv2
 import numpy as np
 
+from engine.jsonio import read_json_retry, write_json
+
 OBJECT_SCHEMA = "matte_desk/object@1.0"
 KEY_SCHEMA = "matte_desk/key@1.0"
 _NAME = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+_LOCKS: Dict[str, threading.RLock] = {}   # object folder -> its lock (requests build their own ObjectStore)
+_LOCKS_GUARD = threading.Lock()
 
 
 def _defaults_object() -> Dict[str, Any]:
@@ -30,6 +35,10 @@ def _defaults_object() -> Dict[str, Any]:
         return dict(d.get("object", {}))
     except (OSError, ValueError):
         return {}
+
+
+class ObjectNotFound(FileNotFoundError):
+    """The open project has no such object (404 in the API)."""
 
 
 class ObjectStore:
@@ -73,7 +82,7 @@ class ObjectStore:
     def get(self, name: str) -> Dict[str, Any]:
         p = self.dir(name) / "object.json"
         if not p.exists():
-            raise FileNotFoundError(f"brak obiektu {name}")
+            raise ObjectNotFound(f"brak obiektu {name}")
         obj = self._read(p)
         if not isinstance(obj.get("band"), dict):   # the shared object band (2026-10-22): migrated on the first read
             from engine.objband import migrate
@@ -86,28 +95,34 @@ class ObjectStore:
             obj = self._read(p)
         return obj
 
-    def update(self, name: str, **fields: Any) -> Dict[str, Any]:
-        obj = self.get(name)
-        for k, v in fields.items():
-            if k == "tool":
-                obj["tool"].update(v)
-            else:
-                obj[k] = v
-        self._write(self.dir(name) / "object.json", obj)
-        return obj
+    def lock(self, name: str) -> threading.RLock:
+        """Hold it around a read-modify-write of object.json: endpoints run in a thread pool next to the job, an
+        unlocked one loses the other's fields (audit 2026-11-02 #20)."""
+        key = str(self.dir(name).resolve())
+        with _LOCKS_GUARD:
+            return _LOCKS.setdefault(key, threading.RLock())
 
-    def remove(self, name: str) -> Path:
-        """Delete an object = move its folder to <work>/trash/objects/<name>_<time> (recoverable by hand), then
-        renumber depth_order of the rest (same order, no gaps) and drop the name from their depends_on."""
-        import shutil
-        import time
+    def update(self, name: str, **fields: Any) -> Dict[str, Any]:
+        with self.lock(name):
+            obj = self.get(name)
+            for k, v in fields.items():
+                if k == "tool":
+                    obj["tool"].update(v)
+                else:
+                    obj[k] = v
+            self._write(self.dir(name) / "object.json", obj)
+            return obj
+
+    def remove(self, name: str) -> int:
+        """Delete an object = its folder is deleted from disk for good (user decision 2026-11-13: no project trash),
+        then renumber depth_order of the rest (same order, no gaps) and drop the name from their depends_on. Returns
+        the bytes freed."""
+        from engine import deletion as DEL
         d = self.dir(name)
         if not (d / "object.json").exists():
             raise FileNotFoundError(f"brak obiektu {name}")
-        trash = self.root.parent / "trash" / "objects" / f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
-        trash.parent.mkdir(parents=True, exist_ok=True)
         gone = self._read(d / "object.json")
-        shutil.move(str(d), str(trash))
+        freed = DEL.remove(d, inside=self.root)
         for g in self.list(groups=True):   # a group entity (engine/groups.py): a deleted member leaves it
             if g.get("kind") == "group" and name in (g.get("members") or []):
                 self.update(g["name"], members=[m for m in g["members"] if m != name])
@@ -119,7 +134,7 @@ class ObjectStore:
             deps = [x for x in o["tool"].get("depends_on", []) if x != name]
             if o.get("depth_order") != i or deps != o["tool"].get("depends_on", []):
                 self.update(o["name"], depth_order=i, tool={"depends_on": deps})
-        return trash
+        return freed
 
     def rename(self, old: str, new: str) -> int:
         """Rename an object (user request 2026-10-16): move objects/<old> to objects/<new>, then replace every JSON
@@ -210,31 +225,8 @@ class ObjectStore:
 
     @staticmethod
     def _read(p: Path) -> Dict[str, Any]:
-        """object.json (JSON); Windows: opening fails (errno 13) for a moment while another thread replaces the file –
-        retried like the replace in _write (2026-10-26)."""
-        import time
-        for i in range(8):
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except PermissionError:
-                if i == 7:
-                    raise
-                time.sleep(0.05 * (i + 1))
-        raise AssertionError("unreachable")
+        return read_json_retry(p)
 
     @staticmethod
     def _write(p: Path, data: Dict[str, Any]) -> None:
-        import threading
-        import time
-        # a tmp of its own per thread: two threads writing the same object (a request + the mask 1+2 background batch,
-        # both migrating on the first read) overwrote one shared .tmp (test_zone_outline flaky, 2026-10-26)
-        tmp = p.with_name(f"{p.name}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        for i in range(8):   # Windows: the replace fails (WinError 5) while another process reads the file – a second
-            try:             # server, a viewer, an antivirus (seen 2026-10-24: a slider save lost with a 500)
-                tmp.replace(p)
-                return
-            except PermissionError:
-                if i == 7:
-                    raise
-                time.sleep(0.05 * (i + 1))
+        write_json(p, data, indent=2, ensure_ascii=False)

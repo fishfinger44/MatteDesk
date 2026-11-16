@@ -5,17 +5,7 @@
  * Complies with SPEC_INTERACTIVE_MATTE_TOOL.md (Section 6, 12: Stage E1).
  */
 
-// Reads a fetch() response whose body should be JSON. A non-JSON body (e.g. a plain-text 500) or a non-OK status gives
-// a readable `error` (HTTP status + the server's `detail` / text) instead of a JSON.parse SyntaxError.
-async function readApiResponse(res) {
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
-  if (res.ok && data !== null) return { ok: true, data, error: '' };
-  let msg = data && data.detail !== undefined ? data.detail : (data && data.error) || text.trim().slice(0, 300) || res.statusText;
-  if (msg && typeof msg === 'object') msg = msg.detail || JSON.stringify(msg);
-  return { ok: false, data: data || {}, error: `HTTP ${res.status}: ${msg}` };
-}
+const readApiResponse = window.UI.read;
 
 class MatteDeskViewer {
   constructor() {
@@ -49,6 +39,7 @@ class MatteDeskViewer {
     this.compare = { mode: 'none', wipe: 0.5, holdC: false, gain: 4, ref: 'beauty', bg: { color: '#ffffff', checker: false } };
     try { Object.assign(this.compare.bg, JSON.parse(localStorage.getItem('md_cmp_bg') || '{}') || {}); } catch (e) { /* no storage */ }
     this.alignedPreview = false;   // auxiliary plates: show the proxy warped by the alignment report
+    this.overlayHooks = [];        // render(): fn(ctx, img) in image space, after the comparison (stage modules)
     this.edgeCache = new Map();    // beauty edge maps per frame (compare 'edges')
 
     // Frame cache: Map<string, Image> (keyed by plate[_al]_frameNum)
@@ -83,18 +74,18 @@ class MatteDeskViewer {
   async checkUpdate(force = false, pre = null) {
     let u = pre;
     if (!u) {
-      try { u = await (await fetch('/api/update' + (force ? '?force=1' : ''))).json(); } catch (e) { return null; }
+      try { u = await window.UI.api('GET', '/api/update' + (force ? '?force=1' : '')); } catch (e) { return null; }
     }
     if (!u || !u.available || (u.skipped && !force)) return u;
     const notes = this.esc(u.notes || '').replace(/\n/g, '<br>');
     const inst = u.can_install;
     const html = `<div>Masz wersję <b>${this.esc(u.current)}</b>.</div>
       ${notes ? `<div style="margin:10px 0;padding:8px 10px;background:#141416;border:1px solid #2a2a2e;border-radius:6px;max-height:40vh;overflow-y:auto;">${notes}</div>` : ''}
-      <div><a href="${this.esc(u.changelog)}" target="_blank" rel="noopener" style="color:#e8a33d;">Pełna lista zmian (CHANGELOG)</a> ·
-        <a href="${this.esc(u.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">strona wydania</a></div>
-      <div style="margin-top:8px;color:#9a9aa0;">${inst ? 'Zaktualizuj = pobranie instalatora i jego uruchomienie; MatteDesk się zamknie, ustawienia zostają.'
+      <div><a href="${this.esc(u.changelog)}" target="_blank" rel="noopener" style="color:var(--border-focus);">Pełna lista zmian (CHANGELOG)</a> ·
+        <a href="${this.esc(u.url)}" target="_blank" rel="noopener" style="color:var(--border-focus);">strona wydania</a></div>
+      <div style="margin-top:8px;color:var(--text-muted);">${inst ? 'Zaktualizuj = pobranie instalatora i jego uruchomienie; MatteDesk się zamknie, ustawienia zostają.'
         : u.kind === 'zip'
-          ? `Kopia z pliku ZIP: <a href="${this.esc(u.zip_url || u.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">pobierz nowy ZIP</a> i rozpakuj go na stary folder MatteDesk (ustawienia z <code>config.local.json</code> zostają – nie ma go w ZIP-ie), zamknij MatteDesk i uruchom nowy <code>start_v${this.esc(u.version)}.bat</code>.${u.setup ? ` Wygodniej: <a href="${this.esc(u.setup.url)}" target="_blank" rel="noopener" style="color:#e8a33d;">instalator</a> – kolejne aktualizacje jednym kliknięciem.` : ''}`
+          ? `Kopia z pliku ZIP: <a href="${this.esc(u.zip_url || u.url)}" target="_blank" rel="noopener" style="color:var(--border-focus);">pobierz nowy ZIP</a> i rozpakuj go na stary folder MatteDesk (ustawienia z <code>config.local.json</code> zostają – nie ma go w ZIP-ie), zamknij MatteDesk i uruchom nowy <code>start_v${this.esc(u.version)}.bat</code>.${u.setup ? ` Wygodniej: <a href="${this.esc(u.setup.url)}" target="_blank" rel="noopener" style="color:var(--border-focus);">instalator</a> – kolejne aktualizacje jednym kliknięciem.` : ''}`
           : `Kopia z gita: zaktualizuj przez <code>git pull</code> w folderze MatteDesk, zamknij MatteDesk i uruchom nowy <code>start_v${this.esc(u.version)}.bat</code> (stary skrót do <code>.bat</code> przestanie działać).`}</div>
       <label style="display:block;margin-top:8px;"><input type="checkbox" id="updSkip"> Nie przypominaj o tej wersji</label>`;
     const yes = await this.uiDialog({ title: `Nowa wersja MatteDesk ${u.version}`, html, ok: inst ? 'Zaktualizuj' : 'OK', cancel: 'Później', tone: 'info' });
@@ -108,7 +99,7 @@ class MatteDeskViewer {
       for (let i = 0; i < 1800; i++) {      // up to ~30 min
         await new Promise((res) => setTimeout(res, 1000));
         let st;
-        try { st = await (await fetch('/api/update/progress')).json(); } catch (e) { break; }   // server stopped: setup runs
+        try { st = await window.UI.api('GET', '/api/update/progress'); } catch (e) { break; }   // server stopped: setup runs
         if (st.state === 'failed') { await this.uiDialog({ title: 'Aktualizacja nie powiodła się', tone: 'error', html: this.esc(st.error || '') }); return u; }
         if (st.state === 'downloading' && st.total) this.showToast(`Pobieranie aktualizacji: ${Math.round(100 * st.done / st.total)} %`);
         if (st.state === 'started') break;
@@ -350,16 +341,25 @@ class MatteDeskViewer {
       this.goToFrame(frame);
     };
 
-    this.timelineTrack.addEventListener('mousedown', (e) => {
+    // pointer events + capture (user report 2026-11-15: a tablet pen could not drag the playhead – the browser took the
+    // pen drag as a scroll gesture, cancelled it and sent no mousemove); index.css: #timelineTrack touch-action: none
+    this.timelineTrack.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      if (e.target.closest && e.target.closest('.wa-handle')) return;   // the work-area brackets drag themselves
       isScrubbing = true;
+      try { this.timelineTrack.setPointerCapture(e.pointerId); } catch (er) { /* capture unsupported */ }
+      e.preventDefault();
       handleScrub(e);
     });
-    window.addEventListener('mousemove', (e) => {
+    this.timelineTrack.addEventListener('pointermove', (e) => {
       if (isScrubbing) handleScrub(e);
     });
-    window.addEventListener('mouseup', () => {
+    const endScrub = (e) => {
       isScrubbing = false;
-    });
+      try { this.timelineTrack.releasePointerCapture(e.pointerId); } catch (er) { /* not captured */ }
+    };
+    this.timelineTrack.addEventListener('pointerup', endScrub);
+    this.timelineTrack.addEventListener('pointercancel', endScrub);
 
     // Canvas Pan & Zoom
     this.canvas.addEventListener('mousedown', (e) => {
@@ -649,12 +649,15 @@ class MatteDeskViewer {
   }
 
   handleWsMessage(msg) {
+    // the ONE server event stream: other modules listen to `md-ws` (objects.js, depth.js) – no second WebSocket
+    // without reconnect (audit 2026-11-02 #14)
+    document.dispatchEvent(new CustomEvent('md-ws', { detail: msg }));
     if (msg.type === 'proxy_progress') {
       const pct = Math.round((msg.done / msg.total) * 100);
       this.timelineBufferedBar.style.width = `${pct}%`;
       this.showToast(`Generowanie proxy: ${msg.done} / ${msg.total} (${pct}%)`);
     } else if (msg.type === 'project_opened') {
-      this.loadCurrentProject();
+      if (!msg.open_id || msg.open_id !== this.appliedOpenId) this.loadCurrentProject(true);
     } else if (msg.type === 'align_progress' || msg.type === 'align_apply_progress') {
       window.dispatchEvent(new CustomEvent('md-align-progress', { detail: msg }));
     } else if (msg.type === 'clean_progress') {
@@ -694,12 +697,15 @@ class MatteDeskViewer {
   // --------------------------------------------------------------------------
   // Project Loading & State
   // --------------------------------------------------------------------------
-  async loadCurrentProject() {
+  // `onlyNew`: the WS `project_opened` – the POST response of that open may have overtaken this fetch (audit 2026-11-02
+  // #15); a direct call (stage0.js after a plate change) always applies
+  async loadCurrentProject(onlyNew = false) {
     try {
       const res = await fetch('/api/project/current');
       const data = await res.json();
       if (data.loaded) {
-        this.applyProject(data);
+        if (onlyNew) this.applyOpened(data);
+        else this.applyProject(data);
       }
     } catch (e) {
       console.warn('Could not load current project', e);
@@ -903,7 +909,7 @@ class MatteDeskViewer {
       if (api.ok && data.success) {
         this.openProjectModal.style.display = 'none';
         this.currentWorkDir = workDir;
-        this.applyProject(data);
+        this.applyOpened(data);
         this.showToast(`Projekt ${data.manifest?.shot || ''} otwarty pomyślnie`);
       } else {
         alert(`Błąd otwierania projektu: ${api.error}`);
@@ -915,15 +921,21 @@ class MatteDeskViewer {
     }
   }
 
+  // One open of a project = one apply: its POST response and its WS event carry the same `open_id`, in any order
+  applyOpened(data) {
+    if (!data.open_id || data.open_id !== this.appliedOpenId) this.applyProject(data);
+  }
+
   applyProject(data) {
+    this.appliedOpenId = data.open_id;
     this.projectLoaded = true;
     const m = data.manifest;
     this.manifest = m;
     this.projectData = data.project || m;
     this.currentWorkDir = m.work || data.work_dir || data.working_dir || '';
 
-    this.firstFrame = m.first || 1;
-    this.lastFrame = m.last || 100;
+    this.firstFrame = m.first ?? 1;    // a shot may start at frame 0 (audit 2026-11-02 #13)
+    this.lastFrame = m.last ?? 100;
     this.fps = m.fps || 24;
     this.fpsSelect.value = String(this.fps);
     this.currentFrame = this.firstFrame;
@@ -954,9 +966,19 @@ class MatteDeskViewer {
     if (this.tiles) { this.tiles.cache.clear(); this.tiles.region = null; }
     this.hasInitialFit = false;
 
-    // Go to first frame
-    this.goToFrame(this.firstFrame);
+    // The new project first, then its first frame: the frame event starts the overlay prefetch, which must not ask this
+    // project for the objects of the previous one
     window.dispatchEvent(new CustomEvent('md-project', { detail: data }));
+    this.goToFrame(this.firstFrame);
+  }
+
+  // a plate whose frames changed under the same name (Cleanup: „cleaned” = another version): new image URLs so the
+  // browser's image cache cannot hand back the old frames (2026-11-11)
+  bumpPlate(name) {
+    this.plateRev = this.plateRev || {};
+    this.plateRev[name] = (this.plateRev[name] || 0) + 1;
+    if (this.frameCache && this.frameCache.clear) this.frameCache.clear();
+    if (this.tiles && this.tiles.cache) this.tiles.cache.clear();
   }
 
   setActivePlate(name) {
@@ -1021,7 +1043,7 @@ class MatteDeskViewer {
     this.loadCompareRef(this.currentFrame);
     this.render();
     this.notifyCompare();
-    window.dispatchEvent(new CustomEvent('md-plate', { detail: { plate: this.activePlate, prev: this.activePlate } }));
+    window.dispatchEvent(new CustomEvent('md-compare-ref', { detail: { ref: name } }));
   }
   // buttons / extra controls of the comparison next to the plate pair
   syncCompareUi() {
@@ -1060,7 +1082,10 @@ class MatteDeskViewer {
     const parts = [];
     const ref = this.compare.ref;
     if (this.activePlate !== 'beauty' || (this.activePlate !== ref && this.compare.mode !== 'none')) {
-      parts.push(`${this.activePlate}${this.alignedPreview && this.activePlate !== 'beauty' ? ' · po dopasowaniu' : ''}`);
+      // „cleaned” names its version (user 2026-11-12, like the mask label of the cut-out stages)
+      const cl = this.activePlate === 'cleaned' && window.MD_CLEANUP && window.MD_CLEANUP.shownLabel ? window.MD_CLEANUP.shownLabel() : null;
+      const out = cl && cl.frames && cl.frames.length && (this.currentFrame < cl.frames[0] || this.currentFrame > cl.frames[1]);
+      parts.push(`${this.activePlate}${cl ? ` · ${cl.text}${out ? ` – poza zakresem: brak klatki F${this.currentFrame}` : ''}` : ''}${this.alignedPreview && this.activePlate !== 'beauty' ? ' · po dopasowaniu' : ''}`);
       const refName = this.isBgRef() ? this.bgRefLabel() : ref;
       const names = { comp: `wycięcie na tle: ${refName}`, ab: `A/B (C = ${refName})`, wipe: `wipe ${refName} – przeciągnij linię`, diff: 'różnica ×' + this.compare.gain, edges: `kontury ${ref}` };
       if (names[this.compare.mode]) parts.push(names[this.compare.mode]);
@@ -1128,6 +1153,7 @@ class MatteDeskViewer {
     this.currentFrame = frameNum;
     this.frameInput.value = frameNum;
     this.frameIndexDisplay.textContent = `(idx: ${frameNum - this.firstFrame})`;
+    if (changed && this.activePlate === 'cleaned') this.updateHudMode();   // „poza zakresem” of the cleaned version
 
     // Update playhead
     const range = Math.max(1, this.lastFrame - this.firstFrame);
@@ -1169,7 +1195,7 @@ class MatteDeskViewer {
     const img = new Image();
     const gen = this.projectGen || 0;
     img.crossOrigin = 'anonymous';
-    img.src = `/api/frame/${frameNum}?plate=${encodeURIComponent(plate)}${aligned ? '&aligned=1' : ''}&g=${gen}`;
+    img.src = `/api/frame/${frameNum}?plate=${encodeURIComponent(plate)}${aligned ? '&aligned=1' : ''}&g=${gen}.${(this.plateRev || {})[plate] || 0}`;
     // a request that never answers (the server restarted under an open page, user report 2026-10-24: „Wczytywanie
     // klatki 78…” for ever) must not keep the frame locked: after 20 s it is asked again (once per load call)
     const watchdog = setTimeout(() => {
@@ -1246,8 +1272,10 @@ class MatteDeskViewer {
       opt.textContent = 'Beauty Plate (X1)';
       this.plateSelect.appendChild(opt);
       if (this.plateRefSelect) this.plateRefSelect.appendChild(opt.cloneNode(true));
+      const prev = this.activePlate;
       this.activePlate = 'beauty';
       this.compare.ref = 'beauty';
+      if (prev && prev !== 'beauty') window.dispatchEvent(new CustomEvent('md-plate', { detail: { plate: 'beauty', prev } }));
       return;
     }
 
@@ -1284,7 +1312,17 @@ class MatteDeskViewer {
     }
 
     if (!foundActive) {
+      // the plate shown is gone (e.g. the last Cleanup version deleted): switch like the selector would, so the object
+      // tools hear it (md-plate) – a silent change left them locked on „przełącz plate na beauty” (user 2026-11-10)
+      const prev = this.activePlate;
       this.activePlate = this.plateSelect.value || 'beauty';
+      if (prev && prev !== this.activePlate) {
+        if (this.compare && this.compare.ref === this.activePlate) this.compare.mode = 'none';
+        this.loadingFrames && this.loadingFrames.clear();
+        if (this.projectLoaded) this.goToFrame(this.currentFrame);
+        this.updateHudMode && this.updateHudMode();
+        window.dispatchEvent(new CustomEvent('md-plate', { detail: { plate: this.activePlate, prev } }));
+      }
     }
     if (this.plateRefSelect) {
       const grp = document.createElement('optgroup');
@@ -1424,6 +1462,8 @@ class MatteDeskViewer {
     ctx.drawImage(img, 0, 0);
     this.drawTiles(ctx, img);
     this.drawCompare(ctx, img);
+    // stage modules draw in image space here (stage 0: residual map, exclusion box – 2026-11-03); fn(ctx, img)
+    for (const fn of this.overlayHooks || []) { try { fn(ctx, img); } catch (e) { /* a broken overlay never breaks the view */ } }
 
     ctx.restore();
     this.updateHudZoom();
@@ -1498,7 +1538,7 @@ class MatteDeskViewer {
       t.crossOrigin = 'anonymous';
       t.onload = () => { if (gen === (this.projectGen || 0) && reg.f === this.currentFrame) this.render(); };
       t.onerror = () => { if (gen === (this.projectGen || 0)) this.tiles.cache.delete(key); };
-      t.src = `/api/frame/${reg.f}/tile?plate=${encodeURIComponent(reg.plate)}&x=${c.x}&y=${c.y}&w=${c.w}&h=${c.h}&g=${gen}`;
+      t.src = `/api/frame/${reg.f}/tile?plate=${encodeURIComponent(reg.plate)}&x=${c.x}&y=${c.y}&w=${c.w}&h=${c.h}&g=${gen}.${(this.plateRev || {})[reg.plate] || 0}`;
       this.tiles.cache.set(key, t);
       while (this.tiles.cache.size > this.tiles.limit) this.tiles.cache.delete(this.tiles.cache.keys().next().value);
     }
@@ -1714,6 +1754,8 @@ class MatteDeskViewer {
         const d = await r.json();
         const el = document.getElementById('appVersion');
         if (el) el.textContent = `v${d.version}`;
+        this.serverCheckout = !!d.checkout;
+        this.serverDiskVersion = d.on_disk || d.version;
         document.title = `${document.title.replace(/ ·? ?v[\d.]+$/, '')} · v${d.version}`;
         if (d.stale || (d.on_disk && d.on_disk !== d.version)) msg = `Serwer MatteDesk działa na starszym kodzie niż na dysku (v${d.version}${d.on_disk && d.on_disk !== d.version ? ' → v' + d.on_disk : ''}).`;
       }
@@ -1727,7 +1769,12 @@ class MatteDeskViewer {
       b.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:20000;background:#7f1d1d;color:#fff;padding:10px 44px 10px 16px;font-size:14px;font-weight:600;text-align:center;box-shadow:0 -2px 12px rgba(0,0,0,.5);';
       document.body.appendChild(b);
     }
-    b.innerHTML = `⚠ ${msg} Zamknij MatteDesk i uruchom go ponownie: skrót z menu Start / pulpitu sam zaproponuje zatrzymanie starego serwera (kopia z gita: zamknij okno konsoli i uruchom <code>start_v….bat</code>).`
+    // a git checkout is restarted by ITS start_v<version>.bat – the Start menu / desktop shortcut runs the installed copy,
+    // which may be an older version (2026-11-10: the shortcut offered to replace 0.60 by the installed 0.32)
+    const how = this.serverCheckout
+      ? `Uruchom ponownie <code>start_v${this.esc(this.serverDiskVersion || '')}.bat</code> z folderu MatteDesk – sam zatrzyma stary serwer (albo zamknij jego okno konsoli). Skrót z menu Start uruchamia zainstalowaną kopię, nie tę.`
+      : 'Zamknij MatteDesk i uruchom go ponownie: skrót z menu Start / pulpitu sam zaproponuje zatrzymanie starego serwera.';
+    b.innerHTML = `⚠ ${msg} ${how}`
       + '<button type="button" title="Ukryj" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:0;color:#fff;font-size:18px;cursor:pointer;">✕</button>';
     b.querySelector('button').addEventListener('click', () => b.remove());
     this.serverStale = msg;
@@ -1736,7 +1783,7 @@ class MatteDeskViewer {
   async checkDoctorStatus() {
     // ComfyUI being started by MatteDesk: show it and check again, do not judge the environment yet
     try {
-      const ls = await (await fetch('/api/comfy/launch')).json();
+      const ls = await window.UI.api('GET', '/api/comfy/launch');
       if (ls.state === 'starting') {
         this.comfyStatusText.textContent = `ComfyUI: uruchamiam (${ls.how || ''})…`;
         this.comfyStatusDot.classList.remove('online');
@@ -1795,43 +1842,12 @@ class MatteDeskViewer {
   esc(t) { return String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
   restartNote() {
-    return '<div style="margin-top:10px;padding:10px 12px;border:2px solid #f0703a;border-radius:6px;background:rgba(240,112,58,.14);">'
-      + '<b style="color:#f0703a;">🔁 Po instalacji węzłów trzeba zrestartować ComfyUI</b><br>'
+    return '<div style="margin-top:10px;padding:10px 12px;border:2px solid var(--accent-warning);border-radius:6px;background:rgba(240,112,58,.14);">'
+      + '<b style="color:var(--accent-warning);">🔁 Po instalacji węzłów trzeba zrestartować ComfyUI</b><br>'
       + '<span style="font-size:12px;">Bez restartu ComfyUI nie załaduje nowych węzłów. Doktor pokaże wtedy przycisk „Zrestartuj ComfyUI”.</span></div>';
   }
 
-  uiDialog({ title, html = '', ok = 'OK', cancel = null, tone = 'info' }) {
-    return new Promise((resolve) => {
-      const col = { info: '#e8a33d', ok: '#10b981', warn: '#f0703a', error: '#ef4444' }[tone] || '#e8a33d';
-      const bg = document.createElement('div');
-      bg.className = 'md-dialog';
-      bg.style.cssText = 'position:fixed;inset:0;z-index:25000;background:rgba(10,10,12,.7);display:flex;align-items:center;justify-content:center;';
-      bg.innerHTML = `<div role="dialog" style="width:min(560px,92vw);max-height:80vh;display:flex;flex-direction:column;background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-top:4px solid ${col};border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.6);">
-          <div style="padding:14px 18px 6px;font-size:16px;font-weight:700;">${this.esc(title)}</div>
-          <div style="padding:6px 18px 12px;font-size:13px;line-height:1.5;overflow:auto;">${html}</div>
-          <div style="padding:12px 18px;border-top:1px solid #2a2a2e;display:flex;gap:8px;justify-content:flex-end;">
-            ${tone === 'error' && window.mdReport ? '<button type="button" class="btn btn-secondary" data-report="1" style="margin-right:auto;" title="Wyślij autorowi opis tego błędu z diagnostyką (przed wysłaniem zobaczysz całość)">🐞 Zgłoś problem</button>' : ''}
-            ${cancel ? `<button type="button" class="btn btn-secondary" data-r="0">${this.esc(cancel)}</button>` : ''}
-            <button type="button" class="btn btn-primary" data-r="1" style="background:${col};border-color:${col};">${this.esc(ok)}</button>
-          </div></div>`;
-      const onKey = (e) => {
-        if (e.key === 'Escape') { e.stopPropagation(); done(false); }
-        if (e.key === 'Enter') { e.stopPropagation(); done(true); }
-      };
-      const done = (v) => { document.removeEventListener('keydown', onKey, true); bg.remove(); resolve(v); };
-      bg.querySelectorAll('button[data-r]').forEach((b) => b.addEventListener('click', () => done(b.dataset.r === '1')));
-      const rep = bg.querySelector('button[data-report]');
-      if (rep) rep.addEventListener('click', () => {   // the error's title + text go with the report (engine/report.py context)
-        const text = (bg.querySelector('[role="dialog"] > div:nth-child(2)') || {}).innerText || '';
-        done(false);
-        window.mdReport.open({ source: 'error_dialog', error_title: String(title || ''), error_text: text });
-      });
-      bg.addEventListener('click', (e) => { if (e.target === bg && cancel) done(false); });
-      document.addEventListener('keydown', onKey, true);
-      document.body.appendChild(bg);
-      bg.querySelector('button[data-r="1"]').focus();
-    });
-  }
+  uiDialog(opts) { return window.UI.dialog(opts); }
 
   // In-app replacement for window.confirm() (Chrome may block native dialogs): plain text, first line = title when no title given
   uiConfirm(msg, { title = null, ok = 'OK', cancel = 'Anuluj', tone = 'warn' } = {}) {
@@ -1843,16 +1859,16 @@ class MatteDeskViewer {
   // Result of one or more installs: ✅ / ❌ per step, short message, raw log collapsed, restart reminder when needed
   showInstallResults(results) {
     const names = { nodes: 'Węzły MatteDesk (PlateMatte, MatAnyone2-Keyframes)', matanyone2_node: 'Węzeł ComfyUI-MatAnyone2',
-      inpaint_nodes: 'Węzły inpaint (LaMa)', depthcrafter_nodes: 'Węzły DepthCrafter', minimax_nodes: 'Węzły MiniMax-Remover', vhs_nodes: 'Węzły VideoHelperSuite', minimax_weights: 'Wagi MiniMax-Remover', sam3: 'Wagi SAM3.1', matanyone2_weights: 'Wagi MatAnyone2', lama: 'Wagi LaMa',
+      inpaint_nodes: 'Węzły inpaint (LaMa)', depthcrafter_nodes: 'Węzły DepthCrafter', vhs_nodes: 'Węzły VideoHelperSuite', sam3: 'Wagi SAM3.1', matanyone2_weights: 'Wagi MatAnyone2', lama: 'Wagi LaMa',
       cotracker: 'CoTracker3', vitmatte: 'ViTMatte', birefnet: 'BiRefNet_HR-matting / Lucida', sapiens2: 'Sapiens2-seg-0.4B', ltx: 'Modele LTX-2.5 Alpha-Gen', videomama: 'VideoMaMa (węzeł + wagi)', restart_comfy: 'Restart ComfyUI' };
     const allOk = results.every((r) => r.ok);
-    const needsRestart = results.some((r) => r.ok && ['nodes', 'matanyone2_node', 'inpaint_nodes', 'depthcrafter_nodes', 'minimax_nodes', 'vhs_nodes', 'videomama'].includes(r.what));
+    const needsRestart = results.some((r) => r.ok && ['nodes', 'matanyone2_node', 'inpaint_nodes', 'depthcrafter_nodes', 'vhs_nodes', 'videomama'].includes(r.what));
     const rows = results.map((r) => {
       const main = (r.lines || []).filter((l) => l && !/^Zrestartuj ComfyUI/.test(l));
       const pick = (re) => main.filter((l) => re.test(l)).join(' · ');
       const short = r.ok ? (pick(/-> OK|pobrane|skopiowany|zrestartowany|już jest/i) || pick(/aktualne/i) || 'Gotowe') : (main.find((l) => /BŁĄD|błąd|kod [1-9]|nie /i.test(l)) || main[0] || 'Błąd');
       const det = (main.length > 1 || !r.ok)
-        ? `<details style="margin-top:4px;font-size:11px;color:#9a9aa0;"><summary style="cursor:pointer;">szczegóły</summary><pre style="white-space:pre-wrap;margin:4px 0 0;">${this.esc(main.join('\n'))}</pre></details>`
+        ? `<details style="margin-top:4px;font-size:11px;color:var(--text-muted);"><summary style="cursor:pointer;">szczegóły</summary><pre style="white-space:pre-wrap;margin:4px 0 0;">${this.esc(main.join('\n'))}</pre></details>`
         : '';
       return `<div style="padding:8px 0;border-bottom:1px solid #2a2a2e;">
         <div style="font-weight:600;">${r.ok ? '✅' : '❌'} ${this.esc(names[r.what] || r.what)}</div>
@@ -1869,7 +1885,7 @@ class MatteDeskViewer {
     if (!bar) {
       bar = document.createElement('div');
       bar.id = 'installBar';
-      bar.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:10000;width:min(560px,92vw);background:#19191b;border:1px solid #e8a33d;border-radius:8px;padding:12px 14px;font-size:12px;color:#dcdcdf;box-shadow:0 8px 24px rgba(0,0,0,.5);';
+      bar.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:10000;width:min(560px,92vw);background:#19191b;border:1px solid var(--border-focus);border-radius:8px;padding:12px 14px;font-size:12px;color:#dcdcdf;box-shadow:0 8px 24px rgba(0,0,0,.5);';
       document.body.appendChild(bar);
     }
     bar.style.display = 'block';
@@ -1883,12 +1899,12 @@ class MatteDeskViewer {
         line += `<br>${fmt(p.done)} / ${fmt(p.total)} (${pct.toFixed(0)}%) · ${(speed / 1048576).toFixed(1)} MB/s${eta ? ' · ok. ' + (eta >= 90 ? Math.ceil(eta / 60) + ' min' : Math.ceil(eta) + ' s') : ''}`;
       }
       const fill = p.total ? `width:${pct}%` : 'width:100%;opacity:.45;animation:pulse 1.2s infinite';
-      bar.innerHTML = `${line}<div style="margin-top:6px;height:8px;background:#2a2a2e;border-radius:4px;overflow:hidden;"><div style="height:100%;background:#e8a33d;${fill}"></div></div>`;
+      bar.innerHTML = `${line}<div style="margin-top:6px;height:8px;background:#2a2a2e;border-radius:4px;overflow:hidden;"><div style="height:100%;background:var(--border-focus);${fill}"></div></div>`;
     };
     const poll = async () => {
       while (!stop) {
         try {
-          const p = await (await fetch('/api/install/progress')).json();
+          const p = await window.UI.api('GET', '/api/install/progress');
           const now = performance.now();
           if (p.file !== last.file) last = { file: p.file, t: now, done: p.done || 0 };
           else if (now - last.t > 1500) { speed = ((p.done || 0) - last.done) / ((now - last.t) / 1000); last = { file: p.file, t: now, done: p.done || 0 }; }
@@ -1907,23 +1923,98 @@ class MatteDeskViewer {
     }
   }
 
+  // Doctor's filter (user 2026-11-10): module (system / Alpha / Cleanup; "both" rows belong to Alpha and Cleanup) and
+  // GPU memory on this card (engine/vram_fit.py levels; rows without a rating count as fitting). Remembered per viewer.
+  doctorRowShown(module, vram, mod, vf) {
+    const modOk = mod === 'all' || module === mod || (module === 'both' && (mod === 'alpha' || mod === 'cleanup'));
+    const vramOk = vf === 'all' || (vf === 'fits' && (!vram || vram === 'ok'))
+      || (vf === 'runs' && vram !== 'unstable' && vram !== 'no') || (vf === 'warn' && !!vram && vram !== 'ok');
+    return modOk && vramOk;
+  }
+
+  wireDoctorFilter() {
+    const root = this.doctorReportContent;
+    const ms = root.querySelector('#doctorModSel');
+    const vs = root.querySelector('#doctorVramSel');
+    if (!ms || !vs) return;
+    try { const f = JSON.parse(localStorage.getItem('md_doctor_filter') || '{}'); ms.value = f.mod || 'all'; vs.value = f.vram || 'all'; } catch (e) { /* storage blocked */ }
+    if (!ms.value) ms.value = 'all';
+    if (!vs.value) vs.value = 'all';
+    const apply = () => {
+      const rows = [...root.querySelectorAll('tr.doctor-row')];
+      let n = 0;
+      rows.forEach((r) => { const on = this.doctorRowShown(r.dataset.module, r.dataset.vram, ms.value, vs.value); r.style.display = on ? '' : 'none'; if (on) n++; });
+      const cnt = root.querySelector('#doctorFilterCount');
+      if (cnt) cnt.textContent = n === rows.length ? '' : window.mdT(`pokazane ${n} z ${rows.length}`);
+      try { localStorage.setItem('md_doctor_filter', JSON.stringify({ mod: ms.value, vram: vs.value })); } catch (e) { /* storage blocked */ }
+    };
+    ms.addEventListener('change', apply);
+    vs.addEventListener('change', apply);
+    apply();
+  }
+
+  // Weights MatteDesk downloads outside ComfyUI's folders (Hugging Face cache: ViTMatte, BiRefNet, Sapiens2 …) – user
+  // decision 2026-11-10 after the HF cache on C: was wiped while freeing disk space: default next to ComfyUI's models,
+  // the HF_HOME variable when set, a folder of the user's choice here (GET / POST /api/config/weights)
+  async weightsDirHtml(inp) {
+    let w;
+    try { w = await window.UI.api('GET', '/api/config/weights'); } catch (e) { return ''; }
+    const q = (v) => String(v || '').replace(/"/g, '&quot;');
+    return `<div id="weightsBox" style="margin-top:8px;padding-top:8px;border-top:1px solid #3c3c42;">
+      <b>Wagi poza ComfyUI</b> <span style="color:var(--text-muted);">(ViTMatte, BiRefNet, Sapiens2 – cache Hugging Face)</span><br>
+      folder: <input id="weightsDir" size="46" value="${q(w.source === 'config.local.json' ? w.path : '')}" placeholder="domyślnie: ${q(w.default)} (${q(w.default_source)})" ${inp}>
+      <label style="margin-left:6px;"><input type="checkbox" id="weightsMove" checked> przenieś już pobrane</label>
+      <button class="btn btn-secondary" id="weightsSave" style="margin-left:6px;padding:2px 10px;font-size:12px;">Zapisz</button>
+      <div style="margin-top:4px;color:var(--text-muted);">Teraz: ${this.esc(w.path)} (${this.esc(w.source)}) · zajęte ${w.used_gb} GB · wolne na dysku ${w.free_gb ?? '?'} GB${w.active ? '' : ' · <span style="color:var(--accent-warning);">zacznie działać po restarcie MatteDesk</span>'}. Puste pole = domyślny.</div>
+    </div>`;
+  }
+
+  wireWeightsDir() {
+    const b = document.getElementById('weightsSave'); if (!b) return;
+    b.addEventListener('click', async () => {
+      const path = document.getElementById('weightsDir').value.trim();
+      const move = document.getElementById('weightsMove').checked;
+      b.disabled = true;
+      try {
+        const r = await window.UI.api('POST', '/api/config/weights', { path, move });
+        this.showToast(`Wagi: ${r.path}${(r.moved || []).length ? ` · przeniesiono ${r.moved.length}` : ''}${(r.kept_in_old || []).length ? ` · ${r.kept_in_old.length} już było w nowym (zostało w starym)` : ''}`);
+        this.fetchDoctorReport();
+      } catch (e) {
+        this.showToast(`Folder wag: ${e.message || e}`);
+      } finally { b.disabled = false; }
+    });
+  }
+
   async fetchDoctorReport() {
     this.doctorReportContent.innerHTML = '<div class="spinner"></div> Sprawdzanie środowiska...';
     try {
       const res = await fetch('/api/doctor');
       const data = await res.json();
-      let html = `<div style="margin-bottom:12px; font-weight:600;">Wariant ComfyUI: ${data.comfy_flavor} | Status ogólny: ${data.all_ok ? '<span style="color:#10b981">OK</span>' : '<span style="color:#f0703a">Wymaga uwagi</span>'}</div>`;
+      let html = `<div style="margin-bottom:12px; font-weight:600;">Wariant ComfyUI: ${data.comfy_flavor} | Status ogólny: ${data.all_ok ? '<span style="color:var(--accent-success)">OK</span>' : '<span style="color:var(--accent-warning)">Wymaga uwagi</span>'}</div>`;
       // licence summary (user decision 2026-10-21): what may be used in commercial work and what is research / non-commercial only
       const lics = data.licences || [];
       const licList = (use) => lics.filter((l) => l.use === use)
         .map((l) => `<span title="${(l.license || '').replace(/"/g, '&quot;')}">${l.name}</span>`).join(', ') || '—';
       if (lics.length) {
-        html += `<div style="margin-bottom:12px;padding:8px 10px;border:1px solid #303035;border-radius:6px;font-size:12px;line-height:1.5;">
-          <span style="color:#10b981;">✔ Komercyjnie:</span> ${licList('commercial')}<br>
-          <span style="color:#f87171;">⚠ Tylko badawczo:</span> ${licList('research')}${lics.some((l) => l.use === 'check') ? `<br>
-          <span style="color:#e8a33d;">? Do sprawdzenia:</span> ${licList('check')}` : ''}
+        html += `<div style="margin-bottom:12px;padding:8px 10px;border:1px solid var(--bg-hover);border-radius:6px;font-size:12px;line-height:1.5;">
+          <span style="color:var(--accent-success);">✔ Komercyjnie:</span> ${licList('commercial')}<br>
+          <span style="color:#f87171;">⚠ Tylko badawczo:</span> ${licList('research')}${lics.some((l) => l.use === 'limited') ? `<br>
+          <span style="color:#f0a03a;">⚠ Komercyjnie z limitem:</span> ${licList('limited')}` : ''}${lics.some((l) => l.use === 'check') ? `<br>
+          <span style="color:var(--border-focus);">? Do sprawdzenia:</span> ${licList('check')}` : ''}
         </div>`;
       }
+      // filter (user 2026-11-10): by module (Alpha = masks, Cleanup; "both" in either) and by GPU memory on this card
+      const fsel = 'style="background:#19191b;color:#dcdcdf;border:1px solid #3c3c42;border-radius:4px;padding:2px 6px;font-size:12px;"';
+      const cardGb = (data.items.find((i) => i.vram) || {}).vram;
+      html += `<div id="doctorFilter" style="margin-bottom:8px;font-size:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+        <label>Moduł: <select id="doctorModSel" ${fsel}>
+          <option value="all">wszystko</option><option value="system">system (Python, ComfyUI, GPU…)</option>
+          <option value="alpha">Alpha (maski)</option><option value="cleanup">Czyszczenie</option></select></label>
+        <label>VRAM${cardGb ? ` (ta karta: ${cardGb.card_gb} GB)` : ''}: <select id="doctorVramSel" ${fsel}>
+          <option value="all">wszystkie</option><option value="fits">mieści się bez przelewania</option>
+          <option value="runs">działa (także z przelewaniem)</option><option value="warn">tylko z ostrzeżeniem VRAM</option></select></label>
+        <span id="doctorFilterCount" style="color:var(--text-muted);"></span>
+      </div>`;
       html += '<table style="width:100%; border-collapse:collapse; font-size:12px;">';
       const ACTIONS = {
         install_ffmpeg: ['ffmpeg', 'Wymagane teraz: TAK – wczytywanie ujęć wideo (MP4 / MOV) i podglądy. Instaluje ffmpeg przez winget (Gyan.FFmpeg, ok. 100 MB, akceptuje jego licencję w Twoim imieniu); gdy winget nie działa – pobiera paczkę portable z gyan.dev do bin/ffmpeg MatteDesk. Ścieżka trafia do config.local.json.'],
@@ -1939,42 +2030,68 @@ class MatteDeskViewer {
         install_lama: ['lama', 'Pobiera big-lama.pt (~196 MB) do models/inpaint (opcjonalne).'],
         restart_comfy: ['restart_comfy', 'Restartuje ComfyUI (przez ComfyUI-Manager) i czeka, aż wstanie (zwykle 30–90 s). Niezapisane zmiany w oknie ComfyUI przepadną.'],
         install_depthcrafter_nodes: ['depthcrafter_nodes', 'Klonuje węzły DepthCrafter (github.com/akatz-ai/ComfyUI-DepthCrafter-Nodes) do custom_nodes ComfyUI i instaluje ich wymagania. Wymagane teraz: nie (tylko funkcja „Głębia”). Do czego: mapa głębi ujęcia (etap 0). Model ok. 4–6 GB pobierze się sam przy 1. użyciu.'],
-        install_minimax_nodes: ['minimax_nodes', 'Klonuje węzły MiniMax-Remover (github.com/1038lab/ComfyUI-MiniMax-Remover) do custom_nodes ComfyUI i instaluje ich wymagania. Wymagane teraz: nie – moduł Inpainting jest dopiero w planach. Do czego: usuwanie obiektów z wideo. Wagi 2,6 GB – osobny przycisk.'],
-        install_minimax_weights: ['minimax_weights', 'Wymagane teraz: nie – moduł Inpainting jest dopiero w planach. Pobiera wagi MiniMax-Remover (2,6 GB: transformer 2,15 GB + vae 0,48 GB) z huggingface.co/zibojia/minimax-remover do models/MiniMax-Remover.'],
         install_vhs_nodes: ['vhs_nodes', 'Wymagane teraz: TAK – ujęcia 8-bitowe (PNG/JPG) w SAM 3.1, MatAnyone2 i strefach (węzeł VHS_LoadImagesPath). Klonuje ComfyUI-VideoHelperSuite (github.com/Kosinkadink/ComfyUI-VideoHelperSuite, ok. 1 MB) do custom_nodes ComfyUI i instaluje jego wymagania w Pythonie ComfyUI (imageio-ffmpeg ok. 30 MB; opencv zwykle już jest).'],
         install_inpaint_nodes: ['inpaint_nodes', 'Klonuje comfyui-inpaint-nodes (github.com/Acly) do custom_nodes ComfyUI (opcjonalne).'],
         install_videomama: ['videomama', 'Wymagane teraz: nie – tylko etap 4 „VideoMaMa” (opcjonalny). Do czego: kosmyki włosów i detal krawędzi z maski 1+2. Klonuje węzeł ComfyUI-VideoMaMa (github.com/okdalto/ComfyUI-VideoMaMa) do custom_nodes ComfyUI i pobiera 7,1 GB wag (UNet VideoMaMa 6,1 GB z huggingface.co/SammyLim/VideoMaMa + image encoder i VAE SVD-xt 1,5 GB) do models/videomama. Po instalacji węzła – restart ComfyUI.'],
+        install_flux3_klein: ['flux3_klein', 'Wymagane teraz: nie – tylko dogenerowanie klucza w trybie Czyszczenie (silnik „FLUX 3 Image Klein + LoRA Restore”; bez niego zostaje LaMa). Pobiera ok. 20,3 GB: model flux3-image-klein-bf16 11,1 GB → models/diffusion_models, koder qwen3vl_4b_bf16 8,9 GB → models/text_encoders, VAE flux2-vae 0,34 GB → models/vae, z huggingface.co/black-forest-labs/flux-3-image-klein-comfy (przerwane pobieranie wznawia się). Repozytorium „gated”: wymaga logowania do Hugging Face („hf auth login”) i akceptacji dostępu na stronie modelu. Wymaga ComfyUI ≥ 0.41.'],
+        install_klein_restore_lora: ['klein_restore_lora', 'Wymagane teraz: nie – tylko dogenerowanie klucza w trybie Czyszczenie (silnik „FLUX 3 Image Klein + LoRA Restore”). Pobiera LoRA Restore dla FLUX 3 Image Klein (flux-3-image-klein-restore.safetensors, 161 MB) z huggingface.co/ausboss/FLUX-3-Image-Klein-Restore-LoRA do models/loras.'],
+        install_prompt_assist: ['prompt_assist', 'Wymagane teraz: nie – tylko „✨ Popraw opis” w palecie Inpaint (C1): lokalny asystent tłumaczy opis na angielski i przepisuje go według zasad MiniMax-H3 / Wan 2.2 Fun VACE / Qwen-Image-2.1, patrząc na klatkę z zaznaczonym obiektem. Pobiera 8,9 GB (Qwen/Qwen3-VL-4B-Instruct, bf16) z huggingface.co do models/LLM/Qwen3-VL-4B-Instruct (przerwane pobieranie wznawia się). Liczy w Pythonie ComfyUI, model wyładowywany po 3 min bezczynności. Licencja Apache-2.0. Restart ComfyUI niepotrzebny.'],
+        install_qwen21: ['qwen21', 'Wymagane teraz: nie – tylko dogenerowanie klucza w trybie Czyszczenie (silnik „Qwen-Image-2.1”, zalecany do usuwania obiektu z dużych obszarów; bez niego zostają LaMa i FLUX 3 Image Klein + LoRA Restore). Pobiera ok. 17,3 GB: model qwen_image_2.1_int8_convrot 7,3 GB → models/diffusion_models, koder qwen3vl_8b_int8_convrot 9,4 GB → models/text_encoders, VAE qwen_image_2.1_vae_bf16 0,68 GB → models/vae, z huggingface.co/Comfy-Org/Qwen-Image-2.1 (przerwane pobieranie wznawia się). Licencja Qwen Research License – tylko niekomercyjnie.'],
+        install_colmap: ['colmap', 'Wymagane teraz: nie – przyszłe liczenie kamery 3D w trybie Czyszczenie (COLMAP + CoTracker3). Pobiera oficjalną paczkę COLMAP 4.2.1 z CUDA (colmap-x64-windows-cuda.zip, ok. 415 MB) z github.com/colmap/colmap, sprawdza sumę SHA-256 i rozpakowuje do bin/colmap MatteDesk.'],
+        install_comfy_update: ['comfy_update', 'Aktualizuje ComfyUI z gita: zapamiętuje obecną wersję (do cofnięcia), git pull (tylko szybkie przewinięcie – przy lokalnych zmianach nic nie robi), instaluje zależności ComfyUI z przypiętym PyTorchem (CUDA bez zmian). Potem restart ComfyUI. Węzły dodatkowe mogą wymagać aktualizacji – Doktor pokaże, które się nie ładują; „Cofnij aktualizację ComfyUI” wraca do poprzedniej wersji.'],
+        install_comfy_rollback: ['comfy_rollback', 'Cofa ComfyUI do wersji zapamiętanej przed aktualizacją (git reset --keep) i instaluje jej zależności z przypiętym PyTorchem. Potem restart ComfyUI.'],
+        install_seedvr2: ['seedvr2', 'Wymagane teraz: nie – tylko „SeedVR2: podbij klucze karty” w Czyszczeniu 3D. Klonuje węzeł ComfyUI-SeedVR2_VideoUpscaler (github.com/numz) do custom_nodes ComfyUI, instaluje jego wymagania w Pythonie ComfyUI z przypiętym PyTorchem (kilka MB, PyTorch bez zmian) i pobiera wagi wg karty – seedvr2_ema_3b_fp8 (3,4 GB) poniżej 16 GB VRAM, seedvr2_ema_7b_sharp_fp8 (8,2 GB) od 16 GB – + VAE (0,5 GB) z huggingface.co/numz/SeedVR2_comfyUI do models/SEEDVR2 (przerwane pobieranie wznawia się). Też „⤴ Upscale” wersji w Inpaint (C1). Restart ComfyUI niepotrzebny.'],
+        install_vace: ['vace', 'Wymagane teraz: nie – tylko silnik „Wan 2.2 Fun VACE” w Inpaint (C1), alternatywa dla MiniMax-H3 na kartach 12 GB. Klonuje węzeł ComfyUI-GGUF (github.com/city96) do custom_nodes ComfyUI (wymagania w Pythonie ComfyUI, PyTorch przypięty), pobiera dwa eksperty Wan2.2-VACE-Fun-A14B Q4_K_S (2 × 10,6 GB, razem z LoRA Lightning 2 × 1,23 GB do „szybko – 4 kroki”) z huggingface.co/QuantStack/Wan2.2-VACE-Fun-A14B-GGUF do models/diffusion_models oraz – jeśli ich nie ma – koder umt5_xxl_fp8 (6,7 GB) i wan_2.1_vae (0,25 GB). Licencja Apache-2.0. Po instalacji restart ComfyUI.'],
+        install_ltx_inpaint: ['ltx_inpaint', 'Wymagane teraz: nie – tylko silnik „LTX-2.5” w Inpaint (C1). Pobiera IC-LoRA in-/outpainting (ltx-2.3-22b-ic-lora-in-outpainting-0.9, 1,31 GB) z huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting do models/loras. Repo „gated”: zaloguj się do Hugging Face („hf auth login”) i zaakceptuj licencję LTX-2.x na stronie repo. Reszta = pliki etapu 7 LTX-2.5. Licencja LTX-2.x Community (darmowo do 10 mln USD przychodu/rok).'],
+        install_vace_lightning: ['vace_lightning', 'Wymagane teraz: nie – przyspiesza silnik „Wan 2.2 Fun VACE” w Inpaint (C1) ok. 5–10 razy (4 kroki przy CFG 1 zamiast 20 przy CFG 3,5), kosztem trochę szczegółu. Pobiera LoRA lightx2v 4-step T2V v1.1 high + low (2 × 1,23 GB) z huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged do models/loras. Licencja Apache-2.0. Restart ComfyUI niepotrzebny.'],
+        install_void: ['void', 'Wymagane teraz: nie – tylko „VOID – wypełnienie ujęcia” w Czyszczeniu 3D. VOID działa natywnie w ComfyUI (≥ 0.45, bez repozytorium i venv). Pobiera z huggingface.co/Comfy-Org/void-model: void_pass1 (11,1 GB) do models/diffusion_models i cogvideox_vae (0,4 GB) do models/vae; koder t5xxl_fp16 (9,8 GB) do models/text_encoders tylko, gdy żadnego t5xxl nie ma (przerwane pobieranie wznawia się).'],
         install_ltx: ['ltx', 'Wymagane teraz: nie – tylko etap 7 „LTX-2.5 Alpha-Gen” (opcjonalny). Do czego: generatywna alfa włosów, dymu, rozmycia ruchu. Pobiera ok. 40 GB (transformer int8 21,5 GB, Gemma int8 15,4 GB, VAE 1,8 GB, LoRA Alpha-Gen 1,3 GB) z huggingface.co/Lightricks do models/ (przerwane pobieranie wznawia się). Wymaga logowania do Hugging Face („hf auth login”) i „Agree and Access” na stronach Lightricks/LTX-2.5 i Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen.'],
       };
       const required = [];   // items with an install action -> "Zainstaluj wszystkie brakujące"
       let nRequired = 0;
       for (const it of data.items) {
-        const color = it.status === 'ok' ? '#10b981' : it.status === 'warning' ? '#f0703a' : '#ef4444';
-        const tag = it.status === 'ok' ? 'OK' : it.status === 'warning' ? 'UWAGA' : 'BŁĄD';
+        // "info" = optional / informative (not installed optional tools, the ComfyUI update) – never shown as an error
+        const color = it.status === 'ok' ? '#10b981' : it.status === 'warning' ? '#f0703a' : it.status === 'info' ? '#8b8b94' : '#ef4444';
+        const tag = it.status === 'ok' ? 'OK' : it.status === 'warning' ? 'UWAGA' : it.status === 'info' ? 'INFO' : 'BŁĄD';
         const act = ACTIONS[it.action];
         const isRestart = act && act[0] === 'restart_comfy';
         // "Zainstaluj wszystkie": required (errors) AND optional (warnings) that have an install button,
         // not items only waiting for a ComfyUI restart
-        // MiniMax-Remover: future Inpainting module, not used by the program yet -> only its own buttons
         // LTX-2.5: optional stage 6, ~40 GB behind a Hugging Face login -> only its own button
-        const notInBatch = ['minimax_nodes', 'minimax_weights', 'ltx', 'videomama', 'vitmatte', 'sapiens2'];   // BiRefNet required, ViTMatte optional (2026-10-23)
-        if (act && !isRestart && !notInBatch.includes(act[0]) && (it.status === 'error' || it.status === 'warning')
-            && !required.some((r) => r[0] === act[0])) { required.push(act); if (it.status === 'error') nRequired++; }
+        // Cleanup 3D (2026-11-09): FLUX 3 Image Klein (~20 GB, gated), its LoRA Restore and COLMAP – optional, own buttons only
+        const notInBatch = ['ltx', 'videomama', 'vitmatte', 'sapiens2', 'flux3_klein', 'klein_restore_lora', 'qwen21', 'colmap', 'seedvr2', 'void', 'vace', 'vace_lightning', 'ltx_inpaint', 'comfy_update', 'comfy_rollback', 'prompt_assist'];   // BiRefNet required, ViTMatte optional (2026-10-23)
+        // GPU memory on THIS card (engine/vram_fit.py, user 2026-11-10): spill / unstable / does not fit – shown in the
+        // row and in the install question; a model that does not fit never goes into "Zainstaluj wszystkie"
+        const vr = it.vram && it.vram.level !== 'ok' ? it.vram : null;
+        const vrHead = !vr ? '' : vr.level === 'spill' ? 'Przelewa się do RAM-u' : vr.level === 'unstable' ? 'Niestabilnie' : 'Nie zmieści się';
+        const vrEst = vr && vr.basis === 'estimate' ? ' (szacunek)' : '';
+        const vramLine = !vr ? '' : `<br><small style="color:${vr.level === 'spill' ? '#f0a03a' : '#f87171'};" title="${this.esc(vr.why || '')}">⚠ VRAM ${vr.card_gb} GB: ${vrHead} – ${this.esc(vr.text)}${vrEst}</small>`;
+        // own attributes, not glued into data-ask: the install text + licence are translated as one catalog pattern
+        const q = (s) => this.esc(s);
+        const vramAsk = !vr ? '' : ` data-vram-gb="${q(vr.card_gb)}" data-vram-head="${q(vrHead)}" data-vram-text="${q(vr.text)}" data-vram-est="${q(vrEst)}" data-vram-level="${q(vr.level)}"`;
+        if (act && !isRestart && !notInBatch.includes(act[0]) && !(vr && vr.level === 'no') && (it.status === 'error' || it.status === 'warning')
+            && !required.some((r) => r[0] === act[0])) {
+          required.push(vr ? [act[0], `⚠ ${vr.card_gb} GB VRAM: ${vrHead}${vrEst}. ${act[1]}`] : act);
+          if (it.status === 'error') nRequired++;
+        }
         // third-party licence: the user downloads the component and accepts its licence (non-commercial ones highlighted)
         const licEsc = (it.license || '').replace(/"/g, '&quot;');
         const licAsk = it.license ? ` Licencja: ${licEsc}${it.license_nc ? ' (NIE do pracy komercyjnej)' : ''} – pobierając, akceptujesz ją.` : '';
-        const licLine = !it.license ? '' : it.license_nc
+        // license_limited: commercial use only under a condition (FLUX Kommunity: < 5 M USD revenue) – highlighted, own wording
+        const licLine = !it.license ? '' : it.license_limited
+          ? `<br><small style="color:#f0a03a;">⚠ ${it.license}</small>`
+          : it.license_nc
           ? `<br><small style="color:#f87171;">⚠ ${it.license} – tylko niekomercyjnie</small>`
-          : `<br><small style="color:#9a9aa0;">${it.license} – <span style="color:#10b981;">komercyjnie OK</span></small>`;
+          : `<br><small style="color:var(--text-muted);">${it.license} – <span style="color:var(--accent-success);">komercyjnie OK</span></small>`;
         const btn = it.action === 'start_comfy'
-          ? `<br><button class="btn doctor-start-comfy" style="margin-top:4px;padding:2px 10px;font-size:12px;background:#10b981;color:#06281d;font-weight:700;border:0;">▶ Uruchom ComfyUI</button>`
+          ? `<br><button class="btn doctor-start-comfy" style="margin-top:4px;padding:2px 10px;font-size:12px;background:var(--accent-success);color:#06281d;font-weight:700;border:0;">▶ Uruchom ComfyUI</button>`
           : !act ? '' : isRestart
-          ? `<br><button class="btn doctor-install" data-what="restart_comfy" data-ask="${act[1]} Kontynuować?" style="margin-top:4px;padding:2px 10px;font-size:12px;background:#f0703a;color:#111;font-weight:700;border:0;">🔁 Zrestartuj ComfyUI</button>`
-          : `<br><button class="btn btn-primary doctor-install" data-what="${act[0]}" data-ask="${act[1]}${licAsk} Potem ewentualnie restart ComfyUI. Kontynuować?" style="margin-top:4px;padding:2px 10px;font-size:12px;">Zainstaluj</button>`;
-        html += `<tr style="border-bottom:1px solid #303035;">
+          ? `<br><button class="btn doctor-install" data-what="restart_comfy" data-ask="${act[1]} Kontynuować?" style="margin-top:4px;padding:2px 10px;font-size:12px;background:var(--accent-warning);color:#111;font-weight:700;border:0;">🔁 Zrestartuj ComfyUI</button>`
+          : `<br><button class="btn btn-primary doctor-install" data-what="${act[0]}"${vramAsk} data-ask="${act[1]}${licAsk} Potem ewentualnie restart ComfyUI. Kontynuować?" style="margin-top:4px;padding:2px 10px;font-size:12px;">${{ comfy_update: '⟳ Zaktualizuj ComfyUI', comfy_rollback: '↶ Cofnij aktualizację' }[act[0]] || 'Zainstaluj'}</button>`;
+        html += `<tr class="doctor-row" data-module="${this.esc(it.module || 'system')}" data-vram="${it.vram ? this.esc(it.vram.level) : ''}" style="border-bottom:1px solid var(--bg-hover);">
           <td style="padding:6px; font-weight:600; color:${color}; width:60px;">[${tag}]</td>
-          <td style="padding:6px; color:#9a9aa0; width:140px;">${it.name}</td>
-          <td style="padding:6px;">${it.message}${licLine}${it.fix_suggestion ? `<br><small style="color:#f0703a;">Sugestia: ${it.fix_suggestion}</small>` : ''}${(it.links || []).map(l => { const m = l.match(/^(https?:\/\/\S+)(.*)$/); return `<br><small>Pobierz: ${m ? `<a href="${m[1]}" target="_blank" rel="noopener" style="color:#f2bb66;">${m[1]}</a>${m[2]}` : l}</small>`; }).join('')}${btn}</td>
+          <td style="padding:6px; color:var(--text-muted); width:140px;">${this.esc(it.name)}</td>
+          <td style="padding:6px;">${this.esc(it.message)}${licLine}${vramLine}${it.fix_suggestion ? `<br><small style="color:var(--accent-warning);">Sugestia: ${it.fix_suggestion}</small>` : ''}${(it.links || []).map(l => { const m = l.match(/^(https?:\/\/\S+)(.*)$/); return `<br><small>Pobierz: ${m ? `<a href="${m[1]}" target="_blank" rel="noopener" style="color:#f2bb66;">${m[1]}</a>${m[2]}` : l}</small>`; }).join('')}${btn}</td>
         </tr>`;
       }
       html += '</table>';
@@ -1989,7 +2106,7 @@ class MatteDeskViewer {
       }
       // ComfyUI switch: Desktop <-> ComfyUI from git; installs/downloads go to the active one
       try {
-        const cc = await (await fetch('/api/config/comfy')).json();
+        const cc = await window.UI.api('GET', '/api/config/comfy');
         const pf = cc.git || {};
         const dk = cc.desktop || {};
         const da = cc.desktop_auto || {};
@@ -2009,43 +2126,46 @@ class MatteDeskViewer {
             modele: <input id="comfyDeskModels" size="44" value="${q(dk.models_dir)}" placeholder="auto: ${q(da.models_dir || 'nie wykryto')}" ${inp}>
             port: <input id="comfyDeskPort" size="5" value="${q(dk.comfy_port)}" placeholder="${q(da.comfy_port || 8188)}" ${inp}>
             <button class="btn btn-secondary" id="comfyDeskAuto" style="padding:2px 8px;font-size:12px;" title="Czyści pola – ścieżki i port wykrywane automatycznie">Wykryj automatycznie</button>
-            <span style="color:#9a9aa0;">puste pole = wykryte automatycznie</span>
+            <span style="color:var(--text-muted);">puste pole = wykryte automatycznie</span>
           </div>
           <label style="margin-left:10px;"><input type="checkbox" id="comfyAutostart"${cc.autostart === false ? '' : ' checked'}> uruchamiaj ComfyUI razem z MatteDesk</label>
           <label style="margin-left:10px;">okno MatteDesk: <select id="appBrowserSel" ${inp}><option value="default"${cc.app_browser === 'edge' ? '' : ' selected'}>domyślna przeglądarka</option><option value="edge"${cc.app_browser === 'edge' ? ' selected' : ''}>Edge</option></select></label>
           <label style="margin-left:10px;"><input type="checkbox" id="updCheckBox"${cc.update_check === false ? '' : ' checked'}> sprawdzaj aktualizacje MatteDesk przy starcie</label>
           <button class="btn btn-secondary" id="comfySaveBtn" style="margin-left:8px;padding:2px 10px;font-size:12px;">Zapisz</button>
-          <div style="margin-top:6px;color:#9a9aa0;">Aktywny${cc.kind === 'portable' ? ' (ComfyUI portable)' : ''}: ${cc.comfy_dir || '(nie ustawiony)'} · modele: ${cc.models_dir || '-'} · port ${cc.comfy_port}. „Zainstaluj” działa na aktywnym.</div>
+          <div style="margin-top:6px;color:var(--text-muted);">Aktywny${cc.kind === 'portable' ? ' (ComfyUI portable)' : ''}: ${cc.comfy_dir || '(nie ustawiony)'} · modele: ${cc.models_dir || '-'} · port ${cc.comfy_port}. „Zainstaluj” działa na aktywnym.</div>
+          ${await this.weightsDirHtml(inp)}
         </div>` + html;
       } catch (e) { /* config endpoint unavailable: report only */ }
       // ComfyUI restart needed: nodes installed but not loaded yet (or an install asked for it in this session)
-      const nodeNames = ['ComfyUI-PlateMatte', 'ComfyUI-MatAnyone2-Keyframes', 'ComfyUI-MatAnyone2', 'Inpaint LaMa (comfyui-inpaint-nodes)', 'ComfyUI-DepthCrafter-Nodes', 'MiniMax-Remover (wideo)'];
+      const nodeNames = ['ComfyUI-PlateMatte', 'ComfyUI-MatAnyone2-Keyframes', 'ComfyUI-MatAnyone2', 'Inpaint LaMa (comfyui-inpaint-nodes)', 'ComfyUI-DepthCrafter-Nodes'];
       const waiting = data.items.filter((it) => it.details && it.details.needs_restart).map((it) => it.name);
       if (this.comfyRestartPending && data.items.filter((it) => nodeNames.includes(it.name)).every((it) => it.status === 'ok')) this.comfyRestartPending = false;
       if (waiting.length || this.comfyRestartPending) {
-        html = `<div style="margin-bottom:12px;padding:12px;border:2px solid #f0703a;border-radius:6px;background:rgba(240,112,58,.14);">
-          <div style="font-size:15px;font-weight:700;color:#f0703a;">🔁 Zrestartuj ComfyUI</div>
+        html = `<div style="margin-bottom:12px;padding:12px;border:2px solid var(--accent-warning);border-radius:6px;background:rgba(240,112,58,.14);">
+          <div style="font-size:15px;font-weight:700;color:var(--accent-warning);">🔁 Zrestartuj ComfyUI</div>
           <div style="margin-top:4px;">Nowe węzły i ich zależności działają dopiero po restarcie ComfyUI (Desktop: zamknij i otwórz aplikację).
           ${waiting.length ? 'Czekają na restart: <b>' + waiting.join(', ') + '</b>.' : ''} Po restarcie kliknij „Odśwież test”.</div>
-          <button class="btn doctor-install" data-what="restart_comfy" data-ask="Restartuje ComfyUI (przez ComfyUI-Manager) i czeka, aż wstanie (zwykle 30–90 s). Niezapisane zmiany w oknie ComfyUI przepadną. Kontynuować?" style="margin-top:8px;padding:4px 14px;font-size:13px;background:#f0703a;color:#111;font-weight:700;border:0;">🔁 Zrestartuj ComfyUI teraz</button></div>` + html;
+          <button class="btn doctor-install" data-what="restart_comfy" data-ask="Restartuje ComfyUI (przez ComfyUI-Manager) i czeka, aż wstanie (zwykle 30–90 s). Niezapisane zmiany w oknie ComfyUI przepadną. Kontynuować?" style="margin-top:8px;padding:4px 14px;font-size:13px;background:var(--accent-warning);color:#111;font-weight:700;border:0;">🔁 Zrestartuj ComfyUI teraz</button></div>` + html;
       }
       if (this.serverStale) {
-        html = `<div style="margin-bottom:12px;padding:10px;border:2px solid #ef4444;border-radius:6px;background:rgba(239,68,68,.12);font-weight:600;">
+        html = `<div style="margin-bottom:12px;padding:10px;border:2px solid var(--accent-danger);border-radius:6px;background:rgba(239,68,68,.12);font-weight:600;">
           ⚠ ${this.serverStale} Raport może być niepełny (brak przycisków, „port undefined”). Zamknij okno konsoli MatteDesk i uruchom ponownie <code>start_v….bat</code>.</div>` + html;
       }
       // 🗑 weights of optional models (2026-10-23): only weights – nodes / packages stay; required models have no bin
       let removable = [];
-      try { removable = (await (await fetch('/api/models/removable')).json()).models || []; } catch (e) { removable = []; }
+      try { removable = (await window.UI.api('GET', '/api/models/removable')).models || []; } catch (e) { removable = []; }
       const gb = (b) => (b >= 1e9 ? `${(b / 2 ** 30).toFixed(1).replace('.', ',')} GB` : `${Math.max(1, Math.round(b / 2 ** 20))} MB`);
       if (removable.length) {
         html += `<div style="margin-top:14px;padding:10px;border:1px solid #3c3c42;border-radius:6px;font-size:12px;">
-          <b>Zainstalowane modele opcjonalne</b> <span style="color:#9a9aa0;">– 🗑 usuwa tylko wagi (węzły ComfyUI zostają); wymagane modele nie mają kosza. Ponowna instalacja: „Zainstaluj” wyżej.</span>
+          <b>Zainstalowane modele opcjonalne</b> <span style="color:var(--text-muted);">– 🗑 usuwa tylko wagi (węzły ComfyUI zostają); wymagane modele nie mają kosza. Ponowna instalacja: „Zainstaluj” wyżej.</span>
           ${removable.map((m) => `<div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
-            <span style="flex:1;">${this.esc(m.label)} <span style="color:#9a9aa0;">· ${gb(m.bytes)} · ${this.esc(m.affects)}</span></span>
+            <span style="flex:1;">${this.esc(m.label)} <span style="color:var(--text-muted);">· ${gb(m.bytes)} · ${this.esc(m.affects)}</span></span>
             <button class="btn btn-secondary doctor-trash" data-key="${this.esc(m.key)}" style="padding:2px 10px;font-size:12px;" title="Usuń wagi ${this.esc(m.label)} (${gb(m.bytes)}) – przed usunięciem zobaczysz listę plików">🗑 Usuń</button></div>`).join('')}
         </div>`;
       }
       this.doctorReportContent.innerHTML = html;
+      this.wireDoctorFilter();
+      this.wireWeightsDir();
       this.doctorReportContent.querySelectorAll('.doctor-trash').forEach((b) => b.addEventListener('click', async () => {
         const m = removable.find((x) => x.key === b.dataset.key);
         if (!m) return;
@@ -2095,11 +2215,11 @@ class MatteDeskViewer {
       }
       this.doctorReportContent.querySelectorAll('.doctor-start-comfy').forEach((b) => b.addEventListener('click', async () => {
         b.disabled = true; b.textContent = 'Uruchamiam ComfyUI…';
-        const st = await (await fetch('/api/comfy/start', { method: 'POST' })).json();
+        const st = await window.UI.api('POST', '/api/comfy/start').catch((e) => ({ state: 'failed', error: e.message }));
         if (st.state === 'failed') { await this.uiDialog({ title: 'Nie udało się uruchomić ComfyUI', tone: 'error', html: this.esc(st.error || '') }); this.fetchDoctorReport(); return; }
         for (let i = 0; i < 120; i++) {   // up to ~4 min
           await new Promise((r) => setTimeout(r, 2000));
-          const ls = await (await fetch('/api/comfy/launch')).json();
+          const ls = await window.UI.api('GET', '/api/comfy/launch').catch(() => ({ state: 'starting' }));
           b.textContent = `Uruchamiam ComfyUI… ${i * 2 + 2} s`;
           if (ls.state !== 'starting') {
             if (ls.state === 'failed') await this.uiDialog({ title: 'Nie udało się uruchomić ComfyUI', tone: 'error', html: this.esc(ls.error || '') });
@@ -2130,9 +2250,14 @@ class MatteDeskViewer {
       });
       this.doctorReportContent.querySelectorAll('.doctor-install').forEach((b) => b.addEventListener('click', async () => {
         const isRestart = b.dataset.what === 'restart_comfy';
+        // GPU memory warning of this card first (engine/vram_fit.py), translated piece by piece
+        const T = window.mdT || ((s) => s);
+        const d = b.dataset;
+        const vramWarn = !d.vramHead ? '' : `<div style="margin-bottom:8px;padding:6px 8px;border-radius:4px;color:${d.vramLevel === 'spill' ? '#f0a03a' : '#f87171'};border:1px solid currentColor;">`
+          + `${this.esc(T(`⚠ Na tej karcie (${d.vramGb} GB VRAM):`))} <b>${this.esc(T(d.vramHead))}</b> – ${this.esc(T(d.vramText))}${d.vramEst ? ' ' + this.esc(T(d.vramEst.trim())) : ''}</div>`;
         const go = await this.uiDialog({
           title: isRestart ? 'Zrestartować ComfyUI?' : 'Zainstalować?', ok: isRestart ? '🔁 Zrestartuj' : 'Zainstaluj', cancel: 'Anuluj',
-          tone: isRestart ? 'warn' : 'info', html: this.esc(b.dataset.ask.replace(/ (Kontynuować|Continue)\?$/, '')) });
+          tone: isRestart || vramWarn ? 'warn' : 'info', html: vramWarn + this.esc(b.dataset.ask.replace(/ (Kontynuować|Continue)\?$/, '')) });
         if (!go) return;
         b.disabled = true; b.textContent = b.dataset.what === 'restart_comfy' ? 'Restartuję ComfyUI…' : 'Instaluję…';
         try {
@@ -2144,7 +2269,7 @@ class MatteDeskViewer {
         this.fetchDoctorReport();
       }));
     } catch (e) {
-      this.doctorReportContent.innerHTML = `<span style="color:#ef4444;">Błąd pobierania raportu doktora: ${e}</span>`;
+      this.doctorReportContent.innerHTML = `<span style="color:var(--accent-danger);">Błąd pobierania raportu doktora: ${e}</span>`;
     }
   }
 
@@ -2228,7 +2353,8 @@ class MatteDeskViewer {
     this.metricCleanInit.textContent = `R ${b_init.r}% / G ${b_init.g}% / B ${b_init.b}% (p95: ${b_init.p95}%)`;
     this.metricCleanFinal.textContent = `R ${b_final.r}% / G ${b_final.g}% / B ${b_final.b}% (p95: ${b_final.p95}%)`;
     this.metricCleanRedPct.textContent = `${rep.reduction_pct}%`;
-    this.metricCleanNoiseRed.textContent = rep.noise_reduction_pct > 0 ? `${rep.noise_reduction_pct}%` : 'Wyłączone';
+    this.metricCleanNoiseRed.textContent = rep.noise_reduction_pct > 0
+      ? `${rep.noise_reduction_pct}%${rep.denoise_device ? ` (${String(rep.denoise_device).toUpperCase()})` : ''}` : 'Wyłączone';
 
     this.btnExportCleanNk.disabled = !rep.nk_group_path;
     this.btnRunClean.disabled = false;
@@ -2414,7 +2540,7 @@ class MatteDeskViewer {
       if (data.success) {
         this.renderPlatesList(data.plates);
       } else {
-        this.platesListContainer.innerHTML = `<div class="field-hint error">Błąd: ${data.detail || 'Nie udało się wczytać listy płyt'}</div>`;
+        this.platesListContainer.innerHTML = `<div class="field-hint error">Błąd: ${this.esc(data.detail || 'Nie udało się wczytać listy płyt')}</div>`;
       }
     } catch (e) {
       this.platesListContainer.innerHTML = `<div class="field-hint error">Błąd połączenia: ${e}</div>`;
@@ -2476,8 +2602,8 @@ class MatteDeskViewer {
       const header = document.createElement('div');
       header.className = 'plate-card-header';
       header.innerHTML = `
-        <span class="plate-badge ${badgeClass}">${p.name}</span>
-        <span class="plate-title">${p.label || p.name}</span>
+        <span class="plate-badge ${badgeClass}">${this.esc(p.name)}</span>
+        <span class="plate-title">${this.esc(p.label || p.name)}</span>
       `;
 
       const patternEl = document.createElement('div');
@@ -2849,20 +2975,7 @@ class MatteDeskViewer {
     this.loadingMessage.textContent = msg;
   }
 
-  showToast(msg, ms = 3500) {
-    console.log('[MatteDesk]', msg);
-    let t = document.getElementById('mdToast');
-    if (!t) { t = document.createElement('div'); t.id = 'mdToast'; t.className = 'md-toast'; document.body.appendChild(t); }
-    // low on the screen, just above the timeline / job bar where the eye is (user 2026-10-22: the top one was missed)
-    const foot = document.querySelector('.app-footer');
-    const jobBar = document.getElementById('jobBar');
-    const barUp = jobBar && getComputedStyle(jobBar).display !== 'none';
-    t.style.bottom = `${Math.round((foot ? foot.getBoundingClientRect().height : 0) + (barUp ? 56 : 16))}px`;
-    const err = /^\s*(Błąd|Error|⚠|✗|❌)/.test(String(msg));
-    t.classList.toggle('md-toast-err', err);
-    t.textContent = msg; t.style.display = 'block';
-    clearTimeout(this._toastT); this._toastT = setTimeout(() => { t.style.display = 'none'; }, err ? Math.max(ms, 7000) : ms);
-  }
+  showToast(msg, ms = 3500) { window.UI.toast(msg, ms); }
 }
 
 // Initialize on page load

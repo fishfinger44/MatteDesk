@@ -12,12 +12,14 @@ Conventions (Nuke): images are float32 H×W×4 RGBA, premultiplied unless a func
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import cv2
 import numpy as np
 
-from engine.merge_matte_nk import KNOB_DEFAULTS, KNOB_RANGES, PRESET_SH010   # noqa: F401  (one source of knobs)
+from engine import log_curves as lc
+from engine.log_curves import LOG_CURVES   # noqa: F401  (the lin ↔ log curves of the `log_curve` knob)
+from engine.merge_matte_nk import KNOB_DEFAULTS, KNOB_RANGES, PRESET_SH010, normalize_knobs   # noqa: F401  (one source of knobs)
 
 # Nuke Blur (filter gaussian) `size` → gaussian sigma, measured 2026-10-29 in the user's Nuke 15.0v1 (impulse response,
 # second moment, sizes 2.5 / 3 / 5 / 23.2 / 100 → 0.4229 / 0.4237 / 0.4236 / 0.4269 / 0.4250; gaussian shape within 0.4 %
@@ -26,21 +28,10 @@ BLUR_SIGMA_PER_SIZE = 0.4236
 
 REC709 = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
-# ---------------------------------------------------------------- colour spaces (OCIO ACES 1.x, as the group uses them)
-_CCT_A, _CCT_B, _CCT_X0, _CCT_Y0 = 10.5402377416545, 0.0729055341958355, 0.0078125, 0.155251141552511
-
-
-def lin_to_acescct(x: np.ndarray) -> np.ndarray:
-    """OCIOColorSpace ACEScg → ACEScct (same primaries, so a per-channel curve)."""
-    x = np.asarray(x, np.float32)
-    hi = (np.log2(np.maximum(x, 1e-10)) + 9.72) / 17.52
-    return np.where(x <= _CCT_X0, _CCT_A * x + _CCT_B, hi).astype(np.float32)
-
-
-def acescct_to_lin(y: np.ndarray) -> np.ndarray:
-    y = np.asarray(y, np.float32)
-    hi = np.exp2(np.minimum(y, 10.0) * 17.52 - 9.72)
-    return np.where(y <= _CCT_Y0, (y - _CCT_B) / _CCT_A, hi).astype(np.float32)
+# ---------------------------------------------------------------- colour spaces
+# lin ↔ log of the `log_curve` knob: engine/log_curves.py (ACEScct kept under its old names for the callers / tests)
+lin_to_acescct = LOG_CURVES["acescct"].lin_to_log
+acescct_to_lin = LOG_CURVES["acescct"].log_to_lin
 
 
 # sRGB (display PNG plate) ↔ ACEScg, i.e. ACES "Utility - sRGB - Texture": sRGB curve + matrix sRGB → AP1 (D65 → D60 via Bradford).
@@ -101,17 +92,45 @@ def blur_masked(img: np.ndarray, size: float, mask: np.ndarray) -> np.ndarray:
     return blur(img, size) * m + img * (1 - m)
 
 
+FE_SIGMA_PER_SIZE, FE_SIGMA_OFFSET = 0.85, 0.42   # FilterErode gaussian: sigma = 0.85 |size| + 0.42 (fitted 2026-11-06)
+
+
+def fe_sigma(size: float) -> float:
+    return FE_SIGMA_PER_SIZE * abs(float(size)) + FE_SIGMA_OFFSET
+
+
+def _dilate_gauss(a: np.ndarray, sigma: float) -> np.ndarray:
+    """max over y of a(x + y) · exp(−|y|² / 2σ²) – separable (non-negative values: the max of products splits into a
+    row pass and a column pass); outside the image = 0 (never wins); support 4σ (exp(−8) ≈ 3e-4)."""
+    r = int(np.ceil(4 * sigma))
+    out = np.asarray(a, np.float32).copy()
+    for axis in (1, 0):
+        src = out
+        res = src.copy()
+        for d in range(1, r + 1):
+            g = np.float32(np.exp(-d * d / (2.0 * sigma * sigma)))
+            if axis == 1:
+                np.maximum(res[:, d:], src[:, :-d] * g, out=res[:, d:])
+                np.maximum(res[:, :-d], src[:, d:] * g, out=res[:, :-d])
+            else:
+                np.maximum(res[d:], src[:-d] * g, out=res[d:])
+                np.maximum(res[:-d], src[d:] * g, out=res[:-d])
+        out = res
+    return out
+
+
 def filter_erode(a: np.ndarray, size: float) -> np.ndarray:
-    """FilterErode, filter gaussian: size > 0 erodes, < 0 dilates (alpha only).
-    APPROXIMATION (open item, LOCAL_CHECKS): grayscale erosion with a disc of radius `size`. Nuke's FilterErode moves a
-    hard edge by ~1.25 × size (erode 6 → 7.5 px, dilate 6 → 5.5 px, erode 20 → 21.5 px) but barely moves a soft 40 px ramp
-    (erode 6 → 0.4 px); neither blur + levels nor a gaussian non-flat structuring element fits within 0.07 alpha.
-    So the Final Touch preview of `choke` is approximate; every other operation follows Nuke."""
-    r = int(round(abs(size)))
-    if r == 0:
-        return a.copy()
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-    return (cv2.erode if size > 0 else cv2.dilate)(a, k)
+    """FilterErode, filter gaussian: size > 0 erodes, < 0 dilates (alpha only) – Nuke's node 1:1 (2026-11-06,
+    tools/filtererode_probe.py on Nuke 11.1v3: steps, ramps 2–40 px, lines 1–5 px, half-level steps, discs, corners,
+    a 1 px diagonal, sizes ±0.5…±20 – max |Δ| 0.0035 alpha, mean < 1e-4). Dilate = a non-flat gaussian max:
+    max_y a(x + y) · g(y), g = exp(−|y|² / 2σ²), σ = 0.85 |size| + 0.42; erode = 1 − dilate(1 − a). A hard edge gets
+    a gaussian tail, a soft ramp barely moves (its own values beat the attenuated neighbours) – what the earlier disc
+    erosion could not do."""
+    if size == 0:
+        return np.asarray(a, np.float32).copy()
+    a = np.asarray(a, np.float32)
+    s = fe_sigma(size)
+    return _dilate_gauss(a, s) if size < 0 else (1.0 - _dilate_gauss(1.0 - a, s)).astype(np.float32)
 
 
 def keymix(b: np.ndarray, a: np.ndarray, mask: np.ndarray, mix: float = 1.0, channels: str = "rgba") -> np.ndarray:
@@ -198,21 +217,24 @@ def _with_alpha(img: np.ndarray, a: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- the group
-def knobs(overrides: Optional[Mapping[str, float]] = None) -> Dict[str, float]:
-    """Node defaults with `overrides` (unknown names ignored)."""
+def knobs(overrides: Optional[Mapping[str, object]] = None, project_curve: Optional[str] = None) -> Dict[str, object]:
+    """Node defaults with `overrides` (unknown names ignored; the old bool `log` → `log_curve`; `log_curve` = `project`
+    resolved to `project_curve`, ACEScct when None – see merge_matte_nk.normalize_knobs)."""
     k = dict(KNOB_DEFAULTS)
     if overrides:
-        k.update({n: float(v) for n, v in overrides.items() if n in KNOB_DEFAULTS})
+        k.update(normalize_knobs(overrides, project_curve))
     return k
 
 
-def merge_matte(fg: np.ndarray, bg: np.ndarray, k: Optional[Mapping[str, float]] = None) -> np.ndarray:
-    """MergeMatte v01: FG = premultiplied RGBA (scene-linear ACEScg), BG = RGBA (alpha usually 0 for a plain plate /
-    Constant). Returns the comp RGBA (RGB = FG over BG with the edge treatments, scene-linear)."""
+def merge_matte(fg: np.ndarray, bg: np.ndarray, k: Optional[Mapping[str, object]] = None) -> np.ndarray:
+    """MergeMatte v01: FG = premultiplied RGBA (scene-linear), BG = RGBA (alpha usually 0 for a plain plate /
+    Constant). Returns the comp RGBA (RGB = FG over BG with the edge treatments, scene-linear). `log_curve` (an id of
+    engine/log_curves.py, none = linear) = the curve the operations run in."""
     k = knobs(k)
     fg = np.asarray(fg, np.float32).copy()
     bg = np.asarray(bg, np.float32).copy()
-    log = bool(k["log"])
+    curve = lc.get(k["log_curve"])
+    log = curve is not None
 
     # Alpha: choke / expand (FilterErode) + soften (Blur) on the FG alpha
     if k["choke"] != 0 or k["soften"] != 0:
@@ -220,12 +242,12 @@ def merge_matte(fg: np.ndarray, bg: np.ndarray, k: Optional[Mapping[str, float]]
         a = filter_erode(s[..., 3], k["choke"])
         a = blur(a, k["soften"])
         fg = premult(_with_alpha(s, a))
-    # Log: both inputs to ACEScct (FG unpremultiplied around the conversion)
+    # Log: both inputs through the curve (FG unpremultiplied around the conversion)
     if log:
         s = unpremult(fg)
-        s[..., :3] = lin_to_acescct(s[..., :3])
+        s[..., :3] = curve.lin_to_log(s[..., :3])
         fg = premult(s)
-        bg[..., :3] = lin_to_acescct(bg[..., :3])
+        bg[..., :3] = curve.lin_to_log(bg[..., :3])
 
     regular = merge_over(fg, bg)
     fgu = unpremult(fg)                                                   # Dot_decon
@@ -282,7 +304,7 @@ def merge_matte(fg: np.ndarray, bg: np.ndarray, k: Optional[Mapping[str, float]]
         out = regular
     out = bg + (out - bg) * k["mix"]                                      # Dissolve(BG, comp, mix)
     if log:
-        out[..., :3] = acescct_to_lin(out[..., :3])
+        out[..., :3] = curve.log_to_lin(out[..., :3])
     return out
 
 
@@ -340,12 +362,14 @@ PX_KNOBS = ("choke", "soften", "decon_spread", "darken_width", "match_width", "w
 
 
 def context_px(k: Mapping[str, float]) -> int:
-    """How far (px) a pixel of the result depends on its neighbours: 3 sigma of the widest blur in use (+ choke)."""
+    """How far (px) a pixel of the result depends on its neighbours: 3 sigma of the widest blur in use (+ choke's
+    FilterErode reach, 4 σ of its gaussian)."""
     k = knobs(k)
     sizes = [3.0, k["edge_blur"], k["soften"], k["darken_width"] if k["darken"] else 0, k["match_width"] if k["match"] else 0,
              k["decon_spread"] if k["decon"] else 0, 8 * k["wrap_size"] if (k["wrap"] or k["flare"]) else 0,
              8 * k["bleed_size"] if k["bleed"] else 0]
-    return int(np.ceil(3 * BLUR_SIGMA_PER_SIZE * max(sizes) + abs(k["choke"]) + 2))
+    choke = 4 * fe_sigma(k["choke"]) if k["choke"] else 0.0
+    return int(np.ceil(3 * BLUR_SIGMA_PER_SIZE * max(sizes) + choke + 2))
 
 
 def preview_region(plate_srgb: np.ndarray, alpha: np.ndarray, bg_srgb, k: Optional[Mapping[str, float]] = None,
@@ -376,6 +400,66 @@ def preview_region(plate_srgb: np.ndarray, alpha: np.ndarray, bg_srgb, k: Option
     ox, oy = round((x - x0) * s), round((y - y0) * s)
     out = out[oy:oy + max(1, round(h * s)), ox:ox + max(1, round(w * s))]
     return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8), s
+
+
+# ---------------------------------------------------------------- QA: background left in the edge (PLAN_FINAL_TOUCH §11 step 5)
+EDGE_LO, EDGE_HI = 0.05, 0.95        # the edge band: 0.05 < alpha < 0.95
+EDGE_SPREAD = 30.0                   # Blur size (px) of the interior colour spread into the edge
+
+
+def edge_bg(plate_srgb: np.ndarray, alpha: np.ndarray, comp_srgb: np.ndarray, bg_srgb, spread: float = EDGE_SPREAD,
+            comp_alpha: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """„Tło w krawędzi” (as in rik-python): how far the comp's edge is from what a clean edge would show –
+    ideal = α · F + (1 − α) · BG, F = the object's own colour spread from its solid interior (α ≥ 0.95, premult → Blur →
+    unpremult) – on the band 0.05 < α < 0.95, display sRGB 0..1. Old plate background (bright sky) carried by the soft
+    edge shows up here; the signed luminance says whether the edge is brighter (+, a halo) or darker (−) than clean.
+    `comp_alpha` = the alpha the comp really used (MergeMatte's choke / soften) for the ideal; the band and the interior
+    stay those of `alpha`, so before / after are measured on the same pixels.
+    Returns {band_px, mean_abs, luma} (mean_abs / luma in % of full scale; None without a band or an interior)."""
+    a = np.clip(np.asarray(alpha, np.float32), 0, 1)
+    band = (a > EDGE_LO) & (a < EDGE_HI)
+    solid = (a >= EDGE_HI).astype(np.float32)
+    n = int(band.sum())
+    if n == 0 or solid.sum() == 0:
+        return {"band_px": n, "mean_abs": None, "luma": None}
+    pl = np.asarray(plate_srgb, np.float32)[..., :3]
+    num = blur(pl * solid[..., None], spread)
+    den = blur(solid, spread)[..., None]
+    f = np.where(den > 1e-3, num / np.maximum(den, 1e-3), pl)
+    bg = np.asarray(bg_srgb, np.float32)
+    bg = np.broadcast_to(bg.reshape(1, 1, 3) if bg.ndim == 1 else bg[..., :3], pl.shape)
+    ca = a if comp_alpha is None else np.clip(np.asarray(comp_alpha, np.float32), 0, 1)
+    ideal = ca[..., None] * f + (1 - ca[..., None]) * bg
+    d = np.asarray(comp_srgb, np.float32)[..., :3] - ideal
+    db = d[band]
+    return {"band_px": n, "mean_abs": round(float(np.abs(db).mean()) * 100, 2),
+            "luma": round(float((db * REC709).sum(-1).mean()) * 100, 2)}
+
+
+def edge_bg_region(plate_srgb: np.ndarray, alpha: np.ndarray, bg_srgb, k: Optional[Mapping[str, object]] = None,
+                   rect: Optional[tuple] = None, max_px: int = 2_500_000) -> Dict[str, Any]:
+    """„Tło w krawędzi” of a region before (a plain Merge over = the neutral knobs) and after MergeMatte with `k` – the
+    same pixels as preview_region (scaled down the same way when the region is large)."""
+    H, W = alpha.shape[:2]
+    x, y, w, h = rect if rect else (0, 0, W, H)
+    x, y = max(0, int(x)), max(0, int(y))
+    w, h = max(1, min(int(w), W - x)), max(1, min(int(h), H - y))
+    neutral = {**KNOB_DEFAULTS, "log_curve": lc.NONE}
+    before, s = preview_region(plate_srgb, alpha, bg_srgb, neutral, (x, y, w, h), max_px)
+    after, _ = preview_region(plate_srgb, alpha, bg_srgb, k, (x, y, w, h), max_px)
+    sz = (before.shape[1], before.shape[0])
+    rs = (lambda im: im) if s >= 1.0 else (lambda im: cv2.resize(im, sz, interpolation=cv2.INTER_AREA))
+    pl = rs(np.ascontiguousarray(plate_srgb[y:y + h, x:x + w]))
+    a = rs(np.ascontiguousarray(alpha[y:y + h, x:x + w]))
+    b = np.asarray(bg_srgb, np.float32)
+    b = rs(np.ascontiguousarray(b[y:y + h, x:x + w])) if b.ndim == 3 else b
+    sp = EDGE_SPREAD * s
+    kk = knobs(k)
+    a2 = a   # the alpha MergeMatte composes with: choke (FilterErode port) + soften, px knobs at the preview's scale
+    if kk["choke"] != 0 or kk["soften"] != 0:
+        a2 = blur(filter_erode(a, kk["choke"] * s), kk["soften"] * s)
+    return {"before": edge_bg(pl, a, before.astype(np.float32) / 255, b, sp),
+            "after": edge_bg(pl, a, after.astype(np.float32) / 255, b, sp, comp_alpha=a2), "scale": round(s, 6)}
 
 
 def checker_srgb(h: int, w: int, cell: int = 16) -> np.ndarray:

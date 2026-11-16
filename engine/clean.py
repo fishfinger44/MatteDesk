@@ -9,22 +9,21 @@ Complies with SPEC_INTERACTIVE_MATTE_TOOL.md (Section 4c, 4c.1-4c.5, 12: Stage E
   3. Detail / shading band (2-40 px) with DIS optical flow & homography (deflicker_detail_mc.py)
   4. Global scalar per-channel correction (deflicker_global_mc.py)
 - Flow-aligned flicker metric (measure_flow.py logic)
-- Temporal motion-compensated denoising with noise residual export (4c.2)
+- Temporal motion-compensated denoising with noise residual export (4c.2); on the GPU per `denoise_device`
+  (engine/denoise_gpu.py, 2026-11-10 – this CPU code is the reference and the fallback)
 - Standalone Nuke Group Deflicker_<plate>.nk generator (4c.4)
 - Full preservation of HDR linear values, OpenEXR channels, compression, and metadata (4c.3)
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -73,6 +72,9 @@ class CleanReport:
     nk_group_path: str = ""
     gain_map_pattern: str = ""
     export_dir: str = ""
+    denoise_device: str = ""   # "gpu" | "cpu" when the denoise ran, "" otherwise
+    denoise_note: str = ""
+    denoise_fell_back: bool = False   # the GPU worker failed during the run, the rest was computed on the CPU
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -90,7 +92,10 @@ class CleanReport:
             "date": self.date,
             "nk_group_path": self.nk_group_path,
             "gain_map_pattern": self.gain_map_pattern,
-            "export_dir": self.export_dir
+            "export_dir": self.export_dir,
+            "denoise_device": self.denoise_device,
+            "denoise_note": self.denoise_note,
+            "denoise_fell_back": self.denoise_fell_back
         }
 
 
@@ -945,20 +950,12 @@ class DenoiseEngine:
         spatial_sigma: float = 1.0,
         luminance_weight: float = 0.5
     ) -> Callable[[int], Tuple[np.ndarray, np.ndarray]]:
-        """Denoise of one frame: fn(i) -> (denoised, residual), reads only frames[i - radius .. i + radius]."""
+        """Denoise of one frame: fn(i) -> (denoised, residual), reads only frames[i - radius .. i + radius].
+        The GPU twin (engine/denoise_gpu.py) shares the flow input (`flow_gray`) and mirrors the rest per pixel."""
         n = len(frames)
         h, w = frames[0].shape[:2]
         gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-
-        # Convert to small luma for fast flow
-        lw = min(1024, w)
-        lh = round(h * lw / w)
-        sx, sy = w / lw, h / lh
-
-        def _gray(f: np.ndarray) -> np.ndarray:
-            sm = np.maximum(cv2.resize(f, (lw, lh), interpolation=cv2.INTER_AREA), 0.0)
-            lg = np.log(sm.mean(axis=2) + 0.01) if sm.ndim == 3 else np.log(sm + 0.01)
-            return cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _gray, sx, sy, _lw, _lh = DenoiseEngine.flow_gray(w, h)
 
         def _frame(i: int) -> Tuple[np.ndarray, np.ndarray]:
             dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)   # one per call: not shared between threads
@@ -999,6 +996,20 @@ class DenoiseEngine:
             return filtered, cur - filtered
 
         return _frame
+
+    @staticmethod
+    def flow_gray(w: int, h: int) -> Tuple[Callable[[np.ndarray], np.ndarray], float, float, int, int]:
+        """(gray(frame) -> uint8 log luma at <= 1024 px for the DIS flow, sx, sy, lw, lh): the flow's input and the
+        factors from flow scale back to full resolution."""
+        lw = min(1024, w)
+        lh = round(h * lw / w)
+
+        def _gray(f: np.ndarray) -> np.ndarray:
+            sm = np.maximum(cv2.resize(f, (lw, lh), interpolation=cv2.INTER_AREA), 0.0)
+            lg = np.log(sm.mean(axis=2) + 0.01) if sm.ndim == 3 else np.log(sm + 0.01)
+            return cv2.normalize(lg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        return _gray, w / lw, h / lh, lw, lh
 
 
 # -----------------------------------------------------------------------------
@@ -1142,7 +1153,9 @@ class PlateCleaner:
         stage3_radius: int = 4,
         stage1_sigma: float = 4.0,
         stage4_luma: bool = False,
-        stage1_content_check: float = 0.5
+        stage1_content_check: float = 0.5,
+        denoise_device: Optional[str] = None,
+        cancel_check: Optional[Callable[[], None]] = None
     ) -> Tuple[Optional[Sequence[np.ndarray]], Sequence[np.ndarray], CleanReport, Optional[List[np.ndarray]]]:
         """Runs the deflicker and optional denoise pipeline on a list of image frames.
 
@@ -1156,6 +1169,9 @@ class PlateCleaner:
         streamed – computed in small blocks, handed to the sink and dropped (a 4K sequence never sits in RAM) – and
         cleaned_frames / noise_residuals come back as None. Without a sink they are returned as lists (tests, small
         sequences).
+        `denoise_device` auto | gpu | cpu (None = env MD_DENOISE_DEVICE / config `denoise_device`): where the
+        denoise runs (engine/denoise_gpu.py; gpu = the same result within float rounding); `cancel_check` is polled
+        while the GPU worker computes ("Przerwij").
 
         Returns:
             (cleaned_frames, combined_gain_maps, report, noise_residuals)
@@ -1245,6 +1261,7 @@ class PlateCleaner:
         residuals = None
         noise_red = 0.0
         flicker_final = None
+        dn_stage = None
         if enable_stage3 or enable_denoise:
             r3 = min(int(stage3_radius), max(1, n // 4))
             fb = h * w * 3 * 4   # one full-res float32 frame
@@ -1255,7 +1272,10 @@ class PlateCleaner:
                 stages.append((r3, lambda inp: DeflickerEngine.stage3_frame_fn(inp, homographies, r3), clean_workers(fb * 16)))
                 stages_applied.append("stage3_detail_mc")
             if enable_denoise:
-                stages.append((2, lambda inp: DenoiseEngine.denoise_frame_fn(inp, radius=2), clean_workers(fb * 12)))
+                from engine.denoise_gpu import DenoiseStage
+                dn_stage = DenoiseStage(denoise_device, radius=2, cpu_workers=clean_workers(fb * 12),
+                                        cancel_check=cancel_check)
+                stages.append((2, dn_stage.make, dn_stage.workers))
                 stages_applied.append("denoise_mc")
             eval_w = 1024
             eval_size = (eval_w, round(h * eval_w / w))
@@ -1289,7 +1309,11 @@ class PlateCleaner:
                                 75 + int(23 * done[0] / n), 100)
 
             block = max(st[2] for st in stages)
-            stream_pixel_stages(n, stages, emit, block, on_value)
+            try:
+                stream_pixel_stages(n, stages, emit, block, on_value)
+            finally:
+                if dn_stage is not None:
+                    dn_stage.close()
             if enable_denoise:
                 var_before = DeflickerMetrics.measure_temporal_variance([var_in[i] for i in range(n)])
                 var_after = DeflickerMetrics.measure_temporal_variance([var_out[i] for i in range(n)])
@@ -1328,7 +1352,10 @@ class PlateCleaner:
             frames_count=n,
             plate_w=w,
             plate_h=h,
-            date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            denoise_device=dn_stage.device if dn_stage is not None else "",
+            denoise_note=dn_stage.note if dn_stage is not None else "",
+            denoise_fell_back=bool(dn_stage is not None and dn_stage.fell_back)
         )
 
         return cur_frames, combined_gains, report, residuals

@@ -116,11 +116,18 @@ def _wired(title: str, name: str, x: int, y: int) -> List[str]:
 
 def mattes_nk(outputs: Dict[str, Any], shot: str, first: int, last: int, w: int, h: int,
               date: Optional[str] = None, channels: Optional[Sequence[str]] = None,
-              merge: Optional[Dict[str, Any]] = None) -> str:
+              merge: Optional[Dict[str, Any]] = None, ft: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
     """Script text from an outputs.json dict (objects[], groups{}, mattes_all). `channels` (multi-EXR layer names,
     default: objects in depth order + <parent>_full + union [+ depth]) is what the multi-EXR really contains.
     `merge` = {"plate": pattern, "colorspace": manifest colorspace, "objects": {name: MergeMatte knobs}} adds the backdrop
-    MERGEMATTE under MASKI (plan PLAN_FINAL_TOUCH §11; `merge_matte_backdrop`)."""
+    MERGEMATTE under MASKI (plan PLAN_FINAL_TOUCH §11; `merge_matte_backdrop`).
+    `ft` = {object: spec of engine/ft_nuke (mode grade | paint, frames, finish, base, front)}: that object's column
+    reads its Final Touch base sequence and rebuilds the corrections as live nodes before the anchor (ft_nuke_specs);
+    its channel in the multi-EXR stays the baked matte."""
+    from engine.ft_nuke import NODE_DY, chain_lines, chain_rows
+    ft = {n: sp for n, sp in (ft or {}).items() if sp.get("base")}
+    dy = max([chain_rows(sp) for sp in ft.values()] or [0]) * NODE_DY   # the anchors of every column move down together
+    ya, yst = Y_ANCHOR + dy, Y_STAMP + dy
     date = date or datetime.now().strftime("%Y-%m-%d %H:%M")
     objs = sorted(outputs.get("objects", []), key=lambda o: o.get("depth_order", 0))
     groups = outputs.get("groups", {}) or {}
@@ -151,7 +158,7 @@ def mattes_nk(outputs: Dict[str, Any], shot: str, first: int, last: int, w: int,
                   f" name Read_{_nk_name(shot)}_mattes", f" label {_q('multi-EXR · ' + date)}", f" xpos {x0}", f" ypos {Y_READ}", "}"]
         nodes_xy.append((x0, Y_READ))
         prev_dot = None
-        for c in channels:
+        for c in [c for c in channels if c not in ft]:
             x = x0 + col * COL_W
             dot = f"Dot_{_nk_name(c)}"
             if prev_dot is not None:
@@ -167,28 +174,34 @@ def mattes_nk(outputs: Dict[str, Any], shot: str, first: int, last: int, w: int,
             lines += ["Shuffle2 {", " fromInput1 {{0} B}", f" in1 {in1}", " fromInput2 {{0} B}", f' mappings "4 {maps}"',
                       f" name MATTE_{_nk_name(c)}", f" label {_q(label)}", f" xpos {x}", f" ypos {Y_SHUF}", "}"]
             nodes_xy.append((x, Y_SHUF))
-            lines += _anchor(c, x, Y_ANCHOR, label)
-            nodes_xy += [(x, Y_ANCHOR), (x, Y_STAMP)]
+            lines += _anchor(c, x, ya, label)
+            nodes_xy += [(x, ya), (x, yst)]
             prev_dot = dot
             col += 1
     # objects / wholes exported without the multi-EXR: their own Read
     in_multi = set(channels) if multi else set()
-    singles = [(o["name"], o.get("matte"), o.get("version", "")) for o in objs if o["name"] not in in_multi and o.get("matte")]
+    singles = [(o["name"], ft[o["name"]]["base"] if o["name"] in ft else o.get("matte"), o.get("version", ""))
+               for o in objs if (o["name"] not in in_multi or o["name"] in ft) and o.get("matte")]
     singles += [(f"{p}_full", g.get("matte"), "") for p, g in groups.items() if f"{p}_full" not in in_multi and g.get("matte")]
     for name, path, ver in singles:
         x = x0 + col * COL_W
         label = " · ".join(v for v in (ver, date) if v)
+        sp = ft.get(name)
+        rlabel = f"Final Touch – baza{' + kreski' if sp and sp.get('mode') == 'grade' else ''} · {label}" if sp else label
         lines += ["Read {", " inputs 0", f" file {_q(path)}", f" format {fmt}", f" first {first}", f" last {last}",
                   f" origfirst {first}", f" origlast {last}", " origset true", " raw true", " on_error black",
-                  f" name Read_{_nk_name(name)}", f" label {_q(label)}", f" xpos {x}", f" ypos {Y_READ}", "}"]
+                  f" name Read_{_nk_name(name)}", f" label {_q(rlabel)}", f" xpos {x}", f" ypos {Y_READ}", "}"]
         nodes_xy.append((x, Y_READ))
         # single-object EXR carries the matte in rgb (no alpha) -> red into all four, like the multi-EXR columns
         maps = " ".join(f"rgba.red 0 0 rgba.{d} 0 {i}" for i, d in enumerate(("red", "green", "blue", "alpha")))
         lines += ["Shuffle2 {", " fromInput1 {{0} B}", " fromInput2 {{0} B}", f' mappings "4 {maps}"',
                   f" name MATTE_{_nk_name(name)}", f" label {_q(label)}", f" xpos {x}", f" ypos {Y_SHUF}", "}"]
         nodes_xy.append((x, Y_SHUF))
-        lines += _anchor(name, x, Y_ANCHOR, label)
-        nodes_xy += [(x, Y_ANCHOR), (x, Y_STAMP)]
+        if sp:
+            lines += chain_lines(sp, name, _nk_name(name), x, Y_SHUF + NODE_DY, w, h, fmt, first, last, label)
+            nodes_xy += [(x, Y_SHUF + NODE_DY * chain_rows(sp))] + ([(x + 140, Y_SHUF)] if sp.get("front") else [])
+        lines += _anchor(name, x, ya, label)
+        nodes_xy += [(x, ya), (x, yst)]
         col += 1
     if not nodes_xy:
         nodes_xy = [(0, 0)]
@@ -284,8 +297,9 @@ def nk_nodes(text: str) -> List[Dict[str, Any]]:
 
 
 def write_mattes_nk(path: Path, outputs: Dict[str, Any], shot: str, first: int, last: int, w: int, h: int,
-                    channels: Optional[Sequence[str]] = None, merge: Optional[Dict[str, Any]] = None) -> Path:
+                    channels: Optional[Sequence[str]] = None, merge: Optional[Dict[str, Any]] = None,
+                    ft: Optional[Dict[str, Dict[str, Any]]] = None) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(mattes_nk(outputs, shot, first, last, w, h, channels=channels, merge=merge), encoding="utf-8")
+    path.write_text(mattes_nk(outputs, shot, first, last, w, h, channels=channels, merge=merge, ft=ft), encoding="utf-8")
     return path

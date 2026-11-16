@@ -167,6 +167,18 @@ class MediaInspector:
                     "source_type": "video"
                 }
 
+        if ext == ".dpx":                      # engine/dpx.py: the header's depth and transfer (log / linear)
+            from engine import dpx
+            try:
+                i = dpx.info(sample_file)
+                return {"width": i["width"], "height": i["height"], "channels": i["channels"],
+                        "bit_depth": int(i["bits"]), "colorspace": "sRGB", "source_type": "img_seq",
+                        "dpx_transfer": i["transfer_name"], "dpx_log": bool(i["log"]),
+                        "note": ("DPX w logu (Cineon / gęstość kopii) – wartości są czytane bez konwersji; "
+                                 "ustaw przestrzeń kolorów projektu") if i["log"] else ""}
+            except (OSError, ValueError):
+                pass
+
         # Standard image fallback
         img = cv2.imread(sample_file, cv2.IMREAD_UNCHANGED)
         if img is not None:
@@ -258,7 +270,6 @@ def _ffmpeg_bin(name: str = "ffmpeg") -> str:
 
 def probe_video(path: Union[str, Path]) -> Dict[str, Any]:
     """Resolution, fps, frame count, bit depth and colour hints from the file header (ffprobe)."""
-    import subprocess
     out = subprocess.run([_ffmpeg_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-count_packets",
                           "-show_entries", "stream=width,height,r_frame_rate,nb_read_packets,pix_fmt,bits_per_raw_sample,"
                           "color_space,color_transfer,color_primaries", "-of", "json", str(path)],
@@ -276,7 +287,6 @@ def probe_video(path: Union[str, Path]) -> Dict[str, Any]:
 def decode_video(path: Union[str, Path], out_dir: Union[str, Path], first_frame: int = 1) -> Dict[str, Any]:
     """Video -> image sequence in the shot work folder (SPEC 1.0): PNG 8-bit for 8-bit sources, PNG 16-bit
     otherwise; frame numbers from `first_frame`. Returns probe info + `pattern`."""
-    import subprocess
     info = probe_video(path)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -479,7 +489,8 @@ class ProjectCreator:
             "colorspace": colorspace,
             "source_type": source_type,
             "bit_depth": bit_depth,
-            "shutter_deg": self.defaults.get("project", {}).get("shutter_deg", 180),
+            # no shutter_deg: the wizard never measured it (it used to write the 180 default) – engine/shutter.py
+            # measures it on the plate into project.json; a manifest that states one is still honoured
             "plates": {
                 "beauty": beauty_pattern,
                 "backlit": backlit_pattern,

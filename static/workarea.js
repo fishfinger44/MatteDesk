@@ -30,15 +30,17 @@
     };
     // frame number next to each bracket (user request 2026-10-16), inside the range so the track does not clip it
     for (const h of [W.els.hL, W.els.hR]) { const s = document.createElement('span'); s.className = 'wa-num'; h.appendChild(s); }
+    // pointer events + capture: a tablet pen drags the brackets too (user report 2026-11-15, as the playhead in app.js)
     const start = (side) => (e) => {
       if (e.button !== 0) return;
       e.stopPropagation(); e.preventDefault();
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (er) { /* capture unsupported */ }
       W.drag = { side, r: (W.range || W.shot).slice() };
     };
-    W.els.hL.addEventListener('mousedown', start(0));
-    W.els.hR.addEventListener('mousedown', start(1));
+    W.els.hL.addEventListener('pointerdown', start(0));
+    W.els.hR.addEventListener('pointerdown', start(1));
     for (const h of [W.els.hL, W.els.hR]) h.addEventListener('dblclick', (e) => { e.stopPropagation(); save(null); });
-    window.addEventListener('mousemove', (e) => {
+    window.addEventListener('pointermove', (e) => {
       if (!W.drag) return;
       const v = V(); const rect = track.getBoundingClientRect();
       const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -47,7 +49,7 @@
       if (W.drag.side === 0) r[0] = Math.min(f, r[1]); else r[1] = Math.max(f, r[0]);
       render(r);
     });
-    window.addEventListener('mouseup', () => {
+    window.addEventListener('pointerup', () => {
       if (!W.drag) return;
       const r = W.drag.r; W.drag = null;
       save(r);

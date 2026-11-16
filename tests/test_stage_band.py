@@ -135,3 +135,22 @@ def test_stage3_lines_read_the_mask12_written_after_the_core(tmp_path, monkeypat
     assert r.status_code == 200, r.text
     assert pipe.write_mask12("obj", frames) is None
     assert pipe._mask12_disk("obj", start) is None
+
+
+def test_band_past_the_computed_core_is_a_note_not_an_error(tmp_path, monkeypatch):
+    """User report 2026-11-06: a frame past the SAM 3.1 core (core F1-60, frame 140) – the zone area gave 409 (the UI
+    retried it 20x, then an error window) and a band point was stored there, never tracked. Now: the area answers
+    `outside` (200, no contours), a new point / key there is refused with the same reason."""
+    app_module, api, shot, pipe, frames, start = _proj(tmp_path, monkeypatch)
+    last = max(frames)
+    (pipe.store.dir("obj") / "core" / f"c_{last:04d}.png").unlink()       # the core ends one frame earlier
+    body = {"mode": "add", "criterion": "matte", "frame": start, "polygon": [], "matting": "vitmatte", "preset": "hair",
+            "params": {"region": "outline", "outline_out_px": 6, "temporal": "none"}}
+    zid = api.post("/api/object/obj/zones/new", json=body).json()["zone"]["zone_id"]
+    r = api.get(f"/api/object/obj/zones/{zid}/region/{last}")
+    assert r.status_code == 200, r.text
+    assert r.json()["contours"] == [] and f"F{last} poza policzonym rdzeniem SAM 3.1" in r.json()["outside"]
+    assert "outside" not in api.get(f"/api/object/obj/zones/{zid}/region/{start}").json()
+    r = api.put(f"/api/object/obj/stage_band/zone:{zid}/{last}", json={"x": 10.0, "y": 10.0})
+    assert r.status_code == 409 and "poza policzonym rdzeniem" in r.json()["detail"]
+    assert api.get(f"/api/object/obj/zones/{zid}/band/{start}").json()["points"] == []    # nothing stored
