@@ -25,7 +25,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 KINDS = ("main", "linked", "own", "original", "projection")
 ID_RE = re.compile(r"^a[0-9a-f]{6}$")
@@ -70,6 +70,66 @@ def main_of(anchors: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 def is_transition(anchors: List[Dict[str, Any]]) -> bool:
     return any(a["kind"] in ("own", "original") for a in anchors)
+
+
+# MiniMax-H3 packs the clip's frames into latent tokens of 1, 4, 4, 4, 4 frames, repeated every 17 frames
+# (FRAME_PER_TOKEN[k % 5] of comfy/ldm/minimax/model.py): frames 0 | 1-4 | 5-8 | 9-12 | 13-16 | 17 | 18-21 … of the
+# range. An anchor is a conditioning image the
+# model attends to (MiniMaxH3AddGuide), not pasted pixels – the 4 frames of a token come out of ONE latent, so two
+# anchors in the same token cannot both hold: the model follows one, the other's frame is an in-between (user test
+# 2026-11-16, a test shot, v004: F2 + F5 linked, the earring came back in F2 – |model − anchor| 18.3 vs 4.9 at F5).
+FRAME_PER_TOKEN = (1, 4, 4, 4, 4)   # comfy/ldm/minimax/model.py
+CYCLE_FRAMES = sum(FRAME_PER_TOKEN)  # 17
+
+
+def token_spans(length: int) -> List[Tuple[int, int]]:
+    """[(first, last) clip frame index] of every latent token of a clip of `length` frames (17k + 5)."""
+    out, i, k = [], 0, 0
+    while i < int(length):
+        n = FRAME_PER_TOKEN[k % 5]
+        out.append((i, min(i + n, int(length)) - 1))
+        i, k = i + n, k + 1
+    return out
+
+
+def h3_token(idx: int) -> int:
+    """The latent token of the clip frame index `idx` (0 = the range's first frame, a token of its own)."""
+    c, r = divmod(max(0, int(idx)), CYCLE_FRAMES)
+    return 5 * c + (0 if r == 0 else (r - 1) // 4 + 1)
+
+
+def h3_token_span(token: int, frames: List[int]) -> List[int]:
+    """[first, last] plate frame of a token within the work range."""
+    c, r = divmod(int(token), 5)
+    lo = c * CYCLE_FRAMES + (0 if r == 0 else (r - 1) * 4 + 1)
+    hi = lo if r == 0 else lo + 3
+    return [frames[min(lo, len(frames) - 1)], frames[min(hi, len(frames) - 1)]]
+
+
+def token_clashes(anchors: List[Dict[str, Any]], frames) -> List[Dict[str, Any]]:
+    """Groups of 2+ anchors that fall into the same MiniMax-H3 token of the work range `frames` (sorted plate frames):
+    [{token, frames: [F…], ids: [...], span: [Fa, Fb]}]. Anchors outside the range are ignored."""
+    frames = [int(f) for f in frames]
+    pos = {f: i for i, f in enumerate(frames)}
+    by: Dict[int, List[Dict[str, Any]]] = {}
+    for a in anchors or []:
+        f = int(a.get("frame", -1))
+        if f in pos:
+            by.setdefault(h3_token(pos[f]), []).append(a)
+    out = []
+    for t in sorted(by):
+        grp = sorted(by[t], key=lambda a: int(a["frame"]))
+        if len(grp) > 1:
+            out.append({"token": t, "frames": [int(a["frame"]) for a in grp], "ids": [a["id"] for a in grp],
+                        "span": h3_token_span(t, frames)})
+    return out
+
+
+def clash_note(c: Dict[str, Any]) -> str:
+    """The warning of one clash (run notes, palette)."""
+    fs = ", ".join(f"F{f}" for f in c["frames"])
+    return (f"Kotwice {fs} w jednym tokenie MiniMax-H3 (F{c['span'][0]}–F{c['span'][1]}): model utrzyma tylko jedną, "
+            f"pozostałe klatki tego tokenu wyjdą pośrednie – zostaw jedną albo przesuń do innej czwórki klatek")
 
 
 def morphs(s: Dict[str, Any], anchors: List[Dict[str, Any]]) -> bool:

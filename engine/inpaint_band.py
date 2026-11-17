@@ -90,7 +90,7 @@ def state(s: Dict[str, Any], frame: int, remove_alphas: Alphas, b=None) -> Dict[
 
 def lines(alphas: Sequence[np.ndarray], grow_px: float, soft_px: float,
           pts: Optional[Sequence[Tuple[float, ...]]] = None, scale: float = 1.0,
-          limit_px: Optional[float] = None) -> Dict[str, Any]:
+          limit_px: Optional[float] = None, limit_alphas: Optional[Sequence[np.ndarray]] = None) -> Dict[str, Any]:
     """The preview lines of the C1 band of one frame (plate px): `band_contours` = the band ring (the objects' outline and
     the band's outer edge, where the solid patch ends), `feather_contours` = where the soft edge ends (the patch reaches
     0) – the same geometry as engine/cleanup.removal_mask, measured on a grid `scale` × the plate (lines scaled back).
@@ -128,9 +128,18 @@ def lines(alphas: Sequence[np.ndarray], grow_px: float, soft_px: float,
         L["band_contours"] = bandsys.contours(solid if solid.any() and not (solid == hard).all() else hard, cv2.RETR_CCOMP)
     cut = None
     if limit_px is not None and hard.any():
-        dl = cv2.distanceTransform((~hard).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        lh = hard   # `limit_alphas` = the masks the engine combines for this frame (cleanup.model_frames), else this one
+        if limit_alphas:
+            la = [np.asarray(a, np.float32) for a in limit_alphas]
+            if scale != 1.0:
+                la = [cv2.resize(a, (hard.shape[1], hard.shape[0]), interpolation=cv2.INTER_AREA) for a in la]
+            lh = hard | (np.max(np.stack(la), axis=0) > 0.02)
+        dl = cv2.distanceTransform((~lh).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         lim = dl <= float(limit_px) * scale + 0.5
         L["limit_contours"] = bandsys.contours(lim, cv2.RETR_CCOMP)
+        if lh is not hard:   # `cut` = the composite's own limit: this frame's area (cleanup.comp_mask_fn), not the token's
+            dl = cv2.distanceTransform((~hard).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+            lim = dl <= float(limit_px) * scale + 0.5
         cut = bool(((full if full is not None else solid) & ~lim).any())
     k = 1.0 / max(scale, 1e-9)
     out: Dict[str, Any] = {key: [[[round(x * k, 1), round(y * k, 1)] for x, y in c] for c in v] for key, v in L.items()}

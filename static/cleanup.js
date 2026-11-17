@@ -460,7 +460,7 @@
     if (window.viewer) window.viewer.render();
   }
   function keptToCut(n) {   // „→ Wycinanie”: cutting mode with that object selected (fix its mask, e.g. Final Touch)
-    setMode('cut');
+    setMode('cut', false);   // that object, not the cleaned thing
     if (window.MD && window.MD.selectObject) window.MD.selectObject(n);
   }
 
@@ -846,7 +846,12 @@
         ctx.restore();
       }
       cv.dataset.frame = String(f);
-      cv.title = `Maska F${f} – klik = duży podgląd (zoom, przesuwanie); czerwień = łata, przerywane linie = krawędź pasa i koniec wtopienia, niebieska ciągła i jasnoniebieskie tło = to, co narysuje model (pas generowania + rozrost silnika)${lines && lines.cut ? ' (pas ucięty na niej)' : ''}`;
+      // what the model's mask of this frame is made of (user 2026-11-16, per model): MiniMax-H3 = its whole latent token
+      // (4 frames drawn from one latent) ±2 frames, the other video models = this frame ±2 (cleanup.model_frames)
+      const tk = lines && lines.h3_token, mf = lines && lines.model_frames;
+      cv.dataset.modelNote = tk ? ` MiniMax-H3 maskuje klatki F${tk[0]}–F${tk[1]} jednym tokenem latentu, więc jego maska tej klatki = suma masek F${mf[0]}–F${mf[1]} (token ± 2 klatki).`
+        : mf && mf[0] !== mf[1] ? ` Maska modelu tej klatki = suma masek F${mf[0]}–F${mf[1]} (± 2 klatki).` : '';
+      cv.title = `Maska F${f} – klik = duży podgląd (zoom, przesuwanie); czerwień = łata, przerywane linie = krawędź pasa i koniec wtopienia, niebieska ciągła i jasnoniebieskie tło = to, co narysuje model (pas generowania + rozrost silnika)${lines && lines.cut ? ' (pas ucięty na niej)' : ''}.${cv.dataset.modelNote}`;
     } catch (e) { window.UI.toast(`Maska F${f}: ${e.message || e}`, 6000); }
   }
   function loadImg(u) {
@@ -982,10 +987,25 @@
       if (mode === 'clean') load().then(() => { if (C.info && !target() && md && md.S && md.S.obj) pick(md.S.obj); });
     }, 0);
   });
-  function setMode(m) {
+  function setMode(m, follow = true) {
+    const was = mode;
     mode = m === 'clean' ? 'clean' : 'cut';
     try { localStorage.setItem(KEY, mode); } catch (e) { /* storage blocked */ }
     apply();
+    if (follow && was !== mode) followSelection();
+  }
+  // the same object in both modes (user 2026-11-17): a switch Wycinanie -> Czyszczenie picks the cut-out selection
+  // for cleaning, Czyszczenie -> Wycinanie selects the cleaned thing. A member of the cleaned group counts as the same
+  // (cleaning takes its whole group), so nothing changes then. Only on a real switch – a page reload keeps the saved target.
+  const sameThing = (sel, tgt) => !!sel && !!tgt && (sel === tgt || ((objOf(sel) || {}).group || null) === tgt);
+  function followSelection() {
+    const md = window.MD; if (!md || !md.S) return;
+    if (mode === 'clean') {
+      load().then(() => { const sel = md.S.obj; if (C.info && sel && !sameThing(sel, target())) pick(sel); });
+    } else {
+      const tgt = target(); const sel = md.S.obj;
+      if (tgt && !sameThing(sel, tgt) && md.selectObject && (md.S.objects || []).some((o) => o.name === tgt)) md.selectObject(tgt);
+    }
   }
 
   function init() {
@@ -1129,7 +1149,7 @@
     $('cuMaskCv').addEventListener('click', () => {   // the big preview like the anchors' (static/pop_view.js)
       const cv = $('cuMaskCv');
       if (window.MD_POPVIEW && cv.width) window.MD_POPVIEW.open({ title: `Maska klatki F${cv.dataset.frame || ''}`, src: cv.toDataURL('image/png'),
-        note: 'Czerwień = łata (im mocniej, tym pełniej); przerywana linia = krawędź pasa, cienka = koniec wtopienia; jasnoniebieskie tło z niebieską ciągłą krawędzią = to, co narysuje model (pas generowania + rozrost silnika; także pod chronionymi obiektami)' });
+        note: 'Czerwień = łata (im mocniej, tym pełniej); przerywana linia = krawędź pasa, cienka = koniec wtopienia; jasnoniebieskie tło z niebieską ciągłą krawędzią = to, co narysuje model (pas generowania + rozrost silnika; także pod chronionymi obiektami).' + (cv.dataset.modelNote || '') });
     });
     $('cuRun').addEventListener('click', () => runCleanup());
     // „🧹 Usuń ten obiekt” shortcut: other scripts may call MD_CLEANUP.removeObject(name)

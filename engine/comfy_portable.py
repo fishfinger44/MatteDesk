@@ -33,12 +33,23 @@ UNPACKED_GB = 6.5     # what the unpacked package takes on disk (v0.41: ~6 GB) â
 PORT = 8188
 
 
+def _safe_exists(p) -> bool:
+    from engine.config import safe_exists
+    return safe_exists(p)
+
+
+def _safe_is_dir(p) -> bool:
+    from engine.config import safe_is_dir
+    return safe_is_dir(p)
+
+
 def embedded_python(comfy_dir: str | Path) -> Optional[Path]:
     """`python_embeded/python.exe` next to a ComfyUI folder (portable package), else None."""
     if not str(comfy_dir or ""):
         return None
+    from engine.config import safe_exists
     p = Path(comfy_dir).parent / "python_embeded" / "python.exe"
-    return p if p.exists() else None
+    return p if safe_exists(p) else None
 
 
 def kind(cfg: Dict[str, Any]) -> str:
@@ -51,9 +62,10 @@ def kind(cfg: Dict[str, Any]) -> str:
 
 def find_comfy_dir(root: str | Path) -> Optional[Path]:
     """The ComfyUI folder (with main.py) for a folder the user points at: the package root, its parent, or ComfyUI itself."""
+    from engine.config import safe_exists
     r = Path(root)
     for c in (r, r / "ComfyUI", r / PACKAGE_DIR / "ComfyUI"):
-        if (c / "main.py").exists():
+        if safe_exists(c / "main.py"):
             return c
     return None
 
@@ -63,7 +75,8 @@ def _drives() -> List[Path]:
     import string
     if os.name != "nt":
         return [Path("/")]
-    return [Path(f"{c}:/") for c in string.ascii_uppercase if Path(f"{c}:/").exists()]
+    from engine.config import safe_exists
+    return [Path(f"{c}:/") for c in string.ascii_uppercase if safe_exists(f"{c}:/")]
 
 
 def scan_roots(env: Optional[Dict[str, str]] = None) -> List[Path]:
@@ -149,7 +162,7 @@ def running_comfy(ports=PROBE_PORTS, get_json: Optional[Callable[[str], Optional
         p = proc(port)
         m = re.search(r'"?([^"]*?main\.py)"?', p.get("cmd") or "")
         main = Path(m.group(1).strip()) if m else None
-        main = main if main is not None and main.is_absolute() and main.exists() else None
+        main = main if main is not None and main.is_absolute() and _safe_exists(main) else None
         return {"port": port, "python": p.get("exe") or "", "comfy_dir": str(main.parent) if main else ""}
     return None
 
@@ -176,7 +189,7 @@ def detect(user_dir: str = "", roots: Optional[List[Path]] = None, desktop: Opti
             if d2.get("comfy_dir"):
                 return d2
             base = desktop_base_path()
-            return {"comfy_dir": base} if base and Path(base).is_dir() else {}
+            return {"comfy_dir": base} if _safe_is_dir(base) else {}
     found = find_installed(roots)
     d = desktop()
     if d.get("comfy_dir"):
@@ -201,7 +214,7 @@ def _from_running(run: Dict[str, Any], user_dir: str, roots) -> Optional[Dict[st
     if comfy is None:
         return None
     kind_ = "portable" if embedded_python(comfy) else "git"
-    venv = (Path(comfy) / ".venv").exists()
+    venv = _safe_exists(Path(comfy) / ".venv")
     return {"kind": kind_, "comfy_dir": str(comfy), "port": run["port"],
             "python": py if (py and kind_ == "git" and not venv) else "",
             "others": [str(x) for x in found[1:]]}

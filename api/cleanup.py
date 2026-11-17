@@ -766,7 +766,14 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
 
         def copied_from(a):
             return next((g.get("projection") for g in a["gens"] if g["name"] == a.get("gen")), None)
+        clashes = []
+        if s.get("model") == "h3":   # two anchors in one MiniMax-H3 token: only one holds (HA.token_clashes)
+            try:
+                clashes = [{**c, "note": HA.clash_note(c)} for c in HA.token_clashes(anchors, list(work_frames()))]
+            except Exception:  # noqa: BLE001 – no work range: no warning
+                clashes = []
         return {"anchors": out, "main": main["id"] if main else None, "transition": HA.is_transition(anchors),
+                "token_clash": clashes,
                 "h3_prompt": s.get("h3_prompt") or "", "on": s.get("anchor") == "frame",
                 "projection": {"render": rs["version"] if rs else None, "stale": bool(rs and rs["stale"]),
                                # copied from another render than the last one = press the button again
@@ -1495,7 +1502,12 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
         # niech uwzględnia pas generowania”) – the same area the composite is cut at
         reach = cu.engine_reach_px(s.get("model"), s, w, h)
         m = cu.comp_mask_fn(s, rm, keep, reach)(frame)
-        g = cu.drawn_area(cu.gen_mask_fn(s, rm, keep)(frame), reach) if s.get("model") in cu.C1_MODELS else np.zeros_like(m, bool)
+        if s.get("model") in cu.C1_MODELS:   # the engine's own mask of this frame (MiniMax-H3: its latent token, ±2 fr.)
+            gfn = cu.gen_mask_fn(s, rm, keep)
+            g = cu.drawn_area(np.max(np.stack([np.asarray(gfn(k), np.float32)
+                                               for k in cu.model_frames(s.get("model"), frame, work_frames())]), axis=0), reach)
+        else:
+            g = np.zeros_like(m, bool)
         sc = proxy_scale()
         size = (max(1, round(w * sc)), max(1, round(h * sc)))
         r8 = cv2.resize((m * 255).astype(np.uint8), size, interpolation=cv2.INTER_AREA)
@@ -1607,12 +1619,14 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
                                        seed=int(s.get("seed") or 42))
                     key_fill = ltx_fill.LtxFill(got, w, h, linear)
                 else:
+                    clash_notes = [HA.clash_note(c) for c in HA.token_clashes(lst, frames)]
                     got = h3_fill.run(comfy_client(), work / "comfy_io", load_config(), frames, plate, rmask,
                                       h3_fill.h3_prompt(text, pm, transition, morph), linear=linear,
                                       progress=lambda t, d, n: job_progress(t, d, n), anchors=anchors, ref_only=ref_only,
                                       seed=int(s.get("seed") or 42), reference=not transition,
                                       strength=h3_fill.run_strength(s.get("h3_strength"), pm))
                     key_fill = h3_fill.H3Fill(got, w, h, linear)
+                    key_fill.clash_notes = clash_notes
                 # the model's own frames next to the version (its canvas size): „⤴ Upscale” works from them
                 (out / "model").mkdir(parents=True, exist_ok=True)
                 for mf, img in got.items():
@@ -1631,6 +1645,7 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
                 cl.report["void_run"] = key_fill.run.get("id")
             if getattr(key_fill, "anchors", None):
                 cl.report["anchors"] = list(key_fill.anchors)
+            cl.notes.extend(getattr(key_fill, "clash_notes", None) or [])   # anchors sharing a MiniMax-H3 token
             if s.get("input_plate"):   # „Wejście” (2026-11-15): made on top of an earlier version
                 cl.report["input_plate"] = s["input_plate"]
                 if in_miss:
@@ -1650,4 +1665,4 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
     # what api/cleanup3d.py shares with this router (the same plates, alphas and fill sources for both renders)
     return router, {"need": _need, "alpha_loaders": _alpha_loaders, "held": _held, "fill_sources": _fill_sources,
                     "inpainter": _inpainter, "set_cleaned": _set_cleaned, "read_plate": _read_plate,
-                    "frame_file": frame_file, "plate": CLEANED_PLATE}
+                    "frame_file": frame_file, "plate": CLEANED_PLATE, "work_frames": lambda: list(work_frames())}

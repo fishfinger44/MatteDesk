@@ -171,7 +171,18 @@ def make(*, STATE, plate_size, cleanup):
         scale = min(1.0, LINES_SIDE / float(max(w, h)))
         # the edge of what the model draws (generation margin + the engine's grow, user 2026-11-13): limit_contours / cut
         lim = float(s["gen_margin_px"]) + cu.engine_reach_px(s.get("model"), s, w, h) if s.get("model") in cu.C1_MODELS else None
-        return _edit(lambda: IB.lines(al, g, sf, pf(int(frame)) if pf else None, scale, lim))
+        # the engine's mask of this frame (user 2026-11-16): ±2 frames, MiniMax-H3 its whole latent token
+        mf = cu.model_frames(s.get("model"), int(frame), cleanup["work_frames"]()) if lim is not None else [int(frame)]
+        lal = [a for k in mf for a in ra(k)] if mf != [int(frame)] else None
+        L = _edit(lambda: IB.lines(al, g, sf, pf(int(frame)) if pf else None, scale, lim, limit_alphas=lal))
+        if lim is not None:
+            L["model_frames"] = [mf[0], mf[-1]]
+            if s.get("model") == "h3":
+                from engine.h3_anchors import h3_token, h3_token_span
+                wf = cleanup["work_frames"]()
+                if int(frame) in wf:
+                    L["h3_token"] = h3_token_span(h3_token(wf.index(int(frame))), wf)
+        return L
 
     @router.delete("/api/cleanup/band/{point_id}")
     def band_delete_point(point_id: str, frame: Optional[int] = None):

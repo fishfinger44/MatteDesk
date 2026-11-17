@@ -10,7 +10,7 @@ Raz naprawiasz plate'y. Generujesz maski alfa wielu obiektów – narzędzie lic
 
 `SAM3.1` · `CoTracker3` · `MatAnyone2` · `VideoMaMa` · `BiRefNet / ViTMatte` · `Sapiens2` · `LTX 2.5 Alpha Gen` · `ComfyUI` · `Nuke / After Effects` · `API dla agentów + CLI` · `100% lokalnie, bez chmury, LLM niepotrzebny`
 
-[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.60/MatteDesk-0.60-setup.exe)
+[![Pobierz dla Windows](https://img.shields.io/badge/%E2%AC%87%20Pobierz%20dla%20Windows-instalator-e8a33d?style=for-the-badge)](https://github.com/fishfinger44/MatteDesk/releases/download/v0.61/MatteDesk-0.61-setup.exe)
 
 Windows 10 / 11 · karta NVIDIA (CUDA): **minimum 12 GB VRAM, zalecane 24 GB** (etap 7 LTX-2.5 wymaga 24 GB + 64 GB RAM) · przycisk pobiera instalator – wszystkie wersje: [Releases](https://github.com/fishfinger44/MatteDesk/releases/latest) – zielony przycisk **Code → Download ZIP** daje tylko kod źródłowy (patrz [INSTALL_WINDOWS.txt](INSTALL_WINDOWS.txt))
 

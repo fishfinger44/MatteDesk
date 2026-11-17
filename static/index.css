@@ -1878,6 +1878,8 @@ body.mode-clean #stagePanel > :not(.c3-pane):not(#cleanupPanel) { display: none 
 .cu-anc-f { font-family: monospace; min-width: 34px; }
 .cu-anc-k { flex: 1; color: var(--text-muted); }
 .cu-anc-st { color: var(--text-dim); }
+.cu-anc-clash { color: #fbbf24; margin-right: 4px; cursor: help; }
+.cu-anc-clash-note { margin: 4px 0; }
 .cu-gens { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; }
 .cu-gen { position: relative; flex: 0 0 auto; width: 54px; border: 2px solid transparent; border-radius: 4px; cursor: pointer; }
 .cu-gen.chosen { border-color: var(--accent-primary); }

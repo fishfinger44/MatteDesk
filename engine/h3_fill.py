@@ -200,6 +200,17 @@ def grow_masks(masks: Sequence[np.ndarray], px: int = MASK_GROW_PX, radius: int 
     return out
 
 
+def token_masks(masks: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """Per-frame masks of the whole clip (17k + 5) -> one mask per latent token = the max over the token's frames
+    (h3_anchors.token_spans: 1, 4, 4, 4, 4 …). ComfyUI fits the noise mask to the latent with a TRILINEAR resize
+    (comfy.utils.reshape_mask): from per-frame masks the token of frames 1-4 sampled the mask near frame 4.4, so where
+    the object moves fast its pixels in the token's first frames stayed UNMASKED and the plate (the object) was kept
+    (user report 2026-11-16, a test shot, v005: at F2 only 11 % of the earring's pixels fully masked, 51 % not at
+    all – the earring came back whatever the anchor / seed). With exactly one mask per token the resize is identity."""
+    from engine.h3_anchors import token_spans
+    return [np.max(np.stack(masks[a:b + 1]), axis=0) for a, b in token_spans(len(masks))]
+
+
 def graph(frames_dir: Path, masks_dir: Path, prefix: str, prompt: str, w: int, h: int, length: int,
           f: Dict[str, Optional[str]], seed: int = SEED,
           guides: Optional[Sequence[Tuple[int, Path]]] = None, reference: bool = True,
@@ -305,11 +316,12 @@ def run(client: Any, io_dir: Path, cfg: Dict[str, Any], frames: Sequence[int], p
             pl = plate_fn(f)
             cv2.imwrite(str(fd / f"f_{i:05d}.png"), cv2.resize(to_display8(pl, linear), (cw, ch), interpolation=cv2.INTER_AREA))
             masks.append(cv2.resize(np.asarray(mask_fn(f), np.float32), (cw, ch), interpolation=cv2.INTER_LINEAR))
-        for i, m in enumerate(grow_masks(masks, grid=MASK_GRID_PX)):
+        grown = grow_masks(masks, grid=MASK_GRID_PX)
+        grown += [grown[-1]] * (length - n)   # pad to 17k + 5: the last mask repeated
+        for i, m in enumerate(token_masks(grown)):   # ONE mask per latent token (see token_masks)
             cv2.imwrite(str(md / f"m_{i:05d}.png"), m)
-        for i in range(n, length):   # pad to 17k + 5: the last frame and mask repeated
+        for i in range(n, length):   # pad to 17k + 5: the last frame repeated
             shutil.copy(fd / f"f_{n - 1:05d}.png", fd / f"f_{i:05d}.png")
-            shutil.copy(md / f"m_{n - 1:05d}.png", md / f"m_{i:05d}.png")
         guides = []
         for f, img in (anchors or {}).items():   # insertion order: the main anchor first (= the <Picture 1> reference)
             if int(f) not in frames:

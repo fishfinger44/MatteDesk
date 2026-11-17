@@ -526,6 +526,29 @@ def engine_reach_px(model: Optional[str], s: Dict[str, Any], w: int, h: int) -> 
     return float(E.MASK_GROW_PX) * float(w) / float(max(1, cw))
 
 
+def model_frames(model: Optional[str], f: int, frames: Sequence[int]) -> List[int]:
+    """The plate frames whose masks the engine combines into ITS mask of frame `f` (the frame mask preview, user
+    2026-11-16 „zależne od modelu”): every canvas engine takes the max over +-MASK_TIME_RADIUS frames (grow_masks);
+    MiniMax-H3 then one mask per latent token (h3_fill.token_masks) = the union over the token's frames, padded clip
+    frames = the last one. `frames` = the work range (sorted); a frame outside it / another model = [f]."""
+    frames = [int(x) for x in frames]
+    if model not in ("h3", "vace", "ltx") or int(f) not in frames:
+        return [int(f)]
+    if model == "h3":
+        from engine import h3_fill as E
+        from engine.h3_anchors import h3_token, token_spans
+        i = frames.index(int(f))
+        lo, hi = token_spans(E.clip_length(len(frames)))[h3_token(i)]
+    elif model == "vace":
+        from engine import vace_fill as E
+        lo = hi = frames.index(int(f))
+    else:
+        from engine import ltx_fill as E
+        lo = hi = frames.index(int(f))
+    r = int(E.MASK_TIME_RADIUS)
+    return frames[max(0, lo - r):min(len(frames), hi + r + 1)]
+
+
 def drawn_area(gen: np.ndarray, reach_px: float) -> np.ndarray:
     """bool: what the model drew – its mask (> 0) grown by the engine's reach (`engine_reach_px`)."""
     g = np.asarray(gen, np.float32) > 0

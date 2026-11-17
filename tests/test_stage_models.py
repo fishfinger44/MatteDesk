@@ -46,7 +46,13 @@ def test_gate_per_stage(env):
     _touch(md / "matanyone2" / "matanyone2.pth")
     _touch(tmp / "hf" / "hub" / "models--hustvl--vitmatte-base-composition-1k" / "snapshots" / "abc" / "config.json")
     g = G.model_gate(cfg)
+    assert set(g) == {"videomama", "ltx", "matanyone"}         # MatAnyone2 weights alone: the node packs too (issue 12)
+    assert g["matanyone"]["missing"] == ["węzeł ComfyUI-MatAnyone2", "węzeł ComfyUI-MatAnyone2-Keyframes"]
+    (tmp / "comfy" / "custom_nodes" / "comfyui_matanyone2").mkdir()      # ComfyUI-Manager's folder name counts
+    (tmp / "comfy" / "custom_nodes" / "ComfyUI-MatAnyone2-Keyframes").mkdir()
+    g = G.model_gate(cfg)
     assert set(g) == {"videomama", "ltx"}
+    assert G._matanyone({**cfg, "comfy_dir": ""}) == []        # no comfy_dir: no verdict on nodes, weights decide
     import engine.videomama as V
     import engine.ltx_alpha as L
     for sub, _r, fn, _g in V.VMM_FILES:

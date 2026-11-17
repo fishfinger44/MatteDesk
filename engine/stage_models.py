@@ -15,7 +15,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 # fine-grained stage -> (Doctor's install action label, checker(cfg) -> missing descriptions)
 DOCTOR = {"core": "„Zainstaluj” przy „Model: SAM 3.1”", "cotracker": "„Zainstaluj” przy „Model: CoTracker3”",
-          "matanyone": "„Zainstaluj” przy „Model: MatAnyone2”", "videomama": "„Zainstaluj VideoMaMa”",
+          "matanyone": "„Zainstaluj” przy „Model: MatAnyone2”, „ComfyUI-MatAnyone2” i „Węzły MatteDesk (pliki)”",
+          "videomama": "„Zainstaluj VideoMaMa”",
           "vitmatte": "„Zainstaluj” przy „Model: ViTMatte” albo „Model: BiRefNet_HR-matting / Lucida”", "ltx": "„Zainstaluj LTX-2.5”"}
 LABEL = {"core": "SAM 3.1", "cotracker": "CoTracker3", "matanyone": "MatAnyone2", "videomama": "VideoMaMa",
          "vitmatte": "ViTMatte", "ltx": "LTX-2.5 Alpha-Gen"}
@@ -38,9 +39,33 @@ def _cotracker(cfg: Dict[str, Any]) -> List[str]:
     return [] if md and (md / "cotracker" / "scaled_offline.pth").exists() else ["cotracker/scaled_offline.pth"]
 
 
+# node packs the MatAnyone2 graph needs (LoadMatAnyone2Model / MatAnyone2RunKeyframes): weights alone are not enough
+# (MatteDesk-dev issue 12: the weights were there, the nodes were not – the run failed in ComfyUI)
+MATANYONE_NODE_PACKS = ("ComfyUI-MatAnyone2", "ComfyUI-MatAnyone2-Keyframes")
+
+
+def _pack_key(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+
+def _missing_packs(cfg: Dict[str, Any], packs) -> List[str]:
+    """Node packs of `packs` not in custom_nodes (name compared case- and -/_-insensitively, as ComfyUI-Manager may
+    name the folder); [] when comfy_dir is unknown (no verdict – ComfyUI's own rejection then names the node)."""
+    from engine.config import safe_is_dir
+    cn = Path(cfg.get("comfy_dir") or "") / "custom_nodes"
+    if not cfg.get("comfy_dir") or not safe_is_dir(cn):
+        return []
+    try:
+        have = {_pack_key(p.name) for p in cn.iterdir() if p.is_dir()}
+    except OSError:
+        return []
+    return [p for p in packs if _pack_key(p) not in have]
+
+
 def _matanyone(cfg: Dict[str, Any]) -> List[str]:
     md = _md(cfg)
-    return [] if md and (md / "matanyone2" / "matanyone2.pth").exists() else ["matanyone2/matanyone2.pth"]
+    miss = [] if md and (md / "matanyone2" / "matanyone2.pth").exists() else ["matanyone2/matanyone2.pth"]
+    return [f"węzeł {p}" for p in _missing_packs(cfg, MATANYONE_NODE_PACKS)] + miss
 
 
 def hf_cached(model_id: str, models_dir: Any = None) -> bool:

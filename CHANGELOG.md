@@ -1,5 +1,20 @@
 # MatteDesk – changelog
 
+## 0.61 – 2026-11-17
+- **Fix: Comfy Desktop 2 installed outside C: was not found.** The ComfyUI folder is now read from Desktop's own
+  installations.json / installDir, so an install on another drive is detected (before, the Doctor could not install the
+  MatteDesk nodes and MatAnyone2 failed with "LoadMatAnyone2Model not found").
+- **Fix: the Doctor crashed on Windows 11** when a folder sits behind a junction Windows does not trust (WinError 448,
+  "untrusted mount point"); such a folder now counts as missing – also when detecting ComfyUI portable / from git.
+- ComfyUI not running: the error now says "ComfyUI is not responding – start ComfyUI" instead of "Comfy rejected the graph:
+  urlopen error 10061"; a node missing in ComfyUI is named with what to install. Stage 3 MatAnyone2 is locked in the stage
+  bar while its node packs (ComfyUI-MatAnyone2, MatAnyone2-Keyframes) are missing, not only its weights.
+- **Fix: MiniMax-H3 left the removed object in fast motion.** The noise mask now goes to the model one mask per latent
+  token (the union of its 4 frames); ComfyUI's resize to the latent used to sample a later frame, so an object moving fast
+  stayed unmasked in the first frames of a token. The "Frame mask" preview shows the model's own mask of the frame, and the
+  anchors palette warns when two anchors fall into one token (only one of them can hold).
+- The same object stays selected when switching between Cut-out and Cleanup.
+
 ## 0.60 – 2026-11-16
 - **New (beta): Cleanup mode – C1 Inpaint.** The "✂ Cut-out / 🧹 Cleanup" switch in the header: pick an object or group in
   the Objects palette and remove or replace it in the plate. The mask comes from MatteDesk (any version, the same band

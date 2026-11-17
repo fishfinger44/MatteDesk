@@ -22,7 +22,6 @@ STATE is polled by the UI (GET /api/comfy/launch): idle | starting | running | f
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
@@ -60,22 +59,17 @@ def desktop_exe(cfg: Dict[str, Any]) -> Optional[Path]:
     if la:
         cands += [Path(la) / "Programs" / "Comfy Desktop" / "Comfy Desktop.exe",
                   Path(la) / "Programs" / "@comfyorgcomfyui-electron" / "ComfyUI.exe"]
+    from engine.config import safe_exists
     for c in cands:
-        if c and Path(c).exists():
+        if c and safe_exists(c):
             return Path(c)
     return None
 
 
-def _read_json(p: Path) -> Any:
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
 def _venv_python(comfy_dir: Path) -> Optional[Path]:
+    from engine.config import safe_exists
     for rel in (".venv/Scripts/python.exe", ".venv/bin/python"):
-        if (comfy_dir / rel).exists():
+        if safe_exists(comfy_dir / rel):
             return comfy_dir / rel
     return None
 
@@ -89,35 +83,27 @@ def desktop2_install(cfg: Dict[str, Any], appdata: Optional[str] = None,
     """A Comfy Desktop 2 install whose server can be started headless, as Desktop itself starts it:
     {comfy_dir, python, yaml, input_dir, output_dir, launch_args, id}; None when there is none.
     Which install: `comfy_dir` from config when it is a Desktop 2 install, else the most recently launched local one."""
+    from engine.config import desktop2_candidates, safe_glob, safe_is_dir, safe_is_file
     ad = appdata if appdata is not None else os.environ.get("APPDATA", "")
     la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA", "")
     root = Path(ad) / "Comfy Desktop" if ad else None
-    settings = (_read_json(root / "settings.json") if root else None) or {}
-    installs = (_read_json(root / "installations.json") if root else None) or []
-    installs = [i for i in installs if isinstance(i, dict) and i.get("installPath") and i.get("sourceId") != "cloud"
-                and i.get("status", "installed") == "installed"]
-    installs.sort(key=lambda i: i.get("lastLaunchedAt") or 0, reverse=True)
-    cands: List[Tuple[Path, Dict[str, Any]]] = [(Path(i["installPath"]) / "ComfyUI", i) for i in installs]
-    inst_root = settings.get("installDir") or (str(Path(la) / "Comfy-Desktop" / "ComfyUI-Installs") if la else "")
-    if inst_root and Path(inst_root).is_dir():   # installs missing from installations.json
-        cands += [(m.parent, {}) for m in sorted(Path(inst_root).glob("*/ComfyUI/main.py"),
-                                                 key=lambda m: m.stat().st_mtime, reverse=True)]
+    cands, settings = desktop2_candidates(ad, la)
+    cands = list(cands)   # type: List[Tuple[Path, Dict[str, Any]]]
     want = cfg.get("comfy_dir") or ""
     if want:   # the folder chosen in config wins when it is a Desktop 2 install (main.py + its own .venv)
         hit = [c for c in cands if _norm(c[0]) == _norm(want)] or [(Path(want), {})]
         cands = hit + cands
-    yamls = sorted((root / "instance-model-paths").glob("*.yaml"), key=lambda y: y.stat().st_mtime, reverse=True) \
-        if root and (root / "instance-model-paths").is_dir() else []
+    yamls = safe_glob(root / "instance-model-paths", "*.yaml") if root else []
     shared = Path(la) / "Comfy-Desktop" / "ComfyUI-Shared" if la else None
     for d, inst in cands:
         py = _venv_python(d)
-        if not (py and (d / "main.py").exists()):
+        if not (py and safe_is_file(d / "main.py")):
             continue
         own = [y for y in yamls if inst.get("id") and y.stem == inst["id"]]
         io: Dict[str, Optional[str]] = {}
         for key, setting in (("input", "inputDir"), ("output", "outputDir")):
             v = settings.get(setting) or (str(shared / key) if shared else "")
-            io[key + "_dir"] = v if v and Path(v).is_dir() else None
+            io[key + "_dir"] = v if safe_is_dir(v) else None
         try:
             extra = shlex.split(str(inst.get("launchArgs") or ""), posix=False)
         except ValueError:

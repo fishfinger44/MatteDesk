@@ -33,6 +33,26 @@ INTERRUPTED_PROMPTS: set = set()
 logger = logging.getLogger("matte_desk.comfy")
 
 
+class ComfyOffline(RuntimeError):
+    """ComfyUI does not answer at all (not started, wrong port). Raised by queue_prompt so the user reads
+    "ComfyUI nie odpowiada – uruchom" instead of "Comfy odrzucił graf: <urlopen error 10061>" (MatteDesk-dev issue 11)."""
+
+
+def offline_message(base_url: str) -> str:
+    return f"ComfyUI nie odpowiada ({base_url}) – uruchom ComfyUI (Doktor → „▶ Uruchom ComfyUI”) i spróbuj ponownie"
+
+
+def rejection_message(resp: Any) -> Any:
+    """ComfyUI's /prompt rejection in words: a missing node class -> what to install (MatteDesk-dev issue 12);
+    anything else unchanged."""
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, dict) and err.get("type") == "missing_node_type":
+        cls = (err.get("extra_info") or {}).get("class_type") or err.get("message") or "?"
+        return (f"W ComfyUI brakuje węzła {cls} – Doktor → „Zainstaluj” przy brakującym węźle, "
+                f"potem zrestartuj ComfyUI")
+    return resp
+
+
 class ComfyClient:
     OUR_PROMPTS: set = set()   # prompt ids sent by MatteDesk in this process (clients are created per job)
 
@@ -183,7 +203,9 @@ class ComfyClient:
                 self.our_prompts.add(prompt_id)
                 self._sent = {prompt_id: (workflow_api, extra_data)}   # for the one retry after GPU out-of-memory
             return {"success": True, "prompt_id": prompt_id, "data": resp}
-        return {"success": False, "error": resp}
+        if status == 0:   # no connection at all: not a rejected graph
+            raise ComfyOffline(offline_message(self.base_url))
+        return {"success": False, "error": rejection_message(resp)}
 
     def get_history(self, prompt_id: str) -> Optional[Dict[str, Any]]:
         status, data = self._request(f"/history/{prompt_id}")

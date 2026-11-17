@@ -147,7 +147,13 @@
     const stTip = a.kind === 'original' ? '' : outdated(a) ? 'skopiowana z innego renderu C5 niż ostatni – „⚓ z kluczy kart” skopiuje bieżący' : PROJ(a) && !a.valid ? 'bez kopii renderu – przebieg skopiuje bieżący render C5' : a.valid ? 'gotowa – przebieg użyje wybranej generacji' : (a.gens || []).length ? 'do przeliczenia (kotwica główna się zmieniła albo przeniesiono klatkę) – przebieg wygeneruje nową' : 'jeszcze bez generacji – policzy się przy przebiegu albo „↻ Generuj”';
     return `<div class="cu-anc-row${a.id === A.sel ? ' sel' : ''}${a.kind === 'main' ? ' main' : ''}" data-aid="${esc(a.id)}" title="${esc(tip)}">
       <span class="cu-anc-ic">${ic}</span><span class="cu-anc-f">F${esc(a.frame)}</span><span class="cu-anc-k">${esc(name)}</span>
-      <span class="cu-anc-st" title="${esc(stTip)}">${st}</span></div>`;
+      ${clashOf(a) ? `<span class="cu-anc-clash" title="${esc(clashOf(a).note)}">⚠</span>` : ''}<span class="cu-anc-st" title="${esc(stTip)}">${st}</span></div>`;
+  }
+  // two anchors in one MiniMax-H3 token (frames 1 | 2–5 | 6–9 … of the range): only one holds (h3_anchors.token_clashes)
+  const clashes = () => (A.data && A.data.token_clash) || [];
+  const clashOf = (a) => clashes().find((c) => (c.ids || []).includes(a.id));
+  function clashHtml() {
+    return clashes().map((c) => `<div class="cu-lint-i warn cu-anc-clash-note">⚠ ${esc(c.note)}</div>`).join('');
   }
   // the edit field of the selected anchor (user 2026-11-11): main = the description of the Inpaint palette (no second
   // field), own = its own description, linked = disabled until „⛓ Odłącz”, original = none
@@ -267,6 +273,7 @@
         box.innerHTML = `<div class="cu-anc-mode ${tr ? 'tr' : ''}" title="${tr ? `Jest kotwica własna albo oryginał: każda kotwica ma swój opis, ${esc(ENG())} dostaje osobny prompt klipu (w palecie Inpaint; bez referencji całego klipu, żeby mógł zmieniać wygląd)` : `Wszystkie kotwice trzymają wzór głównej: jeden opis dla kotwic i ${esc(ENG())}`}">${tr ? '↝ Przejście (morfing) – prompt klipu w palecie Inpaint' : '≡ Wspólny styl – jeden opis'}</div>
           ${linkHtml()}
           ${SHOW_PROJ ? projHtml() : ''}
+          ${clashHtml()}
           <div class="cu-anc-list">${anchors().map(rowHtml).join('') || '<div class="muted pp-hint">Brak kotwic – „⚓+ Kotwica tu” na lewym pasku.</div>'}</div>
           ${detailHtml(byId(A.sel))}`;
       }

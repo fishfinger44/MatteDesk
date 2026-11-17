@@ -418,3 +418,72 @@ def test_anchors_off_means_no_anchor_for_any_model(anchors_app):
     from engine import prompt_rules as PR
     off = PR.final_prompts({**s, "anchor": "none", "model": "h3", "prompt": "a wall"})
     assert not any(i["key"].startswith("anchor") for i in off["items"]) and not off["transition"]
+
+
+def test_token_clash_2026_11_16():
+    """Two anchors in one MiniMax-H3 token (frames 1 | 2-5 | 6-9 ... of the range) = only one holds: the palette and
+    the run notes warn (user test a test shot, v004: F2 + F5 linked, the earring came back in F2)."""
+    frames = list(range(1, 51))
+    assert [HA.h3_token(i) for i in (0, 1, 4, 5, 8, 9)] == [0, 1, 1, 2, 2, 3]
+    a = [{"id": "m", "frame": 49, "kind": "main"}, {"id": "x", "frame": 2, "kind": "linked"},
+         {"id": "y", "frame": 5, "kind": "linked"}]
+    c = HA.token_clashes(a, frames)
+    assert len(c) == 1 and c[0]["frames"] == [2, 5] and c[0]["ids"] == ["x", "y"] and c[0]["span"] == [2, 5]
+    assert "F2, F5" in HA.clash_note(c[0]) and "F2–F5" in HA.clash_note(c[0])
+    # F1 is a token of its own; F5 and F6 are neighbouring tokens; outside the range = ignored
+    assert HA.token_clashes([{"id": "p", "frame": 1}, {"id": "q", "frame": 2}, {"id": "r", "frame": 6},
+                             {"id": "s", "frame": 60}, {"id": "t", "frame": 61}], frames) == []
+    # the range need not start at 1: tokens count from its first frame
+    c2 = HA.token_clashes([{"id": "u", "frame": 102}, {"id": "v", "frame": 105}], list(range(101, 131)))
+    assert c2 and c2[0]["span"] == [102, 105]
+    # wired: the anchors view (model h3 only) and the H3 run notes
+    src = (ROOT / "api" / "cleanup.py").read_text(encoding="utf-8")
+    assert '"token_clash": clashes' in src and "HA.token_clashes(lst, frames)" in src and "clash_notes" in src
+    js = (ROOT / "static" / "cleanup_anchors.js").read_text(encoding="utf-8")
+    assert "token_clash" in js and "clashHtml()" in js
+
+
+def test_h3_token_layout_and_masks_2026_11_16():
+    """Tokens of 1, 4, 4, 4, 4 frames repeated every 17 (comfy FRAME_PER_TOKEN[k % 5]); h3_fill writes ONE noise mask
+    per token = the max over its frames, so ComfyUI's trilinear resize to the latent is identity (v005: the token of
+    F2-F5 sampled the mask near F5.4 and left 51 % of the F2 earring unmasked)."""
+    sp = HA.token_spans(56)
+    assert sp[:7] == [(0, 0), (1, 4), (5, 8), (9, 12), (13, 16), (17, 17), (18, 21)] and len(sp) == 17
+    assert sum(b - a + 1 for a, b in sp) == 56
+    for k, (a, b) in enumerate(sp):   # h3_token agrees with the spans
+        assert all(HA.h3_token(i) == k for i in range(a, b + 1))
+    fr = list(range(1, 57))
+    assert HA.h3_token_span(5, fr) == [18, 18] and HA.h3_token_span(6, fr) == [19, 22]
+    # F18 (idx 17) is a token of its own: F17 + F18 do not clash, F19 + F22 do
+    assert HA.token_clashes([{"id": "a", "frame": 17}, {"id": "b", "frame": 18}], fr) == []
+    assert HA.token_clashes([{"id": "a", "frame": 19}, {"id": "b", "frame": 22}], fr)[0]["span"] == [19, 22]
+    # one mask per token, the union of its frames: an object only in F2 is masked in the token of F2-F5
+    masks = [np.zeros((4, 4), np.uint8) for _ in range(56)]
+    masks[1][0, 0] = 255
+    tm = h3_fill.token_masks(masks)
+    assert len(tm) == 17 and tm[1][0, 0] == 255 and tm[0][0, 0] == 0 and tm[2][0, 0] == 0
+    src = (ROOT / "engine" / "h3_fill.py").read_text(encoding="utf-8")
+    assert "enumerate(token_masks(grown))" in src
+
+
+def test_frame_mask_per_model_2026_11_16():
+    """„Maska klatki” shows the ENGINE's mask of the frame (user 2026-11-16): MiniMax-H3 = its whole latent token
+    ±2 frames, Wan 2.2 Fun VACE / LTX-2.5 = the frame ±2, other models = the frame itself."""
+    fr = list(range(1, 51))
+    assert cu.model_frames("h3", 2, fr) == list(range(1, 8))     # token F2-F5 (idx 1-4) ± 2, clipped at F1
+    assert cu.model_frames("h3", 1, fr) == [1, 2, 3]             # F1 = a token of its own
+    assert cu.model_frames("h3", 18, fr) == list(range(16, 21))   # idx 17 = a single-frame token
+    assert cu.model_frames("vace", 10, fr) == list(range(8, 13))
+    assert cu.model_frames("ltx", 50, fr) == [48, 49, 50]
+    assert cu.model_frames("lama", 10, fr) == [10] and cu.model_frames("h3", 99, fr) == [99]
+    # the limit line follows the union, `cut` stays at this frame's own area (what the composite is cut at)
+    from engine import inpaint_band as IB
+    a = np.zeros((64, 64), np.float32); a[30:34, 10:14] = 1
+    b = np.zeros((64, 64), np.float32); b[30:34, 50:54] = 1
+    one = IB.lines([a], 0, 0, None, 1.0, 3.0)
+    both = IB.lines([a], 0, 0, None, 1.0, 3.0, limit_alphas=[a, b])
+    assert len(both["limit_contours"]) == 2 and len(one["limit_contours"]) == 1 and both["cut"] == one["cut"]
+    src = (ROOT / "api" / "inpaint_band.py").read_text(encoding="utf-8")
+    assert "cu.model_frames(" in src and '"h3_token"' in src
+    assert "cu.model_frames(" in (ROOT / "api" / "cleanup.py").read_text(encoding="utf-8")
+    assert "dataset.modelNote" in (ROOT / "static" / "cleanup.js").read_text(encoding="utf-8")

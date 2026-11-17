@@ -103,22 +103,97 @@ def desktop_base_path(appdata: Optional[str] = None) -> Optional[str]:
     return str(base) if base else None
 
 
+# Path checks that never raise. Windows 11 (build 26100+, RedirectionGuard) refuses to follow a junction it does not
+# trust with OSError WinError 448, which Path.is_dir / exists do NOT swallow – a Desktop 2 folder moved to another
+# drive behind a junction crashed the whole Doctor (MatteDesk-dev issue 11). Such a folder counts as missing.
+def safe_is_dir(p: Any) -> bool:
+    try:
+        return bool(p) and Path(p).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
+def safe_is_file(p: Any) -> bool:
+    try:
+        return bool(p) and Path(p).is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def safe_exists(p: Any) -> bool:
+    try:
+        return bool(p) and Path(p).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except (OSError, ValueError):
+        return 0.0
+
+
+def safe_glob(root: Any, pattern: str) -> list:
+    """Matches of `pattern` under `root`, newest first; [] when the folder is missing or cannot be read."""
+    if not safe_is_dir(root):
+        return []
+    try:
+        found = list(Path(root).glob(pattern))
+    except (OSError, ValueError):
+        return []
+    return sorted(found, key=_mtime, reverse=True)
+
+
+def _read_any(p: Path) -> Any:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def desktop2_candidates(appdata: Optional[str] = None, localappdata: Optional[str] = None):
+    """Comfy Desktop 2 install folders (`.../ComfyUI`), best first, and Desktop 2's settings.json:
+    ([(comfy_dir, install record or {}), ...], settings). Installs listed in
+    %APPDATA%/Comfy Desktop/installations.json (most recently launched first – they may live on any drive), then
+    any `*/ComfyUI/main.py` under settings `installDir` (default %LOCALAPPDATA%/Comfy-Desktop/ComfyUI-Installs).
+    One source for the config autodetect and the headless start (engine/comfy_launch.desktop2_install)."""
+    ad = appdata if appdata is not None else os.environ.get("APPDATA", "")
+    la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA", "")
+    root = Path(ad) / "Comfy Desktop" if ad else None
+    settings = (_read_any(root / "settings.json") if root else None)
+    settings = settings if isinstance(settings, dict) else {}
+    installs = (_read_any(root / "installations.json") if root else None)
+    installs = [i for i in (installs if isinstance(installs, list) else [])
+                if isinstance(i, dict) and i.get("installPath") and i.get("sourceId") != "cloud"
+                and i.get("status", "installed") == "installed"]
+    installs.sort(key=lambda i: i.get("lastLaunchedAt") or 0, reverse=True)
+    cands = [(Path(i["installPath"]) / "ComfyUI", i) for i in installs]
+    seen = {os.path.normcase(os.path.normpath(str(c[0]))) for c in cands}
+    roots = [settings.get("installDir") or ""]
+    if la:
+        roots.append(str(Path(la) / "Comfy-Desktop" / "ComfyUI-Installs"))
+    for r in roots:
+        for m in safe_glob(r, "*/ComfyUI/main.py"):
+            k = os.path.normcase(os.path.normpath(str(m.parent)))
+            if k not in seen:
+                seen.add(k)
+                cands.append((m.parent, {}))
+    return cands, settings
+
+
 def desktop2_paths(appdata: Optional[str] = None, localappdata: Optional[str] = None) -> Dict[str, str]:
-    """New ComfyUI Desktop ("Comfy Desktop 2"): code in %LOCALAPPDATA%/Comfy-Desktop/ComfyUI-Installs/<name>/ComfyUI
-    (custom_nodes/, user/), models in a shared folder named by `base_path` in
+    """New ComfyUI Desktop ("Comfy Desktop 2"): code in an install's ComfyUI folder (custom_nodes/, user/) – see
+    desktop2_candidates – models in a shared folder named by `base_path` in
     %APPDATA%/Comfy Desktop/instance-model-paths/*.yaml. Returns {"comfy_dir", "models_dir"} for what was found."""
     out: Dict[str, str] = {}
-    la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA", "")
     ad = appdata if appdata is not None else os.environ.get("APPDATA", "")
-    if la:
-        installs = Path(la) / "Comfy-Desktop" / "ComfyUI-Installs"
-        found = sorted(installs.glob("*/ComfyUI/main.py"), key=lambda p: p.stat().st_mtime, reverse=True) \
-            if installs.is_dir() else []
-        if found:
-            out["comfy_dir"] = str(found[0].parent).replace("\\", "/")
+    for d, _inst in desktop2_candidates(appdata, localappdata)[0]:
+        if safe_is_file(d / "main.py"):
+            out["comfy_dir"] = str(d).replace("\\", "/")
+            break
     if ad:
-        yamls = sorted((Path(ad) / "Comfy Desktop" / "instance-model-paths").glob("*.yaml"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        yamls = safe_glob(Path(ad) / "Comfy Desktop" / "instance-model-paths", "*.yaml")
         for y in yamls:
             try:
                 for line in y.read_text(encoding="utf-8", errors="ignore").splitlines():

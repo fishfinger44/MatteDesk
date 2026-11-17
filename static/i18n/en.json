@@ -6539,6 +6539,15 @@
   "Deflicker": "Deflicker",
   "LTX-2.5 Alpha-Gen: {name}": "LTX-2.5 Alpha-Gen: {name}",
   "Proxy ({plate})": "Proxy ({plate})",
-  "VideoMaMa: {name}": "VideoMaMa: {name}"
+  "VideoMaMa: {name}": "VideoMaMa: {name}",
+  "Kotwice {0} w jednym tokenie MiniMax-H3 (F{1}–F{2}): model utrzyma tylko jedną, pozostałe klatki tego tokenu wyjdą pośrednie – zostaw jedną albo przesuń do innej czwórki klatek": "Anchors {0} in one MiniMax-H3 token (F{1}–F{2}): the model holds only one, the other frames of this token come out in-between – keep one or move it to another group of four frames",
+  "MiniMax-H3 maskuje klatki F{0}–F{1} jednym tokenem latentu, więc jego maska tej klatki = suma masek F{2}–F{3} (token ± 2 klatki).": "MiniMax-H3 masks frames F{0}–F{1} with one latent token, so its mask of this frame = the union of the masks F{2}–F{3} (token ± 2 frames).",
+  "Maska modelu tej klatki = suma masek F{0}–F{1} (± 2 klatki).": "The model's mask of this frame = the union of the masks F{0}–F{1} (± 2 frames).",
+  "Maska F{0} – klik = duży podgląd (zoom, przesuwanie); czerwień = łata, przerywane linie = krawędź pasa i koniec wtopienia, niebieska ciągła i jasnoniebieskie tło = to, co narysuje model (pas generowania + rozrost silnika){1}.{2}": "Mask F{0} – click = large preview (zoom, pan); red = patch, dashed lines = band edge and feather end, solid blue and light-blue background = what the model will draw (generation band + engine growth){1}.{2}",
+  "Czerwień = łata (im mocniej, tym pełniej); przerywana linia = krawędź pasa, cienka = koniec wtopienia; jasnoniebieskie tło z niebieską ciągłą krawędzią = to, co narysuje model (pas generowania + rozrost silnika; także pod chronionymi obiektami).": "Red = patch (the stronger, the fuller); dashed line = band edge, thin = feather end; light-blue background with a solid blue edge = what the model will draw (generation band + engine growth; also under protected objects).",
+  "ComfyUI nie odpowiada ({0}) – uruchom ComfyUI (Doktor → „▶ Uruchom ComfyUI”) i spróbuj ponownie": "ComfyUI is not responding ({0}) – start ComfyUI (Doctor → “▶ Start ComfyUI”) and try again",
+  "W ComfyUI brakuje węzła {0} – Doktor → „Zainstaluj” przy brakującym węźle, potem zrestartuj ComfyUI": "ComfyUI is missing the node {0} – Doctor → “Install” next to the missing node, then restart ComfyUI",
+  "extra_info": "",
+  "„Zainstaluj” przy „Model: MatAnyone2”, „ComfyUI-MatAnyone2” i „Węzły MatteDesk (pliki)”": "\"Install\" next to \"Model: MatAnyone2\", \"ComfyUI-MatAnyone2\" and \"MatteDesk nodes (files)\""
  }
 }
