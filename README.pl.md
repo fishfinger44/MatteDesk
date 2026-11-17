@@ -20,6 +20,20 @@ Wersja: plik [`VERSION`](VERSION) (widoczna też w lewym górnym rogu UI) · his
 
 </div>
 
+### 🆕 Nowość w 0.60 – Czyszczenie (beta): usuwanie i podmiana obiektów w wideo
+
+[![MatteDesk 0.60 – demo Czyszczenia (beta) na YouTube](https://img.youtube.com/vi/iLeP1fBq9x8/maxresdefault.jpg)](https://youtu.be/iLeP1fBq9x8)
+
+Maska zbudowana w Wycinaniu steruje teraz inpaintingiem wideo (demo 80 s powyżej):
+
+- **Wybierz obiekt** w Wycinaniu – SAM 3.1 daje maskę w każdej klatce
+- **Usuń go albo podmień** w Czyszczeniu – opisz, co ma być w jego miejscu; asystent (✨ Popraw opis) proponuje lepszy prompt
+- **Silniki wideo:** MiniMax-H3 (cały klip, spójny w czasie) · Wan 2.2 Fun VACE (720p, mieści się na kartach 12 GB) · LTX-2.5 (IC-LoRA in- / outpainting)
+- **Kotwice wyglądu:** Qwen-Image-2.1 ustala nowy wygląd, model wideo prowadzi go przez cały klip
+- **Zmienia się tylko obszar maski** – reszta to oryginalny plate; SeedVR2 może podbić wypełnienie do rozdzielczości plate'u
+
+### Demo – wycinanie (2 min)
+
 [![MatteDesk – 2-minutowe demo na YouTube](https://img.youtube.com/vi/GX3guDhhblk/maxresdefault.jpg)](https://youtu.be/GX3guDhhblk)
 
 https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86

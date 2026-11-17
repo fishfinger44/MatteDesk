@@ -20,6 +20,20 @@ Version: file [`VERSION`](VERSION) (also shown in the top-left corner of the UI)
 
 </div>
 
+### 🆕 New in 0.60 – Cleanup (beta): remove or replace objects in video
+
+[![MatteDesk 0.60 – Cleanup (beta) demo on YouTube](https://img.youtube.com/vi/iLeP1fBq9x8/maxresdefault.jpg)](https://youtu.be/iLeP1fBq9x8)
+
+The mask you build in Cut-out now drives video inpainting (80 s demo above):
+
+- **Pick the object** in Cut-out – SAM 3.1 gives a mask on every frame
+- **Remove or replace it** in Cleanup – describe what should be there; the assistant (✨ Improve description) suggests a better prompt
+- **Video engines:** MiniMax-H3 (whole clip, stable in time) · Wan 2.2 Fun VACE (720p, fits 12 GB cards) · LTX-2.5 (IC-LoRA in- / outpainting)
+- **Look anchors:** Qwen-Image-2.1 sets the new look, the video model carries it through the clip
+- **Only the masked area changes** – the rest stays the original plate; SeedVR2 can upscale the fill to plate resolution
+
+### Demo – cutting out (2 min)
+
 [![MatteDesk – 2-min demo on YouTube](https://img.youtube.com/vi/GX3guDhhblk/maxresdefault.jpg)](https://youtu.be/GX3guDhhblk)
 
 https://github.com/user-attachments/assets/9ed23b6d-7dcc-4421-b809-ef9bc2cbde86
