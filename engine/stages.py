@@ -463,8 +463,10 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
         core_ok = (sig == keys_signature(store, name)) if sig is not None else core_t >= key_t
     life_diff = life_changed(store, name, frame_range) if core_t else []
     core_ok = core_ok and not life_diff
-    dn_changed = denoise_changed(store, name, mplate)
-    plate_ch = _beauty_change_after(od, Path(work_dir))     # Z26: beauty repaired in stage 0 after this core
+    from engine.core_import import core_source
+    imported = core_source(od)      # the user's external mask (2026-11-20): not computed from the plate
+    dn_changed = denoise_changed(store, name, mplate) and not imported
+    plate_ch = None if imported else _beauty_change_after(od, Path(work_dir))   # Z26: beauty repaired after this core
     core_ok = core_ok and not plate_ch
     need = tuple(work_range) if work_range else (tuple(frame_range) if frame_range else None)
     core_cov = core_coverage(od) if core_t else None
@@ -480,6 +482,9 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
                        "przedziały”" if life_diff else
                        "klucze lub kadry zmienione po ostatnim liczeniu – „Przelicz zmienione przedziały”" if not core_ok else
                        f"rdzeń nie obejmuje zakresu pracy – brak {fmt_intervals(core_miss)}: „▶▶ Przelicz nieaktualne”")
+        if imported:
+            why["core"] = ("rdzeń z maski zewnętrznej: " + (f"zakres życia zmieniony ({fmt_intervals(life_diff)})" if life_diff
+                           else "klucze zmienione po wczytaniu") + " – „Wczytaj maskę” ponownie albo „Wróć do SAM 3.1”")
     run_cov = run_coverage(od, run) if run else None
     final_miss = need_missing(need, run_cov, life) if (need and run_cov is not None) else []
     final_ok = bool(run and run_t and tool.get("final_valid") and core_t and run_t >= core_t)
@@ -630,7 +635,9 @@ def object_stages(store: Any, name: str, work_dir: Path, frame_range: Optional[T
             "vitmatte_base": vbase,
             "brush_zones": len(brush), "exported": exp_ver,
             "final_touch": {"frames": ft_frames, "base": ft.get("base"), "sig": corrections_sig(ft), "finish": ft_fin},
-            "stale_intervals": stale}
+            "stale_intervals": stale,
+            # the core is the user's external mask (engine/core_import.py): path, frame offset, threshold
+            "core_import": imported}
 
 
 def require(store: Any, name: str, work_dir: Path, stage: str, mplate: Optional[bool] = None,

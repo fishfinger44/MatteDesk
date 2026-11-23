@@ -137,6 +137,48 @@ def test_stage3_lines_read_the_mask12_written_after_the_core(tmp_path, monkeypat
     assert pipe._mask12_disk("obj", start) is None
 
 
+def test_zone_band_lines_on_the_stage_path(tmp_path, monkeypatch):
+    """User report 2026-11-20: the stage-5 zone band (ViTMatte / BiRefNet) was slow – its region endpoint is a
+    long_job (409 while any job ran). A whole-outline zone with nothing painted now answers on the stages' lines path
+    (GET …/stage_band/zone:<id>/{f}/lines): the very same lines as the region endpoint, no job lock, cached by
+    content; a zone with a drawing stays on the tracked region (409 here)."""
+    app_module, api, shot, pipe, frames, start = _proj(tmp_path, monkeypatch)
+    body = {"mode": "add", "criterion": "matte", "frame": start, "polygon": [], "matting": "vitmatte", "preset": "hair",
+            "params": {"region": "outline", "outline_out_px": 6, "temporal": "none"}}
+    zid = api.post("/api/object/obj/zones/new", json=body).json()["zone"]["zone_id"]
+    assert pipe.write_mask12("obj", frames)          # the exact mask 1+2 (a stand-in is never cached)
+    reg = api.get(f"/api/object/obj/zones/{zid}/region/{start}").json()
+    url = f"/api/object/obj/stage_band/zone:{zid}/{start}/lines"
+    lines = api.get(url).json()
+    for k in ("contours", "band_contours", "inset_feather_contours", "feather_contours", "area_px", "region_mode"):
+        assert lines[k] == reg[k], k
+    assert lines["band_contours"]
+    # another job runs: the region endpoint is refused, the lines are not
+    jid = app_module.JOBS.try_start("other_job", "Inne liczenie", "obj")
+    try:
+        assert api.get(f"/api/object/obj/zones/{zid}/region/{start}").status_code == 409
+        r = api.get(url)
+        assert r.status_code == 200 and r.json()["band_contours"] == lines["band_contours"]
+    finally:
+        app_module.JOBS.finish(jid, "done")
+    # cached by content: the second ask computes nothing
+    calls = []
+    real = pipe.zone_region
+    monkeypatch.setattr(type(pipe), "zone_region", lambda self, *a, **k: (calls.append(1), real(*a, **k))[1])
+    assert api.get(url).json()["band_contours"] == lines["band_contours"] and not calls
+    # a slider change = another key: recomputed, the band wider
+    assert api.patch(f"/api/object/obj/zones/{zid}", json={"params": {**body["params"], "outline_out_px": 20}}).status_code == 200
+    wider = api.get(url).json()
+    assert calls and wider["area_px"] > lines["area_px"]
+    # a drawing (exclusion): the lines path refuses, the region endpoint serves it
+    ys, xs = np.where(pipe.load_core("obj", [start])[start])
+    xm = int(np.median(xs)); top = int(ys[xs == xm].min())
+    r = api.put(f"/api/object/obj/zones/{zid}/keys/{start}",
+                json={"polygon": [[xm - 5, top - 5], [xm + 5, top - 5], [xm + 5, top + 5], [xm - 5, top + 5]]})
+    assert r.status_code == 200, r.text
+    assert api.get(url).status_code == 409
+
+
 def test_band_past_the_computed_core_is_a_note_not_an_error(tmp_path, monkeypatch):
     """User report 2026-11-06: a frame past the SAM 3.1 core (core F1-60, frame 140) – the zone area gave 409 (the UI
     retried it 20x, then an error window) and a band point was stored there, never tracked. Now: the area answers

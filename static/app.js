@@ -361,6 +361,41 @@ class MatteDeskViewer {
     this.timelineTrack.addEventListener('pointerup', endScrub);
     this.timelineTrack.addEventListener('pointercancel', endScrub);
 
+    // Alt held = the hand (pan) in every stage: tracked from the keyboard too – a pen event does not always carry altKey
+    // (user report 2026-11-20: Alt + pen drag did not pan). window.mdAltHeld(e) is the one test for the tools.
+    this.altHeld = false;
+    window.addEventListener('keydown', (e) => { if (e.key === 'Alt') this.altHeld = true; }, true);
+    window.addEventListener('keyup', (e) => { if (e.key === 'Alt') this.altHeld = false; }, true);
+    window.addEventListener('blur', () => { this.altHeld = false; });
+    window.mdAltHeld = (e) => !!((e && e.altKey) || this.altHeld);
+    // pen / touch pan on Pointer Events with capture (as the timeline, 2026-11-15): the pen's compatibility mouse events
+    // were not a reliable drag – Alt + pen, or the middle (barrel) button, pans; a tool that claims the pointer first
+    // (mdHandled / preventDefault in its capture listener) keeps it. The mouse keeps the mousedown path below.
+    this.penPan = null;
+    this.canvas.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' || e.mdHandled || e.defaultPrevented) return;
+      if (!(window.mdAltHeld(e) || e.button === 1)) return;
+      e.preventDefault();   // no compatibility mousedown: one pan, not two
+      this.penPan = { id: e.pointerId, x: e.clientX - this.panX, y: e.clientY - this.panY };
+      this.isPanning = false;
+      try { this.canvas.setPointerCapture(e.pointerId); } catch (er) { /* capture unsupported */ }
+      this.canvas.classList.add('panning');
+    });
+    this.canvas.addEventListener('pointermove', (e) => {
+      if (!this.penPan || e.pointerId !== this.penPan.id) return;
+      this.panX = e.clientX - this.penPan.x;
+      this.panY = e.clientY - this.penPan.y;
+      this.render();
+    });
+    const endPenPan = (e) => {
+      if (!this.penPan || e.pointerId !== this.penPan.id) return;
+      this.penPan = null;
+      try { this.canvas.releasePointerCapture(e.pointerId); } catch (er) { /* not captured */ }
+      this.canvas.classList.remove('panning');
+    };
+    this.canvas.addEventListener('pointerup', endPenPan);
+    this.canvas.addEventListener('pointercancel', endPenPan);
+
     // Canvas Pan & Zoom
     this.canvas.addEventListener('mousedown', (e) => {
       if (e.mdHandled) return;
@@ -1195,7 +1230,8 @@ class MatteDeskViewer {
     const img = new Image();
     const gen = this.projectGen || 0;
     img.crossOrigin = 'anonymous';
-    img.src = `/api/frame/${frameNum}?plate=${encodeURIComponent(plate)}${aligned ? '&aligned=1' : ''}&g=${gen}.${(this.plateRev || {})[plate] || 0}`;
+    const view = this.viewParam(plate, aligned);
+    img.src = `/api/frame/${frameNum}?plate=${encodeURIComponent(plate)}${aligned ? '&aligned=1' : ''}${view ? `&view=${encodeURIComponent(view)}` : ''}&g=${gen}.${(this.plateRev || {})[plate] || 0}`;
     // a request that never answers (the server restarted under an open page, user report 2026-10-24: „Wczytywanie
     // klatki 78…” for ever) must not keep the frame locked: after 20 s it is asked again (once per load call)
     const watchdog = setTimeout(() => {
@@ -1255,7 +1291,20 @@ class MatteDeskViewer {
 
   frameKey(plate, frameNum, aligned) {
     const al = aligned === undefined ? (plate !== 'beauty' && this.alignedPreview) : aligned;
-    return `${plate}${al ? '_al' : ''}_${frameNum}`;
+    return `${plate}${al ? '_al' : ''}${this.viewParam(plate, al) ? `_v${this.profileView}` : ''}_${frameNum}`;
+  }
+  // the plate through a colour profile curve (stage 0 „Podgląd przez profil”, 2026-11-20): view only – the models keep
+  // the PlateToDisplay image; not for the aligned preview nor the target background
+  viewParam(plate, aligned) { return this.profileView && !aligned && plate !== 'bg' ? this.profileView : ''; }
+  setProfileView(curve, label) {
+    const v = curve || null;
+    const hud = document.getElementById('hudProfileView');
+    if (hud) { hud.style.display = v ? '' : 'none'; hud.textContent = v ? `Podgląd: ${label || v}` : ''; }
+    if (v === (this.profileView || null)) return;
+    this.profileView = v;
+    this.tiles.cache.clear();
+    this.goToFrame(this.currentFrame);
+    window.dispatchEvent(new CustomEvent('md-profile-view', { detail: { curve: v } }));
   }
 
   hasFrame(frameNum) {
@@ -1509,7 +1558,7 @@ class MatteDeskViewer {
     }
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0, kp, chunks, plate: this.activePlate || 'beauty', f: this.currentFrame };
   }
-  tileKey(c, plate, f) { return `${plate}_${f}_${c.x}_${c.y}_${c.w}_${c.h}`; }
+  tileKey(c, plate, f) { return `${plate}${this.viewParam(plate, false) ? `_v${this.profileView}` : ''}_${f}_${c.x}_${c.y}_${c.w}_${c.h}`; }
   // the current region when its tiles are wanted – { x, y, w, h, kp, chunks: [{x,y,w,h,img|null}] } or null (objects.js / zones.js
   // draw their full-resolution overlays on the same chunks; `complete` = every chunk loaded)
   tileRegion() {
@@ -1538,7 +1587,8 @@ class MatteDeskViewer {
       t.crossOrigin = 'anonymous';
       t.onload = () => { if (gen === (this.projectGen || 0) && reg.f === this.currentFrame) this.render(); };
       t.onerror = () => { if (gen === (this.projectGen || 0)) this.tiles.cache.delete(key); };
-      t.src = `/api/frame/${reg.f}/tile?plate=${encodeURIComponent(reg.plate)}&x=${c.x}&y=${c.y}&w=${c.w}&h=${c.h}&g=${gen}.${(this.plateRev || {})[reg.plate] || 0}`;
+      const view = this.viewParam(reg.plate, false);
+      t.src = `/api/frame/${reg.f}/tile?plate=${encodeURIComponent(reg.plate)}&x=${c.x}&y=${c.y}&w=${c.w}&h=${c.h}${view ? `&view=${encodeURIComponent(view)}` : ''}&g=${gen}.${(this.plateRev || {})[reg.plate] || 0}`;
       this.tiles.cache.set(key, t);
       while (this.tiles.cache.size > this.tiles.limit) this.tiles.cache.delete(this.tiles.cache.keys().next().value);
     }

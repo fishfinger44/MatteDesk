@@ -144,6 +144,13 @@ async function fakeApi(method, url, body) {
       bbox: [300, 100, 421, 241], area_px: 16800, bg_px: 0,
       ...(z.params && z.params.region === 'outline' ? { region_mode: 'outline', exclude_contours: [[[50, 60], [90, 60], [90, 120], [50, 120]]] } : {}) };
   }
+  // whole outline with nothing painted: the band lines on the stages' path (2026-11-20), no exclusion to show
+  if ((m = url.match(/^\/api\/object\/obj\/stage_band\/zone:(z_\d+)\/(\d+)\/lines$/)) && method === 'GET') {
+    const z = srv.zones[m[1]]; const f = +m[2];
+    return { zone_id: z.zone_id, frame: f, keys: sortedKeys(z), is_key: sortedKeys(z).includes(f), contours: [[[300, 100], [420, 100], [420, 240], [300, 240]]],
+      bbox: [300, 100, 421, 241], area_px: 16800, bg_px: 0, region_mode: 'outline', exclude_contours: [],
+      band_contours: [[[290, 90], [430, 90], [430, 250], [290, 250]]], inset_feather_contours: [], feather_contours: [] };
+  }
   if ((m = url.match(/^\/api\/object\/obj\/zones\/(z_\d+)\/apply\?stage=vitmatte$/)) && method === 'POST') {
     const z = srv.zones[m[1]];
     if (srv.hand && z.holdout) { srv.holdoutRefusals++; throw err(409, { detail: 'Obiekty z przodu bez maski: hand', missing_front: ['hand'], queue: [] }); }
@@ -267,8 +274,10 @@ assert($('z4PvFrame').style.display === 'none' && !calls.some((c) => /\/preview\
 // a frame change fetches the band area of that frame
 calls.length = 0;
 viewer.goToFrame(120); await wait(450);
-assert(calls.some((c) => c[0] === 'GET' && c[1].endsWith('/region/120')), 'region fetched on frame change');
-assert(st.regionCache.z_01[120] && st.regionCache.z_01[120].exclude_contours.length === 1, 'outline region with its exclusion contours cached');
+// (a whole outline with nothing painted: the stages' lines path, not the job-locked region endpoint – 2026-11-20)
+assert(calls.some((c) => c[0] === 'GET' && c[1] === '/api/object/obj/stage_band/zone:z_01/120/lines'), 'band lines fetched on frame change (stage path)');
+assert(!calls.some((c) => c[1].endsWith('/region/120')), 'no job-locked region request for a zone without drawing');
+assert(st.regionCache.z_01[120] && st.regionCache.z_01[120].band_contours.length === 1, 'outline band lines cached');
 viewer.goToFrame(115); await wait(30);
 
 // 3. overlays draw without throwing for every view; the loupe

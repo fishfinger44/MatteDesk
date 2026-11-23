@@ -1812,6 +1812,8 @@
       '\nObejrzyj klatki (←/→); złą klatkę popraw punktami (klucz) i „▶ Przelicz klatkę”, potem „▶▶ Przelicz nieaktualne”.', frontMissingKind(d));
     toast(`Maska ${d.whole_shot ? 'w każdej klatce' : `w F${d.frames[0]}–${d.frames[1]}`} gotowa${d.uncertain.length ? ` – niepewnych: ${d.uncertain.length}` : ''}` +
       ((d.front_missing || []).length ? ` · ⚠ obiekt z przodu bez rdzenia: ${d.front_missing.map((m) => m.object).join(', ')}` : ''), 5000);
+    // the mask 1+2 after the core failed (2026-11-20): said aloud – stage 3 / the export will compute it again (slow)
+    if (d.mask12_error) toast(`⚠ Maska 1+2 nie zapisana po rdzeniu: ${d.mask12_error} – etapy 3–5 / eksport policzą ją od nowa (stabilizacja rdzenia)`, 9000);
     renderPointsPalette();
   }
   async function refreshList(select) {
@@ -2409,6 +2411,7 @@
         </div>
         <button type="button" class="btn btn-primary btn-sm" id="ppAll" title="Liczy tylko to, co nieaktualne po ostatnim przeliczeniu: odcinki ze zmienionymi kluczami (reszta z cache). Za pierwszym razem – całe ujęcie (kadry automatycznie, gdy trzeba + rdzeń SAM 3.1)">▶▶ Przelicz nieaktualne</button>
         <div class="pp-hint muted">Klik = punkt + · PPM = punkt − · Alt = łapka · klik na punkt = usuń · Delete = ostatni</div>
+        <div class="pp-life pp-ext" id="ppExt"></div>
       </div>`);
       w.appendChild(box);
       makeFloating(box, w, '.pp-head', ptsPos);
@@ -2416,6 +2419,10 @@
       $('ppCompute').addEventListener('click', () => computePoints(V().currentFrame));
       $('ppClear').addEventListener('click', () => clearPoints(V().currentFrame));
       $('ppAll').addEventListener('click', () => run('ppAll', computeAll));
+      $('ppExt').addEventListener('click', (e) => {
+        const t = e.target.closest('[data-ext]'); if (!t || t.disabled) return;
+        if (t.dataset.ext === 'load') coreImportDialog(); else coreImportRemove();
+      });
       box.querySelectorAll('.pp-tool').forEach((b) => b.addEventListener('click', () => setTool(b.dataset.t)));
     }
     return box;
@@ -2443,13 +2450,86 @@
     $('ppClear').disabled = !pts.length || !!busy;
     box.querySelectorAll('.pp-tool').forEach((b) => b.classList.toggle('active', S.tool === b.dataset.t));
     const core = stageState('core').state, canAll = stageState('detect').state === 'done';
+    const imp = S.info && S.info.core_import;   // the core = the user's external mask: SAM 3.1 would overwrite it
     for (const id of ['ppAll', 'st1All']) {
       const b = $(id); if (!b) continue;
-      b.disabled = !canAll || document.body.classList.contains('job-busy');
-      b.classList.toggle('btn-cta', canAll && core !== 'done');
+      b.disabled = !canAll || !!imp || document.body.classList.contains('job-busy');
+      b.classList.toggle('btn-cta', canAll && !imp && core !== 'done');
       b.textContent = '▶▶ Przelicz nieaktualne';
+      if (imp) b.title = 'Rdzeń = wczytana maska zewnętrzna – SAM 3.1 by ją nadpisał. „↩ Wróć do SAM 3.1” poniżej, potem przelicz.';
     }
+    renderExtMask(imp);
     placeFloating(box, w, ptsPos.get());
+  }
+  // External mask as the core (user request 2026-11-20, engine/core_import.py): instead of SAM 3.1 the user's own alpha
+  // sequence (Nuke roto, another keyer) becomes the stage-1 core + crops + one key per crop segment. The core
+  // stabilisation is computed later, on first use (stages 3 / 4 / 5 / 7, the export).
+  function renderExtMask(imp) {
+    const box = $('ppExt'); if (!box) return;
+    const busy = document.body.classList.contains('job-busy') ? 'disabled' : '';
+    const st = S.info && (S.info.steps || []).find((x) => x.id === 'sam3');
+    const file = imp ? String(imp.pattern || imp.path || '').split('/').pop() : '';
+    box.innerHTML = '<div class="sec-title">Maska zewnętrzna</div>' + (imp
+      ? `<div class="muted" title="${esc(imp.pattern || imp.path || '')}">Rdzeń z pliku: <b>${esc(file)}</b>` +
+        `${imp.offset ? ` · klatki przesunięte o ${imp.offset > 0 ? '+' : ''}${imp.offset}` : ''} · próg ${imp.threshold}` +
+        `${st && st.state === 'stale' ? ` · <span class="warn">${esc(st.why || 'nieaktualny')}</span>` : ''}</div>
+        <div class="row"><button class="btn btn-ghost btn-sm" data-ext="load" ${busy} title="Wczytaj maskę jeszcze raz (np. poprawioną w Nuke) – zastępuje rdzeń, kadry i klucze">⟳ Wczytaj ponownie</button>` +
+        `<button class="btn btn-ghost btn-sm" data-ext="sam" ${busy} title="Usuń wczytany rdzeń z dysku (klucze zostają) – potem „▶▶ Przelicz nieaktualne” liczy SAM 3.1">↩ Wróć do SAM 3.1</button></div>`
+      : `<div class="row"><button class="btn btn-ghost btn-sm" data-ext="load" ${busy} title="Własna maska (sekwencja EXR / PNG / TIFF – kanał A albo R) jako rdzeń zamiast SAM 3.1: rdzeń, kadry i klucze z pliku. Stabilizacja rdzenia policzy się później (etapy 3–5 / 7 albo eksport).">📂 Wczytaj maskę zewnętrzną…</button></div>`);
+  }
+  function coreImportDialog() {
+    if (!S.obj || $('extPath')) return;
+    const LS = 'md_core_import_path';
+    let last = ''; try { last = localStorage.getItem(LS) || ''; } catch (e) { /* storage blocked */ }
+    const imp = S.info && S.info.core_import;
+    const nk = (S.keys || []).length;
+    const pr = window.UI.form({
+      title: `📂 Maska zewnętrzna → rdzeń „${S.obj}”`, ok: 'Wczytaj', okTitle: 'Wczytaj maskę jako rdzeń (Enter)', cancelTitle: 'Zamknij (Esc)',
+      focus: 'extPath', select: true, tone: 'warn',
+      html: `<label class="md-field">Sekwencja maski <span class="muted">(folder, plik jednej klatki albo wzorzec ####, %04d)</span>
+          <span style="display:flex;gap:4px"><input id="extPath" class="form-input" style="flex:1" autocomplete="off" value="${esc((imp && imp.path) || last)}" title="Folder z sekwencją albo dowolna klatka sekwencji (EXR / PNG / TIFF)">
+          <button type="button" class="btn btn-ghost btn-sm" id="extPickDir" title="Wybierz folder sekwencji">📁</button><button type="button" class="btn btn-ghost btn-sm" id="extPickFile" title="Wybierz jedną klatkę sekwencji">🎞️</button></span></label>
+        <label class="md-field">Próg rdzenia <span class="muted">(alfa powyżej = rdzeń; miękka alfa zostaje jako start pasa)</span>
+          <input id="extThr" class="form-input" type="number" min="0.01" max="0.99" step="0.05" value="${imp ? imp.threshold : 0.5}" title="Próg binarnego rdzenia 0,01–0,99"></label>
+        <div class="muted md-modal-tip">Kanał: A (gdy niestały), inaczej R. Inna rozdzielczość o tych samych proporcjach jest skalowana do plate'u. Numery klatek: jak w ujęciu albo sekwencja tej samej długości od innego numeru (przesunięta).</div>
+        <div class="muted md-modal-tip">⚠ Zastępuje rdzeń, kadry${nk ? ` i klucze tego obiektu (${nk} – klucze cofa Ctrl+Z)` : ''}; nowe klucze = maska na początku każdego odcinka kadru. Stabilizacja rdzenia nie liczy się teraz – policzą ją etapy 3–5 / 7 albo eksport (raz, potem z pamięci).</div>`,
+      check: () => {
+        if (!$('extPath').value.trim()) return null;
+        const t = +$('extThr').value;
+        return !(t >= 0.01 && t <= 0.99) ? 'Próg: 0,01–0,99' : '';
+      },
+      submit: () => ({ path: $('extPath').value.trim(), threshold: +$('extThr').value }),
+    });
+    const pick = async (file) => {   // the form is in the DOM synchronously
+      const r = await api('POST', file ? '/api/dialog/pick_file' : '/api/dialog/pick_folder', { title: file ? 'Wybierz klatkę maski' : 'Wybierz folder sekwencji maski' });
+      const v = file ? r.path : r.folder;
+      if (v && $('extPath')) { $('extPath').value = v; $('extPath').dispatchEvent(new Event('input', { bubbles: true })); }
+    };
+    if ($('extPickDir')) $('extPickDir').addEventListener('click', () => pick(false));
+    if ($('extPickFile')) $('extPickFile').addEventListener('click', () => pick(true));
+    pr.then((req) => {
+      if (!req) return;
+      try { localStorage.setItem(LS, req.path); } catch (e) { /* storage blocked */ }
+      return run('ppAll', async () => {
+        status(`Wczytuję maskę zewnętrzną do „${S.obj}”…`);
+        const d = await api('POST', `/api/object/${S.obj}/core_import`, req);
+        clearOverlays(); await loadCrops(); await loadKeys(); await loadStages(); restoreUserView();
+        const emp = (d.empty || []).map(([x, y]) => (x === y ? `F${x}` : `F${x}–${y}`)).join(', ');
+        status(`Rdzeń z maski zewnętrznej: F${d.frames[0]}–${d.frames[1]} (${d.visible} kl.), odcinków kadru ${d.segments}, kluczy ${d.keys.length}` +
+          (d.offset ? `, klatki przesunięte o ${d.offset}` : '') + (emp ? `\nPusta maska w: ${emp}` : '') +
+          '\nStabilizacja rdzenia policzy się w etapach 3–5 / 7 albo w eksporcie.', emp ? 'warn' : 'ok');
+        toast(`Maska zewnętrzna wczytana jako rdzeń (${d.visible} kl.)`, 4000);
+      });
+    });
+  }
+  async function coreImportRemove() {
+    if (!S.obj) return;
+    const ok = await window.UI.confirmDelete({ title: `↩ Wrócić do SAM 3.1 w „${S.obj}”?`, ok: 'Usuń wczytany rdzeń na stałe',
+      what: 'Wczytany rdzeń (maska zewnętrzna) zostanie usunięty z dysku. Klucze zostają – „▶▶ Przelicz nieaktualne” policzy z nich rdzeń SAM 3.1. Plik maski na dysku nie jest ruszany.',
+      submit: async () => api('DELETE', `/api/object/${S.obj}/core_import`) });
+    if (!ok) return;
+    clearOverlays(); await loadStages();
+    toast(`Wczytany rdzeń usunięty (zwolniono ${window.UI.bytes(ok.freed_bytes)}) – „▶▶ Przelicz nieaktualne” = SAM 3.1`, 6000);
   }
   async function flushPoints(f) {
     if (!S.obj || S.pointsBusy[f]) return;
@@ -4205,7 +4285,7 @@
     window.addEventListener('blur', () => setAltPan(false));
     cv.addEventListener('mousedown', (e) => {
       if (!S.obj || S.auxMode) return;
-      if (e.altKey && e.button === 0) return;   // Alt = hand: no tool, app.js pans
+      if (window.mdAltHeld(e) && e.button === 0) return;   // Alt = hand: no tool, app.js pans
       if (S.pipette && S.stage === ST.EXPERIMENTS && e.button === 0) {   // Z24: colour of the "color" zone criterion
         e.mdHandled = true; e.preventDefault(); e.stopPropagation();
         const p = canvasToPlate(e); if (!p) return;
@@ -4265,7 +4345,7 @@
     cv.addEventListener('pointerdown', notePen, true);
     cv.addEventListener('pointermove', notePen, true);
     cv.addEventListener('pointerdown', (e) => {
-      if (!brushOn() || e.altKey) return;   // Alt = hand
+      if (!brushOn() || window.mdAltHeld(e)) return;   // Alt = hand (also when a pen event lacks altKey, 2026-11-20)
       // the pen's eraser end: button 5 on the way down, or the eraser bit WITHOUT the tip bit (some drivers raise the
       // eraser bit together with the tip – that is the tip, user report 2026-10-22: „−” painted white)
       // (a BOOLEAN: `buttons & 32` is a number, and `false !== 0` is true – with the pen every „−” stroke became „+”,

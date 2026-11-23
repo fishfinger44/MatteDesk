@@ -496,7 +496,7 @@
     V().canvas.style.cursor = tool() ? 'crosshair' : ''; info(); V().render(); }
   function wire(cv) {
     cv.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || e.altKey || !on()) return;
+      if (e.button !== 0 || (window.mdAltHeld ? window.mdAltHeld(e) : e.altKey) || !on()) return;
       const f = V().currentFrame; const p = H.canvasToPlate(e); if (!p) return;
       const ht = hit(f, p); const t = tool();
       if (t === 'band_remove') {

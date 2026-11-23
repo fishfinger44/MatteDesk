@@ -820,7 +820,7 @@ class ObjectPipeline:
 
     # ---- the stabilised core of a whole run on disk (2026-10-25): <obj>/cache/corestab/<sig>/
     _CORESTAB_V = 1          # bump when stabilized_core changes what it returns (corestab.py is hashed on its own)
-    _CORESTAB_KEEP = 2       # signatures kept per object (stage 1's frame list + a different work area)
+    _CORESTAB_KEEP = 2       # signatures kept per object besides the pinned longest run (stage 1's frame list)
 
     def _corestab_sig(self, name: str, frames: Sequence[int], keys: Dict[int, np.ndarray], fronts: Sequence[str],
                       radius: int, band_px: int) -> Optional[str]:
@@ -909,8 +909,17 @@ class ObjectPipeline:
                                             "soft_frames": sorted(int(f) for f in soft),
                                             "stats": stats}, default=float)
             os.utime(d)
-            old = sorted((p for p in root.iterdir() if p.is_dir() and p.name != sig), key=lambda p: p.stat().st_mtime,
-                         reverse=True)
+            # the longest run (stage 1's whole frame list) is pinned: short zone previews (5 / 13 frames) used to push
+            # it out and every "Apply zone" recomputed ~150 frames (SD160_020, 2026-11-20). Ties -> the newest.
+            def n_frames(p: Path) -> int:
+                try:
+                    return len(json.loads((p / "corestab.json").read_text(encoding="utf-8")).get("frames") or [])
+                except (OSError, ValueError):
+                    return -1
+            dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+            sizes = {p.name: n_frames(p) for p in dirs}
+            pinned = max(dirs, key=lambda p: sizes[p.name]).name if dirs else None
+            old = [p for p in dirs if p.name not in (sig, pinned)]
             for p in old[self._CORESTAB_KEEP - 1:]:
                 shutil.rmtree(p, ignore_errors=True)
         except OSError as e:
@@ -2310,8 +2319,10 @@ class ObjectPipeline:
         return tracker
 
     def _tracker_frames_for(self):
-        s = min(1.0, 1024.0 / max(self.w, self.h))
-        return lambda sub: ([cv2.resize(self.loader.frame(f), None, fx=s, fy=s, interpolation=cv2.INTER_AREA) for f in sub], s)
+        """Tracker frames of the zone / brush propagation (CoTracker3 at 1024 px): the beauty proxies like the band
+        points (2026-11-20, SD160_020: the 6K EXR + display conversion cost 0.70 s a frame, ~100 s for 148 frames
+        before the GPU started; a proxy JPEG 0.012 s), the plate where a proxy is missing."""
+        return self._band_tracker_frames(None)
 
     BAND_TRACK_SIDE = 640         # longer side of the object-stabilised crop the band points are tracked on (px)
 
@@ -2897,7 +2908,7 @@ class ObjectPipeline:
             if reg is not None and reg.any():
                 # the whole band ring – outer AND inner edges (user report 2026-10-21: with band points the band
                 # vanished from the preview, only the outer edge came back); the UI fills it even-odd
-                from engine.bandsys import area_lines, contours
+                from engine.bandsys import area_lines_crop as area_lines, contours
                 from engine.zones import zone_feather_at, zone_outer_feather_px, zone_whole
                 if f in core:
                     # where the feathers end, both inside the band and never crossing: the same distances and lengths

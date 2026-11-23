@@ -764,7 +764,47 @@ def write_alpha_exr(path: Path, a: np.ndarray) -> None:
     write_gray_exr(path, np.clip(a, 0, 1), half=True, channels=("R", "G", "B"))
 
 
+def _read_alpha_exr(path: Path) -> Optional[np.ndarray]:
+    """The channel read_alpha takes (A of RGBA, R of RGB, the only one of a 1-channel file), decoded alone by
+    OpenEXR – the same values as cv2.imread + the channel pick, ~15x faster (0.78 -> 0.05 s on a 4624 px crop,
+    SD160_020 2026-11-20: cv2 decodes all three channels to float32). None = a layout it does not mirror (cv2 then)."""
+    import Imath
+    import OpenEXR
+    from engine.exr_io import _simple_layout
+    f = OpenEXR.InputFile(str(path))
+    try:
+        hdr = f.header()
+        lay = _simple_layout(hdr)
+        chs = hdr["channels"]
+        if lay is None:
+            return None
+        if len(chs) == 4 and "A" in chs and all(c in chs for c in "RGB"):
+            c = "A"
+        elif len(chs) == 3 and all(c in chs for c in "RGB"):
+            c = "R"
+        elif len(chs) == 1:
+            c = next(iter(chs))
+        else:
+            return None
+        pt = str(chs[c].type)
+        if pt not in ("HALF", "FLOAT"):
+            return None
+        _, _, w, h = lay
+        dt = np.float16 if pt == "HALF" else np.float32
+        raw = f.channel(c, Imath.PixelType(getattr(Imath.PixelType, pt)))
+        return np.frombuffer(raw, dt).reshape(h, w).astype(np.float32)
+    finally:
+        f.close()
+
+
 def read_alpha(path: Path) -> np.ndarray:
+    if str(path).lower().endswith(".exr"):
+        try:
+            a = _read_alpha_exr(path)
+        except OSError:
+            a = None
+        if a is not None:
+            return a
     m = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if m is None:
         raise FileNotFoundError(path)

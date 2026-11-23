@@ -1,5 +1,24 @@
 # MatteDesk – changelog
 
+## 0.62 – 2026-11-23
+- **Faster mask export.** Frames are written by several processes at once (config `export_workers`, auto = CPU cores − 4,
+  at most 8) and each object's alpha is read as one channel – a 148-frame 6K shot with two objects went from ~5.7 min to
+  under 1 min; the files are bit-identical to the old export.
+- **Fix: stage 1 did not save the mask 1+2 after the SAM 3.1 core.** The write failed silently, so stages 3–5 and the
+  export stabilised every frame of the core again (minutes on long 6K shots). It is saved again; a failure now shows a
+  warning, and "Cancel" in that step no longer pretends the job finished. Objects computed with an older version build
+  the mask once on first use (or after "▶▶ Recompute outdated").
+- Core stabilisation cache keeps the whole-shot run – short zone previews no longer push it out.
+- **Faster edge band:** band lines of stages 3 / 4 / 7 and the whole-outline zone of stage 5 (ViTMatte / BiRefNet) are
+  computed on a crop around the object (same lines, ~2.7–3.3× faster on 6K); the stage 5 zone band uses the same
+  request as the other stages, so it no longer waits for another running job. Zone / brush tracking (CoTracker3) reads
+  the frame proxies (~100 s less loading on a 148-frame 6K shot).
+- **New: external mask as the core** (stage 1, "📂 Load external mask…"): your own EXR / PNG / TIFF mask sequence
+  (channel A or R) becomes the object's core, crops and keys; "↩ Back to SAM 3.1" removes it.
+- **New: view the plate through the colour profile curve** (stage 0, "👁 View through profile") – view only, the models
+  still compute on the fixed display image.
+- Alt + pen drag pans the viewer (graphics tablets).
+
 ## 0.61 – 2026-11-17
 - **Fix: Comfy Desktop 2 installed outside C: was not found.** The ComfyUI folder is now read from Desktop's own
   installations.json / installDir, so an install on another drive is detected (before, the Doctor could not install the

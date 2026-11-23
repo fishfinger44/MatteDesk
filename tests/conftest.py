@@ -33,6 +33,8 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 # config `align_device` = auto would otherwise send these tests to the GPU worker on a workstation.
 os.environ.setdefault("MD_ALIGN_DEVICE", "cpu")
 os.environ.setdefault("MD_MODEL_GATE", "0")
+# Export in this process (monkeypatches reach it); tests/test_export_parallel.py compares the process pool explicitly
+os.environ.setdefault("MD_EXPORT_WORKERS", "1")
 # FLUX 3 Image Klein variant by the card (stage_models.klein_preferred): fixed so the tests do not depend on this GPU;
 # tests/test_klein_variant.py sets int8 explicitly
 os.environ.setdefault("MD_KLEIN_VARIANT", "bf16")

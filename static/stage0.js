@@ -21,6 +21,7 @@
       <div id="p0Plates"></div>
       <div class="row"><label title="Krzywa lin ↔ log plate'u (tylko krzywa, bez gamutu): domyślna krzywa trybu Log w palecie MergeMatte i w eksporcie .nk; auto = propozycja z typu źródła / colorspace manifestu / nagłówka EXR (ACES, ARRI, Sony, RED). Zapis w project.json, nie w manifeście">Profil koloru<select id="p0ColorProfile" class="form-input input-sm" title="auto = propozycja (powód w nawiasie) albo krzywa wybrana ręcznie; MergeMatte „z profilu plate'u” i eksport .nk używają tej krzywej"></select></label></div>
       <div id="p0ColorProfileInfo" class="muted"></div>
+      <label class="row" title="Pokaż plate w podglądzie przez krzywą wybranego profilu (lin → log, jak w trybie Log MergeMatte i w .nk). Tylko podgląd: modele nadal liczą na stałym obrazie PlateToDisplay – wyniki i cache bez zmian"><input type="checkbox" id="p0ProfileView" title="Podgląd plate'u przez krzywą profilu koloru – tylko podgląd, obliczenia bez zmian"> 👁 Podgląd przez profil <span class="muted">(tylko podgląd, nie zmienia obliczeń)</span></label>
       <div class="row"><button class="btn btn-secondary btn-sm" id="p0Manage">⚙ Zarządzaj plate'ami</button><button class="btn btn-secondary btn-sm" id="p0Proxy" title="Proxy 1920 px dla oglądanego plate'u">⚡ Proxy (ten plate)</button></div>
     </div>
     <div class="pane-section" id="p0QaSec">
@@ -116,8 +117,8 @@
   let profile = null;
   async function loadColorProfile() {
     const sel = $('p0ColorProfile'); if (!sel) return;
-    if (!info) { profile = null; sel.innerHTML = ''; $('p0ColorProfileInfo').textContent = ''; return; }
-    try { profile = await window.MD.api('GET', '/api/project/color_profile'); } catch (e) { profile = null; }
+    if (!info) { profile = null; sel.innerHTML = ''; $('p0ColorProfileInfo').textContent = ''; V().setProfileView(null); return; }
+    try { profile = await window.MD.api('GET', '/api/project/color_profile'); } catch (e) { profile = null; V().setProfileView(null); }
     renderColorProfile();
   }
   function renderColorProfile() {
@@ -126,6 +127,16 @@
     sel.innerHTML = profile.options.map((o) => `<option value="${window.MD.esc(o.id)}" title="${window.MD.esc(o.note || '')}">${window.MD.esc(o.label)}</option>`).join('');
     sel.value = profile.setting;
     inf.textContent = `Teraz: ${profile.effective.label} (${profile.effective.reason}).`;
+    syncProfileView();
+  }
+  // „👁 Podgląd przez profil” (2026-11-20): the viewer shows the plate through the profile's curve (view only); the
+  // switch is a per-viewer convenience (localStorage), the curve follows the profile
+  const PV_KEY = 'md.profileView';
+  const pvWanted = () => { try { return localStorage.getItem(PV_KEY) === '1'; } catch (e) { return false; } };
+  function syncProfileView() {
+    const cb = $('p0ProfileView'); if (!cb) return;
+    cb.checked = pvWanted();
+    V().setProfileView(cb.checked && profile ? profile.effective.id : null, profile ? profile.effective.label : '');
   }
   // content check actions (NEXT_STEPS 5, 2026-11-07): measure again; „użyj mimo to” for a plate wrongly flagged „inne ujęcie”
   function contentButtons(p) {
@@ -627,6 +638,11 @@
         window.dispatchEvent(new CustomEvent('md-color-profile', { detail: profile }));
       } catch (err) { window.MD.toast(`Profil koloru: ${err.message}`, 6000); await loadColorProfile(); }
       finally { sel.disabled = false; }
+    });
+    $('p0ProfileView').addEventListener('change', (e) => {
+      try { localStorage.setItem(PV_KEY, e.target.checked ? '1' : '0'); } catch (er) { /* storage blocked */ }
+      syncProfileView();
+      if (e.target.checked && profile) window.MD.toast(`Podgląd przez krzywą ${profile.effective.label} – tylko podgląd, modele liczą na stałym obrazie`, 4000);
     });
     $('p0CleanOpen').addEventListener('click', () => V().openCleanModal());
     $('p0CameraOpen').addEventListener('click', () => V().openCameraModal());

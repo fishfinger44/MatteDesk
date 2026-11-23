@@ -160,7 +160,7 @@ app.add_middleware(
 # a group entity (PLAN_GROUP_COMPOSE) has no stages 1 + 2 of its own – its mask is the composition of its members: the
 # SAM 3.1 / key / crop / core / brush actions are refused on it (409), the members get them
 _GROUP_NO_OWN = re.compile(r"^/api/object/([^/]+)/(points|detect|choose|keys|crops|run|compute_all|rerun_from|preview_frame|"
-                           r"core_fix|life|correct|interval_engine|import_review)(/|$)")
+                           r"core_fix|core_import|life|correct|interval_engine|import_review)(/|$)")
 
 
 @app.middleware("http")
@@ -1606,16 +1606,59 @@ def _aligned_proxy_path(plate: str, frame_num: int) -> Path:
     return out
 
 
+def _view_curve_or_400(view: str) -> str:
+    from engine.log_curves import LOG_CURVES
+    if view not in LOG_CURVES:
+        raise HTTPException(status_code=400, detail=f"Podgląd profilu: krzywa musi być jedną z: {', '.join(LOG_CURVES)}")
+    return view
+
+
+def _view_proxy_path(plate: str, frame_num: int, view: str) -> Path:
+    """Proxy JPEG of a plate frame seen through a colour profile curve (engine/profile_view.py, view only – the
+    models keep the PlateToDisplay image): proxy/<plate>_view_<curve>/, rendered again when the source changes."""
+    from engine.profile_view import view_rgb
+    _plate_name_or_400(plate)
+    _view_curve_or_400(view)
+    manifest = STATE.get("manifest") or {}
+    pattern = (manifest.get("plates") or {}).get(plate, "")
+    src = ProxyGenerator.resolve_frame_path(pattern, frame_num) if pattern else None
+    if not src or not src.exists():
+        raise HTTPException(status_code=404, detail=f"Brak klatki {frame_num} plate'u '{plate}'")
+    out = Path(STATE["work_dir"]) / "proxy" / f"{plate}_view_{view}" / f"p_{frame_num:04d}.jpg"
+    side = out.with_suffix(".src")
+    ident = f"{Path(src).resolve()}|{src.stat().st_mtime_ns}|{manifest.get('colorspace', 'ACES2065-1')}"
+    try:
+        if out.exists() and side.read_text(encoding="utf-8") == ident:
+            return out
+    except OSError:
+        pass
+    rgb = view_rgb(src, manifest.get("colorspace", "ACES2065-1"), view)
+    h, w = rgb.shape[:2]
+    s = min(1920.0 / w, 1920.0 / h, 1.0)
+    if s < 1.0:
+        rgb = cv2.resize(rgb, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), np.ascontiguousarray(rgb[..., ::-1]), [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    try:
+        side.write_text(ident, encoding="utf-8")
+    except OSError:
+        pass
+    return out
+
+
 @app.get("/api/frame/{frame_num}")
-def get_proxy_frame(frame_num: int, plate: str = "beauty", aligned: int = 0):
+def get_proxy_frame(frame_num: int, plate: str = "beauty", aligned: int = 0, view: str = ""):
     """Proxy JPEG of a frame. aligned=1 (auxiliary plates only): warped by the alignment report = preview of the
-    result of 'Skoryguj plate' without writing anything to the plate folders."""
+    result of 'Skoryguj plate' without writing anything to the plate folders. view=<curve id> (2026-11-20): the
+    frame through a colour profile curve – view only, the models keep the PlateToDisplay image."""
     if not STATE["work_dir"]:
         raise HTTPException(status_code=400, detail="No project loaded")
     # no-cache = the browser asks again (cheap 304 by ETag) instead of reusing a proxy a new Cleanup run has replaced
     nc = {"Cache-Control": "no-cache"}
     if aligned:
         return FileResponse(_aligned_proxy_path(plate, frame_num), media_type="image/jpeg", headers=nc)
+    if view and plate != "bg":
+        return FileResponse(_view_proxy_path(plate, frame_num, view), media_type="image/jpeg", headers=nc)
     return FileResponse(_proxy_path(plate, frame_num), media_type="image/jpeg", headers=nc)
 
 
@@ -1623,17 +1666,22 @@ TILE_MAX = 2048          # Z8: max side of a tile (plate px)
 DISPLAY_CACHE_FRAMES = 3  # full-frame display images kept in memory (4096x2731x3 B ~ 33 MB each)
 
 
-def _full_display_u8(plate: str, frame_num: int) -> np.ndarray:
+def _full_display_u8(plate: str, frame_num: int, view: str = "") -> np.ndarray:
     """Full-resolution display image (BGR uint8) of a plate frame – the SAME conversion as the proxy
-    (`ProxyGenerator.load_frame_rgb`), so the tile has the proxy's colours. LRU of DISPLAY_CACHE_FRAMES in STATE."""
+    (`ProxyGenerator.load_frame_rgb`), so the tile has the proxy's colours. LRU of DISPLAY_CACHE_FRAMES in STATE.
+    `view` = a colour profile curve (the frame through it, as the view proxy)."""
     cache = STATE.setdefault("display_cache", LockedLRU(DISPLAY_CACHE_FRAMES))
     manifest = STATE.get("manifest") or {}
     pattern = manifest.get("plates", {}).get(plate, "")
     src = ProxyGenerator.resolve_frame_path(pattern, frame_num) if pattern else None
     if not src or not src.exists():
         raise HTTPException(status_code=404, detail=f"Brak klatki {frame_num} plate'u '{plate}'")
-    key = (plate, int(frame_num), str(src), src.stat().st_mtime_ns)   # a new / rewritten source = a new entry
+    key = (plate, int(frame_num), str(src), src.stat().st_mtime_ns, view)   # a new / rewritten source = a new entry
     img = cache.get(key)
+    if img is None and view:
+        from engine.profile_view import view_rgb
+        img = np.ascontiguousarray(view_rgb(src, manifest.get("colorspace", "ACES2065-1"), _view_curve_or_400(view))[..., ::-1])
+        cache.put(key, img)
     if img is None:
         rgb = ProxyGenerator.load_frame_rgb(src, colorspace=manifest.get("colorspace", "ACES2065-1"))
         img = np.ascontiguousarray(rgb[..., ::-1])
@@ -1656,12 +1704,14 @@ def _png_response(img: np.ndarray):
 
 
 @app.get("/api/frame/{frame_num}/tile")
-def get_frame_tile(frame_num: int, x: int, y: int, w: int, h: int, plate: str = "beauty", fmt: str = "jpg"):
+def get_frame_tile(frame_num: int, x: int, y: int, w: int, h: int, plate: str = "beauty", fmt: str = "jpg",
+                   view: str = ""):
     """Z8: full-resolution crop [x, y, w, h] (plate px) of a plate frame for zoom > 100 % of the proxy – the same
-    display conversion as the proxy. JPEG q95 by default, fmt=png = lossless (tests: pixels == load_frame_rgb crop)."""
+    display conversion as the proxy. JPEG q95 by default, fmt=png = lossless (tests: pixels == load_frame_rgb crop).
+    view=<curve id>: through a colour profile curve, as GET /api/frame?view=."""
     if not STATE["work_dir"]:
         raise HTTPException(status_code=400, detail="No project loaded")
-    img = _full_display_u8(plate, frame_num)
+    img = _full_display_u8(plate, frame_num, view if plate != "bg" else "")
     x, y, w, h = _tile_rect(x, y, w, h, img.shape[1], img.shape[0])
     crop = np.ascontiguousarray(img[y:y + h, x:x + w])
     if fmt == "png":
@@ -2170,6 +2220,8 @@ def _require_stage(name: str, stage: str) -> None:
     from engine.stage_models import model_gate
     from engine.stages import require
     _require_plates_ok()
+    if stage in ("crops", "core"):   # SAM 3.1 crop / core runs would overwrite an imported external mask
+        _refuse_imported_core(name)
     g = model_gate(load_config()).get(stage)
     if g:   # user rule 2026-10-16: a stage without its model is unavailable
         raise HTTPException(status_code=409, detail=g["why"])
@@ -2408,8 +2460,8 @@ async def compute_all(name: str):
         res = await loop.run_in_executor(None, lambda: pipe.run_core(name, frames, cb))
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
-    await _auto_mask12(pipe, name)
-    return {"success": True, "frames": [frames[0], frames[-1]], "work_area": _work_area(),
+    m12 = await _auto_mask12(pipe, name)
+    return {"success": True, "mask12_error": m12, "frames": [frames[0], frames[-1]], "work_area": _work_area(),
             "whole_shot": frames == _shot_frames(), "crops_recomputed": bool(reason), "crops_reason": reason,
             "crop_segments": len(crops["segments"]) if crops else None, "crop_flags": (crops or {}).get("flags") or {},
             "life_hints": getattr(res, "life_hints", []), "front_missing": getattr(res, "front_missing", []),
@@ -2417,22 +2469,32 @@ async def compute_all(name: str):
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals}
 
 
-async def _auto_mask12(pipe, name: str) -> None:
+async def _auto_mask12(pipe, name: str) -> Optional[str]:
     """Stage 1 done: the mask 1+2 (stabilised core) on every frame the core covers -> core_fix/ (objects without brush
-    corrections; 2026-10-22: stage 3 band lines read it instead of recomputing ~0.5 s per frame). Never fails the core."""
+    corrections; 2026-10-22: stage 3 band lines read it instead of recomputing ~0.5 s per frame). Never fails the core:
+    an error comes back as the reason (the endpoint returns it as `mask12_error`, the UI shows it). „Przerwij” is NOT
+    swallowed (2026-11-20, SD160_020 „tlo”: the job said done, nothing was written and the export stabilised all
+    148 frames again) – the job ends cancelled."""
     from engine.workarea import core_coverage
     try:
         if not hasattr(pipe, "write_mask12"):
-            return
+            return None
         cov = core_coverage(_objects().dir(name)) or []
         frames = [f for f in _shot_frames() if any(a <= f <= b for a, b in cov)]
         if not frames:
-            return
-        JOBS.progress("Maska 1+2 (wygładzony rdzeń) na dysk")
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda: pipe.write_mask12(name, frames, _ws_progress("object_progress", name)))
-    except Exception as e:   # the core is there; stage 3 computes the mask itself as before
+            return None
+        JOBS.progress("Maska 1+2 (wygładzony rdzeń) na dysk", 0, len(frames))
+        # the callback is built HERE, on the event loop: _ws_progress asks for the running loop, and inside the executor
+        # lambda (a worker thread) that raised „no running event loop” – swallowed below, so stage 1 never wrote the
+        # mask 1+2 nor the stabilised core cache, and stage 3 / the export stabilised every frame again (2026-11-20)
+        cb = _ws_progress("object_progress", name)
+        await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.write_mask12(name, frames, cb))
+        return None
+    except JobCancelled:
+        raise
+    except Exception as e:   # the core is there; stage 3 / the export compute the mask themselves as before
         logging.getLogger(__name__).warning("maska 1+2 po rdzeniu %s: %s", name, e)
+        return str(e) or e.__class__.__name__
 
 
 @app.post("/api/object/{name}/run")
@@ -2447,11 +2509,60 @@ async def run_object_core(name: str):
         res = await asyncio.get_running_loop().run_in_executor(None, lambda: pipe.run_core(name, frames, cb))
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         raise HTTPException(status_code=409, detail=str(e))
-    await _auto_mask12(pipe, name)
-    return {"success": True, "frames": [frames[0], frames[-1]], "life_hints": getattr(res, "life_hints", []),
+    m12 = await _auto_mask12(pipe, name)
+    return {"success": True, "mask12_error": m12, "frames": [frames[0], frames[-1]], "life_hints": getattr(res, "life_hints", []),
             "front_missing": getattr(res, "front_missing", []),
             "uncertain": res.uncertain, "suggested_keys": res.suggested_keys,
             "recomputed": res.recomputed_intervals, "cached": res.cached_intervals}
+
+
+def _refuse_imported_core(name: str) -> None:
+    """SAM 3.1 would overwrite the user's external mask (engine/core_import.py) – 409 with the way out."""
+    from engine.core_import import core_source
+    if core_source(_objects().dir(name)):
+        raise HTTPException(status_code=409, detail="Rdzeń tego obiektu to wczytana maska zewnętrzna – SAM 3.1 by ją "
+                            "nadpisał. „Wczytaj maskę” ponownie albo „Wróć do SAM 3.1” (etap 1), potem przelicz.")
+
+
+class CoreImportRequest(BaseModel):
+    path: str
+    threshold: float = 0.5
+
+
+@app.post("/api/object/{name}/core_import")
+@long_job("Wczytaj maskę: {name}")
+async def core_import_object(name: str, req: CoreImportRequest):
+    """Stage 1 alternative (user request 2026-11-20): the user's external mask sequence (EXR / PNG / TIFF alpha) as the
+    core instead of SAM 3.1 – core/, core_soft/, crops.json and one key per crop segment (engine/core_import.py).
+    The core stabilisation is not computed here: stages 3 / 4 / 5 / 7 and the export compute it on first use."""
+    from engine.core_import import import_core
+    from engine.keys import KeyHistory
+    store = _objects()
+    obj = store.get(name)
+    w, h = _plate_size()
+    cb = _ws_progress("object_progress", name)
+    try:
+        info = await asyncio.get_running_loop().run_in_executor(None, lambda: import_core(
+            store, name, req.path, _shot_frames(), w, h, threshold=req.threshold,
+            crop_cfg=load_defaults().get("crop", {}), thin_parts="thin_parts" in obj.get("flags", []),
+            for_ltx=obj.get("edge_mode") == "ltx", key_history=KeyHistory(store, name), progress_cb=cb,
+            cancel_check=JOBS.check))
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"success": True, **info}
+
+
+@app.delete("/api/object/{name}/core_import")
+@object_edit
+def core_import_remove(name: str):
+    """„Wróć do SAM 3.1”: the imported core removed from disk for good (keys stay) – then „▶▶ Przelicz nieaktualne”."""
+    from engine.core_import import remove_import
+    from engine.deletion import human
+    try:
+        freed = remove_import(_objects(), name)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"success": True, "freed_bytes": freed, "freed": human(freed)}
 
 
 class FinalizeRequest(BaseModel):
@@ -4623,8 +4734,7 @@ def _band_lines_cached(name: str, frame: int, mask: np.ndarray, out: float, inn:
     stage on the shared band (3 / 4 / 7 on the same base) asks for the very same lines – one entry serves them all
     (user request 2026-10-24: connected stages share one cache). Not kept while the mask is the stand-in or the band
     points are still tracked (`cacheable`)."""
-    from engine.bandsys import band_widths, feather_lines, preview_lines
-    from engine.ltx_alpha import sdf_px
+    from engine.bandsys import band_lines
     m = np.asarray(mask) > 0.5
     pts = list(pts or [])
     key = json.dumps([name, frame, list(m.shape), int(zlib.crc32(np.packbits(m).tobytes())), float(out), float(inn),
@@ -4632,12 +4742,50 @@ def _band_lines_cached(name: str, frame: int, mask: np.ndarray, out: float, inn:
     hit = _LINES_CACHE.get(key) if cacheable else None
     if hit is not None:
         return dict(hit)
-    o, i = band_widths(m, out, inn, pts or None)
-    if np.isinf(i).all() and unit:   # „cały rdzeń”: the points' inner whiskers shape the feather
-        from engine.bandsys import whole_feather
-        fi = whole_feather(m, fi, pts or None, unit)
-    res = preview_lines(*feather_lines(sdf_px(m.astype(np.float32)), o, i, fi, fo))
+    # one function, on the band's crop (engine/bandsys.band_lines – the same lines, ~4x faster on a 6K frame)
+    res = band_lines(m, out, inn, fi, fo, pts, unit)
     if cacheable:
+        _LINES_CACHE.put(key, res)
+    return dict(res)
+
+
+def _zone_band_lines(name: str, zone_id: str, frame: int) -> Dict[str, Any]:
+    """The band lines of a whole-outline zone with nothing painted (stage 5: ViTMatte / BiRefNet) on the SAME path as
+    stages 3 / 4 / 7 (user request 2026-11-20: the zone band preview was slow): a plain GET, never a long_job (the
+    region endpoint answered 409 while any job ran and the UI gave up after ~12 s), cached by content in
+    _LINES_CACHE. The geometry stays the zone's own (pipeline.zone_region: outline_regions + area_lines), so the
+    lines show exactly what „Zastosuj” computes. A zone with a drawing (exclusion tracked by CoTracker3) -> 409,
+    its area comes from …/zones/{id}/region/{f}."""
+    from engine import bandtrack
+    from engine.zones import outline_without_drawing
+    z = _load_zone_or_404(name, zone_id)
+    if not outline_without_drawing(z):
+        raise HTTPException(status_code=409, detail=f"Strefa {zone_id} ma rysunek – obszar z …/zones/{zone_id}/region/{frame}")
+    outside = _band_outside(name, frame)
+    if outside:
+        return {"frame": frame, "contours": [], "outside": outside}
+    pipe = _pipeline()
+    try:
+        mask = np.asarray(pipe.preview_core(name, [frame])[frame]) > 0.5
+        pf = pipe.band_points_fn(name, pipe.zone_band(name, z), [frame], only=[frame])
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    approx = bool(pipe.last_mask12_approx)
+    pts = [[round(float(v), 2) for v in p] for p in ((pf(frame) if pf else None) or [])]
+    # cached only when nothing outside this object's mask and band shapes the area (excluded objects, group members
+    # read other objects' masks, which change without touching this key)
+    plain = not (z.params or {}).get("exclude_objects") and not pipe.group_members(name) and not pipe._is_group(name)
+    cacheable = plain and not approx and not bandtrack._RUNNING
+    key = json.dumps(["zone", name, zone_id, frame, list(mask.shape), int(zlib.crc32(np.packbits(mask).tobytes())),
+                      z.params, (_objects().get(name) or {}).get("band"), pts], sort_keys=True, default=str)
+    hit = _LINES_CACHE.get(key) if cacheable else None
+    if hit is not None:
+        return dict(hit)
+    try:
+        res = pipe.zone_region(name, zone_id, [frame], frame)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if cacheable and not res.get("approx"):
         _LINES_CACHE.put(key, res)
     return dict(res)
 
@@ -4663,6 +4811,8 @@ def stage_band_lines(name: str, stage: str, frame: int, outer_feather_px: Option
     …/zones/{id}/region/{f}) and ONE cache by content (_band_lines_cached, 2026-10-24): stages 3 / 4 / 7 on the shared
     band with the same base mask get the same entry. Slider values may be given for a live preview."""
     from engine import bandtrack
+    if stage.startswith("zone:"):    # stage 5 whole-outline zone: the same path, the zone's own geometry
+        return _zone_band_lines(name, stage[5:], frame)
     ow = _stage_owner(name, stage)   # every stage has its band (2026-10-24: no adaptive / region modes – no 409)
     pipe = _pipeline()
     # the band = the one settings model (engine/objband.BandSettings) with the palette values on top; the only thing

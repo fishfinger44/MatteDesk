@@ -163,7 +163,7 @@ def test_kept_objects_list_overlay_and_jump_to_cutting():
     ld = _fn(js, "load")
     assert "C.liveBump = (C.liveBump || 0) + 1; C.ho.bump += 1;" in ld
     cut = _fn(js, "keptToCut")
-    assert "setMode('cut')" in cut and "window.MD.selectObject(n)" in cut
+    assert "setMode('cut'" in cut and "window.MD.selectObject(n)" in cut   # setMode('cut', false) since 130c57d
     obj = (STATIC / "objects.js").read_text(encoding="utf-8")
     assert "objColor: (n) => objColor(n)," in obj
 

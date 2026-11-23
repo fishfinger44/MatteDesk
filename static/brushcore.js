@@ -81,7 +81,7 @@
     }
     setRadius(r) { this.radius = clampR(r); this.o.onRadius(this.radius); this.o.onChange(); }
     down(e) {
-      if (!this.o.enabled() || e.altKey || e.button !== 0) return;   // Alt = hand (pan), as in the stages
+      if (!this.o.enabled() || (window.mdAltHeld ? window.mdAltHeld(e) : e.altKey) || e.button !== 0) return;   // Alt = hand (pan), as in the stages
       const p = this.o.toImage(e); if (!p) return;
       e.preventDefault(); e.stopPropagation();
       if (!e.shiftKey && !this.o.canStart()) return;

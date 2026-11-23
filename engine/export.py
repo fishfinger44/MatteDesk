@@ -296,6 +296,92 @@ def frame_alphas(work_dir: Path, objects: Sequence[Dict[str, Any]], f: int, w: i
     return FrameAlphas(work_dir, objects, w, h).frame(f)
 
 
+def export_workers() -> int:
+    """Processes of the export: config `export_workers` (0 / missing = auto: cores - 4, at most 8 – the frames go to
+    one disk, more processes only queue on it), capped by the free RAM in run_frames. 1 = in this process.
+    Env MD_EXPORT_WORKERS overrides (the tests run in this process)."""
+    import os
+    if os.environ.get("MD_EXPORT_WORKERS", "").strip().isdigit():
+        return max(1, int(os.environ["MD_EXPORT_WORKERS"]))
+    try:
+        from engine.config import load_config
+        n = int(load_config().get("export_workers") or 0)
+    except Exception:
+        n = 0
+    return n if n > 0 else max(1, min(8, (os.cpu_count() or 4) - 4))
+
+
+def _export_frame(job: Dict[str, Any]) -> Dict[str, Any]:
+    """One frame of export_objects (a process-pool job; plain values in, written paths out): the mattes of every
+    written object, the Final Touch base / front sequences, the core PNGs and the multi-EXR of frame job["f"]."""
+    f, w, h = job["f"], job["w"], job["h"]
+    work_dir, out_root, png = Path(job["work_dir"]), Path(job["out_root"]), job["png"]
+    want = None if job["want"] is None else set(job["want"])
+    fa = FrameAlphas(work_dir, job["objects"], w, h)
+
+    def write_matte(name: str, a: np.ndarray, run: str) -> str:
+        d = out_root / name
+        d.mkdir(parents=True, exist_ok=True)
+        if png:
+            cv2.imwrite(str(d / f"{name}_{f:04d}.png"), (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8))
+        else:
+            write_gray_exr(d / f"{name}_{f:04d}.exr", a, half=True, channels=("R", "G", "B"),
+                           extra_attrs={"matteDesk/object": name.encode(), "matteDesk/run": run.encode()})
+        return str(d / (f"{name}_####." + ("png" if png else "exr"))).replace("\\", "/")
+
+    out: Dict[str, Any] = {"written": {}, "ft": {}, "multi": None, "depth": False}
+    alphas = fa.frame(f)
+    if job["ftn"]:
+        from engine import final_touch as _ft
+        for n_, sp in job["ftn"].items():
+            od = work_dir / "objects" / n_
+            run = fa.run_of(n_)
+            load = _ft.partial_loader(od, run_alpha_loader(od, _ft.base_run(run), w, h), sp["mode"] == "grade")
+            raw = load(f) if fa.visible(n_, f) else np.zeros((h, w), np.float32)
+            paths = {"base_matte": write_matte(f"{n_}_ftbase", raw, "ft-base")}
+            if sp["front"]:
+                fr = fa.fronts.get(n_)
+                paths["front_matte"] = write_matte(f"{n_}_front", fr if fr is not None else np.zeros((h, w), np.float32), "front")
+            out["ft"][n_] = paths
+    for o in fa.objs:
+        if want is not None and o["name"] not in want:
+            continue
+        out["written"][o["name"]] = write_matte(o["name"], alphas[o["name"]], o["tool"]["active_run"])
+        if job["with_core"]:
+            cp = work_dir / "objects" / o["name"] / "core" / f"c_{f:04d}.png"
+            if cp.exists():
+                cd = out_root / f"{o['name']}_core"
+                cd.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(cd / f"{o['name']}_core_{f:04d}.png"), cv2.imread(str(cp), cv2.IMREAD_GRAYSCALE))
+    if job["multichannel"] and not png:
+        import Imath
+        import OpenEXR
+        if want is not None:   # the palette's selection: its mattes only (the context objects cut, not written)
+            alphas = {n: a for n, a in alphas.items() if n in want}
+        union = np.clip(sum(alphas.values()), 0.0, 1.0) if alphas else np.zeros((h, w), np.float32)
+        hdr = OpenEXR.Header(w, h)
+        half = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
+        chans = {f"{n}.alpha": a for n, a in alphas.items()}
+        chans["union.alpha"] = union
+        out["multi"] = list(alphas) + ["union"]
+        if job["depth_pattern"]:
+            from engine.depth import frame_path, read_depth
+            dp = frame_path(job["depth_pattern"], f)
+            if dp.exists():
+                chans["depth.disparity"] = read_depth(dp)
+                out["depth"] = True
+        hdr["channels"] = {k: (Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)) if k.startswith("depth.") else half)
+                           for k in chans}
+        hdr["compression"] = Imath.Compression(Imath.Compression.ZIP_COMPRESSION)
+        md = out_root / "all"
+        md.mkdir(parents=True, exist_ok=True)
+        o_ = OpenEXR.OutputFile(str(md / f"{job['shot']}_mattes_{f:04d}.exr"), hdr)
+        o_.writePixels({k: np.ascontiguousarray(v, np.float32 if k.startswith("depth.") else np.float16).tobytes()
+                        for k, v in chans.items()})
+        o_.close()
+    return out
+
+
 def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]], frames: Sequence[int], w: int, h: int,
                    bit_depth: int = 16, multichannel: bool = True, depth_pattern: Optional[str] = None,
                    with_core: bool = False, progress_cb: Optional[Callable[[str, int, int], None]] = None,
@@ -322,16 +408,6 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
     png = fmt == "png"
     written: Dict[str, str] = {}
 
-    def write_matte(name: str, a: np.ndarray, f: int, run: str) -> str:
-        d = out_root / name
-        d.mkdir(parents=True, exist_ok=True)
-        if png:
-            cv2.imwrite(str(d / f"{name}_{f:04d}.png"), (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8))
-        else:
-            write_gray_exr(d / f"{name}_{f:04d}.exr", a, half=True, channels=("R", "G", "B"),
-                           extra_attrs={"matteDesk/object": name.encode(), "matteDesk/run": run.encode()})
-        return str(d / (f"{name}_####." + ("png" if png else "exr"))).replace("\\", "/")
-
     # Final Touch as Nuke nodes (engine/ft_nuke, user decision 2026-11-16): the objects written from Final Touch whose
     # nuke_mode is grade / paint get their base sequence (raw, not cut) + the max of their front layers; their matte
     # stays the baked one (the multi-EXR / union unchanged), the .nk rebuilds it from the base with live nodes
@@ -350,59 +426,29 @@ def export_objects(work_dir: Path, shot: str, objects: Sequence[Dict[str, Any]],
         if not ok:
             ftn[o["name"]] = {"mode": "bake", "requested": d["nuke_mode"], "why": why}
             continue
-        ftn[o["name"]] = {"mode": d["nuke_mode"], "front": fa.has_front(o["name"]),
-                          "load": _ft.partial_loader(od, run_alpha_loader(od, _ft.base_run(run), w, h), d["nuke_mode"] == "grade")}
+        ftn[o["name"]] = {"mode": d["nuke_mode"], "front": fa.has_front(o["name"])}
+    # frames are independent: written in a process pool (engine/procpool; 2026-11-20 – one by one it was ~2.2 s a
+    # frame on a 6K plate, the EXR decode / ZIP encode hold the GIL so threads gave only 1.6x). Each job rebuilds its
+    # own FrameAlphas from these plain values, so a frame is written bit for bit as in this process (workers=1).
+    ctx = {"work_dir": str(work_dir), "objects": list(objects), "w": int(w), "h": int(h), "out_root": str(out_root),
+           "png": png, "want": None if want is None else sorted(want), "with_core": bool(with_core),
+           "multichannel": bool(multichannel), "shot": shot, "depth_pattern": depth_pattern,
+           "ftn": {n: {"mode": sp["mode"], "front": sp["front"]} for n, sp in ftn.items() if sp["mode"] != "bake"}}
+    from engine.procpool import run_frames
+    n_layers = len(objs) + 2 * len(ctx["ftn"])
+    per_worker = int(w) * int(h) * 4 * (3 * n_layers + 6)      # the float32 layers of one frame + copies / union
+    res = run_frames(_export_frame, [{**ctx, "f": int(f)} for f in frames], workers=export_workers(),
+                     on_done=(lambda n, _i: progress_cb("Eksport", n, len(frames))) if progress_cb else None,
+                     per_worker_bytes=per_worker)
     multi_channels: List[str] = []
-    for i, f in enumerate(frames):
-        alphas = fa.frame(f)
-        for n_, sp in ftn.items():
-            if sp["mode"] == "bake":
-                continue
-            raw = sp["load"](f) if fa.visible(n_, f) else np.zeros((h, w), np.float32)
-            sp["base_matte"] = write_matte(f"{n_}_ftbase", raw, f, "ft-base")
-            if sp["front"]:
-                fr = fa.fronts.get(n_)
-                sp["front_matte"] = write_matte(f"{n_}_front", fr if fr is not None else np.zeros((h, w), np.float32), f, "front")
-        for o in objs:
-            if want is not None and o["name"] not in want:
-                continue
-            written[o["name"]] = write_matte(o["name"], alphas[o["name"]], f, o["tool"]["active_run"])
-            if with_core:
-                cp = work_dir / "objects" / o["name"] / "core" / f"c_{f:04d}.png"
-                if cp.exists():
-                    cd = out_root / f"{o['name']}_core"
-                    cd.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(cd / f"{o['name']}_core_{f:04d}.png"), cv2.imread(str(cp), cv2.IMREAD_GRAYSCALE))
-        if multichannel and not png:
-            import Imath
-            import OpenEXR
-            if want is not None:   # the palette's selection: its mattes only (the context objects cut, not written)
-                alphas = {n: a for n, a in alphas.items() if n in want}
-            union = np.clip(sum(alphas.values()), 0.0, 1.0) if alphas else np.zeros((h, w), np.float32)
-            hdr = OpenEXR.Header(w, h)
-            half = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
-            chans = {f"{n}.alpha": a for n, a in alphas.items()}
-            chans["union.alpha"] = union
-            if not multi_channels:
-                multi_channels = list(alphas) + ["union"]
-            if depth_pattern:
-                from engine.depth import frame_path, read_depth
-                dp = frame_path(depth_pattern, f)
-                if dp.exists():
-                    chans["depth.disparity"] = read_depth(dp)
-                    if "depth" not in multi_channels:
-                        multi_channels.append("depth")
-            hdr["channels"] = {k: (Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)) if k.startswith("depth.") else half)
-                               for k in chans}
-            hdr["compression"] = Imath.Compression(Imath.Compression.ZIP_COMPRESSION)
-            md = out_root / "all"
-            md.mkdir(parents=True, exist_ok=True)
-            o_ = OpenEXR.OutputFile(str(md / f"{shot}_mattes_{f:04d}.exr"), hdr)
-            o_.writePixels({k: np.ascontiguousarray(v, np.float32 if k.startswith("depth.") else np.float16).tobytes()
-                            for k, v in chans.items()})
-            o_.close()
-        if progress_cb:
-            progress_cb("Eksport", i + 1, len(frames))
+    for r in res:                                               # frame order: the same as the former serial loop
+        written.update(r["written"])
+        for n_, paths in r["ft"].items():
+            ftn[n_].update(paths)
+        if r["multi"] and not multi_channels:
+            multi_channels = list(r["multi"])
+        if r.get("depth") and multi_channels and "depth" not in multi_channels:
+            multi_channels.append("depth")
     # outputs.json (data contract)
     holes = fa.core_fix_holes(frames)
     entries = []

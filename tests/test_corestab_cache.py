@@ -98,8 +98,24 @@ def test_cache_invalidated_by_frames_keys_and_core(tmp_path, monkeypatch):
     _clear(pipe)
     c4, s4 = pipe.core_with_soft("obj", frames, keys, True)
     assert all(np.array_equal(c3[f], c4[f]) for f in frames) and all(np.array_equal(s3[f], s4[f]) for f in s3)
-    # at most _CORESTAB_KEEP signatures stay on disk
-    assert len([d for d in pipe._corestab_dir("obj").iterdir() if d.is_dir()]) <= pipe._CORESTAB_KEEP
+    # at most _CORESTAB_KEEP signatures + the pinned longest run stay on disk
+    assert len([d for d in pipe._corestab_dir("obj").iterdir() if d.is_dir()]) <= pipe._CORESTAB_KEEP + 1
+
+
+def test_short_previews_do_not_evict_the_whole_run(tmp_path, monkeypatch):
+    """SD160_020 2026-11-20: zone previews on 5 / 13 frames pushed stage 1's whole run out of the cache and
+    "Apply zone" recomputed every frame. The longest run stays; the short ones rotate among themselves."""
+    pipe, frames, _ = _prep(tmp_path / "a", True, CC_NEW)
+    keys = pipe.keys("obj")
+    _clear(pipe)
+    pipe.core_with_soft("obj", frames, keys, True)                    # stage 1: the whole list
+    for k in range(1, pipe._CORESTAB_KEEP + 3):                         # more short runs than the cache keeps
+        pipe.core_with_soft("obj", frames[k:k + 2], keys, True)
+    dirs = [d for d in pipe._corestab_dir("obj").iterdir() if d.is_dir()]
+    assert len(dirs) <= pipe._CORESTAB_KEEP + 1
+    calls = _count_calls(monkeypatch)
+    pipe.core_with_soft("obj", frames, keys, True)
+    assert not calls, "the whole run must still come from disk"
 
 
 def test_preview_only_is_never_cached(tmp_path, monkeypatch):

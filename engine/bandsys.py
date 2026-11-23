@@ -415,6 +415,69 @@ def area_lines(area: np.ndarray, core: np.ndarray, inner_px: float, outer_px: fl
     return preview_lines(area, inner, outer)
 
 
+def band_lines(mask: np.ndarray, out_px: float, in_px: float, inner_px: float, outer_px: float, pts=None,
+               unit: float = 0.0, crop: bool = True) -> Dict[str, Any]:
+    """The preview lines of a stage band (GET …/stage_band/{stage}/{f}/lines): band widths from the sliders + points,
+    the feather ends – `preview_lines(feather_lines(sdf(mask), …))`. `unit` = the inset slider for „cały rdzeń” (the
+    points' inner whiskers shape the inset feather). `crop` (2026-11-20, SD160_020: ~0.8 s a 6K frame for a band
+    covering 1.9 % of it): computed on the mask's bbox + the reach of the band and the feathers, starting / spanning
+    multiples of CROP_ALIGN (as compose_area_crop) – the same lines; tests/test_band_lines_crop.py pins it."""
+    from engine.ltx_alpha import sdf_px
+    m = np.asarray(mask) > 0.5
+    pts = list(pts or []) or None
+    o, i = band_widths(m, out_px, in_px, pts)
+    fi: Width = inner_px
+    if is_whole(i) and unit:
+        fi = whole_feather(m, inner_px, pts, unit)
+    # outside the mask's bbox only the outer band and the feathers reach (the inner band is inside the mask); the
+    # depth deficit („cały rdzeń”) looks deficit_reach px around; chamfer distances within ~2 %: 10 % + 8 px headroom
+    reach = float(np.max(o)) + max(0.0, float(np.max(fi))) + max(0.0, float(outer_px))
+    sl = crop_slices(m, int(np.ceil(1.1 * reach)) + deficit_reach(float(np.max(fi))) + 8) if crop else None
+    if sl is None:
+        return preview_lines(*feather_lines(sdf_px(m.astype(np.float32)), o, i, fi, outer_px))
+    cut = (lambda w: w if np.isscalar(w) else np.asarray(w)[sl])
+    return shift_lines(preview_lines(*feather_lines(sdf_px(m[sl].astype(np.float32)), cut(o), cut(i), cut(fi), outer_px)), sl)
+
+
+def crop_slices(mask: np.ndarray, margin: int) -> Optional[Tuple[slice, slice]]:
+    """(rows, cols) of the mask's bbox grown by `margin` px, starting on multiples of CROP_ALIGN and spanning multiples
+    of it (OpenCV's distance transforms / morphology give 1-ulp different results on unaligned crops – see
+    compose_area_crop); None for an empty mask. A band computed on it equals the whole-frame one when nothing it reads
+    reaches further than `margin` from the mask."""
+    m = np.asarray(mask).astype(bool)
+    rows, cols = np.flatnonzero(m.any(axis=1)), np.flatnonzero(m.any(axis=0))
+    if not len(rows):
+        return None
+    H, W = m.shape
+    mg = max(0, int(margin))
+
+    def span(lo: int, hi: int, n: int) -> slice:
+        s0 = max(0, lo - mg) // CROP_ALIGN * CROP_ALIGN
+        s1 = s0 + -(-(min(n, hi + 1 + mg) - s0) // CROP_ALIGN) * CROP_ALIGN
+        return slice(s0, min(n, s1))
+    return span(int(rows[0]), int(rows[-1]), H), span(int(cols[0]), int(cols[-1]), W)
+
+
+def shift_lines(lines: Dict[str, Any], sl: Tuple[slice, slice]) -> Dict[str, Any]:
+    """Polylines computed on a crop moved back to frame px."""
+    x0, y0 = sl[1].start, sl[0].start
+    return {k: [[[q[0] + x0, q[1] + y0] for q in c] for c in v] for k, v in lines.items()}
+
+
+def area_lines_crop(area: np.ndarray, core: np.ndarray, inner_px: Width, outer_px: float, whole: bool = False) -> Dict[str, Any]:
+    """`area_lines` (a stage-5 zone's band lines) computed on the bbox of area ∪ core + the feathers' reach (2026-11-20:
+    0.46 s on a 6K frame) – the same lines; tests/test_band_lines_crop.py pins it. `inner_px` may be a map (the
+    „cały rdzeń” feather shaped by the band points)."""
+    a = np.asarray(area).astype(bool)
+    c = np.asarray(core).astype(bool)
+    fi = max(0.0, float(np.max(inner_px)))
+    sl = crop_slices(a | c, int(np.ceil(1.1 * (fi + max(0.0, float(outer_px))))) + deficit_reach(fi) + 8)
+    if sl is None:
+        return area_lines(a, c, inner_px, outer_px, whole=whole)
+    ip = inner_px if np.isscalar(inner_px) else np.asarray(inner_px)[sl]
+    return shift_lines(area_lines(a[sl], c[sl], ip, outer_px, whole=whole), sl)
+
+
 # ----------------------------------------------------------------------------- preview lines
 def contours(mask: Optional[np.ndarray], mode: int = cv2.RETR_EXTERNAL) -> List[List[List[int]]]:
     """Polylines (px) of a mask's outlines, simplified to 1.5 px; [] for None / empty."""

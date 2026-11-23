@@ -934,7 +934,11 @@
     let stale = false, busy409 = false;
     const p = (async () => {
       try {
-        const d = await api('GET', `/api/object/${obj()}/zones/${z.zone_id}/region/${f}`);
+        // whole outline with nothing painted: the band lines on the same path as stages 3 / 4 / 7 (GET …/stage_band/
+        // zone:<id>/{f}/lines – no job lock, cached by content; 2026-11-20); a drawing needs the tracked region
+        const url = isOutline(z) && !hasDrawing(z) ? `/api/object/${obj()}/stage_band/zone:${z.zone_id}/${f}/lines`
+          : `/api/object/${obj()}/zones/${z.zone_id}/region/${f}`;
+        const d = await api('GET', url);
         // the zone changed while this was asked (a slider, a band point – its cache was dropped): the answer belongs
         // to the old settings, ask again for this frame (user report 2026-10-21: the band vanished after a slider)
         stale = Z.regionCache[z.zone_id] !== c;
@@ -979,14 +983,8 @@
     const cheap = isOutline(z) && !hasDrawing(z);
     frameTimer = setTimeout(() => {
       if (curFrame() !== f || !bandPvGet()) return;
-      if (cheap) {
-        const ask = (n) => {   // busy (another job): ask again a little later instead of skipping (user report 2026-10-21)
-          if (curFrame() !== f || (Z.regionCache[z.zone_id] || {})[f]) return;
-          if (!document.body.classList.contains('job-busy')) regionFor(z, f, false);
-          else if (n > 0) setTimeout(() => ask(n - 1), 500);
-        };
-        ask(20);
-      }
+      // the cheap band lines take no job lock (stage_band lines, 2026-11-20): asked right away, also while a job runs
+      if (cheap) regionFor(z, f, false);
       else status(`F${f}: obszar strefy ${z.zone_id} jeszcze niepoliczony w tej klatce – „👁 Podgląd klatek” policzy go (CoTracker3) razem z podglądem`);
     }, 350);
   }

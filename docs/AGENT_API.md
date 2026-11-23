@@ -213,6 +213,8 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | GET | `/api/object/{name}/stages` | – | Stage strip of the objects panel: done / stale / todo / locked + the next action. |
 | POST | `/api/object/{name}/compute_all` | long_job | „▶▶ Przelicz nieaktualne” (user decision 2026-10-15): crops only when missing or when a user key no longer fits its crop, then the core on the whole shot (uncha |
 | POST | `/api/object/{name}/run` | long_job | Core SAM 3.1 on the whole shot from the keys (7.2); intervals with unchanged inputs come from cache. |
+| POST | `/api/object/{name}/core_import` | long_job | Stage 1 alternative (user request 2026-11-20): the user's external mask sequence (EXR / PNG / TIFF alpha) as the core instead of SAM 3.1 – core/, core_soft/, cr |
+| DELETE | `/api/object/{name}/core_import` | object_edit | „Wróć do SAM 3.1”: the imported core removed from disk for good (keys stay) – then „▶▶ Przelicz nieaktualne”. |
 | POST | `/api/object/{name}/core_fix` | long_job | Stage 2 „▶▶ Zastosuj poprawki” (2026-10-15): the mask 1+2 (SAM 3.1 core + brush corrections propagated by CoTracker3) on every frame the core covers -> core_fix |
 | POST | `/api/object/{name}/finalize` | long_job | 'Przelicz finalnie' (7.3a) -> runs/v### on the work area (whole shot without one); the core must cover it |
 | GET | `/api/object/{name}/ltx` | – | Stage „LTX-2.5 Alpha-Gen”: the object's settings (defaults.json "ltx" <- object `ltx`), the stage result, models. |

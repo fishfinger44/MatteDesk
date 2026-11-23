@@ -757,8 +757,19 @@ def _disk_k(r: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
 
-def outline_band(core: np.ndarray, out_px: int, in_px: int, whole: bool = False) -> np.ndarray:
-    """Pixels within out_px outside the core edge or within in_px inside it (`whole`: the whole core inside)."""
+def outline_band(core: np.ndarray, out_px: int, in_px: int, whole: bool = False, crop: bool = True) -> np.ndarray:
+    """Pixels within out_px outside the core edge or within in_px inside it (`whole`: the whole core inside).
+    `crop` (2026-11-20, SD160_020: the 81 px dilation of a 6K frame took ~1 s per frame, previews and „Zastosuj”):
+    the morphology runs on the core's bbox + the kernels' reach (engine/bandsys.crop_slices) – the same pixels: the
+    dilation never reaches past out_px, the erosion kernel never meets the crop border (tests/test_band_lines_crop.py)."""
+    if crop:
+        from engine.bandsys import crop_slices
+        sl = crop_slices(core, max(int(out_px), int(in_px)) + 2)
+        if sl is None:
+            return np.zeros(core.shape, bool)
+        out = np.zeros(core.shape, bool)
+        out[sl] = outline_band(np.asarray(core)[sl], out_px, in_px, whole, crop=False)
+        return out
     c = core.astype(np.uint8)
     outer = cv2.dilate(c, _disk_k(out_px)).astype(bool) if out_px > 0 else core.astype(bool)
     if whole:
@@ -783,8 +794,17 @@ def outline_regions(z: "Zone", cores: Dict[int, np.ndarray], drawn: Dict[int, np
     def band(c, pts):
         if pts:
             from engine.bandmap import variable_band, width_maps
+            from engine.bandsys import crop_slices
             om, im = width_maps(c, pts, out_px, 0 if whole else in_px)
-            return variable_band(c, om, np.full_like(im, np.inf) if whole else im)
+            im = np.full_like(im, np.inf) if whole else im
+            # the signed distance on the core's bbox + the widest whisker (2026-11-20): the same band, a fraction of a
+            # 6K frame; the width maps stay whole-frame (their nearest-outline lookup is shared with the stages)
+            sl = crop_slices(c, int(np.ceil(1.1 * max(float(om.max()), float(im[np.isfinite(im)].max()) if np.isfinite(im).any() else 0.0))) + 8)
+            if sl is None:
+                return variable_band(c, om, im)
+            res = np.zeros(c.shape, bool)
+            res[sl] = variable_band(np.asarray(c)[sl], om[sl], im[sl])
+            return res
         return outline_band(c, out_px, in_px, whole)
     # the band of each frame is independent and cv2 / numpy release the GIL: frames in a thread pool (plan
     # docs/PLAN_EDGE_SPEED.md A6b, 2026-10-28 – 0.23 s/frame on a 4K sh060 frame); the same function per frame, so the

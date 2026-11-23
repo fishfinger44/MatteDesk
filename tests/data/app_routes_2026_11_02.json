@@ -493,6 +493,20 @@
   [
    "POST"
   ],
+  "/api/object/{name}/core_import",
+  "core_import_object"
+ ],
+ [
+  [
+   "DELETE"
+  ],
+  "/api/object/{name}/core_import",
+  "core_import_remove"
+ ],
+ [
+  [
+   "POST"
+  ],
   "/api/object/{name}/core_fix",
   "core_fix_object"
  ],
