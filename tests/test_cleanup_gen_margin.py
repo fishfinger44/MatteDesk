@@ -28,17 +28,19 @@ def _dist_from(obj):
 
 
 def test_old_settings_read_margin_from_their_band():
-    assert cu.settings()["gen_margin_px"] == 24.0
-    assert cu.settings({"grow_px": 30, "soft_px": 10})["gen_margin_px"] == 40.0          # older project: its band
-    assert cu.settings({"grow_px": 4, "soft_px": 2})["gen_margin_px"] == 24.0
+    old = {"gen_band": False}   # the 2026-11-13 rule (a version saved before 2026-11-23)
+    assert cu.settings(old)["gen_margin_px"] == 24.0
+    assert cu.settings()["gen_margin_px"] == 4.0           # 2026-11-23: margin beyond the band edge, none set = 4
+    assert cu.settings({**old, "grow_px": 30, "soft_px": 10})["gen_margin_px"] == 40.0   # older project: its band
+    assert cu.settings({**old, "grow_px": 4, "soft_px": 2})["gen_margin_px"] == 24.0
     assert cu.settings({"grow_px": 30, "soft_px": 10, "gen_margin_px": 12})["gen_margin_px"] == 12.0
     assert cu.settings({"gen_margin_px": -5})["gen_margin_px"] == 0.0
-    assert cu.settings({"grow_px": 200, "soft_px": 100})["gen_margin_px"] == 300.0      # never cut an old band
+    assert cu.settings({**old, "grow_px": 200, "soft_px": 100})["gen_margin_px"] == 300.0   # never cut an old band
     assert "gen_margin_px" in cu.PER_TARGET
     s = cu.settings({"remove": ["a"], "grow_px": 50, "soft_px": 0, "gen_margin_px": 60})
     cu.switch_target(s, "a", "b")
     s = cu.settings(s)
-    assert s["gen_margin_px"] == 24.0 and s["per_target"]["a"]["gen_margin_px"] == 60.0
+    assert s["gen_margin_px"] == 4.0 and s["per_target"]["a"]["gen_margin_px"] == 60.0
     cu.switch_target(s, "b", "a")
     assert cu.settings(s)["gen_margin_px"] == 60.0
 
@@ -47,7 +49,8 @@ def test_model_mask_is_the_margin_hard_no_band_points_holdout_cut():
     obj = _obj()
     keep = np.zeros_like(obj)
     keep[:, 150:] = 1.0
-    s = cu.settings({"grow_px": 40, "soft_px": 10, "gen_margin_px": 12,
+    # the 2026-11-13 rule = a version saved before 2026-11-23 (gen_band False; new runs: test_c1_gen_band.py)
+    s = cu.settings({"grow_px": 40, "soft_px": 10, "gen_margin_px": 12, "gen_band": False,
                      "band_points": [{"id": "p1", "keys": {"1": {"x": 145, "y": 90, "out": 90, "in": 0}}}],
                      "band_ref_out": 40})
     g = cu.gen_mask_fn(s, [lambda f: obj], [lambda f: keep])(1)
@@ -76,7 +79,7 @@ class _Fill:
 def _cleaner(s, gen=True):
     obj = _obj()
     plate = np.full((H, W, 3), 0.6, np.float32)
-    s = cu.settings({"tone": False, **s})
+    s = cu.settings({"tone": False, "gen_band": False, **s})   # the pre-2026-11-23 model mask (no band in it)
     return cu.Cleaner(s, W, H, False, plate=lambda f: plate, remove_alphas=lambda f: [obj], keep_alphas=lambda f: [],
                       key_fill=_Fill(), gen_mask=cu.gen_mask_fn(s, [lambda f: obj], []) if gen else None), obj
 
@@ -105,7 +108,8 @@ def test_band_limit_and_engine_reach():
     assert abs(r - h3_fill.MASK_GROW_PX * 1920 / h3_fill.canvas(1920, 1080)[0]) < 1e-6
     lim = cu.band_limit(s, 1920, 1080)
     assert lim["limit_px"] == round(24 + r, 1) and lim["cut"] is False
-    assert cu.band_limit({**s, "grow_px": 60}, 1920, 1080)["cut"] is True
+    assert cu.band_limit({**s, "grow_px": 60, "gen_band": False}, 1920, 1080)["cut"] is True
+    assert cu.band_limit({**s, "grow_px": 60}, 1920, 1080)["cut"] is False   # 2026-11-23: the model covers the band
     assert cu.engine_reach_px("lama", s, 1920, 1080) == 0.0
     f = h3_fill.H3Fill({1: np.zeros((768, 1344, 3), np.uint8)}, 1920, 1080, False)
     assert abs(f.drawn_px - r) < 1e-6 and f.tone_gap_px > f.drawn_px
@@ -147,9 +151,11 @@ def c1_app(tmp_path, monkeypatch):
 
 
 def test_mask_preview_and_lines_show_the_limit(c1_app):
+    """2026-11-23 (`gen_band`, test_c1_gen_band.py): the model's mask covers the band (60 + 10 px here, margin 8) –
+    the preview is the WHOLE band, nothing cut, no limit line; the model's area (G) holds the band."""
     c, work, obj = c1_app
     L = c.get("/api/cleanup/band/2/lines").json()
-    assert L["cut"] is True and L["limit_contours"]
+    assert "cut" not in L and not L.get("limit_contours") and L["band_contours"]
     png = c.get("/api/cleanup/mask/2").content
     m = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)[..., 2]   # R = the patch (G = model area)
     s = cu.load_settings(work)
@@ -157,13 +163,10 @@ def test_mask_preview_and_lines_show_the_limit(c1_app):
     d = _dist_from(obj)
     sc = m.shape[1] / W
     big = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST) if sc != 1 else m
-    assert (big[d > lim + 3] == 0).all()                    # the preview is the cut composite, not the 70 px band
+    assert (big[(d > lim + 3) & (d < 55)] > 0).all()                 # the band beyond the old limit stays
     gch = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)[..., 1]   # G = what the model draws (2026-11-15)
     gbig = cv2.resize(gch, (W, H), interpolation=cv2.INTER_NEAREST) if sc != 1 else gch
-    assert (gbig[d <= lim - 3] > 0).all() and (gbig[d > lim + 3] == 0).all()
-    assert c.put("/api/cleanup", json={"gen_margin_px": 120}).json()["settings"]["gen_margin_px"] == 120
-    L2 = c.get("/api/cleanup/band/2/lines").json()
-    assert L2["cut"] is False
+    assert (gbig[big > 0] > 0).all()
 
 
 def test_gen_holdout_default_and_old_versions_2026_11_15():

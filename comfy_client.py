@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -85,6 +86,8 @@ class ComfyClient:
         self.spill_watch_factory: Optional[Any] = None
         self._spill_reader: Optional[Any] = None
         self._sent: Dict[str, Any] = {}    # the last queued graph {prompt_id: (graph, extra_data)}
+        self.keep_outputs = False          # True = leave downloaded results in Comfy's output folder (discard_output)
+        self._output_dir: Any = False      # False = not looked up yet (_local_output_dir)
 
     @staticmethod
     def is_timeout(err: Any) -> bool:
@@ -400,7 +403,65 @@ class ComfyClient:
         q = urllib.parse.urlencode({"filename": file_info["filename"], "subfolder": file_info.get("subfolder", ""),
                                     "type": file_info.get("type", "output")})
         with urllib.request.urlopen(f"{self.base_url}/view?{q}", timeout=60) as resp:
-            return resp.read()
+            data = resp.read()
+        if not self.keep_outputs:
+            try:
+                self.discard_output(file_info, len(data))
+            except Exception as e:   # cleanup never fails a download
+                logger.debug("discard_output %s: %s", file_info, e)
+        return data
+
+    # Comfy's output folder is not ours to fill (user decision 2026-11-23: 3.7 GB / 7300 files had piled up in
+    # output/matte_desk): a downloaded result is deleted from it right away – only under output/matte_desk/, only in a
+    # job folder with a per-run id (8+ hex: track_1a2b3c4d, h3_2c268056 …; a fixed prefix such as matte_desk/void is
+    # kept – Comfy replays the file names of a cached identical graph, a deleted file would then be a 404), only on a
+    # local ComfyUI whose output folder we can find, and only when the file there has exactly the downloaded size.
+    OUR_OUTPUT_ROOT = "matte_desk"
+    _RUN_ID = re.compile(r"[0-9a-f]{8}")
+
+    def _local_output_dir(self) -> Optional[Path]:
+        """The output folder of a local ComfyUI: its `--output-directory` (Desktop passes one), else <main.py dir>/output,
+        else <comfy_dir>/output (from /system_stats argv; cached). None = remote / unknown."""
+        if self._output_dir is not False:
+            return self._output_dir
+        out: Optional[Path] = None
+        if self.host in ("127.0.0.1", "localhost", "::1"):
+            argv = ((self.get_system_stats() or {}).get("system") or {}).get("argv") or []
+            if "--output-directory" in argv and argv.index("--output-directory") + 1 < len(argv):
+                out = Path(argv[argv.index("--output-directory") + 1])
+            else:
+                main = Path(argv[0]) if argv else None
+                base = main.parent if main is not None and main.is_absolute() else self.comfy_dir
+                out = base / "output" if base is not None else None
+            if out is not None and not out.is_dir():
+                out = None
+        self._output_dir = out
+        return out
+
+    def discard_output(self, file_info: Dict[str, Any], size: int) -> bool:
+        """Delete one downloaded result from the local Comfy output folder (rules above); empty job folders go too.
+        True = deleted."""
+        if file_info.get("type", "output") != "output":
+            return False
+        parts = [p for p in str(file_info.get("subfolder", "")).replace("\\", "/").split("/") if p]
+        if len(parts) < 2 or parts[0] != self.OUR_OUTPUT_ROOT or not self._RUN_ID.search(parts[1]) or ".." in parts:
+            return False
+        root = self._local_output_dir()
+        if root is None:
+            return False
+        ours = (root / self.OUR_OUTPUT_ROOT).resolve()
+        p = (root.joinpath(*parts) / str(file_info["filename"])).resolve()
+        if ours not in p.parents or not p.is_file() or p.stat().st_size != int(size):
+            return False
+        p.unlink()
+        d = p.parent
+        while d != ours and ours in d.parents:
+            try:
+                d.rmdir()          # only when empty
+            except OSError:
+                break
+            d = d.parent
+        return True
 
     # -------------------------------------------------------------------------
     # Process management (ComfyUI from git)

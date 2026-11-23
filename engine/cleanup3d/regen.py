@@ -479,7 +479,7 @@ QWEN_MASK_GROW_PX = 6      # model px the latent noise mask is grown by (the mas
 
 def qwen_graph(crop_dir: PathLike, prefix: str, prompt: str, seed: int = QWEN_SEED,
                ref_dir: Optional[PathLike] = None, denoise: float = 1.0,
-               mask_dir: Optional[PathLike] = None) -> Dict[str, Any]:
+               mask_dir: Optional[PathLike] = None, soft_mask: bool = False) -> Dict[str, Any]:
     """The edit graph of removers_test/remove_test.py (mode q21): the whole crop (object still visible) is the image of
     the instruction AND the latent the sampler starts from (VAEEncode, denoise 1). File names from engine/stage_models.py
     (what the Doctor checks)."""
@@ -514,6 +514,10 @@ def qwen_graph(crop_dir: PathLike, prefix: str, prompt: str, seed: int = QWEN_SE
         g["22"] = {"class_type": "GrowMask", "inputs": {"mask": ["21", 0], "expand": QWEN_MASK_GROW_PX, "tapered_corners": True}}
         g["23"] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["10", 0], "mask": ["22", 0]}}
         g["12"]["inputs"]["latent_image"] = ["23", 0]
+        if soft_mask:   # a feathered mask (the anchors, user 2026-11-23): each pixel denoised as far as its mask value –
+            # Qwen-Image-2.1 fades into the plate instead of drawing a hard outline at the mask edge (native node)
+            g["24"] = {"class_type": "DifferentialDiffusion", "inputs": {"model": ["1", 0]}}
+            g["12"]["inputs"]["model"] = ["24", 0]
     return g
 
 
@@ -521,7 +525,7 @@ def _run_qwen(client: Any, io_dir: Path, real: np.ndarray, region: np.ndarray, p
               progress: Optional[Callable[[int, int], None]], mode: str = "remove", seed: int = QWEN_SEED,
               ref: Optional[np.ndarray] = None, text: Optional[str] = None,
               denoise: float = 1.0, feather_px: int = 0, what: Optional[str] = None,
-              latent_mask: bool = False) -> Tuple[np.ndarray, np.ndarray, int]:
+              latent_mask: bool = False, mask_weight: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, int]:
     """Qwen-Image-2.1 edit on a crop around each group (user 2026-11-10): the model gets the REAL crop (the object still
     visible – an edit model removes what the instruction names) scaled to about QWEN_PX, edits the whole crop; the
     output, scaled back, covers its crop in the generated image (so the ring around the area can be colour-matched),
@@ -552,9 +556,11 @@ def _run_qwen(client: Any, io_dir: Path, real: np.ndarray, region: np.ndarray, p
             md = None
             if latent_mask:   # the area to redraw, as a picture of the crop (white = redraw; the anchors, 2026-11-15)
                 md = job / f"m_{g:03d}"
-                mc = cv2.resize(region[y0:y1, x0:x1].astype(np.float32), (mw, mh), interpolation=cv2.INTER_AREA)
+                src = region if mask_weight is None else mask_weight   # soft: 0..1 = how far to redraw
+                mc = cv2.resize(src[y0:y1, x0:x1].astype(np.float32), (mw, mh), interpolation=cv2.INTER_AREA)
                 write_png8(md / "mask.png", np.repeat(np.clip(mc, 0.0, 1.0)[..., None], 3, axis=2))
-            gr = qwen_graph(d, f"matte_desk/c3regen_{job.name}/c{g:03d}", text, seed, rd, denoise, md)
+            gr = qwen_graph(d, f"matte_desk/c3regen_{job.name}/c{g:03d}", text, seed, rd, denoise, md,
+                            soft_mask=md is not None and mask_weight is not None)
             out = _comfy_image(client, gr, QWEN_SAVE_NODE, QWEN_NAME, mw, mh)
             out = cv2.resize(out, (cw, ch), interpolation=cv2.INTER_CUBIC if down else cv2.INTER_AREA)
             fill = (wsum[y0:y1, x0:x1] == 0) | (lab[y0:y1, x0:x1] == g)   # own region always; context: first crop

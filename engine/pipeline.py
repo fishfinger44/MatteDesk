@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 import cv2
 import numpy as np
 
-from engine.comfy_io import job_progress
+from engine.comfy_io import job_progress, job_thumb
 
 # zone previews (2026-10-16, „live” sliders): mask PNGs and group wholes read again and again for the same frames –
 # cached by path + mtime (a rewritten file = a new entry), bounded
@@ -38,9 +38,12 @@ def _cache_put(k, v):
     return v
 
 
-_CORE_LRU: "OrderedDict[Any, np.ndarray]" = OrderedDict()
-_CORE_LRU_MAX = 12            # ~8 MB each at 4K
+_CORE_LRU: "OrderedDict[Any, Any]" = OrderedDict()   # key -> (shape, bbox or None, bool crop or None)
+_CORE_LRU_MAX = 400           # entries; the byte budget below is the real bound
+_CORE_LRU_BYTES = 768 << 20   # crops of the masks' bboxes (2026-11-23: a 70-px object on a 6K plate held 12 full
+#                               frames = 312 MB, and every zone preview re-read all 49 cores ~5.5 s)
 _CORE_LRU_LOCK = threading.Lock()
+_CORE_LRU_USED = [0]
 _EDGE_CORE_MEMO: "OrderedDict[str, Any]" = OrderedDict()   # mask12_key -> (mask 1+2, source) – exact (work area)
 _APPROX_MEMO: "OrderedDict[str, Any]" = OrderedDict()      # mask12_key -> (mask 1+2, source) – one-frame stand-in
 _MASK12_WARM: Dict[str, threading.Thread] = {}             # "<object dir>|<sig>" -> the background batch (one per sig)
@@ -57,19 +60,38 @@ def _read_core_png(fp: Path) -> Optional[np.ndarray]:
         return None
     k = (str(fp), st.st_mtime_ns, st.st_size)
     with _CORE_LRU_LOCK:
-        m = _CORE_LRU.get(k)
-        if m is not None:
+        e = _CORE_LRU.get(k)
+        if e is not None:
             _CORE_LRU.move_to_end(k)
-    if m is None:
-        g = cv2.imread(str(fp), cv2.IMREAD_GRAYSCALE)
-        if g is None:
-            return None
-        m = g > 127
-        with _CORE_LRU_LOCK:
-            _CORE_LRU[k] = m
-            while len(_CORE_LRU) > _CORE_LRU_MAX:
-                _CORE_LRU.popitem(last=False)
-    return m.copy()
+    if e is not None:
+        return _uncrop_mask(e)
+    g = cv2.imread(str(fp), cv2.IMREAD_GRAYSCALE)
+    if g is None:
+        return None
+    m = g > 127
+    e = _crop_mask(m)
+    with _CORE_LRU_LOCK:
+        if k not in _CORE_LRU:
+            _CORE_LRU[k] = e
+            _CORE_LRU_USED[0] += e[2].nbytes if e[2] is not None else 0
+        while _CORE_LRU and (len(_CORE_LRU) > _CORE_LRU_MAX or _CORE_LRU_USED[0] > _CORE_LRU_BYTES):
+            _, old = _CORE_LRU.popitem(last=False)
+            _CORE_LRU_USED[0] -= old[2].nbytes if old[2] is not None else 0
+    return m
+
+
+def _crop_mask(m: np.ndarray):
+    from engine.zones import nonzero_bbox
+    b = nonzero_bbox(m)
+    return (m.shape, b, None if b is None else m[b[1]:b[3], b[0]:b[2]].copy())
+
+
+def _uncrop_mask(e) -> np.ndarray:
+    shape, b, c = e
+    out = np.zeros(shape, bool)
+    if b is not None:
+        out[b[1]:b[3], b[0]:b[2]] = c
+    return out
 
 
 def _read_mask_cached(fp: Path, w: int, h: int) -> Optional[np.ndarray]:
@@ -676,6 +698,7 @@ class ObjectPipeline:
         cdir.mkdir(parents=True, exist_ok=True)
         for f, m in res.core.items():
             cv2.imwrite(str(cdir / f"c_{f:04d}.png"), (m > 0.5).astype(np.uint8) * 255)
+            job_thumb(f, m > 0.5)
         hidden = [f for f in frames if f not in res.core]       # outside the life: empty core, nothing computed
         if hidden:
             zero = np.zeros((self.h, self.w), np.uint8)
@@ -792,7 +815,7 @@ class ObjectPipeline:
         probs = self.load_core_soft(name, frames, core)
         stab, stats = stabilize_core(core, gray, radius=radius, band_px=band_px, keys=user_keys, probs=probs or None,
                                      progress=lambda d, t: job_progress("Stabilizacja rdzenia", d, t), probs_out=po,
-                                     only=only)
+                                     only=only, emit=job_thumb if only is None else None)
         # the edge against an object in front is the run_core front subtraction, not SAM jitter: it must follow the
         # front object in every frame – the temporal vote dragged it after the moving front object and opened seams
         # in the export union (E6 synthetic: 5 -> 14 px). Within band_px of a front core the frame keeps its own value
@@ -874,10 +897,10 @@ class ObjectPipeline:
         stab: Dict[int, np.ndarray] = {}
         soft: Dict[int, np.ndarray] = {}
         for f in frames:
-            m = cv2.imread(str(d / f"c_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
+            m = _read_core_png(d / f"c_{f:04d}.png")     # the bbox-crop memory: previews read it again and again
             if m is None or m.shape != (self.h, self.w):
                 return None
-            stab[f] = m > 127
+            stab[f] = m
         for f in j.get("soft_frames") or []:
             p = cv2.imread(str(d / f"p_{f:04d}.png"), cv2.IMREAD_GRAYSCALE)
             if p is None:
@@ -1133,6 +1156,7 @@ class ObjectPipeline:
                 job_progress("Maska 1+2 jako wersja", n, len(frames))
                 c = (extract_crop(core2[f].astype(np.float32), seg) > 0.5).astype(np.float32)
                 write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", c)
+                job_thumb(f, c, seg.crop)
                 write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", c)
                 cd = run_dir / "core" / seg.seg_id
                 cd.mkdir(parents=True, exist_ok=True)
@@ -1254,6 +1278,7 @@ class ObjectPipeline:
                     cc = extract_crop(core2[f].astype(np.float32), seg)
                     a = finish(m, cc, s, crop_pts(f, seg))
                     write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+                    job_thumb(f, a, seg.crop)
                     write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
                     write_alpha_exr(run_dir / "ltx_raw" / seg.seg_id / f"a_{f:04d}.exr", m)
                     cd = run_dir / "core" / seg.seg_id
@@ -1352,6 +1377,7 @@ class ObjectPipeline:
                 cc = extract_crop(mask[f].astype(np.float32), seg)
                 a = finish(m, cc, s, crop_points(pts_at, f, seg))
                 write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+                job_thumb(f, a, seg.crop)
                 write_alpha_exr(run_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", a)
                 write_alpha_exr(run_dir / "ltx_raw" / seg.seg_id / f"a_{f:04d}.exr", m)
                 cd = run_dir / "core" / seg.seg_id
@@ -1441,6 +1467,7 @@ class ObjectPipeline:
                     in_unit=s["inset_px"])
         t = _tick(tm, "compose", t)            # band geometry + feathers (videomama.compose -> bandsys.compose)
         write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+        job_thumb(f, a, seg.crop)
         t = _tick(tm, "write_alpha", t)
         # alpha_base = the same alpha (a VideoMaMa version has no zones): a hard link of the file instead of encoding
         # it a second time, as stage 3 does (plan docs/PLAN_EDGE_SPEED.md section 11); a copy where links fail
@@ -1650,6 +1677,7 @@ class ObjectPipeline:
         for i, f in enumerate(frames):
             job_progress("Zapis maski 1+2", i + 1, len(frames))
             cv2.imwrite(str(d / f"c_{f:04d}.png"), fixed[f].astype(np.uint8) * 255)
+            job_thumb(f, fixed[f])
             changed += int((fixed[f] != core[f]).sum())
         info = {"schema": "matte_desk/core_fix@1.0", "sig": core_fix_sig(self.store, name),
                 "coverage": intervals_from_frames(frames), "changed_px": changed,
@@ -3146,6 +3174,7 @@ class ObjectPipeline:
                                         extract_crop(zres.weights[f], seg) if f in zres.weights else None)
             t = _tick(st, "overlay_blend", t)
             write_alpha_exr(new_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+            job_thumb(f, a, seg.crop)
             t = _tick(st, "overlay_write_exr", t)
             try:
                 os.link(rdir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr", new_dir / "alpha_base" / seg.seg_id / f"a_{f:04d}.exr")

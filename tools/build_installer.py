@@ -40,8 +40,25 @@ SEVENZR_URL = "https://www.7-zip.org/a/7zr.exe"
 SEVENZR_SHA256 = "256feca8e274e5da655e2a284fabafd9f554365eb164862089dacd4e8276d282"   # 7zr.exe 26.x, pinned 2026-10-17
 
 
+def _gh_token() -> Optional[str]:
+    """GITHUB_TOKEN / GH_TOKEN, else `gh auth token` (2026-11-23: the anonymous API limit of 60 requests / h stopped a
+    release build with 403 „rate limit exceeded”). None = anonymous."""
+    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if tok:
+        return tok.strip()
+    try:
+        r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _api(url: str) -> Dict[str, Any]:
-    req = urllib.request.Request(url, headers={"User-Agent": dl.UA, "Accept": "application/vnd.github+json"})
+    headers = {"User-Agent": dl.UA, "Accept": "application/vnd.github+json"}
+    tok = _gh_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
 

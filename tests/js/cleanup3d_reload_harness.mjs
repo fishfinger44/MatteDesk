@@ -62,7 +62,7 @@ async function fakeApi(method, url) {
   const e = new Error(DETAIL); e.status = 501; throw e;
 }
 const toasts = [];
-window.UI = { api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true, bytes: (n) => `${n} B` };
+window.UI = { exportBtn: () => '<button class="md-export">Export</button>', exportMenu: () => {}, api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true, bytes: (n) => `${n} B` };
 window.fetch = async (url) => { assert(String(url).includes('/static/i18n/en.json'), `fetch ${url}`); return { json: async () => CATALOG }; };
 window.MD = { S: { objects: [] }, renderStageBar: () => {} };
 window.viewer = { projectLoaded: true, currentWorkDir: WORK, manifest: { plates: {} }, projectData: { plate_w: 1280, plate_h: 720 }, canvas: $('cv'),

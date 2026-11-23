@@ -636,7 +636,7 @@ def test_one_band_drawing_2026_10_24():
     zon = (STATIC / "zones.js").read_text(encoding="utf-8")
     bp = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
     assert "function strokeLines(ctx, k, L, opts = {})" in bp and "strokeLines(ctx, k, L, { alpha: 0.5 })" in bp   # the previous lines dimmed until the new arrive (2026-11-11)
-    assert "function dirtyLines() { B.lines = {}; }" in bp
+    assert "function dirtyLines() { B.lines = {}; B.gen = (B.gen || 0) + 1; }" in bp   # lastLines stay (2026-11-23: + B.gen)
     assert "rgba(255,212,0" not in zon and "window.MD_BANDPTS.strokeLines(ctx, k, reg)" in zon
     assert bp.count("rgba(255,212,0") == 2                       # the band edge and the feather ends, once
     assert "function lineNote(f, params)" in bp and "if (L && L.error) return false;" in bp
@@ -959,3 +959,14 @@ def test_frame_mask_preview_lines_and_popup_2026_11_11():
     assert "/api/cleanup/band/${f}/lines?grow_px=" in cu and "window.MD_POPVIEW.open(" in cu
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     assert html.index("/static/pop_view.js") < html.index("/static/cleanup.js")
+
+
+def test_band_lines_refresh_2026_11_23():
+    """„czasami nie odświeża”: the lines request drops its busy flag BEFORE the redraw (a live drawLines skips asking
+    while the frame has a request in flight), an answer asked before the band changed is dropped (B.gen), and a
+    prefetch of the frame now shown redraws too."""
+    js = (STATIC / "bandpoints.js").read_text(encoding="utf-8")
+    body = js[js.index("async function loadLines"):js.index("// a band edit: Ctrl+Z restores")]
+    assert body.index("delete B.busy[k];") < body.index("render()")
+    assert "if (gen !== (B.gen || 0))" in body and "B.gen = (B.gen || 0) + 1" in js
+    assert "(!prefetch || v.currentFrame === f)" in body

@@ -90,7 +90,8 @@ def state(s: Dict[str, Any], frame: int, remove_alphas: Alphas, b=None) -> Dict[
 
 def lines(alphas: Sequence[np.ndarray], grow_px: float, soft_px: float,
           pts: Optional[Sequence[Tuple[float, ...]]] = None, scale: float = 1.0,
-          limit_px: Optional[float] = None, limit_alphas: Optional[Sequence[np.ndarray]] = None) -> Dict[str, Any]:
+          limit_px: Optional[float] = None, limit_alphas: Optional[Sequence[np.ndarray]] = None,
+          full_size: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
     """The preview lines of the C1 band of one frame (plate px): `band_contours` = the band ring (the objects' outline and
     the band's outer edge, where the solid patch ends), `feather_contours` = where the soft edge ends (the patch reaches
     0) – the same geometry as engine/cleanup.removal_mask, measured on a grid `scale` × the plate (lines scaled back).
@@ -101,9 +102,10 @@ def lines(alphas: Sequence[np.ndarray], grow_px: float, soft_px: float,
         return bandsys.preview_lines(np.zeros((1, 1), bool), None, None)
     al = [np.asarray(a, np.float32) for a in alphas]
     if scale != 1.0:
-        h, w = al[0].shape[:2]
+        # `full_size` (w, h) = the plate: the alphas may come already at the grid (api/inpaint_band cache, 2026-11-23)
+        w, h = full_size if full_size else (al[0].shape[1], al[0].shape[0])
         size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-        al = [cv2.resize(a, size, interpolation=cv2.INTER_AREA) for a in al]
+        al = [a if (a.shape[1], a.shape[0]) == size else cv2.resize(a, size, interpolation=cv2.INTER_AREA) for a in al]
         pts = [((p[0]) * scale, (p[1]) * scale, p[2] * scale, p[3] * scale) + tuple(p[4:]) for p in pts] if pts else None
     hard = np.max(np.stack(al), axis=0) > 0.02
     if grow_px < 0:   # erode (2026-11-15): removal_mask's own geometry (local band points too)

@@ -1,5 +1,26 @@
 # MatteDesk – changelog
 
+## 0.63 – 2026-11-23
+- **New: export the edge band to Nuke or After Effects.** The "⇪ Export" of the band palettes (stages 3 / 4 / 5 / 7)
+  and of the Inpaint patch band writes the band as a Nuke Roto (clipboard / .nk file: band edges + feather ends, each
+  shape followed across frames with one point count) or as After Effects masks (.jsx script for the active comp).
+- **New: band tracker export** in the same menu: the band points (followed by CoTracker3) and the mask centre as a Nuke
+  Tracker4 or as After Effects nulls – the motion of the masked object for match-moves.
+- Band export of a group covers the whole work area; frames are computed side by side (a 6K group band, 49 frames:
+  ~3.5 min -> ~1 min, identical files).
+- One "⇪ Export" button everywhere (Final Touch, MergeMatte, band palettes, patch band) with a clearer look.
+- **Inpaint (beta):** computed versions on top of the panel as readable cards, fresh versions highlighted, a 📂 button
+  shows a version in Explorer; the model's mask covers the patch band with its band points and the generation margin
+  counts from the band's edge (default 4 px); anchors get a soft edge outside the generation mask (no hard patch
+  outline on a soft background); previews use the viewer's colour curve (no exposure jump on the paused frame).
+- **Faster patch band preview** (a 6K group with a MiniMax-H3 token: 8.6 s -> 0.1 s a frame) and band previews that
+  refresh after the last slider move without showing stale lines.
+- Stage 2: brush corrections computed on the object's window (Apply ~7× faster on a 6K object). Stage 1: fix for a
+  stale start frame. The progress window shows a thumbnail of the last frame; downloaded results are removed from the
+  ComfyUI output folder.
+- Layout: the patch band row on one line, the Objects palette rows no longer overlap, the Export palette labels sit
+  above their fields.
+
 ## 0.62 – 2026-11-23
 - **Faster mask export.** Frames are written by several processes at once (config `export_workers`, auto = CPU cores − 4,
   at most 8) and each object's alpha is read as one channel – a 148-frame 6K shot with two objects went from ~5.7 min to

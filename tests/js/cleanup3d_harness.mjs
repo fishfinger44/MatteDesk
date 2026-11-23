@@ -119,7 +119,7 @@ async function fakeApi(method, url, body) {
 const fetches = [];
 window.fetch = async (url) => { fetches.push(url); return { ok: false, status: 501, statusText: 'Not Implemented', json: async () => ({ detail: DETAIL('P6 projekcja i składanie + P8') }) }; };
 const toasts = [];
-window.UI = { api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true,
+window.UI = { exportBtn: () => '<button class="md-export">Export</button>', exportMenu: () => {}, api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true,
   bytes: (n) => `${((+n || 0) / 1048576).toFixed(1).replace('.', ',')} MB` };
 const lastToast = () => toasts[toasts.length - 1] || '';
 

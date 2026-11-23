@@ -55,7 +55,7 @@ install_log_buffer()   # last log lines for "Zgłoś problem" (the start_v*.bat 
 
 class _QuietPolling(logging.Filter):
     """Hide successful UI polling (job progress, Comfy health) from the uvicorn access log; errors still show."""
-    PATHS = ("/api/jobs", "/api/jobs/details", "/api/comfy/health")
+    PATHS = ("/api/jobs", "/api/jobs/details", "/api/jobs/thumb", "/api/comfy/health")
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
@@ -415,6 +415,71 @@ def jobs_details():
             client = None
         return job_details(client, JOBS.snapshot())
     return _DETAILS.get(build)
+
+
+JOB_THUMB_SIDE = 320   # px, longer side of the progress window's thumbnail
+
+
+def _job_thumb_image(t: Dict[str, Any]) -> Optional[np.ndarray]:
+    """BGR uint8 thumbnail of a job's last finished frame (JOBS.thumb_of): the plate proxy around the mask (its crop,
+    or the mask's bbox + 15 % margin for a full-frame mask) with the mask tinted green and outlined. None = no proxy."""
+    try:
+        base = _load_proxy_display(int(t["frame"]))
+    except HTTPException:
+        return None
+    ph, pw = base.shape[:2]
+    W, _H = _plate_size()
+    s = pw / float(W)
+    m = t["mask"].astype(np.float32) / 255.0
+    full = np.zeros((ph, pw), np.float32)
+    if t.get("crop"):
+        x, y, w, h = t["crop"]
+        X0, Y0 = int(round(x * s)), int(round(y * s))
+        cw, ch = max(1, int(round(w * s))), max(1, int(round(h * s)))
+        mm = cv2.resize(m, (cw, ch), interpolation=cv2.INTER_AREA)
+        ax0, ay0, ax1, ay1 = max(0, X0), max(0, Y0), min(pw, X0 + cw), min(ph, Y0 + ch)
+        if ax1 > ax0 and ay1 > ay0:
+            full[ay0:ay1, ax0:ax1] = mm[ay0 - Y0:ay1 - Y0, ax0 - X0:ax1 - X0]
+        rx0, ry0, rx1, ry1 = ax0, ay0, ax1, ay1
+    else:
+        full = cv2.resize(m, (pw, ph), interpolation=cv2.INTER_AREA)
+        ys, xs = np.nonzero(full > 0.5)
+        if xs.size:
+            mg = int(0.15 * max(xs.max() - xs.min(), ys.max() - ys.min())) + 8
+            rx0, ry0 = max(0, int(xs.min()) - mg), max(0, int(ys.min()) - mg)
+            rx1, ry1 = min(pw, int(xs.max()) + 1 + mg), min(ph, int(ys.max()) + 1 + mg)
+        else:
+            rx0, ry0, rx1, ry1 = 0, 0, pw, ph
+    if rx1 <= rx0 or ry1 <= ry0:
+        rx0, ry0, rx1, ry1 = 0, 0, pw, ph
+    img = (base[ry0:ry1, rx0:rx1] * 255.0).astype(np.float32)
+    a = full[ry0:ry1, rx0:rx1][..., None]
+    img = img * (1.0 - 0.45 * a) + np.array([80.0, 220.0, 80.0], np.float32) * (0.45 * a)
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    k = min(1.0, JOB_THUMB_SIDE / float(max(img.shape[:2])))
+    if k < 1.0:
+        img = cv2.resize(img, (max(1, round(img.shape[1] * k)), max(1, round(img.shape[0] * k))), interpolation=cv2.INTER_AREA)
+        a = cv2.resize(a[..., 0], (img.shape[1], img.shape[0]), interpolation=cv2.INTER_AREA)
+    else:
+        a = a[..., 0]
+    cnts, _ = cv2.findContours((a > 0.5).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    cv2.drawContours(img, cnts, -1, (80, 255, 80), 1)
+    return img
+
+
+@app.get("/api/jobs/thumb")
+def jobs_thumb(job: Optional[int] = None):
+    """Progress window thumbnail (user request 2026-11-23): JPEG of the last frame the running job finished – the plate
+    proxy with that frame's mask. 204 = nothing yet (no per-frame result, no project, no proxy)."""
+    from fastapi.responses import Response
+    t = JOBS.thumb_of(job)
+    if t is None or not STATE.get("work_dir"):
+        return Response(status_code=204)
+    img = _job_thumb_image(t)
+    if img is None:
+        return Response(status_code=204)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return Response(content=buf.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/jobs/cancel")
@@ -2089,8 +2154,8 @@ def set_points(name: str, frame: int, req: PointsRequest):
     key = KeyHistory(store, name).save_key(frame, r["mask"], author="user", kind="points",
                                            positive=req.positive, negative=req.negative,
                                            prompt=r["prompt"] if r["mode"] in ("prompt+points", "prompt") else None)
-    if not store.get(name).get("tool", {}).get("start_frame"):
-        store.update(name, tool={"start_frame": frame})
+    if store.get(name).get("tool", {}).get("start_frame") not in store.keys(name):
+        store.update(name, tool={"start_frame": frame})   # no start key yet, or its key was deleted -> this key
     store.update(name, tool={"final_valid": False, "stale_from": frame, "status": "klucze z punktów"})
     return {"success": True, "frame": frame, "key": {"frame": frame, "author": "user", "kind": "points"},
             "seconds": r["seconds"], "crop": r["crop"], "mode": r["mode"], "prompt": r["prompt"],
@@ -4840,6 +4905,15 @@ def stage_band_lines(name: str, stage: str, frame: int, outer_feather_px: Option
     return {"frame": frame, "approx": approx, **lines}
 
 
+# ---- band export (Nuke Roto / After Effects masks, 2026-11-23) -> api/band_export.py
+from api.band_export import make as _make_band_export
+_r, _x = _make_band_export(STATE=STATE, long_job=lambda *a, **k: long_job(*a, **k), objects=lambda: _objects(),
+                           lines_fn=lambda n, s, f: stage_band_lines(n, s, f), band_frames=lambda n, f: _band_frames(n, f),
+                           work_frames=lambda: _work_frames(), plate_size=lambda: _plate_size(),
+                           points_fn=lambda n, s, f: get_stage_band(n, s, f))
+app.include_router(_r)
+
+
 @app.post("/api/object/{name}/zones/{zone_id}/apply")
 @long_job("Zastosuj strefę {zone_id}: {name}")
 async def apply_zone_ep(name: str, zone_id: str, stage: Optional[str] = None):
@@ -6533,8 +6607,8 @@ def _compute_crops(name: str) -> Dict[str, Any]:
     store = _objects()
     obj = store.get(name)
     keys = store.keys(name)
-    start = obj["tool"].get("start_frame")
-    if start is None or start not in keys:
+    start = store.start_frame(name, keys)   # a stale start key (deleted) -> the nearest existing key
+    if start is None:
         raise HTTPException(status_code=400, detail="Najpierw wybierz instancję obiektu (klucz startowy)")
     manifest = STATE["manifest"]
     frames = list(range(int(manifest.get("first", 1)), int(manifest.get("last", 1)) + 1))
@@ -6630,7 +6704,8 @@ del _r, _x
 
 # The band of Cleanup step C1 „Inpaint” (2026-11-11, engine/inpaint_band.py): the editor's points, preview lines
 from api.inpaint_band import make as _make_inpaint_band   # noqa: E402
-_r, _x = _make_inpaint_band(STATE=STATE, plate_size=lambda: _plate_size(), cleanup=_cleanup_exports)
+_r, _x = _make_inpaint_band(STATE=STATE, plate_size=lambda: _plate_size(), cleanup=_cleanup_exports,
+                            long_job=lambda *a, **k: long_job(*a, **k))
 app.include_router(_r)
 del _r, _x
 

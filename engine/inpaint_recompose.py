@@ -93,7 +93,8 @@ def recompose_settings(cur: Dict[str, Any], vs: Dict[str, Any],
     margin = what the model drew) with the CURRENT composite band of the version's cleaned thing (`cur`: its own band
     when it is the thing shown, else the one stored for it under per_target, else the version's) and the current
     composite options; `overrides` = unsaved slider values of the palette (the live preview)."""
-    src = cu.settings(vs)
+    # a version saved before 2026-11-23 has no gen_band key: read with the old rule (its margin derivation too)
+    src = cu.settings({"gen_band": False, **(vs or {})})
     cur = cu.settings(cur)
     who = (src.get("remove") or [None])[0]
     shown = (cur.get("remove") or [None])[0]
@@ -107,6 +108,10 @@ def recompose_settings(cur: Dict[str, Any], vs: Dict[str, Any],
     if any((overrides or {}).get(k) is not None for k in ("grow_px", "soft_px")):
         out["band_keys"] = {}       # the palette's values of the shown frame win there (the live preview, one frame)
     out["gen_margin_px"] = src["gen_margin_px"]
+    # the model's mask covered the source's band (2026-11-23)? A version before has no key: it did not
+    out["gen_band"] = bool((vs or {}).get("gen_band", False))
+    out["gen_band_src"] = ((src.get("gen_band_src") or {k: src[k] for k in BAND_FIELDS})   # a recomposite of a
+                           if out["gen_band"] else None)                                    # recomposite: the model's band
     out["gen_holdout"] = bool((vs or {}).get("gen_holdout", True))   # what the model drew: a version before 2026-11-15
     # had the kept objects cut out of its mask
     return cu.settings(out)

@@ -108,6 +108,13 @@ DEFAULTS: Dict[str, Any] = {
     # see-through hair fringe and the old skin showed through). False for new runs; a version saved before has no key
     # and reads as True (engine/inpaint_recompose: what that model really drew)
     "gen_holdout": False,
+    # the MODEL's mask covers the composite band too, band points included (user 2026-11-23, SD160_150 v004 F27: a band
+    # point's whisker reached the frame corner, the model's mask did not – the band was cut there and the plate's prop
+    # stayed). True for new runs; a version saved before has no key and reads as False (inpaint_recompose: what that
+    # model really drew). `gen_band_src` = the band fields the model's mask was made with (a recomposite with another
+    # band keeps the source's drawn area)
+    "gen_band": True,
+    "gen_band_src": None,
     # the composite band („Pas łaty”): what of the generated material goes into the picture – clamped to what the model
     # drew (gen_margin_px + the engine's grow, `drawn_area`)
     "grow_px": 8.0,        # the hard mask grown by (motion blur / soft edge / a halo of the object's light)
@@ -222,8 +229,11 @@ def settings(d: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         gm = float(s["gen_margin_px"]) if s["gen_margin_px"] is not None else None
     except (TypeError, ValueError):
         gm = None
-    # an older project (no key): the margin its model mask had, so a recomposite / rerun means what it meant
+    # an older project (no key): the margin its model mask had, so a recomposite / rerun means what it meant; with the
+    # band in the model's mask (`gen_band`, 2026-11-23) the margin counts from the band's edge – none set = 4 px
+    s["gen_band"] = bool(s["gen_band"])
     s["gen_margin_px"] = float(min(GEN_MARGIN_MAX, max(0.0, gm if gm is not None else
+                                                         GEN_BAND_MARGIN_PX if s["gen_band"] else
                                                          max(GEN_MARGIN_PX, s["grow_px"] + s["soft_px"]))))
     s["band_points"] = [dict(p) for p in (s["band_points"] or []) if isinstance(p, dict)]
     for k in ("band_ref_out", "band_ref_in"):
@@ -242,6 +252,7 @@ def settings(d: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     s["anchor_ref_only"] = False
     s["holdout_skip_lost"] = bool(s["holdout_skip_lost"])
     s["gen_holdout"] = bool(s["gen_holdout"])
+    s["gen_band_src"] = dict(s["gen_band_src"]) if isinstance(s["gen_band_src"], dict) else None
     import re as _re
     s["input_plate"] = str(s.get("input_plate") or "") if _re.fullmatch(r"v\d{3}", str(s.get("input_plate") or "")) else ""
     s["anchor_morph"] = bool(s["anchor_morph"])
@@ -289,14 +300,18 @@ def cleanup_dir(work_dir: Path) -> Path:
 
 def load_settings(work_dir: Path) -> Dict[str, Any]:
     try:
-        return settings(json.loads((cleanup_dir(work_dir) / "cleanup.json").read_text(encoding="utf-8")))
+        s = settings(json.loads((cleanup_dir(work_dir) / "cleanup.json").read_text(encoding="utf-8")))
     except (OSError, ValueError):
-        return settings()
+        s = settings()
+    # the current settings never carry a recomposite's frozen band: a new run's model covers the CURRENT band
+    s["gen_band"], s["gen_band_src"] = True, None
+    return s
 
 
 def save_settings(work_dir: Path, s: Dict[str, Any]) -> Dict[str, Any]:
     from engine.jsonio import write_json
     s = settings(s)
+    s["gen_band"], s["gen_band_src"] = True, None   # a recomposite's / an old version's model-mask rule stays in its run.json
     d = cleanup_dir(work_dir)
     d.mkdir(parents=True, exist_ok=True)
     write_json(d / "cleanup.json", {"schema": SCHEMA, **s}, indent=1, ensure_ascii=False)
@@ -477,7 +492,8 @@ def removal_mask(alphas: Sequence[np.ndarray], grow_px: float, soft_px: float,
     return np.clip(1.0 - d / float(soft_px), 0.0, 1.0).astype(np.float32)
 
 
-GEN_MARGIN_PX = 24.0       # default „Zapas generowania” (plate px)
+GEN_MARGIN_PX = 24.0       # „Zapas generowania” (plate px) of the 2026-11-13 rule (margin from the objects, gen_band off)
+GEN_BAND_MARGIN_PX = 4.0   # default (user 2026-11-23: a small margin when nobody touches the band) with the band in the model's mask (2026-11-23): the margin beyond the band's edge
 GEN_MARGIN_MAX = 300.0     # grow_px 200 + soft_px 100: an older project's derived margin is never cut
 
 
@@ -490,23 +506,42 @@ def grow_hard(alphas: Sequence[np.ndarray], px: float) -> np.ndarray:
     return hard.astype(np.float32)
 
 
-def gen_mask(remove: Sequence[np.ndarray], keep: Sequence[np.ndarray], s: Dict[str, Any]) -> np.ndarray:
+def gen_mask(remove: Sequence[np.ndarray], keep: Sequence[np.ndarray], s: Dict[str, Any],
+             band: Optional[np.ndarray] = None) -> np.ndarray:
     """The mask the video MODEL gets (user decision 2026-11-13): the removed objects grown by „Zapas generowania”
-    (`gen_margin_px`), hard – no band points, no feather. Since 2026-11-15 it reaches over the kept objects too (the
-    model draws under them, the composite protects them); `gen_holdout` True = the old rule (minus the kept objects)
-    for versions computed that way."""
+    (`gen_margin_px`), hard. `band` (2026-11-23, `gen_band`) = the composite band of the frame with its band points
+    (`mask_fn` without the holdout): the model's mask = (objects | band > 0) grown by the margin, so the band is never
+    cut and the margin is the extra beyond the band (0 is enough: the engines grow their canvas mask by another 46–98
+    plate px on a 6K plate, `engine_reach_px`). Since
+    2026-11-15 it reaches over the kept objects too (the model draws under them, the composite protects them);
+    `gen_holdout` True = the old rule (minus the kept objects) for versions computed that way."""
     if not remove:
         raise ValueError("brak obiektów do usunięcia")
-    m = grow_hard(remove, s["gen_margin_px"])
+    # 2026-11-23 (user): with the band the margin counts from the BAND's outer edge (feather included) – the band says
+    # what the model draws, the margin only widens it; without it (an older version) from the objects
+    m = grow_hard(list(remove) + ([(np.asarray(band, np.float32) > 0).astype(np.float32)] if band is not None else []),
+                  s["gen_margin_px"])
     h = holdout_mask(keep) if s["holdout"] and s.get("gen_holdout") else None
     return m if h is None else m * (1.0 - h)
+
+
+def gen_band_settings(s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The settings whose band the model's mask covers (`gen_band`): the source version's band (`gen_band_src`) when
+    recomposited, else the current one; no holdout (the model draws under the kept objects). None = `gen_band` off."""
+    if not s.get("gen_band"):
+        return None
+    src = s.get("gen_band_src")
+    return {**s, **(src or {}), "holdout": False}
 
 
 def gen_mask_fn(s: Dict[str, Any], remove: Sequence[Callable[[int], np.ndarray]],
                 keep: Sequence[Callable[[int], np.ndarray]]) -> Callable[[int], np.ndarray]:
     """f -> the model's mask of frame f – ONE function for the run (MiniMax-H3 / Wan 2.2 Fun VACE / LTX-2.5), the
     anchors and the recomposite (what the model drew)."""
-    return lambda f: gen_mask([fn(int(f)) for fn in remove], [fn(int(f)) for fn in keep], s)
+    bs = gen_band_settings(s)
+    bm = mask_fn(bs, remove, []) if bs is not None else None
+    return lambda f: gen_mask([fn(int(f)) for fn in remove], [fn(int(f)) for fn in keep], s,
+                              bm(int(f)) if bm is not None else None)
 
 
 def engine_reach_px(model: Optional[str], s: Dict[str, Any], w: int, h: int) -> float:
@@ -573,7 +608,8 @@ def band_limit(s: Dict[str, Any], w: int, h: int) -> Dict[str, Any]:
     lim = float(s["gen_margin_px"]) + eng
     reach = band_reach_max(s)
     return {"gen_margin_px": s["gen_margin_px"], "engine_px": round(eng, 1), "limit_px": round(lim, 1),
-            "reach_px": reach, "cut": reach > lim + 0.5}
+            "reach_px": reach, "cut": reach > lim + 0.5 and not s.get("gen_band"),   # gen_band: the model covers the band
+            "gen_band": bool(s.get("gen_band"))}
 
 
 def holdout_mask(keep: Sequence[np.ndarray]) -> Optional[np.ndarray]:

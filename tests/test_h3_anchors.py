@@ -72,7 +72,7 @@ def anchors_app(tmp_path, monkeypatch):
     monkeypatch.setitem(A.STATE, "manifest", {"plates": {"beauty": str(tmp_path / "b" / "f_####.png")}})
     calls = []
 
-    def fake_anchor(client, io, plate, mask, prompt, mode, linear=False, seed=None, ref=None, init=None, denoise=1.0, region=None, text=None, raw=None, plate_denoise=None, what=None):
+    def fake_anchor(client, io, plate, mask, prompt, mode, linear=False, seed=None, ref=None, init=None, denoise=1.0, region=None, text=None, raw=None, plate_denoise=None, what=None, feather_px=0.0):
         calls.append({"prompt": prompt, "seed": seed, "ref": ref is not None, "init": init is not None, "denoise": denoise})
         if raw is not None:
             raw.append(np.zeros((8, 8, 3), np.uint8))

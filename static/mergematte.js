@@ -41,7 +41,7 @@
       <div class="pp-chk"><label class="chk" title="Podgląd MergeMatte w widoku Comp (wyłącz = zwykłe wycięcie, A/B)"><input type="checkbox" id="mmOn"> wł.</label>
         <button type="button" class="btn btn-ghost btn-xs" id="mmPresetDef" title="Wszystkie knoby = domyślne węzła">↺ domyślne</button>
         <button type="button" class="btn btn-ghost btn-xs" id="mmPresetSd" title="Zestaw startowy dla włosów na jasnym / kontrastowym tle: choke 6, decon 100 px, darken 23 px, match, wrap, flare, edge blur 2">preset włosy</button>
-        <button type="button" class="btn btn-ghost btn-xs" id="mmNuke" title="Węzeł MergeMatte z tymi ustawieniami do Nuke'a – schowek (Ctrl+V w grafie węzłów; wejścia: FG = plate z alfą, BG = tło) albo plik .nk w folderze obiektu">⇪ Export</button>
+        ${UI.exportBtn('id="mmNuke"', "Węzeł MergeMatte z tymi ustawieniami do Nuke'a – schowek (Ctrl+V w grafie węzłów; wejścia: FG = plate z alfą, BG = tło) albo plik .nk w folderze obiektu", { float: false })}
         <button type="button" class="btn btn-ghost btn-xs" id="mmEdgeBg" title="Ile starego tła (np. jasnego nieba) zostaje w miękkiej krawędzi bieżącej klatki: średnia różnica koloru krawędzi (pas α 0,05–0,95) od czystej krawędzi (kolor wnętrza obiektu × α + nowe tło × (1 − α)), w % pełnej skali – zwykły Merge over i MergeMatte z tymi ustawieniami, na wybranym tle Comp. Jasność + = otoczka jaśniejsza od czystej krawędzi">📏 Tło w krawędzi</button></div>
       <div class="muted pp-hint" id="mmNote"></div>
       <div class="muted pp-hint" id="mmEdgeOut" style="display:none"></div>

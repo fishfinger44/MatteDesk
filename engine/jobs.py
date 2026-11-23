@@ -44,6 +44,7 @@ class Jobs:
         self._jobs: Dict[int, Dict[str, Any]] = {}
         self._cancel = threading.Event()
         self._local = threading.local()
+        self._thumbs: Dict[int, Dict[str, Any]] = {}   # job id -> last finished frame's mask (small uint8) + crop
 
     # ------------------------------------------------------------------ lifecycle
     def try_start(self, kind: str, label: str, obj: Optional[str] = None, quiet: bool = False) -> int:
@@ -103,6 +104,7 @@ class Jobs:
             done = sorted((k for k, v in self._jobs.items() if v["state"] != "running"))
             for k in done[:-5]:
                 self._jobs.pop(k, None)
+            self._thumbs.pop(jid, None)
 
     # ------------------------------------------------------------------ progress / cancel
     def check(self) -> None:
@@ -147,6 +149,47 @@ class Jobs:
                 if gpu_spill_gb is not None:
                     j["gpu_spill_gb"] = max(float(gpu_spill_gb), j.get("gpu_spill_gb") or 0.0)
                 j["updated"] = time.time()
+
+    THUMB_SIDE = 320       # px, longer side of the stored mask
+    THUMB_EVERY_S = 0.4    # at most this often per job (the UI polls once a second)
+
+    def thumb(self, frame: int, mask: Any, crop: Optional[Any] = None, jid: Optional[int] = None) -> None:
+        """The progress window's thumbnail (user request 2026-11-23): the mask of the frame the job has just finished.
+        `mask` = 2-D array (bool / uint8 0..255 / float 0..1) of the full frame or of `crop` = [x, y, w, h] in plate px
+        (x, y may be < 0: a padded crop square). Kept small, in memory; the job dict gets {"frame", "seq"} only."""
+        jid = jid or getattr(self._local, "jid", None) or self._latest_running()
+        now = time.time()
+        with self._lock:
+            j = self._jobs.get(jid) if jid else None
+            old = self._thumbs.get(jid, {})
+            if not j or j["state"] != "running" or now - old.get("t", 0.0) < self.THUMB_EVERY_S:
+                return
+            self._thumbs[jid] = {**old, "t": now}   # claimed: a parallel writer within the interval skips
+        import cv2
+        import numpy as np
+        m = np.asarray(mask)
+        if m.ndim != 2 or not m.size:
+            return
+        m = (m.astype(np.uint8) * 255 if m.dtype == bool else
+             m if m.dtype == np.uint8 else (np.clip(m.astype(np.float32), 0, 1) * 255.0 + 0.5).astype(np.uint8))
+        s = min(1.0, self.THUMB_SIDE / float(max(m.shape)))
+        if s < 1.0:
+            m = cv2.resize(m, (max(1, round(m.shape[1] * s)), max(1, round(m.shape[0] * s))), interpolation=cv2.INTER_AREA)
+        with self._lock:
+            j = self._jobs.get(jid)
+            if not j or j["state"] != "running":
+                return
+            seq = int((j.get("thumb") or {}).get("seq", 0)) + 1
+            self._thumbs[jid] = {"t": now, "frame": int(frame), "mask": m,
+                                 "crop": [int(v) for v in crop] if crop is not None else None}
+            j["thumb"] = {"frame": int(frame), "seq": seq}
+
+    def thumb_of(self, jid: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """{"frame", "mask", "crop"} of the job's latest thumbnail (default: the latest running job), None = none yet."""
+        with self._lock:
+            jid = jid or self._latest_running()
+            t = self._thumbs.get(jid) if jid else None
+            return dict(t) if t and "mask" in t else None
 
     def spill_gb(self, jid: Optional[int] = None) -> Optional[float]:
         """Peak GPU memory spilled to RAM in job `jid` (default: this thread's job / the latest running); None = none seen."""

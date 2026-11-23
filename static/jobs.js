@@ -34,6 +34,10 @@
   modal.innerHTML = `<div id="jobCard"><div class="t" id="jmTitle"></div><div class="s" id="jmStep"></div>
     <div class="jobTrack"><div class="jobFill" id="jmFill"></div></div>
     <div class="s" id="jmMeta"></div>
+    <div id="jmThumbBox" style="display:none;margin-top:10px;text-align:center">
+      <img id="jmThumb" alt="" title="Ostatnio policzona klatka – kliknij: zwiń okno i przejdź do tej klatki"
+        style="max-width:100%;max-height:220px;border-radius:6px;background:#000;cursor:pointer;display:inline-block">
+      <div class="s" id="jmThumbCap" style="font-size:11px;margin-top:2px"></div></div>
     <div class="s" id="jmSpill" style="display:none;margin-top:8px;padding:6px 8px;border-radius:6px;background:rgba(240,112,58,.18);color:#fde68a"></div>
     <div class="s" id="jmErr" style="display:none;margin-top:8px;padding:6px 8px;border-radius:6px;background:rgba(239,68,68,.18);color:#fecaca"></div>
     <div class="jobDet" id="jmDet"></div>
@@ -158,6 +162,32 @@
   $('jmCancel').addEventListener('click', () => cancel($('jmCancel')));
   $('jobCancel').addEventListener('click', () => cancel($('jobCancel')));
   $('jmMin').addEventListener('click', () => { if (busy) minimized[busy.id] = true; render([busy].filter(Boolean)); });
+
+  // ---- thumbnail of the last finished frame (GET /api/jobs/thumb, user request 2026-11-23): the job reports
+  // thumb {frame, seq}; a new seq loads a new JPEG (204 = nothing yet -> the box stays hidden). Stages computed in
+  // ComfyUI batches only report frames when a batch comes back.
+  let thumbKey = '';
+  let thumbFrame = null;
+  function updateThumb(j) {
+    const t = j && j.thumb;
+    if (!t) { if (!j || thumbKey.split(':')[0] !== String(j.id)) { $('jmThumbBox').style.display = 'none'; thumbKey = ''; } return; }
+    const key = `${j.id}:${t.seq}`;
+    if (key === thumbKey) return;
+    thumbKey = key;
+    const img = new Image();
+    img.onload = () => {
+      if (thumbKey !== key) return;      // a newer one was requested meanwhile
+      $('jmThumb').src = img.src; thumbFrame = t.frame;
+      $('jmThumbCap').textContent = `klatka ${t.frame} – ostatnio policzona`;
+      $('jmThumbBox').style.display = '';
+    };
+    img.src = `/api/jobs/thumb?job=${j.id}&s=${t.seq}`;
+  }
+  $('jmThumb').addEventListener('click', () => {
+    if (!busy || thumbFrame == null) return;
+    minimized[busy.id] = true; render([busy]);
+    if (window.viewer && window.viewer.goToFrame) window.viewer.goToFrame(thumbFrame);
+  });
   $('jobExpand').addEventListener('click', () => { if (busy) delete minimized[busy.id]; render([busy].filter(Boolean)); });
 
   // Buttons that start a computation or switch the project: locked while something is being computed.
@@ -232,6 +262,7 @@
       $('jmStep').textContent = stepOf(j) || 'start…';
       fill($('jmFill'), j);
       $('jmMeta').textContent = meta(j);
+      updateThumb(j);
       // GPU memory spilled to RAM (comfy_client.wait_for_prompt, user request 2026-10-26): the run goes on, many times slower
       const sp = (j.comfy_info || {}).spill_gb;
       $('jmSpill').style.display = sp ? '' : 'none';

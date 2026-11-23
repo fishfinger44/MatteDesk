@@ -145,6 +145,10 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
             raise HTTPException(status_code=400, detail="Brak otwartego projektu")
         return Path(STATE["work_dir"]), STATE["manifest"]
 
+    def _plate_linear() -> bool:
+        """Scene-linear beauty (EXR) – the encoding the C1 pictures are converted from (to_display8 / to_view8)."""
+        return str(((STATE.get("manifest") or {}).get("plates") or {}).get("beauty") or "").lower().endswith(".exr")
+
     def _objs() -> List[Dict[str, Any]]:
         return objects().list(groups=True)
 
@@ -682,6 +686,7 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
         sd = int(s.get("seed") or 42) if seed is None else int(seed)
         from engine import anchor_warp as AW
         raws: list = []   # Qwen-Image-2.1's pictures before the paste: saved as g_###_raw.png (+ _hole_raw for the repaint)
+        feather = 0.0 if how == "warp" else h3_fill.anchor_feather_px(s, a["frame"])
         if how == "warp":
             img = init   # the warp alone: no Qwen-Image-2.1 pass (the holes hold the surrounding pattern)
         else:
@@ -694,9 +699,12 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
             own_dn = float(s.get("anchor_denoise", 1.0)) if a["kind"] in ("main", "own") else None   # „Siła kotwicy”
             img = h3_fill.make_anchor(comfy_client(), work / "comfy_io", plate(a["frame"]), rmask(a["frame"]), text, mode,
                                       linear, seed=sd, ref=ref_img, init=init, denoise=AW.denoise(s), raw=raws,
-                                      plate_denoise=own_dn, what=_removed_noun(s) if init is None else None)
+                                      plate_denoise=own_dn, what=_removed_noun(s) if init is None else None,
+                                      feather_px=feather)
         ok, buf = cv2.imencode(".png", img)
         meta = {"prompt": text, "mode": mode, "seed": sd, "ref": ref, "frame": a["frame"], "kind": a["kind"]}
+        if feather:
+            meta["feather_px"] = round(feather, 1)   # the soft edge it was made with (Pas łaty x ANCHOR_FEATHER_MULT)
         if a["kind"] in ("main", "own") and how != "warp" and float(s.get("anchor_denoise", 1.0)) < 1.0:
             meta["denoise"] = float(s["anchor_denoise"])     # made from the plate at this strength
         if how:
@@ -1047,8 +1055,10 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
         return _anchors_view(work, s)
 
     @router.get("/api/cleanup/anchors/{aid}/gens/{name}")
-    def cleanup_anchor_gen_image(aid: str, name: str, raw: str = ""):   # str: an old cached UI glues "?raw=1?t=…"
-        """raw=1: Qwen-Image-2.1's whole picture saved next to the generation (the pasted one when there is none)."""
+    def cleanup_anchor_gen_image(aid: str, name: str, raw: str = "", view: str = ""):   # str: an old cached UI glues "?raw=1?t=…"
+        """raw=1: Qwen-Image-2.1's whole picture saved next to the generation (the pasted one when there is none).
+        view=1 (2026-11-23): a JPEG at the viewer's preview size in the viewer's curve (as the plate proxies) for the
+        palette previews; without it the stored PNG as is (model space, sRGB) – the export / Photoshop round trip."""
         from engine import h3_anchors as HA
         work, _ = _need()
         try:
@@ -1059,6 +1069,16 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
             f = f.with_name(f"{name}_raw.png")
         if not f.exists():
             raise HTTPException(status_code=404, detail="Brak generacji")
+        if str(view).startswith("1"):
+            from engine.cleanup3d.void_engine import model_to_view8
+            im = cv2.imread(str(f), cv2.IMREAD_COLOR)
+            if im is None:
+                raise HTTPException(status_code=404, detail="Brak generacji")
+            w, h = plate_size()
+            sc = proxy_scale()
+            im = cv2.resize(im, (max(1, round(w * sc)), max(1, round(h * sc))), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", model_to_view8(im, _plate_linear()), [cv2.IMWRITE_JPEG_QUALITY, 92])
+            return Response(content=buf.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
         return Response(content=f.read_bytes(), media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @router.delete("/api/cleanup/anchors/{aid}/gens/{name}")
@@ -1103,6 +1123,27 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
         plates = _set_cleaned(d, v.get("comp_ext") or cu.file_ext(v.get("ext") or "png"))
         s = _restore_version(work, d)
         return {"version": version, "plate": CLEANED_PLATE, "plates": plates, "settings": s}
+
+    @router.post("/api/cleanup/versions/{version}/reveal")
+    def cleanup_reveal_version(version: str):
+        """„📂” of a version card (user 2026-11-23): the system file browser on the version's composite frames
+        (v###/comp, its first frame selected on Windows; the version folder when there is no comp)."""
+        import subprocess
+        import sys
+        work, _ = _need()
+        d = _version_dir(work, version)
+        comp = d / "comp"
+        files = sorted(p for p in comp.iterdir() if p.is_file()) if comp.is_dir() else []
+        target = files[0] if files else (comp if comp.is_dir() else d)
+        try:
+            if sys.platform == "win32":
+                args = ["explorer", f"/select,{target}"] if target.is_file() else ["explorer", str(target)]
+                subprocess.Popen(args)
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(target if target.is_dir() else target.parent)])
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Nie udało się otworzyć eksploratora: {e}")
+        return {"version": version, "path": str(target).replace("\\", "/")}
 
     def _version_anchors(work: Path, vdir: Path, vs: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The anchor list of a version: its saved list when every chosen generation is still there; else one anchor
@@ -1410,9 +1451,16 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
         im = cv2.imread(str(f), cv2.IMREAD_COLOR) if f.exists() else None
         if im is None:
             raise HTTPException(status_code=404, detail=f"{version}: brak obrazu modelu F{frame}")
+        import json as _json
+        from engine.cleanup3d.void_engine import model_to_view8
+        try:
+            linear = bool(_json.loads((d / "run.json").read_text(encoding="utf-8")).get("linear"))
+        except (OSError, ValueError):
+            linear = _plate_linear()
         w, h = plate_size()
         sc = proxy_scale()
         im = cv2.resize(im, (max(1, round(w * sc)), max(1, round(h * sc))), interpolation=cv2.INTER_AREA)
+        im = model_to_view8(im, linear)   # the viewer's curve, as the plate proxies (2026-11-23)
         ok, buf = cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 90])
         return Response(content=buf.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
@@ -1421,7 +1469,7 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
                                   soft_px: Optional[float] = None):
         """Live preview of a recomposite: frame `frame` of `version` composited with the current band (+ the palette's
         unsaved grow_px / soft_px), the source version's levelling gain, grain – PNG at the viewer's preview size."""
-        from engine.cleanup3d.void_engine import to_display8
+        from engine.cleanup3d.void_engine import to_view8
         ov = {"grow_px": None if grow_px is None else max(cu.GROW_MIN, min(cu.GROW_MAX, float(grow_px))),
               "soft_px": None if soft_px is None else max(0.0, min(100.0, float(soft_px)))}
         P = _recompose_parts(version, ov)
@@ -1441,7 +1489,8 @@ def make(*, STATE, objects, plate_size, work_frames, proxy_scale, comfy_client, 
             raise HTTPException(status_code=409, detail=str(e))
         sc = proxy_scale()
         w, h = P["w"], P["h"]
-        img = cv2.resize(to_display8(comp, P["linear"]), (max(1, round(w * sc)), max(1, round(h * sc))),
+        # the viewer's curve, as the plate proxies (2026-11-23: plain sRGB over the proxy = an „exposure jump”)
+        img = cv2.resize(to_view8(comp, P["linear"]), (max(1, round(w * sc)), max(1, round(h * sc))),
                          interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])   # ~10x smaller than PNG, a preview
         return Response(content=buf.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})

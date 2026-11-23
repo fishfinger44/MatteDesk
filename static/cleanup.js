@@ -10,7 +10,8 @@
   const $ = (id) => document.getElementById(id);
   const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const KEY = 'md_mode';
-  const C = { mode: 'cut', info: null, saveT: null, liveOn: false, live: null };
+  // fresh: versions made in this page session (run / upscale / recompose) not looked at yet – highlighted (user 2026-11-23)
+  const C = { mode: 'cut', info: null, saveT: null, liveOn: false, live: null, fresh: new Set() };
   try { C.liveOn = localStorage.getItem('md_cu_live') === '1'; } catch (e) { /* storage blocked */ }
   let mode = 'cut';
   try { mode = localStorage.getItem(KEY) === 'clean' ? 'clean' : 'cut'; } catch (e) { /* storage blocked */ }
@@ -29,6 +30,8 @@
   function panelHtml() {
     return `<div class="stage-pane" id="cleanupPanel" style="display:none">
       <div class="stage-title">🧹 Inpaint – usuń / zastąp</div>
+      <div class="cu-vers-box" id="cuVersBox"><div class="zp-sub cu-vers-h">Policzone wersje <span class="cu-vers-n" id="cuVersN"></span></div>
+        <div id="cuVersions" class="cu-versions"></div></div>
       <div class="cu-intro">
         <div class="pp-hint cu-intro-lead"><b>Co robi:</b> <span>usuwa obiekt z ujęcia albo zastępuje go czymś z opisu.</span> <b>Najlepsze do:</b> <span>rigów, uchwytów, wymiany elementu, przemiany (morfing).</span></div>
         <ol class="cu-steps">
@@ -43,8 +46,6 @@
       <div id="cuObjects" class="cu-objects"></div>
       <div class="pp-hint warn" id="cuWarn" style="display:none"></div>
       <div id="cuAnchors"></div>
-      <div class="zp-sub">Wersje</div>
-      <div id="cuVersions" class="muted pp-hint"></div>
     </div>`;
   }
 
@@ -80,7 +81,7 @@
         <select id="cuVaceSpeed" class="form-input" title="Szybko = LoRA Lightning: 4 kroki przy CFG 1 (ok. 5–10× szybciej, trochę mniej szczegółu); dokładnie = 20 kroków przy CFG 3,5"><option value="fast">szybko – 4 kroki</option><option value="quality">dokładnie – 20 kroków</option></select>
       </div>
       <div class="pp-hint warn" id="cuVaceNote" style="display:none"></div>
-      <label class="edge-px cu-gen" title="Zapas generowania: o ile px wokół usuwanego obiektu model wideo ma narysować nowy obraz (maska modelu = obiekt poszerzony o tyle, twardo, bez punktów pasa i wtopienia, także na chronione obiekty – złożenie przywraca je z ich alfą; silnik dokłada swój rozrost). Liczy się przed „▶ Policz Inpaint” – po liczeniu zmienia go tylko nowe liczenie. Większy zapas = więcej materiału dla pasa łaty">Zapas generowania <input type="range" id="cuGenR" min="0" max="200" step="1" title="Zapas generowania (px) – zapis po puszczeniu"><input type="number" id="cuGen" class="form-input edge-num" min="0" max="300" step="1" title="Zapas generowania (px) – wpisz i Enter"></label>
+      <label class="edge-px cu-gen" title="Zapas generowania: o ile px POZA pasem łaty model wideo rysuje jeszcze nowy obraz (maska modelu = obiekt + cały pas łaty z punktami i wtopieniem, poszerzone o tyle, twardo, także na chronione obiekty – złożenie przywraca je z ich alfą). 0 zwykle wystarcza: zakres wyznacza pas łaty, a silnik i tak dokłada swój rozrost (Wan 2.2 Fun VACE ~46 px, MiniMax-H3 ~87 px, LTX-2.5 ~98 px na 6K). Liczy się przed „▶ Policz Inpaint” – po liczeniu zmienia go tylko nowe liczenie">Zapas generowania <input type="range" id="cuGenR" min="0" max="200" step="1" title="Zapas generowania (px) – zapis po puszczeniu"><input type="number" id="cuGen" class="form-input edge-num" min="0" max="300" step="1" title="Zapas generowania (px) – wpisz i Enter"></label>
       <div class="muted pp-hint cu-sources" id="cuSources"></div>
       <div class="pp-btns cu-run-row">
         <button type="button" class="btn btn-secondary btn-sm" id="cuPreview" title="Maska usuwania bieżącej klatki (czerwone = łata) – ta sama, której użyje „Policz”">👁 Maska klatki</button>
@@ -98,7 +99,7 @@
     return `<div class="pts-palette cu-pal cu-comp-pal" id="cuCompPal" style="display:none">
       <div class="pp-head" title="Przeciągnij, żeby przesunąć paletę (dwuklik = z powrotem w rogu)"><span class="ol-grip">⠿</span> 🧩 Złożenie</div>
       <div class="pp-sec cu-band">
-        <div class="cu-sec-h" title="Pas łaty – co z wygenerowanego materiału wchodzi w obraz. Ten sam system pasa co w etapach wycinania, tylko strona zewnętrzna: łata musi przykryć cały obiekt, więc nie ma wcięcia. Pas jest własny dla czyszczonego obiektu (niezależny od pasa etapów wycinania). Sięga najwyżej do granicy tego, co narysował model (zapas generowania + rozrost silnika)">Pas łaty</div>
+        <div class="cu-sec-h" title="Pas łaty – co z wygenerowanego materiału wchodzi w obraz. Ten sam system pasa co w etapach wycinania, tylko strona zewnętrzna: łata musi przykryć cały obiekt, więc nie ma wcięcia. Pas jest własny dla czyszczonego obiektu (niezależny od pasa etapów wycinania). Wyznacza też, gdzie rysuje model (maska modelu = pas + zapas generowania); w wersjach sprzed 2026-11-23 sięga najwyżej do granicy tego, co narysował model">Pas łaty ${UI.exportBtn({ bandexp: "1" }, "Pas łaty (krawędzie pasa + koniec wtopienia, wszystkie klatki obszaru roboczego) jako Roto w Nuke'u (schowek / plik .nk) albo maski w After Effects (skrypt .jsx)")}</div>
         <div class="cu-band-row">
           <label class="chk" title="Linie pasa na podglądzie (krawędź pasa i koniec wtopienia) i punkty pasa"><input type="checkbox" id="cuBandPv" title="Podgląd pasa wł. / wył."> 👁 podgląd pasa</label>
           <button type="button" class="btn btn-ghost btn-xs" id="cuBandAdd" title="Dodaj punkt pasa: klik przy obrysie obiektu = nowy punkt (klucz tej klatki); przeciągnij żółty wąs = jak daleko łata sięga na zewnątrz w tym miejscu. Między kluczami punkt jedzie za obiektem. Esc = koniec">⊕ Punkt</button>
@@ -508,26 +509,49 @@
     const all = (d.versions || []).slice().reverse();
     const mine = n ? all.filter((v) => (v.remove || []).includes(n)) : all;
     const rest = all.length - mine.length;
+    // a card per version (user 2026-11-23: on top, readable, fresh ones stand out): head = version · model · frames
+    // (+ NOWA / NA PLATE badges), meta = anchors / origin, the description (2 lines), then a row of actions
     const row = (v) => {
       const shown = v.shown && onCleaned();   // Beauty / another plate on screen: no version is shown (2026-11-15)
+      const fresh = C.fresh.has(v.version);
       const fr = v.frames || [];
-      const anc = (v.anchors || []).length ? ` · ⚓ ${(v.anchors || []).map((f) => `F${f}`).join(' ')}` : '';
-      const upTxt = (v.upscaled_from ? ` · ⤴ z ${v.upscaled_from}` : v.recomposed_from ? ` · ⟲ z ${v.recomposed_from}` : '')
-        + (v.input_plate ? ` · na ${v.input_plate}` : '');   // made on top of an earlier version („Wejście”)
+      const meta = [(v.anchors || []).length ? `⚓ ${(v.anchors || []).map((f) => `F${f}`).join(' ')}` : '',
+        v.upscaled_from ? `⤴ upscale z ${v.upscaled_from}` : v.recomposed_from ? `⟲ złożona z ${v.recomposed_from}` : '',
+        v.input_plate ? `na ${v.input_plate}` : ''].filter(Boolean);   // made on top of an earlier version („Wejście”)
       // „⟲ Złóż ponownie” (2026-11-13): only versions that kept the model's frames (model/)
-      const rec = v.has_model ? `<button type="button" class="btn btn-ghost btn-xs cmp-run-act" data-cu-recomp="${esc(v.version)}" title="${esc(`Złóż ponownie ${v.version} bez liczenia modelu: jej obraz modelu z bieżącym pasem łaty (pas, wtopienie, punkty), ochroną, wyrównaniem poziomu i ziarnem – nowa wersja (ta zostaje)`)}">⟲ Złóż ponownie</button>` : '';
+      const rec = v.has_model ? `<button type="button" class="btn btn-ghost btn-xs" data-cu-recomp="${esc(v.version)}" title="${esc(`Złóż ponownie ${v.version} bez liczenia modelu: jej obraz modelu z bieżącym pasem łaty (pas, wtopienie, punkty), ochroną, wyrównaniem poziomu i ziarnem – nowa wersja (ta zostaje)`)}">⟲ Złóż ponownie</button>` : '';
       const up = d.upscale || {};
-      const why = [shown ? 'na plate „cleaned”' : '', v.prompt ? `„${v.prompt.length > 60 ? `${v.prompt.slice(0, 60)}…` : v.prompt}”` : ''].filter(Boolean).join(' · ');
-      return `<div class="row-item cmp-run cu-ver${shown ? ' cur' : ''}" data-cu-show="${esc(v.version)}" title="${esc(shown ? `${v.version} jest na plate „cleaned”` : `Klik = ${v.version} na plate „cleaned” + jej model, opis i kotwice wracają do panelu`)}">
-        <span class="cmp-run-txt"><span class="cmp-run-name">${shown ? '▶ ' : ''}${esc(v.version)} · ${esc(MODEL_NAME[v.model] || v.model || '?')} · F${esc(fr[0])}–${esc(fr[1])}${esc(anc)}${esc(upTxt)}</span>${why ? `<span class="cmp-run-why">${esc(why)}</span>` : ''}</span>
-        ${rec}<button type="button" class="btn btn-ghost btn-xs cmp-run-act" data-cu-up="${esc(v.version)}" title="${esc(up.available ? `Upscale ${v.version} przez SeedVR2: wypełnienie podbite do rozdzielczości plate'u jako jeden klip, podmienione tylko w masce – nowa wersja (ta zostaje)` : `SeedVR2 niedostępny: ${up.reason || 'brak'} – Doktor → Zainstaluj SeedVR2`)}"${up.available ? '' : ' disabled'}>⤴</button>
-        <button type="button" class="btn btn-ghost btn-xs cmp-run-del" data-cu-del="${esc(v.version)}" title="Usuń wersję ${esc(v.version)} z dysku na stałe (przed usunięciem zapytam)">🗑</button></div>`;
+      return `<div class="cu-ver${shown ? ' cur' : ''}${fresh ? ' fresh' : ''}" data-cu-show="${esc(v.version)}" title="${esc(shown ? `${v.version} jest na plate „cleaned”` : `Klik = ${v.version} na plate „cleaned” + jej model, opis i kotwice wracają do panelu`)}">
+        <div class="cu-ver-head"><b class="cu-ver-v">${esc(v.version)}</b><span class="cu-ver-m">${esc(MODEL_NAME[v.model] || v.model || '?')}</span><span class="cu-ver-f">F${esc(fr[0])}–${esc(fr[1])}</span>
+          ${fresh ? '<span class="cu-badge new" title="Nowa wersja – jeszcze nieoglądana (klik = pokaż)">NOWA</span>' : ''}${shown ? '<span class="cu-badge on" title="Ta wersja jest teraz na plate „cleaned”">NA PLATE</span>' : ''}</div>
+        ${meta.length ? `<div class="cu-ver-meta">${esc(meta.join(' · '))}</div>` : ''}
+        ${v.prompt ? `<div class="cu-ver-p">„${esc(v.prompt)}”</div>` : ''}
+        <div class="cu-ver-acts">${rec}<button type="button" class="btn btn-ghost btn-xs" data-cu-up="${esc(v.version)}" title="${esc(up.available ? `Upscale ${v.version} przez SeedVR2: wypełnienie podbite do rozdzielczości plate'u jako jeden klip, podmienione tylko w masce – nowa wersja (ta zostaje)` : `SeedVR2 niedostępny: ${up.reason || 'brak'} – Doktor → Zainstaluj SeedVR2`)}"${up.available ? '' : ' disabled'}>⤴ Upscale</button>
+          <span class="cu-ver-sp"></span>
+          <button type="button" class="btn btn-ghost btn-xs" data-cu-reveal="${esc(v.version)}" title="Pokaż klatki ${esc(v.version)} (comp) w Eksploratorze">📂</button>
+          <button type="button" class="btn btn-ghost btn-xs cmp-run-del" data-cu-del="${esc(v.version)}" title="Usuń wersję ${esc(v.version)} z dysku na stałe (przed usunięciem zapytam)">🗑</button></div></div>`;
     };
-    return `<details class="cmp-runs" open><summary title="Wersje czyszczenia tego obiektu; klik = na plate „cleaned” i jej ustawienia (model, opis, kotwice) wracają do panelu; 🗑 = usuń z dysku na stałe (z ostrzeżeniem)">Wersje czyszczenia (klik = pokaż + kotwice, 🗑 = usuń)${n ? ` – ${esc(n)}` : ''}</summary>`
+    const nEl = $('cuVersN');
+    if (nEl) {
+      const nf = mine.filter((v) => C.fresh.has(v.version)).length;
+      nEl.textContent = mine.length ? `${mine.length}${nf ? ` · ${nf} nowa` : ''}` : '';
+      nEl.classList.toggle('new', !!nf);
+    }
+    const box = $('cuVersBox'); if (box) box.classList.toggle('has-new', mine.some((v) => C.fresh.has(v.version)));
+    return (n ? `<div class="cu-vers-for muted">Obiekt: ${esc(n)} · klik = pokaż na plate „cleaned” + jej ustawienia wracają</div>` : '')
       + (mine.length ? mine.map(row).join('') : `<div class="muted">${n ? `„${esc(n)}” – jeszcze nic nie policzono.` : 'Jeszcze nic nie policzono.'}</div>`)
-      + '</details>'
       + (rest > 0 ? `<div class="muted">+ ${rest} wersji innych obiektów (wybierz je w palecie)</div>` : '')
-      + `<div class="muted">${esc(d.out_dir)}</div>`;
+      + `<div class="cu-vers-dir" title="Folder wersji czyszczenia">${esc(d.out_dir)}</div>`;
+  }
+  // a freshly computed version: highlighted, list scrolled into view (user 2026-11-23: „po przeliczeniu zwróć uwagę”)
+  function markFresh(ver) {
+    if (!ver) return;
+    C.fresh.add(ver);
+    requestAnimationFrame(() => { const b = $('cuVersBox'); if (b && b.scrollIntoView) b.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); });
+  }
+  async function revealVersion(ver) {
+    try { const r = await api('POST', `/api/cleanup/versions/${encodeURIComponent(ver)}/reveal`); window.UI.toast(`${ver} w Eksploratorze: ${r.path}`, 4000); }
+    catch (e) { window.UI.toast(`${ver}: ${e.message}`, 6000); }
   }
 
   // fill models (user 2026-11-10): LaMa / Qwen-Image-2.1 / VOID – not installed = a short card with the GPU verdict of
@@ -719,7 +743,7 @@
         : 'Czyszczenie na zakresie pracy (oś czasu) → nowa wersja w <work>/inpaint i plate „cleaned”';
     $('cuPreview').disabled = !(o && o.mask && o.mask.run);
     syncBandSliders(); renderBandKeysLane();
-    if (document.activeElement !== $('cuGen') && document.activeElement !== $('cuGenR')) { $('cuGen').value = s.gen_margin_px ?? 24; $('cuGenR').value = Math.min(200, s.gen_margin_px ?? 24); }
+    if (document.activeElement !== $('cuGen') && document.activeElement !== $('cuGenR')) { $('cuGen').value = s.gen_margin_px ?? 4; $('cuGenR').value = Math.min(200, s.gen_margin_px ?? 4); }
     bandLimitUi();
     recompUi();
     $('cuHoldout').checked = s.holdout; $('cuFill').value = s.fill;
@@ -882,6 +906,7 @@
     if (v && r && r.plates) { v.updatePlateSelector(r.plates); if (v.bumpPlate) v.bumpPlate('cleaned'); else if (v.frameCache) v.frameCache.clear(); if (r.plates[r.plate || 'cleaned']) v.setActivePlate('cleaned'); }
   }
   async function showVersion(ver) {
+    C.fresh.delete(ver);
     try {
       await flush();
       const r = await api('POST', `/api/cleanup/versions/${encodeURIComponent(ver)}/show`);
@@ -896,7 +921,7 @@
   async function upscaleVersion(ver) {   // SeedVR2 over the version's fill -> a new version (api/cleanup.py)
     try {
       const r = await api('POST', `/api/cleanup/versions/${encodeURIComponent(ver)}/upscale`);
-      afterPlates(r);
+      afterPlates(r); markFresh(r.version);
       window.UI.toast(`Upscale ${ver} → ${r.version} (SeedVR2, ${r.n_frames} kl., ${r.seconds} s)`, 6000);
     } catch (e) { window.UI.toast(`Upscale ${ver}: ${e.message}`, 9000); }
     await load();
@@ -905,7 +930,7 @@
     try {
       await flush();
       const r = await api('POST', `/api/cleanup/versions/${encodeURIComponent(ver)}/recompose`);
-      afterPlates(r);
+      afterPlates(r); markFresh(r.version);
       C.live = null;
       window.UI.toast(`Złożono ponownie ${ver} → ${r.version} (${r.n_frames} kl., ${r.seconds} s, bez modelu)${(r.band_cut || []).length ? ' · pas ucięty na granicy obszaru modelu' : ''}`, 7000);
     } catch (e) { window.UI.toast(`Złóż ponownie ${ver}: ${e.message}`, 9000); }
@@ -930,6 +955,7 @@
     try {
       const r = await api('POST', '/api/cleanup/run');
       const c = r.counts || {};
+      markFresh(r.version);
       window.UI.toast(`Czyszczenie ${r.version}: ${r.n_frames} kl., ${r.seconds} s · clear plate ${c['clear plate'] || 0} px, LaMa ${c.LaMa || 0} px, OpenCV ${c.OpenCV || 0} px${(r.notes || []).length ? ' · ' + r.notes.join('; ') : ''}`, 10000);
       const v = window.viewer;
       if (v && r.plates) { v.updatePlateSelector(r.plates); if (v.bumpPlate) v.bumpPlate(r.plate || 'cleaned'); else if (v.frameCache) v.frameCache.clear(); v.setActivePlate(r.plate); }
@@ -1044,8 +1070,11 @@
       const rc = e.target.closest('[data-cu-recomp]');
       if (rc) { e.stopPropagation(); recomposeVersion(rc.dataset.cuRecomp); return; }
       if (up) { e.stopPropagation(); upscaleVersion(up.dataset.cuUp); return; }
+      const rv = e.target.closest('[data-cu-reveal]');
+      if (rv) { e.stopPropagation(); revealVersion(rv.dataset.cuReveal); return; }
       if (del) { e.stopPropagation(); deleteVersion(del.dataset.cuDel); }
       else if (show && !show.classList.contains('cur')) showVersion(show.dataset.cuShow);
+      else if (show && C.fresh.delete(show.dataset.cuShow) && C.info) $('cuVersions').innerHTML = versionsHtml(C.info);   // the shown fresh one: looked at
     });
     // the shared Objects palette picks what is cleaned (static/objects.js selectObject -> md-object-pick)
     window.addEventListener('md-object-pick', (e) => { if (mode === 'clean') pick(e.detail && e.detail.name); });

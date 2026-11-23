@@ -6,7 +6,8 @@
 //   UI.toast(text, ms)         -> the short message above the timeline / job bar
 //   UI.dialog({...})           -> Promise<boolean>: a message window (OK / Anuluj), tone info | ok | warn | error | danger
 //   UI.form({...})             -> Promise<value | null>: a window with fields, its own validation and a server call
-//   UI.exportMenu(btn, {get, what, off}) -> the „⇪ Export” menu: Nuke clipboard / .nk file / After Effects (later)
+//   UI.exportBtn(attrs, title, {float}) -> the „⇪ Export” button HTML (one look: CSS .md-export)
+//   UI.exportMenu(btn, {get, getAe, what, off}) -> the „⇪ Export” menu: Nuke clipboard / .nk file / After Effects .jsx (getAe)
 //   UI.copyText(text)          -> Promise<bool>: text to the clipboard (async API, else execCommand)
 //   UI.confirmDelete({...})    -> Promise<false | value>: the warning before a PERMANENT delete (red, Enter never deletes)
 //   UI.bytes(n)                -> "1,2 GB" (Polish decimal comma, as engine/deletion.py human)
@@ -181,7 +182,7 @@ window.UI = (() => {
     m.className = 'md-menu'; m.anchor = anchor;
     for (const it of items) {
       const b = document.createElement('button');
-      b.type = 'button'; b.className = 'md-menu-item'; b.textContent = it.label;
+      b.type = 'button'; b.className = it.head ? 'md-menu-item md-menu-head' : 'md-menu-item'; b.textContent = it.label;
       if (it.title) b.title = it.title;
       b.disabled = !!it.disabled;
       b.addEventListener('click', (e) => { e.stopPropagation(); closeMenu(); if (it.run) it.run(); });
@@ -196,19 +197,39 @@ window.UI = (() => {
   }
   document.addEventListener('mousedown', (e) => { if (openMenu && !openMenu.contains(e.target) && e.target !== openMenu.anchor) closeMenu(); }, true);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
-  // the menu of a „⇪ Export” button: Nuke clipboard / Nuke .nk file / After Effects (later). `get` = async () =>
-  // {text, path} of the node(s); `off` = why it cannot be exported (items disabled with that reason)
-  function exportMenu(anchor, { get, what, off = '', status }) {
-    const say = status || ((t, k) => toast(t, k));
-    menu(anchor, [
+  // THE „⇪ Export” button (user decision 2026-11-23: one look everywhere, changed in one place – CSS `.md-export`).
+  // attrs: {id?, <data key>: value} -> id="…" / data-<key>="…" (or a raw attribute string, e.g. 'id="mmNuke"' – keeps the id
+  // visible to tests/test_static_js id checks); float: true = right edge of a section header
+  function exportBtn(attrs = {}, title = '', { float = true } = {}) {
+    const a = typeof attrs === 'string' ? attrs : Object.entries(attrs || {}).map(([k, v]) => (k === 'id' ? `id="${esc(v)}"` : `data-${k}="${esc(v)}"`)).join(' ');
+    return `<button type="button" class="btn btn-xs md-export${float ? ' md-export-float' : ''}" ${a} title="${esc(title)}">⇪ Export</button>`;
+  }
+  // the menu of a „⇪ Export” button: Nuke clipboard / Nuke .nk file / After Effects. `get` = async () =>
+  // {text, path} of the node(s); `off` = why it cannot be exported (items disabled with that reason).
+  // `more` = further sections in the same menu (2026-11-23: the band's tracker): [{what, get, getAe, aeAs, off}],
+  // each under its own heading; `aeAs` = what the .jsx makes in After Effects (default: masks)
+  function exportItems({ get, getAe, what, off = '', aeAs = 'maski' }, say) {
+    return [
       { label: "⧉ Nuke – do schowka (Ctrl+V)", title: off || `${what} do schowka – w Nuke'u Ctrl+V w grafie węzłów (zapisany też jako plik .nk)`, disabled: !!off,
         run: async () => { try { const r = await get(); const ok = await copyText(r.text);
           say(ok ? `${what} w schowku – w Nuke'u Ctrl+V w grafie węzłów (plik: ${r.path})` : `Schowek niedostępny – plik: ${r.path}`, ok ? 'ok' : 'warn');
         } catch (e) { say(`${what} → Nuke: ${e.message || e}`, 'err'); } } },
       { label: '💾 Nuke – plik .nk', title: off || `${what} jako plik .nk (File → Import Script albo przeciągnij do Nuke'a)`, disabled: !!off,
         run: async () => { try { const r = await get(); say(`${what} – plik .nk: ${r.path}`, 'ok'); } catch (e) { say(`${what} → Nuke: ${e.message || e}`, 'err'); } } },
-      { label: 'After Effects – wkrótce', title: 'Eksport do After Effects jeszcze nie jest zrobiony', disabled: true },
-    ]);
+      getAe
+        ? { label: '🎞 After Effects – skrypt .jsx', title: off || `${what} jako ${aeAs} w After Effects: otwórz kompozycję z plate'em, potem File → Scripts → Run Script File… i wskaż plik .jsx`, disabled: !!off,
+            run: async () => { try { const r = await getAe(); say(`${what} – skrypt After Effects: ${r.path} (w AE: File → Scripts → Run Script File… przy otwartej kompozycji z plate'em)`, 'ok'); } catch (e) { say(`${what} → After Effects: ${e.message || e}`, 'err'); } } }
+        : { label: 'After Effects – wkrótce', title: 'Eksport do After Effects jeszcze nie jest zrobiony', disabled: true },
+    ];
   }
-  return { esc, read, api, toast, dialog, form, confirmDelete, bytes, copyText, menu, exportMenu };
+  function exportMenu(anchor, { get, getAe, what, off = '', status, more = [] }) {
+    const say = status || ((t, k) => toast(t, k));
+    let items = exportItems({ get, getAe, what, off }, say);
+    if (more.length) {
+      items = [{ label: what, disabled: true, head: true }, ...items];
+      for (const sec of more) items.push({ label: sec.what, disabled: true, head: true }, ...exportItems({ ...sec, off: sec.off || off }, say));
+    }
+    menu(anchor, items);
+  }
+  return { esc, read, api, toast, dialog, form, confirmDelete, bytes, copyText, menu, exportMenu, exportBtn };
 })();

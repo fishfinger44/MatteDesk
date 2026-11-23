@@ -211,6 +211,19 @@ class ObjectStore:
             out[int(k["frame"])] = k
         return out
 
+    def start_frame(self, name: str, keys: Optional[Dict[int, Dict[str, Any]]] = None) -> Optional[int]:
+        """The object's start key frame. A stale one (its key deleted: points cleared, empty SAM 3.1 result, undo)
+        is healed to the nearest existing key and saved; None only when the object has no keys."""
+        keys = self.keys(name) if keys is None else keys
+        start = self.get(name).get("tool", {}).get("start_frame")
+        if start in keys:
+            return start
+        if not keys:
+            return None
+        new = min(keys, key=lambda f: (abs(f - start), f)) if start is not None else min(keys)
+        self.update(name, tool={"start_frame": int(new)})
+        return int(new)
+
     def key_mask(self, name: str, frame: int) -> np.ndarray:
         m = cv2.imread(str(self.dir(name) / "keys" / f"k_{frame:04d}_mask.png"), cv2.IMREAD_GRAYSCALE)
         if m is None:

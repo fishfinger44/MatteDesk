@@ -94,7 +94,7 @@ async function fakeApi(method, url, body) {
   throw err(404, `fake api: ${method} ${url}`);
 }
 const toasts = [];
-window.UI = { api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true, bytes: (n) => `${n} B` };
+window.UI = { exportBtn: () => '<button class="md-export">Export</button>', exportMenu: () => {}, api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true, bytes: (n) => `${n} B` };
 const lastToast = () => toasts[toasts.length - 1] || '';
 const last = (method, re) => calls.filter((c) => c[0] === method && re.test(c[1])).pop();
 const count = (method, re) => calls.filter((c) => c[0] === method && re.test(c[1])).length;

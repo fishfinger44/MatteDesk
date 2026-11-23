@@ -50,7 +50,7 @@ async function fakeApi(method, url, body) {
   const e = new Error(`fake api: ${method} ${url}`); e.status = 404; throw e;
 }
 const toasts = [];
-window.UI = { api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true, bytes: (n) => `${n} B` };
+window.UI = { exportBtn: () => '<button class="md-export">Export</button>', exportMenu: () => {}, api: fakeApi, toast: (t) => toasts.push(String(t)), dialog: async () => true, confirmDelete: async () => true, bytes: (n) => `${n} B` };
 window.viewer = { projectLoaded: true, currentWorkDir: 'D:/W/shot/matte_desk', manifest: { plates: { beauty: 'b.####.png' } },
   firstFrame: 1, lastFrame: 57, currentFrame: 1, activePlate: 'beauty', setActivePlate() {}, goToFrame() {}, render() {} };
 window.MD = { placeFloating() {}, makeFloating() {}, renderStageBar() {}, S: { objects: [] } };

@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from engine.comfy_io import job_progress
+from engine.comfy_io import job_progress, job_thumb
 from engine.crop import CropSegment, extract_crop, paste_crop
 from engine.depth import frame_path
 from engine.jsonio import write_json
@@ -1403,6 +1403,7 @@ class Finalizer:
                     t = _tick(st, "soft_override_threads", t)
                 # write crop-only alpha + core (runs/v###/alpha/<seg>/a_####.exr)
                 write_alpha_exr(run_dir / "alpha" / seg.seg_id / f"a_{f:04d}.exr", a)
+                job_thumb(f, a, seg.crop)
                 t = _tick(st, "write_exr_threads", t)
                 cv2.imwrite(str(_mk(run_dir / "core" / seg.seg_id) / f"c_{f:04d}.png"), c.astype(np.uint8) * 255)
                 _tick(st, "write_core_png_threads", t)

@@ -147,6 +147,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | GET | `/api/version` | – | Running version + whether the server runs older code than on disk (the UI then asks for a restart). |
 | GET | `/api/jobs` | – | What is being computed now (status bar) + who holds / waits for the GPU (engine/gpu_manager: a job waiting has `gpu_wait`; background work without a job – band  |
 | GET | `/api/jobs/details` | – | 'Szczegóły' of the running job (Z19): GPU (nvidia-smi; null without it), Comfy RAM / VRAM / queue (foreign prompts), our step with frames and ETA, Comfy state o |
+| GET | `/api/jobs/thumb` | – | Progress window thumbnail (user request 2026-11-23): JPEG of the last frame the running job finished – the plate proxy with that frame's mask |
 | POST | `/api/jobs/cancel` | – | 'Przerwij': stop the running job(s) at the next safe point; our Comfy prompt is removed / interrupted. |
 | GET | `/api/doctor` | – |  |
 | POST | `/api/report/preview` | – | The whole package, anonymised, as it will be sent – kept under `id` for /api/report/send. |
@@ -278,6 +279,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/object/{name}/band/propose` | long_job (quiet), object_edit | „Zaproponuj pas” (plan docs/PLAN_SAPIENS2.md point 1, user decisions 2026-10-22): Sapiens2-seg-0.4B body parts of the person in `frame` -> band points of the ba |
 | GET | `/api/object/{name}/mask12_status` | – | Is the exact mask 1+2 of the work area ready (the band previews stop being „przybliżony” then)? A cheap poll – nothing is computed here (the batch runs once in  |
 | GET | `/api/object/{name}/stage_band/{stage}/{frame}/lines` | – | Preview lines of a stage band in `frame` (plate px): band edges (dashed), where the inset / outer feather end (thin dashes) – one lines function for every band  |
+| POST | `/api/object/{name}/stage_band/{stage}/export` | long_job |  |
 | POST | `/api/object/{name}/zones/{zone_id}/apply` | long_job | „Zastosuj” (plan step 4): only the zones are recomputed (cache) on the base alpha of the active version -> a new version runs/v### (QA + edge report); 409 with  |
 | GET | `/api/object/{name}/color_lab/{frame}` | – | Pipette of the "color" zone criterion (Z24): median Lab of 5 x 5 px of the plate-to-mask display image (the image the zone key is computed on) around (x, y) in  |
 | DELETE | `/api/object/{name}/zones/{zone_id}` | object_edit |  |
@@ -365,9 +367,10 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | POST | `/api/cleanup/anchors/linked/generate` | long_job | Every linked anchor not made from the main one's chosen image yet (all=1: every linked one again, e.g |
 | POST | `/api/cleanup/anchors/{aid}/generate` | long_job | A new generation of the anchor (a new random seed unless given; the description shown in the panel). |
 | POST | `/api/cleanup/anchors/{aid}/import` | – | The user's own image as a new generation of the anchor (e.g |
-| GET | `/api/cleanup/anchors/{aid}/gens/{name}` | – | raw=1: Qwen-Image-2.1's whole picture saved next to the generation (the pasted one when there is none). |
+| GET | `/api/cleanup/anchors/{aid}/gens/{name}` | – | raw=1: Qwen-Image-2.1's whole picture saved next to the generation (the pasted one when there is none) |
 | DELETE | `/api/cleanup/anchors/{aid}/gens/{name}` | – | A generation deleted from disk for good (user decision 2026-11-13); the chosen one deleted = the newest remaining is chosen |
 | POST | `/api/cleanup/versions/{version}/show` | – | Plate „cleaned” = the comp of this version (nothing recomputed) AND its settings come back for its object: model, description, seed and its anchors (user 2026-1 |
+| POST | `/api/cleanup/versions/{version}/reveal` | – | „📂” of a version card (user 2026-11-23): the system file browser on the version's composite frames (v###/comp, its first frame selected on Windows; the version  |
 | DELETE | `/api/cleanup/versions/{version}` | – | A version deleted from disk for good (user decision 2026-11-13: no project trash any more) |
 | POST | `/api/cleanup/versions/{version}/upscale` | long_job | „⤴ Upscale (SeedVR2)” (user 2026-11-11): the version's fill restored at the plate's scale by SeedVR2 as one clip (engine/inpaint_upscale.py) and laid back throu |
 | POST | `/api/cleanup/versions/{version}/recompose` | long_job | „⟲ Złóż ponownie”: a NEW version from the stored model frames of `version` with the CURRENT composite band (grow_px, soft_px, band points / keys), holdout, leve |
@@ -384,6 +387,7 @@ Kind: `long_job` = heavy, one at a time, listed in `/api/jobs` (quiet = status b
 | GET | `/api/cleanup/band/{frame}` | – | The band points in `frame` as the editor shows them (carried by the removed objects, snapped to their outline, widths scaled by „Pas na zewnątrz”). |
 | PUT | `/api/cleanup/band/{frame}` | – | Add a band point in `frame` or set its key there (position / outer width); the mask and the run use it. |
 | GET | `/api/cleanup/band/{frame}/lines` | – | Preview lines of the C1 band in `frame` (plate px): the band ring (objects' outline + where the solid patch ends) and where the soft edge ends – the geometry of |
+| POST | `/api/cleanup/band/export` | long_job | The C1 patch band (band ring + where the soft edge ends) of every frame of the work range as a Nuke Roto (clipboard / .nk) or After Effects masks (.jsx) – the s |
 | DELETE | `/api/cleanup/band/{point_id}` | – | Remove a band point, or only its key in `frame` (?frame=N; the last key removes the point). |
 | DELETE | `/api/cleanup/band` | – | The band keys of ALL points in `frame` (?frame=N), or every point (no frame = the plain band again). |
 | GET | `/api/cleanup3d` | – | State of the Cleanup 3D mode: steps done / stale, camera report, cards with keys, engines and solve availability. |

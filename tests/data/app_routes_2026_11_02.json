@@ -22,6 +22,13 @@
  ],
  [
   [
+   "GET"
+  ],
+  "/api/jobs/thumb",
+  "jobs_thumb"
+ ],
+ [
+  [
    "POST"
   ],
   "/api/jobs/cancel",
@@ -948,6 +955,13 @@
   [
    "POST"
   ],
+  "/api/object/{name}/stage_band/{stage}/export",
+  "export_band"
+ ],
+ [
+  [
+   "POST"
+  ],
   "/api/object/{name}/zones/{zone_id}/apply",
   "apply_zone_ep"
  ],
@@ -1576,6 +1590,13 @@
  ],
  [
   [
+   "POST"
+  ],
+  "/api/cleanup/versions/{version}/reveal",
+  "cleanup_reveal_version"
+ ],
+ [
+  [
    "DELETE"
   ],
   "/api/cleanup/versions/{version}",
@@ -1685,6 +1706,13 @@
   ],
   "/api/cleanup/band/{frame}/lines",
   "band_lines"
+ ],
+ [
+  [
+   "POST"
+  ],
+  "/api/cleanup/band/export",
+  "band_export"
  ],
  [
   [

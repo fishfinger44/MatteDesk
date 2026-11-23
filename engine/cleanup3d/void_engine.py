@@ -572,6 +572,24 @@ def from_display(img8: np.ndarray, linear: bool = False) -> np.ndarray:
     return _srgb_to_lin(a) if linear else a
 
 
+# the VIEWER's picture (2026-11-23, user report SD160_150 v004 F27 „exposure jump at the anchor”): the plate proxies are
+# drawn with the PlateToDisplay curve (engine/ingest.tonemap_plate_to_display), the models get plain sRGB (to_display8).
+# Every C1 image drawn in the viewer over / next to a plate proxy (the live composite, the model picture, the anchor
+# previews) goes through to_view8 / model_to_view8 – the same curve as the proxies; a plain sRGB overlay looked darker
+# and harder on the frame it was paused on. The models' own input / output stays to_display8 / from_display.
+def to_view8(img: np.ndarray, linear: bool = False) -> np.ndarray:
+    """Plate-space image (float / uint8 / uint16 BGR) -> uint8 BGR as the viewer shows the plate (its proxies)."""
+    if not linear:
+        return to_display8(img, False)
+    from engine.ingest import tonemap_plate_to_display
+    return tonemap_plate_to_display(np.asarray(_f32(img), np.float32))
+
+
+def model_to_view8(img8: np.ndarray, linear: bool = False) -> np.ndarray:
+    """A model-space uint8 BGR picture (to_display8 encoding: a model's frame, an anchor) -> uint8 BGR as the viewer."""
+    return to_view8(from_display(img8, linear), linear)
+
+
 def _mask01(m: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
     if m is None:
         return np.zeros(shape, np.float32)

@@ -1762,6 +1762,19 @@ canvas.edge-hot { cursor: pointer !important; }
 .other-layers .ol-seam { margin-left: 18px; padding-left: 4px !important; border-left: 1px solid var(--border-subtle); }
 .other-layers .ol-seam { display: grid; grid-template-columns: 1fr 96px 36px; align-items: center; gap: 6px; padding: 1px 4px 4px 18px; color: var(--text-muted); }
 .other-layers .ol-seam-l { display: flex; align-items: center; gap: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Objects palette layout (user report 2026-11-23): member rows fit the palette (the member seam's number spilled over
+   the opacity slider), the seam row on one line (slider + number + px). Later than the rules above on purpose. */
+.other-layers .ol-row.grp-part { grid-template-columns: 10px 14px 22px 22px minmax(56px, 1fr) 80px 62px 56px 36px 12px 16px; gap: 4px; }
+.other-layers .ol-row.solo { grid-template-columns: 10px 14px 22px 22px minmax(56px, 1fr) 80px 56px 36px 12px 16px; gap: 4px; }
+.other-layers .ol-row.grp-part .ol-op, .other-layers .ol-row.solo .ol-op { width: 56px; }
+.other-layers .ol-row.grp-part .md-num, .other-layers .ol-row.solo .md-num { width: 36px; padding: 0 3px; }
+.other-layers .ol-src { max-width: 80px; }
+.other-layers .ol-mseam { gap: 2px; min-width: 0; }
+.other-layers .ol-mseam input[type=range] { width: 30px !important; min-width: 0; flex: none; }
+.other-layers .ol-mseam .md-num { width: 28px !important; padding: 0 2px; }
+.other-layers .ol-mseam .md-num-unit { display: none; }
+.other-layers .ol-seam { grid-template-columns: 1fr 96px 36px 14px; gap: 4px; }
+.other-layers .ol-seam .md-num { width: 36px; padding: 0 3px; }
 .other-layers .ol-seam-l i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .other-layers .ol-seam-r { width: 96px; accent-color: var(--accent-primary); cursor: pointer; }
 .other-layers .ol-seam-v { text-align: right; font-variant-numeric: tabular-nums; }
@@ -1896,8 +1909,33 @@ body.mode-clean #stagePanel > :not(.c3-pane):not(#cleanupPanel) { display: none 
 .cu-anc-hover img { width: 100%; display: block; border-radius: 3px; }
 .cu-anc-hover-t { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
 .timeline-zones .zone-key.cu-anchor-key { transform: none; border: none; width: 12px; height: 10px; margin-left: -6px; top: -1px; font-size: 9px; line-height: 10px; text-align: center; }
-.cu-ver { display: flex; align-items: center; gap: 4px; }
-.cu-ver.shown .cu-ver-l { color: var(--accent-success); }
+/* step C1 versions (static/cleanup.js versionsHtml; user 2026-11-23): on top of the panel, a readable card per version,
+   fresh ones (computed in this session, not looked at yet) highlighted */
+.cu-vers-box { margin: 6px 0 10px; padding: 6px; border: 1px solid var(--border-subtle); border-radius: 6px; background: rgba(255,255,255,.02); }
+.cu-vers-box.has-new { border-color: var(--accent-primary); box-shadow: 0 0 0 1px rgba(232,163,61,.35), 0 0 14px rgba(232,163,61,.18); }
+.cu-vers-h { display: flex; align-items: center; gap: 6px; margin-top: 0; }
+.cu-vers-n { font-size: 10.5px; font-weight: 400; color: var(--text-muted); }
+.cu-vers-n.new { color: var(--accent-primary); font-weight: 600; }
+.cu-vers-for { font-size: 10.5px; margin-bottom: 4px; }
+.cu-versions { display: flex; flex-direction: column; gap: 5px; }
+.cu-ver { display: flex; flex-direction: column; gap: 3px; padding: 6px 7px; border: 1px solid var(--border-subtle); border-radius: 5px; cursor: pointer; background: var(--bg-panel); }
+.cu-ver:hover { border-color: var(--text-muted); }
+.cu-ver.cur { border-color: var(--accent-success); background: rgba(74,222,128,.06); cursor: default; }
+.cu-ver.fresh { border-color: var(--accent-primary); background: rgba(232,163,61,.10); animation: cuFresh 1.4s ease-in-out 3; }
+@keyframes cuFresh { 50% { box-shadow: 0 0 0 3px rgba(232,163,61,.45); } }
+.cu-ver-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-size: 12px; color: var(--text-main); }
+.cu-ver-v { font-size: 13px; }
+.cu-ver-m { color: var(--text-main); }
+.cu-ver-f { color: var(--text-muted); font-family: var(--font-mono, monospace); font-size: 11px; }
+.cu-badge { font-size: 9.5px; font-weight: 700; letter-spacing: .04em; padding: 1px 5px; border-radius: 3px; }
+.cu-badge.new { background: var(--accent-primary); color: #1a1a1a; }
+.cu-badge.on { border: 1px solid var(--accent-success); color: var(--accent-success); }
+.cu-ver-meta { font-size: 10.5px; color: var(--text-muted); }
+.cu-ver-p { font-size: 10.5px; color: var(--text-muted); font-style: italic; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cu-ver-acts { display: flex; align-items: center; gap: 4px; margin-top: 2px; }
+.cu-ver-acts .btn { height: 22px; padding: 0 6px; font-size: 11px; white-space: nowrap; }
+.cu-ver-sp { flex: 1; }
+.cu-vers-dir { margin-top: 6px; font-size: 10px; color: var(--text-muted); font-family: var(--font-mono, monospace); word-break: break-all; }
 
 /* step C1 „Inpaint” palettes (static/cleanup.js #cuPal, static/cleanup_anchors.js #cuAnchorPal; user 2026-11-11): left,
    floating, collapsible (static/palette_fold.js), the big anchor preview in a popup */
@@ -1924,6 +1962,7 @@ body.mode-clean #stagePanel > :not(.c3-pane):not(#cleanupPanel) { display: none 
 #cuAnchorPal .cu-anc-proj .pp-hint { flex-basis: 100%; margin: 0; }
 /* C1 Inpaint palette, tidied (user 2026-11-12): sections, the two actions big, the prompt stands out, the run full width */
 .cu-pal .cu-sec-h { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-subtle); font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); }
+.cu-pal .cu-sec-h { display: flow-root; }
 .cu-pal .pp-head + .cu-sec-h { margin-top: 0; border-top: none; padding-top: 0; }
 .cu-row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .cu-row2 > label { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 11px; }
@@ -1970,8 +2009,9 @@ body.mode-clean #stagePanel > :not(.c3-pane):not(#cleanupPanel) { display: none 
 .cu-mcard-b { color: var(--text-muted); margin-top: 1px; }
 .cu-dots { letter-spacing: -1px; color: #ffd400; } .cu-dots .off { opacity: .2; }
 .cu-guide-f { font-size: 10px; }
-.cu-band-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-.cu-band-row .chk { margin-right: auto; }
+.cu-band-row { display: flex; flex-wrap: nowrap; align-items: center; gap: 2px; }   /* one line: preview, ⊕ / ⊖ point, key ✕ (user 2026-11-23) */
+.cu-band-row .chk { margin-right: auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cu-band-row .btn { flex: none; padding: 1px 5px; white-space: nowrap; }
 .cu-pal .cu-band .btn.active { background: rgba(255,212,0,.22); border-color: #ffd400; color: #ffe680; }
 .cu-pal .cu-grain { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
 /* step C1 RIGHT palette „🧩 Złożenie” (static/cleanup.js #cuCompPal, 2026-11-15): band, protection, grain – bottom right
@@ -2051,7 +2091,27 @@ body.mode-clean #stagePanel > :not(.c3-pane):not(#cleanupPanel) { display: none 
   font: 12px var(--font-sans); cursor: pointer; white-space: nowrap; }
 .md-menu-item:hover:not(:disabled) { background: var(--bg-hover); color: var(--accent-primary); }
 .md-menu-item:disabled { color: var(--text-dim); cursor: default; }
-.sec-export { float: right; padding: 0 6px; font-weight: 500; }
+.md-menu-item.md-menu-head { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); padding-top: 6px; }
+.md-menu-item.md-menu-head:not(:first-child) { border-top: 1px solid var(--border-subtle); margin-top: 2px; }
+.band-exp-h { font-weight: 600; margin: 6px 0 2px; display: flow-root; }  /* „Pas ⇪ Export” header of the band palettes (stages 3 / 4 / 5 / 7) */
+
+/* THE „⇪ Export” button (user decision 2026-11-23): one look everywhere – Final Touch sections, MergeMatte, band palettes
+   (stages 3 / 4 / 5 / 7), C1 patch band. Built only by UI.exportBtn (static/ui.js); change its look HERE only. */
+.btn.md-export { padding: 1px 8px; font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; line-height: 1.4;
+  color: var(--accent-primary); background: transparent; border: 1px solid color-mix(in srgb, var(--accent-primary) 55%, transparent); border-radius: 4px; }
+.btn.md-export:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-primary) 16%, transparent); border-color: var(--accent-primary); }
+.btn.md-export.md-export-float { float: right; margin-left: 6px; }
+
+/* Export palette (stage 8) readability (user request 2026-11-23): every label ABOVE its control at full width (the
+   inline labels broke „Export folder” across two rows), more air between the groups, the action button set apart */
+.pts-palette.e6-palette { padding-bottom: 10px; }
+.pts-palette.e6-palette label:not(.chk) { display: flex; flex-direction: column; align-items: stretch; gap: 3px; margin: 10px 0 0; }
+.pts-palette.e6-palette label:not(.chk) > .form-input { width: 100%; box-sizing: border-box; margin: 0; }
+.pts-palette.e6-palette .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 10px; }
+.pts-palette.e6-palette .chk { display: inline-flex; align-items: center; gap: 5px; }
+.pts-palette.e6-palette #e5MembersL { display: flex; margin-top: 10px; }
+.pts-palette.e6-palette .pp-hint { margin-top: 5px; line-height: 1.4; }
+.pts-palette.e6-palette #st5Export { margin-top: 14px; }
 
 /* Cleanup 3D steps C1-C6 (static/cleanup3d.js, docs/PLAN_CLEANUP_3D.md section 2) */
 .c3-palette { width: 280px; max-width: 300px; max-height: calc(100% - 60px); overflow-y: auto; overflow-x: hidden; box-sizing: border-box; }

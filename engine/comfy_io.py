@@ -155,6 +155,17 @@ def job_progress(step: str, done: int, total: int) -> None:
         JOBS.progress(f"{pre} – {step}" if pre else step, done, total)
 
 
+def job_thumb(frame: int, mask: Any, crop: Optional[Any] = None) -> None:
+    """The progress window's thumbnail: the mask of the frame just finished (full frame, or of `crop` = [x, y, w, h]
+    plate px; a crop square [x, y, side, side] works as is). Throttled in JOBS.thumb; no-op outside a job, never raises."""
+    from engine.jobs import JOBS
+    try:
+        if JOBS.running():
+            JOBS.thumb(frame, mask, crop)
+    except Exception:   # a thumbnail must never fail the computation
+        pass
+
+
 class LazySeq:
     """Read-only sequence whose items are made on access (`fn(index)`); slicing gives another LazySeq. Keeps long
     shots (1000+ frames) from holding every frame / mask in RAM at once (results are the same as with a list)."""

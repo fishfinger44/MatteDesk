@@ -143,6 +143,15 @@ def next_zone_id(obj_dir: Path) -> str:
 
 
 # ----------------------------------------------------------------------------- region of the zone per frame
+def nonzero_bbox(m: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """(x0, y0, x1, y1) – exclusive ends – of the non-zero pixels of a 2-D mask, None = empty."""
+    rows = np.flatnonzero(m.any(axis=1))
+    if not len(rows):
+        return None
+    cols = np.flatnonzero(m.any(axis=0))
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
 def zone_mask_at(z: Zone, shape: Tuple[int, int], transform: Optional[np.ndarray] = None) -> np.ndarray:
     """Polygon / strokes rasterized at a frame; `transform` (2x3) moves the drawing from `z.frame`."""
     return raster_drawing(z.polygon, z.strokes, shape, transform)
@@ -216,10 +225,9 @@ def local_warp_mask(mask: np.ndarray, lw: "LocalWarp") -> np.ndarray:
     normalised Gaussian splat (on a 1/8 grid) of the visible points' displacements placed at their positions in THIS
     frame; where the points do not reach, the fallback transform's displacement is used."""
     H, W = mask.shape
-    m = mask.astype(np.float32)
     v = lw.vis.astype(bool)
     if v.sum() < 6:
-        return cv2.warpAffine(m, lw.fallback, (W, H), flags=cv2.INTER_LINEAR) > 0.5
+        return cv2.warpAffine(mask.astype(np.float32), lw.fallback, (W, H), flags=cv2.INTER_LINEAR) > 0.5
     g = 8
     gh, gw = (H + g - 1) // g, (W + g - 1) // g
     acc = np.zeros((2, gh, gw), np.float32)
@@ -244,10 +252,57 @@ def local_warp_mask(mask: np.ndarray, lw: "LocalWarp") -> np.ndarray:
     trust = np.clip(wb / (0.25 * peak), 0.0, 1.0)              # 1 near the points, 0 far away
     dx = trust * (ax / np.maximum(wb, 1e-9)) + (1 - trust) * fx
     dy = trust * (ay / np.maximum(wb, 1e-9)) + (1 - trust) * fy
+    # 2026-11-23: only the window the warped mask can reach (its bbox + the largest displacement) – a target pixel
+    # farther away samples 0 in every bilinear neighbour; bit-identical (tests/test_zone_roi.py), a 6K frame ~0.26 s ->
+    # a few ms for a small object
+    sb = nonzero_bbox(mask)
+    if sb is None:
+        return np.zeros((H, W), bool)
+    ex, ey = int(np.ceil(float(np.abs(dx).max()))) + 2, int(np.ceil(float(np.abs(dy).max()))) + 2
+    x0, y0, x1, y1 = max(0, sb[0] - ex), max(0, sb[1] - ey), min(W, sb[2] + ex), min(H, sb[3] + ey)
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((H, W), bool)
+    if (x1 - x0) * (y1 - y0) < 0.6 * H * W:
+        if gw * g == W and gh * g == H:
+            # the same bilinear weights on a sub-grid (scale exactly 1/g, 2 coarse cells of context on each side)
+            c0, c1 = max(0, x0 // g - 2), min(gw, -(-x1 // g) + 2)
+            r0, r1 = max(0, y0 // g - 2), min(gh, -(-y1 // g) + 2)
+
+            def full(a):
+                return cv2.resize(np.ascontiguousarray(a[r0:r1, c0:c1]), ((c1 - c0) * g, (r1 - r0) * g),
+                                  interpolation=cv2.INTER_LINEAR)[y0 - r0 * g:y1 - r0 * g, x0 - c0 * g:x1 - c0 * g]
+        else:
+            def full(a):
+                return cv2.resize(a, (W, H), interpolation=cv2.INTER_LINEAR)[y0:y1, x0:x1]
+        dxs, dys = full(dx), full(dy)
+        X = np.arange(x0, x1, dtype=np.float32)[None, :]
+        Y = np.arange(y0, y1, dtype=np.float32)[:, None]
+        # the source cut to the mask's bbox + 2 px; the maps shifted by whole pixels (exact in float32 near the window)
+        s0x, s0y, s1x, s1y = max(0, sb[0] - 2), max(0, sb[1] - 2), min(W, sb[2] + 2), min(H, sb[3] + 2)
+        src = np.ascontiguousarray(mask[s0y:s1y, s0x:s1x], dtype=np.float32)
+        mx = (X - dxs).astype(np.float32, copy=False) - np.float32(s0x)
+        my = (Y - dys).astype(np.float32, copy=False) - np.float32(s0y)
+        out = np.zeros((H, W), bool)
+        out[y0:y1, x0:x1] = cv2.remap(src, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.5
+        return out
+    m = mask.astype(np.float32)
     dx = cv2.resize(dx, (W, H), interpolation=cv2.INTER_LINEAR)
     dy = cv2.resize(dy, (W, H), interpolation=cv2.INTER_LINEAR)
     X, Y = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
     return cv2.remap(m, X - dx, Y - dy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.5
+
+
+def _crossfade(ra: np.ndarray, rb: np.ndarray, t: float) -> np.ndarray:
+    """((1 - t) * ra + t * rb) >= 0.5 of two bool masks, on the bbox of their union (0 >= 0.5 is False elsewhere)."""
+    b = nonzero_bbox(ra | rb)
+    out = np.zeros(ra.shape, bool)
+    if b is None:
+        return out
+    x0, y0, x1, y1 = b
+    fa = ra[y0:y1, x0:x1].astype(np.float32)
+    fb = rb[y0:y1, x0:x1].astype(np.float32)
+    out[y0:y1, x0:x1] = ((1.0 - t) * fa + t * fb) >= 0.5
+    return out
 
 
 def follow_transforms(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarray],
@@ -308,12 +363,24 @@ def _object_points(z: Zone, core: Optional[np.ndarray], n: int = 48, margin: int
     over the head – a part / an object in front, 2026-10-15): no point on it (grown 8 px), it would drag the zone."""
     if core is None or not core.any():
         return None
-    area = cv2.dilate(zone_mask_at(z, core.shape).astype(np.uint8),
-                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))).astype(bool)
-    inner = cv2.erode(core.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)  # off the edge: stable texture
+    drawn = zone_mask_at(z, core.shape)
+    # on the window of the drawing + margin only (2026-11-23, bit-identical: outside it the grown drawing is empty; the
+    # erode / exclude dilate get 2 / 8 px of context, the image border stays the image border): 6K ~1.1 s -> ms
+    H, W = core.shape
+    b = nonzero_bbox(drawn)
+    if b is None:
+        return None
+    x0, y0, x1, y1 = max(0, b[0] - margin), max(0, b[1] - margin), min(W, b[2] + margin), min(H, b[3] + margin)
+    c = 8
+    X0, Y0, X1, Y1 = max(0, x0 - c), max(0, y0 - c), min(W, x1 + c), min(H, y1 + c)
+    win = (slice(y0 - Y0, y1 - Y0), slice(x0 - X0, x1 - X0))
+    area = cv2.dilate(drawn[Y0:Y1, X0:X1].astype(np.uint8),
+                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))).astype(bool)[win]
+    inner = cv2.erode(core[Y0:Y1, X0:X1].astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)[win]  # off the edge
     if exclude is not None and exclude.any():
-        inner &= ~cv2.dilate(exclude.astype(np.uint8), np.ones((17, 17), np.uint8)).astype(bool)
+        inner &= ~cv2.dilate(exclude[Y0:Y1, X0:X1].astype(np.uint8), np.ones((17, 17), np.uint8)).astype(bool)[win]
     ys, xs = np.where(inner & area)
+    ys, xs = ys + y0, xs + x0
     if len(xs) < 12:
         return None
     idx = np.linspace(0, len(xs) - 1, min(n, len(xs))).astype(int)
@@ -323,8 +390,8 @@ def _object_points(z: Zone, core: Optional[np.ndarray], n: int = 48, margin: int
 def _bbox_transforms(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
     eye = np.eye(2, 3, dtype=np.float32)
     def bb(m):
-        ys, xs = np.where(m)
-        return (xs.min(), ys.min(), xs.max(), ys.max()) if len(xs) else None
+        b = nonzero_bbox(m)      # inclusive max, as np.where's min / max were (no full-frame index arrays)
+        return (b[0], b[1], b[2] - 1, b[3] - 1) if b is not None else None
     ref = bb(cores[z.frame])
     out = {}
     for f in frames:
@@ -567,9 +634,8 @@ def propagate_regions(z: Zone, frames: Sequence[int], cores: Dict[int, np.ndarra
                 regions[f] = raster_drawing(_lerp_polygon(pa, pb, t).tolist(), [], shape, None)
             elif isinstance(Ma, LocalWarp) or isinstance(Mb, LocalWarp):
                 # local mode: both keys warped to f, cross-faded by the distance to each key (no union doubling)
-                ra = region_of(a, Ma).astype(np.float32)
-                rb = region_of(b, Mb).astype(np.float32)
-                regions[f] = ((1.0 - t) * ra + t * rb) >= 0.5
+                ra, rb = region_of(a, Ma), region_of(b, Mb)
+                regions[f] = _crossfade(ra, rb, t)
             else:
                 regions[f] = zone_mask_at(kz(a), shape, Ma) | zone_mask_at(kz(b), shape, Mb)
             near = a if t < 0.5 else b
@@ -626,6 +692,23 @@ def zone_median_lab(z: "Zone", img: np.ndarray) -> Optional[List[float]]:
 
 def connected_to(cand: np.ndarray, core: np.ndarray, reach: int = 200) -> np.ndarray:
     """Candidate pixels in components touching the object and within `reach` px of it (no floating islands)."""
+    if not cand.any() or not core.any():
+        return np.zeros_like(cand)
+    # on the core's bbox + the reach only (2026-11-23, bit-identical): every kept pixel is within `reach` of the core,
+    # the chamfer distance of such a pixel runs inside the bbox of it and its core pixel, the components of the kept
+    # set lie inside the window; a 70-px object on a 6K plate: ~0.32 s -> a few ms a frame
+    H, W = core.shape
+    b = nonzero_bbox(core)
+    m = int(np.ceil(reach * 1.05)) + 4          # chamfer DIST_L2/5 underestimates the Euclidean distance by < 2 %
+    x0, y0, x1, y1 = max(0, b[0] - m), max(0, b[1] - m), min(W, b[2] + m), min(H, b[3] + m)
+    if (x1 - x0) * (y1 - y0) < 0.6 * H * W:
+        out = np.zeros_like(cand)
+        out[y0:y1, x0:x1] = _connected_to_full(cand[y0:y1, x0:x1], core[y0:y1, x0:x1], reach)
+        return out
+    return _connected_to_full(cand, core, reach)
+
+
+def _connected_to_full(cand: np.ndarray, core: np.ndarray, reach: int) -> np.ndarray:
     if not cand.any() or not core.any():
         return np.zeros_like(cand)
     dist = cv2.distanceTransform((~core).astype(np.uint8), cv2.DIST_L2, 5)
@@ -1758,12 +1841,25 @@ def apply_zones(frames: Sequence[int], cores: Dict[int, np.ndarray], images: Cal
         # already coherent in time – propagated by CoTracker3 from the zone keys), applied in EVERY frame: it corrects
         # the SAM3 result after stage 1, so a SAM3 user key in the frame does not win over it
         brush = (z.params or {}).get("source") == "brush"
-        keys = ([regions[f].astype(np.float32) for f in frames] if brush else
+        # a brush key = its region (bool); `(k > 0.5) & reg` of the float copy was the region itself – no 26-Mpx float
+        # per frame (2026-11-23: 47 frames of a 6K plate = 4.9 GB and ~1.3 s of astype)
+        fast = brush and not (z.soft and z.criterion != "all")
+        keys = (None if fast else [regions[f].astype(np.float32) for f in frames] if brush else
                 stabilize_keys([criterion_key(images(f), z) * regions[f] for f in frames]))
         for i, f in enumerate(frames):
             if f in user_keys and not brush:
                 continue  # a user key has priority in its frame
-            k, reg = keys[i], regions[f]
+            reg = regions[f]
+            if fast:
+                hit = reg.astype(bool, copy=False)
+                if z.mode == "add":
+                    core[f] = core[f] | connected_to(hit, core[f], z.grow_px)
+                else:
+                    rm = core[f] & hit
+                    core[f] = core[f] & ~hit
+                    removed[f] |= cv2.dilate(rm.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & reg
+                continue
+            k = keys[i]
             if z.soft and z.criterion != "all":
                 alpha = k if z.mode == "add" else (1.0 - k)
                 area = reg & ((k > 0.02) if z.mode == "add" else core[f])

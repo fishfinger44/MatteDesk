@@ -2745,6 +2745,7 @@
       <div class="band-seed" id="epBandSeed"></div>
       <div class="muted pp-hint" id="ePvInfo"></div>
       <div class="pp-sec edge-settings" id="edgeSettings">
+      <div class="zp-sub band-exp-h" title="Pas krawędzi tego etapu: suwaki i punkty pasa">Pas ${UI.exportBtn({ bandexp: "1" }, "Pas tego etapu (krawędzie pasa + końce wtopień, wszystkie klatki obszaru roboczego) jako Roto w Nuke'u (schowek / plik .nk) albo maski w After Effects (skrypt .jsx)")}</div>
       ${bandRow('out', 'MatAnyone2', 'o4Out', 'o4OutV')}
       ${bandRow('in', 'MatAnyone2', 'o4In', 'o4InV')}
       ${bandRow('feather', 'MatAnyone2', 'o4Feather', 'o4FeatherV')}
@@ -3107,7 +3108,8 @@
         <option value="steer">Izoluj + rozmyj tło</option></select></label>
       <label title="Dłuższy bok obrazu dla LTX-2.5 (tylko w dół; potem dopełnienie do wielokrotności 32, krótszy bok ≤ 1088). Więcej = więcej detalu, więcej VRAM / czasu">Rozdzielczość LTX-2.5<select id="lx6Side" class="form-input" title="Dłuższy bok obrazu dla LTX-2.5"><option value="768">768 px</option><option value="1024">1024 px</option><option value="1280">1280 px</option><option value="1536">1536 px</option><option value="1920">1920 px</option></select></label>
       <label title="Klatki w jednej paczce modelu (8k+1, maks. 145 – dłuższe paczki: model wpuszcza RGB do maski). Paczki zachodzą na siebie 8 klatek z przenikaniem. Dłuższa = stabilniej w czasie, więcej pamięci">Długość paczki<select id="lx6Frames" class="form-input" title="Klatki w jednej paczce modelu (8k+1)"><option value="25">25 kl.</option><option value="49">49 kl.</option><option value="73">73 kl.</option><option value="97">97 kl.</option><option value="121">121 kl.</option></select></label>
-      <label title="Jak wynik modelu staje się alfą obiektu. Pas = ten sam pas co w etapach 3 / 4 / 5 (suwaki, punkty pasa, wtopienia w rdzeń): LTX-2.5 decyduje tylko w pasie, środek = maska 1+2. Surowy = bez pasa – model sam decyduje, co wycina">Wynik<select id="lx6Combine" class="form-input" title="Jak wynik modelu staje się alfą obiektu"><option value="band">pas (jak w etapach 3 / 4 / 5)</option><option value="raw">surowy (bez pasa – decyduje model)</option></select></label>        ${bandRow('out', 'LTX-2.5', 'lx6RegionS', 'lx6Region', 'lx-band-only')}
+      <label title="Jak wynik modelu staje się alfą obiektu. Pas = ten sam pas co w etapach 3 / 4 / 5 (suwaki, punkty pasa, wtopienia w rdzeń): LTX-2.5 decyduje tylko w pasie, środek = maska 1+2. Surowy = bez pasa – model sam decyduje, co wycina">Wynik<select id="lx6Combine" class="form-input" title="Jak wynik modelu staje się alfą obiektu"><option value="band">pas (jak w etapach 3 / 4 / 5)</option><option value="raw">surowy (bez pasa – decyduje model)</option></select></label>        <div class="zp-sub band-exp-h lx-band-only" title="Pas krawędzi tego etapu: suwaki i punkty pasa">Pas ${UI.exportBtn({ bandexp: "1" }, "Pas tego etapu (krawędzie pasa + końce wtopień, wszystkie klatki obszaru roboczego) jako Roto w Nuke'u (schowek / plik .nk) albo maski w After Effects (skrypt .jsx)")}</div>
+      ${bandRow('out', 'LTX-2.5', 'lx6RegionS', 'lx6Region', 'lx-band-only')}
         ${bandRow('in', 'LTX-2.5', 'lx6ErodeS', 'lx6Erode', 'lx-band-only')}
         ${bandRow('feather', 'LTX-2.5', 'lx6FeatherS', 'lx6Feather', 'lx-band-only')}
         ${bandRow('outFeather', 'LTX-2.5', 'lx6SoftS', 'lx6Soft', 'lx-band-only')}
@@ -3182,7 +3184,8 @@
       <div class="band-seed" id="vmBandSeed"></div>
       <div class="muted pp-hint" id="vmPvInfo"></div>
       <div class="pp-sec">
-        ${bandRow('out', 'VideoMaMa', 'vmReachS', 'vmReach')}
+        <div class="zp-sub band-exp-h" title="Pas krawędzi tego etapu: suwaki i punkty pasa">Pas ${UI.exportBtn({ bandexp: "1" }, "Pas tego etapu (krawędzie pasa + końce wtopień, wszystkie klatki obszaru roboczego) jako Roto w Nuke'u (schowek / plik .nk) albo maski w After Effects (skrypt .jsx)")}</div>
+      ${bandRow('out', 'VideoMaMa', 'vmReachS', 'vmReach')}
         ${bandRow('in', 'VideoMaMa', 'vmInsetS', 'vmInset')}
         ${bandRow('feather', 'VideoMaMa', 'vmFeatherS', 'vmFeather')}
         ${bandRow('outFeather', 'VideoMaMa', 'vmOuterFeatherS', 'vmOuterFeather')}

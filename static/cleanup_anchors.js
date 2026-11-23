@@ -38,7 +38,9 @@
   const byId = (id) => anchors().find((a) => a.id === id) || null;
   const chosen = (a) => a && (a.gens || []).find((g) => g.name === a.gen);
   // a generation's image: url = what the video model gets (Qwen-Image-2.1's raw picture with anchor_raw, else the pasted one)
-  const gsrc = (g) => (g ? `${g.url}${String(g.url).includes('?') ? '&' : '?'}t=${encodeURIComponent(g.time || '')}` : '');
+  // view=1 (2026-11-23): shown in the viewer's curve like the plate proxies (the stored PNG is the models' sRGB – it looked
+  // darker / harder than the frame); the ⤓ Export link keeps g.url = the stored PNG as is
+  const gsrc = (g) => (g ? `${g.url}${String(g.url).includes('?') ? '&' : '?'}view=1&t=${encodeURIComponent(g.time || '')}` : '');
   const imgOf = (a) => (!a ? '' : a.kind === 'original' ? `/api/frame/${a.frame}?plate=beauty` : gsrc(chosen(a)));
 
   function set(d) {
@@ -174,7 +176,12 @@
     const s = (A.ctx && A.ctx.settings) || {};
     const m = LINK[s.link_method] ? s.link_method : 'qwen';
     const dn = s.link_denoise != null ? +s.link_denoise : 0.4;
-    return `<div class="cu-anc-link" title="${esc(LINK[m][1])}"><label>Podłączone<select id="cuLinkMethod" class="form-input">${Object.entries(LINK).map(([k, v]) => `<option value="${k}"${k === m ? ' selected' : ''} title="${esc(v[1])}">${esc(v[0])}</option>`).join('')}</select></label>
+    // the main anchor shows an imported (touched-up) image: „Qwen (styl głównej)” draws anew and keeps only its style –
+    // the touch-up is lost on the linked ones (user 2026-11-23)
+    const mn = anchors().find((x) => x.kind === 'main');
+    const imp = m === 'qwen' && mn && chosen(mn) && chosen(mn).imported
+      ? '<div class="cu-lint-i warn">⚠ Główna jest z importu, a „Qwen (styl głównej)” rysuje od nowa i bierze z niej tylko styl – poprawki nie przejdą na podłączone. Wybierz „Przeniesienie + Qwen” albo „Tylko przeniesienie”.</div>' : '';
+    return `${imp}<div class="cu-anc-link" title="${esc(LINK[m][1])}"><label>Podłączone<select id="cuLinkMethod" class="form-input">${Object.entries(LINK).map(([k, v]) => `<option value="${k}"${k === m ? ' selected' : ''} title="${esc(v[1])}">${esc(v[0])}</option>`).join('')}</select></label>
       ${m === 'warp_qwen' ? `<label class="cu-anc-dn" title="Siła poprawki Qwen-Image-2.1 (denoise): mało = wzór zostaje prawie bez zmian, dużo = Qwen rysuje więcej od siebie">Siła <input type="range" id="cuLinkDenoise" min="0.1" max="0.8" step="0.05" value="${dn}"></label>` : ''}
       <label class="chk" title="Przejście między kotwicami (2026-11-15): model wideo płynnie przechodzi z wyglądu jednej przypiętej kotwicy w następną, klatka po klatce, zamiast trzymać wzór głównej i przeskakiwać przy każdej kotwicy (bez jednego wzoru &lt;Picture 1&gt; na cały klip). Dla kotwic „Qwen (styl głównej)” z różnym układem wzoru"><input type="checkbox" id="cuAnchorMorph"${s.anchor_morph ? ' checked' : ''}> przejście między kotwicami</label></div>`;
   }
@@ -319,7 +326,9 @@
     view.addEventListener('wheel', (e) => {
       e.preventDefault();
       const r = view.getBoundingClientRect(); const cx = e.clientX - r.left, cy = e.clientY - r.top;
-      const z1 = Math.max(0.25, Math.min(16, P.z * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+      // the floor follows the fit: the tiles are the frames' own size (6K plate = fit ~0.04) – a fixed 0.25 floor made
+      // wheel-out jump IN (user 2026-11-23)
+      const z1 = Math.max(Math.min(0.25, fitZoom() / 4), Math.min(16, P.z * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
       P.x = cx - (cx - P.x) * (z1 / P.z); P.y = cy - (cy - P.y) * (z1 / P.z); P.z = z1; viewXf();
     }, { passive: false });
     view.addEventListener('mousedown', (e) => {
@@ -374,11 +383,16 @@
     return p;
   }
   function viewXf() { const st = $('cuPopStrip'); if (st) st.style.transform = `translate(${P.x}px, ${P.y}px) scale(${P.z})`; }
+  function fitZoom() {   // the scale that shows every anchor in the window (1 when not measurable yet)
+    const st = $('cuPopStrip'); const view = $('cuPopView'); if (!st || !view) return 1;
+    const sw = st.offsetWidth, sh = st.offsetHeight; if (!sw || !sh) return 1;
+    return Math.min((view.clientWidth || 600) / sw, (view.clientHeight || 400) / sh);
+  }
   function fitView() {   // every anchor in the window (the strip at scale 1 = the frames' own size side by side)
     const st = $('cuPopStrip'); const view = $('cuPopView'); if (!st || !view) return;
     const sw = st.offsetWidth, sh = st.offsetHeight; if (!sw || !sh) return;
     const vw = view.clientWidth || 600, vh = view.clientHeight || 400;
-    P.z = Math.min(vw / sw, vh / sh);
+    P.z = fitZoom();
     P.x = (vw - sw * P.z) / 2; P.y = (vh - sh * P.z) / 2; viewXf();
   }
   // a dragged popup stays inside the window (a smaller window / a position saved on a bigger one, user 2026-11-12)

@@ -448,13 +448,39 @@ def anchor_key(frame: int, prompt: str, mode: str, mask: np.ndarray, seed: int =
 
 
 ANCHOR_LATENT_MASK = True   # anchors: Qwen-Image-2.1 inpaints under the mask (2026-11-15); False = the whole crop edited
+# the anchor's soft edge (user 2026-11-23): a hard latent mask made Qwen-Image-2.1 draw a sharp outline along the mask
+# edge (in-focus felt over a defocused plate, SD160). Width = the C1 patch band („Pas łaty”: outer band + outer feather)
+# x this factor – the band is measured in plate px from the object, the model works at ~1 MP, so the band alone is ~1
+# model px; 0 = the old hard anchor
+ANCHOR_FEATHER_MULT = 8.0
+
+
+def anchor_feather_px(s: Dict[str, Any], f: Optional[int] = None) -> float:
+    """Plate px of the anchor's outward ramp at frame f, from the C1 patch band (engine/cleanup.band_at)."""
+    from engine import cleanup as cu
+    try:
+        grow, soft = cu.band_at(s, f)
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, float(grow) + float(soft)) * ANCHOR_FEATHER_MULT
+
+
+def anchor_feather(hard: np.ndarray, feather_px: float) -> np.ndarray:
+    """float32 0..1: 1 in `hard` (> 0.5), smoothstep falling to 0 over `feather_px` px OUTSIDE it (never inward)."""
+    h = np.asarray(hard, np.float32) > 0.5
+    if feather_px <= 0 or not h.any():
+        return h.astype(np.float32)
+    d = cv2.distanceTransform((~h).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    t = np.clip(1.0 - d / float(feather_px), 0.0, 1.0)
+    return np.where(h, 1.0, t * t * (3.0 - 2.0 * t)).astype(np.float32)
 
 
 def make_anchor(client: Any, io_dir: Path, plate: np.ndarray, mask: np.ndarray, prompt: str, mode: str,
                 linear: bool = False, seed: Optional[int] = None, ref: Optional[np.ndarray] = None,
                 init: Optional[np.ndarray] = None, denoise: float = 1.0, region: Optional[np.ndarray] = None,
                 text: Optional[str] = None, raw: Optional[list] = None,
-                plate_denoise: Optional[float] = None, what: Optional[str] = None) -> np.ndarray:
+                plate_denoise: Optional[float] = None, what: Optional[str] = None,
+                feather_px: float = 0.0) -> np.ndarray:
     """uint8 BGR plate frame with Qwen-Image-2.1's edit pasted inside the mask (soft by the mask's own values).
     `plate_denoise` < 1 (no `init`, „Siła kotwicy”, user 2026-11-15): Qwen-Image-2.1 starts from the plate itself –
     the face's shape, light and expression stay, the edit goes over them; 1 / None = drawn anew in the mask.
@@ -475,10 +501,14 @@ def make_anchor(client: Any, io_dir: Path, plate: np.ndarray, mask: np.ndarray, 
     m = (np.asarray(mask, np.float32) > 0.02).astype(np.float32)
     if region is not None:   # only this part is edited and pasted (the warp's holes, engine/anchor_warp)
         m = m * (np.asarray(region, np.float32) > 0.5)
+    elif feather_px > 0:     # soft OUTWARD from the model's mask (clean plate there – no ghost of the object)
+        m = anchor_feather(m, feather_px)
+    soft = bool(feather_px > 0 and region is None and ANCHOR_LATENT_MASK)
     from engine.cleanup3d.regen import QWEN_FEATHER_PX, QWEN_SEED
     r = None if ref is None else cv2.resize(np.asarray(ref), (disp.shape[1], disp.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     # the anchors are inpainted (latent noise mask, 2026-11-15): Qwen-Image-2.1 redraws only the mask
     gen, _w, _n = _run_qwen(client, Path(io_dir), disp, m > 0.02, prompt, None, mode, what=what, latent_mask=ANCHOR_LATENT_MASK,
+                            mask_weight=m if soft else None,
                             seed=QWEN_SEED if seed is None else int(seed), ref=r,
                             text=text or (_touchup(prompt) if init is not None else
                                   derived_prompt(prompt, mode, what) if r is not None else None),

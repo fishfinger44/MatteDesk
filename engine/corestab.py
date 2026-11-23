@@ -50,7 +50,9 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
                    probs: Optional[Dict[int, np.ndarray]] = None, flip_margin: float = 0.0,
                    protect_thin: bool = True,
                    probs_out: Optional[Dict[int, np.ndarray]] = None,
-                   only: Optional[Iterable[int]] = None) -> Tuple[Dict[int, np.ndarray], Dict[str, float]]:
+                   only: Optional[Iterable[int]] = None,
+                   emit: Optional[Callable[[int, np.ndarray, Tuple[int, int, int, int]], None]] = None
+                   ) -> Tuple[Dict[int, np.ndarray], Dict[str, float]]:
     """Returns (stabilised cores, stats {changed_px_per_frame, frames, mode}).
 
     Two guards against eroding what is not jitter (synthetic puppet 2026-10-14: a 2-4 px antenna vanished entirely,
@@ -182,6 +184,8 @@ def stabilize_core(cores: Dict[int, np.ndarray], gray: Callable[[int], np.ndarra
         changed += int((sub != (cc > 0.5)).sum())
         new[y0:y1, x0:x1] = sub
         out[f] = new
+        if emit is not None:   # progress window thumbnail: the stabilised crop of this frame, [x, y, w, h]
+            emit(f, sub, (x0, y0, w, h))
         if probs_out is not None and use_prob and probs.get(f) is not None:
             p = probs[f]
             p8 = (p.copy() if p.dtype == np.uint8 else (np.clip(p, 0, 1) * 255.0 + 0.5).astype(np.uint8))

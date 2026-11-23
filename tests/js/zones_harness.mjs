@@ -195,6 +195,7 @@ const hooks = {
 const tileCalls = [];
 
 // ---------------------------------------------------------------- load zones.js into the window
+window.eval(readFileSync(path.join(STATIC, 'ui.js'), 'utf-8'));     // UI.exportBtn (the „⇪ Export” button)
 window.eval(readFileSync(path.join(STATIC, 'zones.js'), 'utf-8'));
 const ZN = window.MD_ZONES;
 const assert = (c, msg) => { if (!c) throw new Error(`ASSERT: ${msg}`); };

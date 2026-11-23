@@ -36,4 +36,4 @@ def test_api_and_ui_wired():
     assert 'cl.report["input_plate"] = s["input_plate"]' in src
     js = (ROOT / "static" / "cleanup.js").read_text(encoding="utf-8")
     assert 'id="cuInput"' in js and "function renderInput(d)" in js and "save({ input_plate: e.target.value })" in js
-    assert "(v.input_plate ? ` · na ${v.input_plate}` : '')" in js
+    assert "v.input_plate ? `na ${v.input_plate}` : ''" in js     # version card (2026-11-23 cards)

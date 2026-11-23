@@ -71,19 +71,19 @@
       <label id="ftRunL" style="display:none" title="Która wersja z listy jest bazą">Wersja<select id="ftRun" class="form-input"></select></label>
       <div class="muted pp-hint" id="ftBaseInfo"></div>
       <div class="pp-sec">
-        <div class="zp-sub" title="Grading alfy – cała alfa, po kreskach pędzla; na żywo, bez przeliczania modeli; to samo idzie do eksportu">Grade <button type="button" class="btn btn-ghost btn-xs sec-export" data-ftexp="grade" title="Grade / Dilate / Blur z tymi wartościami do Nuke'a – schowek albo plik .nk (Ctrl+V podłącza do zaznaczonego węzła)">⇪ Export</button></div>
+        <div class="zp-sub" title="Grading alfy – cała alfa, po kreskach pędzla; na żywo, bez przeliczania modeli; to samo idzie do eksportu">Grade ${UI.exportBtn({ ftexp: "grade" }, "Grade / Dilate / Blur z tymi wartościami do Nuke'a – schowek albo plik .nk (Ctrl+V podłącza do zaznaczonego węzła)")}</div>
         ${FIN.filter(([k]) => GRADE.includes(k)).map(finRow).join('')}
         <button type="button" class="btn btn-ghost btn-xs" id="ftFinReset" title="Wyzeruj grade i motion blur (baza bez zmian)">↺ bez wykończenia</button>
       </div>
       <div class="pp-sec">
-        <div class="zp-sub" title="Rozmycie ruchu alfy wzdłuż ruchu obiektu (po grade, przed rozmyciem Gaussa)">Motion blur <button type="button" class="btn btn-ghost btn-xs sec-export" data-ftexp="mb" title="Motion blur Final Touch nie ma odpowiednika w węzłach Nuke'a – zostaje wpalony w alfę eksportu">⇪ Export</button></div>
+        <div class="zp-sub" title="Rozmycie ruchu alfy wzdłuż ruchu obiektu (po grade, przed rozmyciem Gaussa)">Motion blur ${UI.exportBtn({ ftexp: "mb" }, "Motion blur Final Touch nie ma odpowiednika w węzłach Nuke'a – zostaje wpalony w alfę eksportu")}</div>
         ${FIN.filter(([k]) => !GRADE.includes(k)).map(finRow).join('')}
         <div class="row"><label class="chk" title="Hybryda (plan 2026-10-22): kierunek rozmycia z ruchu obiektu, SIŁA per odcinek krawędzi zmierzona na plate'cie – szerokość przejścia 10–90 % w poprzek krawędzi wobec rozmycia przewidzianego z prędkości i migawki (łapie obrót, palce, rolling shutter, defocus). Wyłączone = jedna siła na cały obiekt"><input type="checkbox" id="ftMbMeasured" checked> siła z pomiaru plate'u</label>
           <button type="button" class="btn btn-ghost btn-xs" id="ftMbShutterManifest" title="Shutter ujęcia: zmierzony na plate'cie, a bez pomiaru z manifestu">↺ ujęcia</button>
           <button type="button" class="btn btn-ghost btn-xs" id="ftMbShutterMeasure" title="Zmierz kąt migawki na plate'cie ujęcia (pary klatek o różnej prędkości kamery; wynik w project.json, manifest bez zmian)">📏 Zmierz</button></div>
       </div>
       <div class="pp-sec">
-        <div class="zp-sub" title="Dodaj (G) / Usuń (R) / Gumka (E) na lewym pasku; kreska = tylko ta klatka">Pędzel <button type="button" class="btn btn-ghost btn-xs sec-export" data-ftexp="paint" title="Kreski pędzla jako RotoPaint (każda kreska tylko na swojej klatce) – schowek albo plik .nk">⇪ Export</button></div>
+        <div class="zp-sub" title="Dodaj (G) / Usuń (R) / Gumka (E) na lewym pasku; kreska = tylko ta klatka">Pędzel ${UI.exportBtn({ ftexp: "paint" }, "Kreski pędzla jako RotoPaint (każda kreska tylko na swojej klatce) – schowek albo plik .nk")}</div>
         <label title="Twardość pędzla: 100 % = ostra krawędź kreski, 0 % = miękka (krycie spada od środka do krawędzi kreski; nic nie wychodzi poza promień)">Twardość <span id="ftHardN">${Math.round(F.hardness * 100)} %</span>
           <input type="range" id="ftHard" min="0" max="100" value="${Math.round(F.hardness * 100)}" style="width:100%"></label>
         <div class="pp-chk"><label class="chk" title="Warstwa korekt tej klatki na obrazie (zielone = dodaje, czerwone = odejmuje; gumka ją wymazuje). Wyłącz, żeby oceniać samą alfę"><input type="checkbox" id="ftShow" ${F.showStrokes ? 'checked' : ''}> 👁 kreski pędzla</label>

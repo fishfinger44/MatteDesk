@@ -122,7 +122,9 @@
   // the last lines drawn per frame stay (lastLines): they are shown dimmed until the new ones arrive, so a slider
   // release / point edit never blanks the band (user report 2026-11-11, C1: the band vanished after a slider change)
   function dirty() { B.data = B.keep ? { [B.keep.k]: B.keep.d } : {}; B.keyset = null; dirtyLines(); B.live = null; }
-  function dirtyLines() { B.lines = {}; }
+  // B.gen: an answer asked before the band changed is dropped (user 2026-11-23: „czasami nie odświeża” – a request in
+  // flight during an edit stored the OLD lines under the same key after the clear)
+  function dirtyLines() { B.lines = {}; B.gen = (B.gen || 0) + 1; }
   // preview lines of the band: the palette's slider values (live while dragging = the whiskers scale, lines after release)
   async function loadLines(f, params, prefetch) {
     const q = Object.entries(params || {}).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
@@ -131,16 +133,24 @@
     if (Object.keys(B.lines).length > 240) B.lines = {};
     B.busy[k] = true;
     const url = `${base()}/${f}/lines?${q}`;
-    try {
-      B.lines[k] = await H.api('GET', url); if (!prefetch) V().render();
+    const gen = B.gen || 0;
+    let L = null, err = null;
+    try { L = await H.api('GET', url); } catch (e) { err = e; }
+    // not busy BEFORE the redraw (2026-11-23, „czasami nie odświeża”): a live drawLines skips asking while this frame
+    // has a request in flight – redrawing with the flag still set dropped the newest slider values until a mouse move
+    delete B.busy[k];
+    const v = V();
+    if (gen !== (B.gen || 0)) { if (v) v.render(); return null; }   // the band changed meanwhile: dropped, asked again
+    if (err) {   // the reason stays with the frame (lineNote) until the band changes – not „ładuję…” for ever (2026-10-24)
+      if (!prefetch) { B.lines[k] = { band_contours: [], error: err.message || String(err) }; if (v) v.render(); }
+    } else {
+      B.lines[k] = L;
+      // a prefetch of the frame now shown redraws too: a slider dragged meanwhile waited for it
+      if (v && (!prefetch || v.currentFrame === f)) v.render();
       // the mask 1+2 of this frame was the quick stand-in (the exact one is computed in the background, 2026-10-24):
       // shown now; asked again ONCE, when the cheap status says the exact mask is ready (no re-asking every few seconds)
-      if (B.lines[k] && B.lines[k].approx) watchMask12(() => { for (const kk of Object.keys(B.lines)) if (B.lines[kk] && B.lines[kk].approx) delete B.lines[kk]; if (V()) V().render(); });
+      if (L && L.approx) watchMask12(() => { for (const kk of Object.keys(B.lines)) if (B.lines[kk] && B.lines[kk].approx) delete B.lines[kk]; if (V()) V().render(); });
     }
-    catch (e) {   // the reason stays with the frame (lineNote) until the band changes – not „ładuję…” for ever (2026-10-24)
-      if (!prefetch) { B.lines[k] = { band_contours: [], error: e.message || String(e) }; V().render(); }
-    }
-    finally { delete B.busy[k]; }
     // the neighbours in the background (user report 2026-10-22: the band showed late after a frame step): the next
     // step finds its lines here / in the server cache – one at a time, only while the frame stays put and not playing
     if (!prefetch && !isC3d()) {
@@ -603,6 +613,26 @@
   function onFrame() { if (on()) { if (!st(V().currentFrame)) load(V().currentFrame); renderLane(); info(); } else renderLane(); }
   function reset() { B.data = {}; B.keyset = null; B.lines = {}; B.lastLines = {}; B.undo = []; B.live = null; B.drag = null; renderLane(); }
 
+  // „⇪ Export” of a band palette (user request 2026-11-23, like Final Touch): the band of the current stage over the
+  // work area as a Nuke Roto (clipboard / .nk) or After Effects masks (.jsx) – api/band_export.py
+  // + the C1 „Pas łaty” of Cleanup (api/inpaint_band.py, the cleaned thing's own band)
+  const EXPORTABLE = (s) => !!s && (['matanyone', 'videomama', 'ltx', 'c1'].includes(s) || s.startsWith('zone:'));
+  function exportMenu(btn) {
+    const stage = STAGE_OF();
+    const c1 = stage === 'c1';
+    const off = !EXPORTABLE(stage) ? 'eksport pasa: tylko etapy 3 / 4 / 5 / 7 obiektu i pas łaty C1' : (!c1 && !obj()) ? 'brak wybranego obiektu' : '';
+    const get = (fmt, what = 'band') => () => H.api('POST', c1 ? `/api/cleanup/band/export?fmt=${fmt}&what=${what}`
+      : `/api/object/${encodeURIComponent(obj())}/stage_band/${encodeURIComponent(stage)}/export?fmt=${fmt}&what=${what}`);
+    // + the band's tracker (2026-11-23): the band points (CoTracker3) + the mask centre – Nuke Tracker4 / After Effects nulls
+    const trk = { what: c1 ? 'Tracker pasa łaty' : `Tracker pasa (${stage || '–'})`, aeAs: 'nulle (punkty pasa + środek maski)',
+                  get: get('nk', 'tracker'), getAe: get('jsx', 'tracker') };
+    window.UI.exportMenu(btn, { what: c1 ? 'Pas łaty' : `Pas (${stage || '–'})`, off, status: (t, k) => H.status(t, k), get: get('nk'), getAe: get('jsx'),
+                                more: [trk] });
+  }
+  document.addEventListener('click', (e) => {
+    const b = e.target && e.target.closest && e.target.closest('[data-bandexp]');
+    if (b && H) { e.preventDefault(); exportMenu(b); }
+  });
   function init(hooks) {
     H = hooks;
     wire(V().canvas);
@@ -631,5 +661,5 @@
   const setSliderKeys = (stage, o) => { SK[stage] = o; };
   window.MD_BANDPTS = { init, draw, drawLines, strokeLines, lineNote, onTool, slider, SLIDER_ORDER, pointsAt: (f) => pts(f), watchMask12, onFrame, reset, dirty, undo, hasKeyAt, deleteKeyAt, copyFrom, setLive,
                         keyedAt, setSliderKeys, setSliderKey, hasSliderKey,
-                        renderLane, info, stage: STAGE_OF, renderMode, renderModeInto, ready: false };
+                        renderLane, info, stage: STAGE_OF, renderMode, renderModeInto, exportMenu, ready: false };
 })();
